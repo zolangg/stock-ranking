@@ -111,7 +111,7 @@ if "stock_scores" not in st.session_state:
 
 st.header("Neuen Stock bewerten")
 with st.form(key="stock_form", clear_on_submit=True):
-    ticker = st.text_input("Stock-Ticker (z.B. MCVT)", max_chars=10).strip().upper()
+    ticker = st.text_input("Stock-Ticker", max_chars=10).strip().upper()
     criteria_points = {}
     for crit in CRITERIA:
         idx = st.radio(crit["question"], options=list(enumerate(crit["options"], 1)),
