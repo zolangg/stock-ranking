@@ -184,7 +184,6 @@ with st.form(key="stock_form", clear_on_submit=True):
     for crit in CRITERIA:
         st.markdown(f"##### {crit['question']}")
         idx = st.radio(
-            "",
             options=list(enumerate(crit["options"], 1)),
             format_func=lambda x: x[1],
             key=crit["name"]
