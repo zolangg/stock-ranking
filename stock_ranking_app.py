@@ -255,7 +255,6 @@ if st.session_state.stock_scores:
         if st.button("Delete this stock from ranking"):
             del_idx = ticker_list.index(delete_ticker)
             st.session_state.stock_scores.pop(del_idx)
-            st.success(f"Stock {delete_ticker} removed! Table and export updated.")
     else:
         st.info("No stocks saved yet — nothing to remove.")
 
