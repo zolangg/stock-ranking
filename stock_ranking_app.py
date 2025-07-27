@@ -1,163 +1,160 @@
 import streamlit as st
 import pandas as pd
 
-st.header("Premarket Stock Ranking")
+st.header("Premarket Stock Ranking Tool")
 
 CATALYSTS = [
-    # NEWS
     {"name": "Unusually good/bad earnings report (surprise!)", "score": 1.0},
     {"name": "Better/worse than expected guidance reported", "score": 0.9},
-    {"name": "Market can’t put a ceiling on earnings (growth stocks)", "score": 0.9},
-    {"name": "New/Delayed product announced", "score": 0.8},
-    {"name": "Announced positive/negative results of an ongoing study", "score": 0.8},
-    {"name": "Announced positive/negative results of an independent study", "score": 0.9},
-    {"name": "Announced positive/negative results of a completed study", "score": 0.9},
-    {"name": "Move into a hot new sector", "score": 0.7},
-    {"name": "Gained market share", "score": 0.7},
-    {"name": "Collaboration/Dissociation with an established company", "score": 0.7},
-    {"name": "Announced offering/reverse-split/supply with dilution impact", "score": -0.8},
-    {"name": "Favorable/unfavorable government regulatory announcement", "score": 1.0},
-    {"name": "New/cancellation of a large contract for the company", "score": 0.8},
-    {"name": "Getting new funding", "score": 0.5},
+    {"name": "Market can't put a ceiling on earnings (growth stocks)", "score": 0.9},
+    {"name": "New or delayed product announcement", "score": 0.8},
+    {"name": "Positive/negative results of ongoing study announced", "score": 0.8},
+    {"name": "Positive/negative results of independent study announced", "score": 0.9},
+    {"name": "Positive/negative results of completed study announced", "score": 0.9},
+    {"name": "Company moves into a hot new sector", "score": 0.7},
+    {"name": "Company gains significant market share", "score": 0.7},
+    {"name": "Collaboration or separation with a major company", "score": 0.7},
+    {"name": "Dilutive offering/reverse split/supply", "score": -0.8},
+    {"name": "Government regulatory announcement (positive/negative)", "score": 1.0},
+    {"name": "Large contract win or cancellation announced", "score": 0.8},
+    {"name": "New funding round", "score": 0.5},
     {"name": "Cost cuts", "score": 0.4},
-    {"name": "Improved net margin", "score": 0.4},
-    {"name": "Analyst upgrades/downgrades", "score": 0.5},
+    {"name": "Net margin improvement", "score": 0.4},
+    {"name": "Analyst upgrades or downgrades", "score": 0.5},
     {"name": "Macroeconomic news", "score": 0.6},
     {"name": "Management changes", "score": 0.3},
-    {"name": "Dividend announcements", "score": 0.2},
-    {"name": "Report alleging misconduct by the company", "score": -0.5},
-    {"name": "Showcased at a prestigious event to potential investors, partners, and industry colleagues", "score": 0.3},
-    {"name": "Honored for excellence in performance or product innovation", "score": 0.2},
-    {"name": "Paid-off debt", "score": 0.3},
+    {"name": "Dividend announcement", "score": 0.2},
+    {"name": "Report alleging misconduct", "score": -0.5},
+    {"name": "Showcased at a prestigious event", "score": 0.3},
+    {"name": "Honored for excellence or innovation", "score": 0.2},
+    {"name": "Debt paid off", "score": 0.3},
     {"name": "Anchor/Sympathy Play", "score": 0.2},
-    # TECHNICAL
     {"name": "Anchored/2-Day VWAP", "score": 0.4},
     {"name": "Moving Average", "score": 0.3},
     {"name": "Candlestick Pattern", "score": 0.3},
     {"name": "Chart Pattern", "score": 0.4},
     {"name": "Trendline", "score": 0.3},
     {"name": "Volume", "score": 0.5},
-    {"name": "Moving higher with unusually strong Options Volume", "score": 0.5},
-    {"name": "Break-out/-down Angle", "score": 0.4},
-    {"name": "Support/Resistance Levels", "score": 0.3},
-    # PRICE
-    {"name": "Overnight gap of ±3% and min. 10% of Average Daily Volume", "score": 0.7},
-    {"name": "Held bid in an up-trending stock visible on Level 2 and Time, Sales", "score": 0.6},
+    {"name": "Unusual options volume", "score": 0.5},
+    {"name": "Break-out or break-down angle", "score": 0.4},
+    {"name": "Key support/resistance level", "score": 0.3},
+    {"name": "Overnight gap of ±3% and at least 10% of ADV", "score": 0.7},
+    {"name": "Held bid in uptrend visible in Level 2/T&S", "score": 0.6},
     {"name": "Gap fill", "score": 0.3},
-    {"name": "Recent History (2Y)", "score": 0.2},
-    {"name": "Full/Half/Quarter Price Level", "score": 0.2},
+    {"name": "Relevant recent history (last 2Y)", "score": 0.2},
+    {"name": "Full/Half/Quarter price level", "score": 0.2},
     {"name": "Overextension", "score": 0.3},
-    {"name": "Beaten Down Stock", "score": 0.3},
-    {"name": "All-time/52W High/Low Break", "score": 0.7},
+    {"name": "Beaten down stock", "score": 0.3},
+    {"name": "Break of all-time/52W high or low", "score": 0.7},
     {"name": "Breakout", "score": 0.7},
 ]
 
 CRITERIA = [
     {
         "name": "RVOL",
-        "question": "Wie hoch ist das Relative Volume (RVOL)?",
+        "question": "Relative Volume (RVOL):",
         "options": [
-            "1 – Unterdurchschnittlich (<1)",
-            "2 – Niedrig (1–2)",
-            "3 – Durchschnittlich (2–5)",
-            "4 – Hoch (5–10)",
-            "5 – Extrem hoch (>10)",
+            "1 – Under 1.0 (very low, no real attention)",
+            "2 – 1.0–2.0 (low, weak setup)",
+            "3 – 2.0–5.0 (moderate, typical smallcap premarket)",
+            "4 – 5.0–10.0 (high, strong in-play stock)",
+            "5 – Over 10.0 (exceptional volume, extreme attention)",
         ],
         "weight": 0.18,
     },
     {
         "name": "ATR",
-        "question": "Wie groß ist die ATR ($)?",
+        "question": "Average True Range (ATR, $):",
         "options": [
-            "1 – Sehr eng (<0.1 $)",
-            "2 – Eng (0.1–0.2 $)",
-            "3 – Mittel (0.2–0.5 $)",
-            "4 – Hoch (0.5–1.0 $)",
-            "5 – Sehr groß (>1.0 $)",
+            "1 – < $0.10 (no range, not tradeable)",
+            "2 – $0.10–$0.20 (tight, limited opportunity)",
+            "3 – $0.20–$0.50 (average, can work)",
+            "4 – $0.50–$1.00 (wide, high potential)",
+            "5 – > $1.00 (huge range, big moves possible)",
         ],
         "weight": 0.08,
     },
     {
         "name": "Float",
-        "question": "Wie niedrig ist der Float?",
+        "question": "Public Float (shares):",
         "options": [
-            "1 – Sehr hoch (>100 Mio.)",
-            "2 – Hoch (50–100 Mio.)",
-            "3 – Mittel (25–50 Mio.)",
-            "4 – Niedrig (10–25 Mio.)",
-            "5 – Sehr niedrig (<10 Mio.)",
+            "1 – >100M (very high, hard to move)",
+            "2 – 50M–100M (high, slow mover)",
+            "3 – 25M–50M (medium, can move)",
+            "4 – 10M–25M (low, can squeeze)",
+            "5 – <10M (ultra low, explosive potential)",
         ],
         "weight": 0.09,
     },
     {
         "name": "FloatPct",
-        "question": "Wie viel Prozent des Floats wurden Premarket bereits gehandelt?",
+        "question": "Premarket Volume as % of Float:",
         "options": [
-            "1 – <2%",
-            "2 – 2–5%",
-            "3 – 5–10%",
-            "4 – 10–20%",
-            "5 – >20%"
+            "1 – <2% (very low, weak setup)",
+            "2 – 2%–10% (low, not in-play)",
+            "3 – 10%–30% (solid, gaining traction)",
+            "4 – 30%–100% (strong, clear in-play momentum)",
+            "5 – Over 100% (exceptional: full float rotation, extreme momentum)",
         ],
         "weight": 0.10,
     },
     {
         "name": "PreMarket",
-        "question": "Wie ist die Pre-Market Struktur?",
+        "question": "Premarket Price Structure:",
         "options": [
-            "1 – Flatline, keine Bewegung",
-            "2 – Chaotisch, keine klaren Levels",
-            "3 – Gap und Volumen, keine echte Struktur",
-            "4 – Guter Move, aber leichte Unsauberkeiten",
-            "5 – Klarer, starker Move, klare Trigger",
+            "1 – Flat/no action",
+            "2 – Choppy, random, no levels",
+            "3 – Gap with volume, but messy",
+            "4 – Clean move, minor noise",
+            "5 – Strong trend, clean triggers",
         ],
         "weight": 0.10,
     },
     {
         "name": "Technicals",
-        "question": "Wie sind die Technicals (Pattern, Overhead, Struktur)?",
+        "question": "Technical Setup:",
         "options": [
-            "1 – Kein klares Setup, viel Overhead",
-            "2 – Viele Widerstände, durchwachsen",
-            "3 – Leichte Overhead-Levels, mittelmäßig",
-            "4 – Klares Muster, wenig Overhead",
-            "5 – Kein Overhead, Gap-Up, Blue-Sky",
+            "1 – No setup, heavy overhead",
+            "2 – Many resistances, messy",
+            "3 – Some overhead, average",
+            "4 – Clear pattern, low resistance",
+            "5 – Perfect: no resistance, blue-sky/gap-up",
         ],
         "weight": 0.10,
     },
     {
         "name": "Monthly",
-        "question": "Wie sieht der Monthly/Weekly-Kontext aus?",
+        "question": "Monthly/Weekly Chart Context:",
         "options": [
-            "1 – Kein Kontext, Flat/Random",
-            "2 – Alter Downtrend, kein Volumen",
-            "3 – Downtrend mit Volumen, viele alte Levels",
-            "4 – Großer Volumenanstieg, leichte alte Widerstände",
-            "5 – Dead-Chart, frischer Volumenpeak, Breakout",
+            "1 – No context, dead/sideways",
+            "2 – Old downtrend, no volume",
+            "3 – Downtrend with volume, many levels",
+            "4 – Recent volume surge, minor old resistance",
+            "5 – Breakout: fresh volume, clean chart",
         ],
         "weight": 0.08,
     },
     {
         "name": "VolProfile",
-        "question": "Wie ist das Volume Profile?",
+        "question": "Volume Profile:",
         "options": [
-            "1 – Flat, keine Struktur",
-            "2 – Chaotisch, viele Cluster",
-            "3 – Viele Cluster, einige Level als Widerstand",
-            "4 – Gute Cluster, wenig Overhead",
-            "5 – Klares Volumencluster, keine Overhead-Resistance",
+            "1 – Flat/no structure",
+            "2 – Choppy, many clusters",
+            "3 – Many clusters, some resistance",
+            "4 – Good clusters, little overhead",
+            "5 – Clean cluster, no overhead",
         ],
         "weight": 0.08,
     },
     {
         "name": "Spread",
-        "question": "Wie eng ist der Bid-Ask-Spread?",
+        "question": "Bid-Ask Spread:",
         "options": [
-            "1 – Sehr groß (>3%)",
-            "2 – Groß (2–3%)",
-            "3 – Mittel (1–2%)",
-            "4 – Eng (0.5–1%)",
-            "5 – Extrem eng (<0.5%)"
+            "1 – >3% (very wide, untradeable)",
+            "2 – 2%–3% (wide, risky)",
+            "3 – 1%–2% (average, manageable)",
+            "4 – 0.5%–1% (tight, good fills)",
+            "5 – <0.5% (super tight, ideal)",
         ],
         "weight": 0.09,
     },
@@ -168,21 +165,25 @@ if "stock_scores" not in st.session_state:
     st.session_state.stock_scores = []
 
 with st.form(key="stock_form", clear_on_submit=True):
-    ticker = st.text_input("Stock-Ticker", max_chars=10).strip().upper()
+    ticker = st.text_input("Stock ticker (symbol)", max_chars=10).strip().upper()
     criteria_points = {}
     for crit in CRITERIA:
-        idx = st.radio(crit["question"], options=list(enumerate(crit["options"], 1)),
-                       format_func=lambda x: x[1], key=crit["name"])
+        idx = st.radio(
+            crit["question"],
+            options=list(enumerate(crit["options"], 1)),
+            format_func=lambda x: x[1],
+            key=crit["name"]
+        )
         criteria_points[crit["name"]] = idx[0]
 
     selected_catalysts = st.multiselect(
-        "Wähle alle News/Technicals/Price-Katalysatoren (Mehrfachauswahl möglich):",
+        "Select all relevant catalysts/news/technical/price triggers (multiple allowed):",
         options=[cat["name"] for cat in CATALYSTS]
     )
     catalyst_score = sum(cat["score"] for cat in CATALYSTS if cat["name"] in selected_catalysts)
     catalyst_score = min(max(catalyst_score, 0), 1.0)
     catalyst_points = round(catalyst_score * 5, 2)
-    submit = st.form_submit_button("Stock bewerten & speichern")
+    submit = st.form_submit_button("Save Stock & Add to Ranking")
 
 if submit and ticker:
     base_score = sum(
@@ -194,14 +195,13 @@ if submit and ticker:
         "Ticker": ticker,
         **criteria_points,
         "Catalyst": catalyst_points,
-        # "Catalyst_Types": ', '.join(selected_catalysts) if selected_catalysts else "None",  # <--- Weggelassen!
         "Score": score_normalized
     }
     st.session_state.stock_scores.append(stock_entry)
-    st.success(f"Stock {ticker} gespeichert!")
+    st.success(f"Stock {ticker} saved!")
 
 st.write("---")
-st.header("Ranking")
+st.header("Current Stock Ranking")
 
 def heat_level(score):
     if score >= 4.5:
@@ -240,23 +240,24 @@ if st.session_state.stock_scores:
     st.dataframe(styled, use_container_width=True)
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Tabelle als CSV herunterladen",
+        label="Download ranking as CSV",
         data=csv,
         file_name="stock_ranking.csv",
         mime="text/csv"
     )
 
-    # --- Zeile löschen ---
+    # --- Delete row ---
+    st.write("---")
 
     ticker_list = [entry["Ticker"] for entry in st.session_state.stock_scores]
     if len(ticker_list) > 0:
-        delete_ticker = st.selectbox("Ticker auswählen zum Löschen", ticker_list, key="delete_ticker")
-        if st.button("Lösche diesen Stock aus dem Ranking"):
+        delete_ticker = st.selectbox("Select ticker to remove", ticker_list, key="delete_ticker")
+        if st.button("Delete this stock from ranking"):
             del_idx = ticker_list.index(delete_ticker)
             st.session_state.stock_scores.pop(del_idx)
-            st.success(f"Stock {delete_ticker} wurde entfernt! Tabelle und Export sind jetzt aktualisiert.")
+            st.success(f"Stock {delete_ticker} removed! Table and export updated.")
     else:
-        st.info("Noch keine Stocks gespeichert – nichts zu löschen.")
+        st.info("No stocks saved yet — nothing to remove.")
 
 else:
-    st.info("Noch keine Stocks bewertet. Fülle den Fragebogen oben aus!")
+    st.info("No stocks have been ranked yet. Please fill out the form above!")
