@@ -236,7 +236,8 @@ if st.session_state.stock_scores:
         "Ticker", "RVOL", "ATR", "Float", "FloatPct", "PreMarket", "Technicals",
         "Monthly", "VolProfile", "Spread", "Catalyst", "Score", "Level"
     ]
-    
+
+    # 1. Main DataFrame: Pinned Ticker, no colors
     st.dataframe(
         df[ordered_cols],
         use_container_width=True,
@@ -254,6 +255,12 @@ if st.session_state.stock_scores:
         }
     )
 
+    # 2. Show grading with colors for Level (read-only view)
+    styled = df[ordered_cols].style.format({"Score": "{:.2f}", "Catalyst": "{:.2f}"}).applymap(color_level, subset=["Level"])
+    st.write("### Grading Color Table (no pinned columns)")
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # CSV Export with Level
     csv = df[ordered_cols].to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download ranking as CSV",
