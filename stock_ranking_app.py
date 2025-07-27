@@ -186,6 +186,7 @@ with st.form(key="stock_form", clear_on_submit=True):
     # Score addieren (Deckelung: maximal 1.0)
     catalyst_score = sum(cat["score"] for cat in CATALYSTS if cat["name"] in selected_catalysts)
     catalyst_score = min(max(catalyst_score, 0), 1.0)
+    catalyst_points = round(catalyst_score * 5, 2)
     catalyst_points = catalyst_score * 5   # auf 1–5 Skala
     
     criteria_points["Catalyst"] = catalyst_points
@@ -237,12 +238,10 @@ if st.session_state.stock_scores:
     df = df.sort_values("Score", ascending=False).reset_index(drop=True)
     df["Level"] = df["Score"].apply(heat_level)
     df["Score"] = df["Score"].astype(float).round(2)
-
-    # Für die Anzeige: Gestylte Tabelle
-    styled = df.style.format({"Score": "{:.2f}"}).applymap(color_level, subset=["Level"])
+    if "Catalyst" in df.columns:
+        df["Catalyst"] = df["Catalyst"].astype(float).round(2)   # <- Catalyst auf 2 Nachkommastellen
+    styled = df.style.format({"Score": "{:.2f}", "Catalyst": "{:.2f}"}).applymap(color_level, subset=["Level"])
     st.dataframe(styled, use_container_width=True)
-
-    # Für den Download: Unstylierten DataFrame nehmen!
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Tabelle als CSV herunterladen",
