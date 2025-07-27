@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 
-st.set_page_config(page_title="Stock Ranking Questionnaire", layout="wide")
+st.header("Stock Ranking Questionnaire")
 
 # Kriterien mit Frage, Skalenbeschreibung und Gewichtung
 CRITERIA = [
@@ -132,7 +132,7 @@ if submit and ticker:
     st.success(f"Stock {ticker} gespeichert!")
 
 st.write("---")
-st.header("Bisherige Bewertungen & Ranking")
+st.header("Ranking")
 if st.session_state.stock_scores:
     df = pd.DataFrame(st.session_state.stock_scores)
     df = df.sort_values("Score", ascending=False).reset_index(drop=True)
