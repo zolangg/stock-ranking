@@ -182,7 +182,7 @@ with st.form(key="stock_form", clear_on_submit=True):
     ticker = st.text_input("Stock ticker (symbol)", max_chars=10).strip().upper()
     criteria_points = {}
     for crit in CRITERIA:
-        st.markdown(f"# {crit['question']}")
+        st.markdown(f"#### {crit['question']}")
         idx = st.radio(
             "",
             options=list(enumerate(crit["options"], 1)),
