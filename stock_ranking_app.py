@@ -227,18 +227,18 @@ def color_level(val):
 
 if st.session_state.stock_scores:
     df = pd.DataFrame(st.session_state.stock_scores)
+    df["Score"] = df["Score"].astype(float).round(2)
+    if "Catalyst" in df.columns:
+        df["Catalyst"] = df["Catalyst"].astype(float).round(2)
+    df["Level"] = df["Score"].apply(heat_level)
+
     ordered_cols = [
         "Ticker", "RVOL", "ATR", "Float", "FloatPct", "PreMarket", "Technicals",
         "Monthly", "VolProfile", "Spread", "Catalyst", "Score", "Level"
     ]
-    df = df[ordered_cols]
-    df["Level"] = df["Score"].apply(heat_level)
-    df["Score"] = df["Score"].astype(float).round(2)
-    if "Catalyst" in df.columns:
-        df["Catalyst"] = df["Catalyst"].astype(float).round(2)
     
     st.dataframe(
-        df,
+        df[ordered_cols],
         use_container_width=True,
         hide_index=True,
         column_order=ordered_cols,
@@ -254,7 +254,7 @@ if st.session_state.stock_scores:
         }
     )
 
-    csv = df.to_csv(index=False).encode("utf-8")
+    csv = df[ordered_cols].to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download ranking as CSV",
         data=csv,
