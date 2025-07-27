@@ -68,11 +68,11 @@ CRITERIA = [
         "name": "ATR",
         "question": "Average True Range (ATR) in USD:",
         "options": [
-            "1 – Less than 0.10 (no range, not tradeable)",
-            "2 – 0.10 – 0.20 (tight, limited opportunity)",
-            "3 – 0.20 – 0.50 (average, can work)",
-            "4 – 0.50 – 1.00 (wide, high potential)",
-            "5 – Over 1.00 (huge range, big moves possible)",
+            "1 – Less than $0.10 (no range, not tradeable)",
+            "2 – $0.10 – $0.20 (tight, limited opportunity)",
+            "3 – $0.20 – $0.50 (average, can work)",
+            "4 – $0.50 – $1.00 (wide, high potential)",
+            "5 – Over $1.00 (huge range, big moves possible)",
         ],
         "weight": 0.08,
     },
@@ -182,8 +182,9 @@ with st.form(key="stock_form", clear_on_submit=True):
     ticker = st.text_input("Stock ticker (symbol)", max_chars=10).strip().upper()
     criteria_points = {}
     for crit in CRITERIA:
-        st.markdown(f"##### {crit['question']}")
+        st.markdown(f"### {crit['question']}")
         idx = st.radio(
+            "",
             options=list(enumerate(crit["options"], 1)),
             format_func=lambda x: x[1],
             key=crit["name"]
