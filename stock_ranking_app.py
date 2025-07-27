@@ -2,13 +2,12 @@ import streamlit as st
 import pandas as pd
 
 st.set_page_config(page_title="Stock Ranking Questionnaire", layout="wide")
-st.title("Stock Ranking Questionnaire (Momentum Daytrading)")
 
 # Kriterien mit Frage, Skalenbeschreibung und Gewichtung
 CRITERIA = [
     {
         "name": "RVOL",
-        "question": "Wie hoch ist das Relative Volume (RVOL) im Vergleich zum Durchschnitt?",
+        "question": "Wie hoch ist das Relative Volume (RVOL)?",
         "options": [
             "1 – Unterdurchschnittlich (<1)",
             "2 – Niedrig (1–2)",
@@ -32,7 +31,7 @@ CRITERIA = [
     },
     {
         "name": "ATR",
-        "question": "Wie groß ist die Tagesrange/ATR (absolut, $)?",
+        "question": "Wie groß ist die ATR ($)?",
         "options": [
             "1 – Sehr eng (<0.1 $)",
             "2 – Eng (0.1–0.2 $)",
@@ -44,7 +43,7 @@ CRITERIA = [
     },
     {
         "name": "Float",
-        "question": "Wie niedrig ist der Float (Anzahl handelbarer Aktien)?",
+        "question": "Wie niedrig ist der Float?",
         "options": [
             "1 – Sehr hoch (>100 Mio.)",
             "2 – Hoch (50–100 Mio.)",
@@ -67,8 +66,8 @@ CRITERIA = [
         "weight": 0.1,
     },
     {
-        "name": "Charttechnik",
-        "question": "Wie ist die Charttechnik (Pattern, Overhead, Struktur)?",
+        "name": "Technicals",
+        "question": "Wie sind die Technicals (Pattern, Overhead, Struktur)?",
         "options": [
             "1 – Kein klares Setup, viel Overhead",
             "2 – Viele Widerstände, durchwachsen",
@@ -92,7 +91,7 @@ CRITERIA = [
     },
     {
         "name": "VolProfile",
-        "question": "Wie ist das Volume Profile/Levelstruktur?",
+        "question": "Wie ist das Volume Profile?",
         "options": [
             "1 – Flat, keine Struktur",
             "2 – Chaotisch, viele Cluster",
@@ -109,7 +108,6 @@ NEWS_BONUS = 1
 if "stock_scores" not in st.session_state:
     st.session_state.stock_scores = []
 
-st.header("Neuen Stock bewerten")
 with st.form(key="stock_form", clear_on_submit=True):
     ticker = st.text_input("Stock-Ticker", max_chars=10).strip().upper()
     criteria_points = {}
