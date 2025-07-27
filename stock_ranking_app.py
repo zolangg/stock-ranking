@@ -101,26 +101,26 @@ CRITERIA = [
         "weight": 0.10,
     },
     {
-        "name": "PreMarket",
-        "question": "Premarket Price Structure:",
-        "options": [
-            "Flat/no action",
-            "Choppy, random, no levels",
-            "Gap with volume, but messy",
-            "Clean move, minor noise",
-            "Strong trend, clean triggers",
-        ],
-        "weight": 0.10,
+    "name": "PreMarket",
+    "question": "Premarket Price Structure:",
+    "options": [
+        "Flat/no action, no real price movement or liquidity",
+        "Very choppy, random price action, no defined levels or trend",
+        "Gapped up or down with significant premarket volume, but price action is messy, overlapping, or inconsistent",
+        "Clean, directional move in premarket, clear trend, but with minor noise or some unclear moments",
+        "Strong, continuous premarket trend with obvious and clean trigger levels, easy to spot inflection points",
+    ],
+    "weight": 0.10,
     },
     {
         "name": "Technicals",
         "question": "Technical Setup:",
         "options": [
-            "No setup, heavy overhead",
-            "Many resistances, messy",
-            "Some overhead, average",
-            "Clear pattern, low resistance",
-            "Perfect: no resistance, blue-sky/gap-up",
+            "No recognizable setup, heavy overhead resistance, chart is unattractive",
+            "Many resistance levels above, price action is messy or mixed, setup is not clean",
+            "Some overhead levels present but manageable, pattern is average or unclear",
+            "Clear chart pattern (e.g. flag, breakout setup), minimal overhead resistance, structure is easy to interpret",
+            "Perfect technicals: no resistance above, clean breakout or gap-up, 'blue sky' setup with obvious potential",
         ],
         "weight": 0.10,
     },
@@ -128,11 +128,11 @@ CRITERIA = [
         "name": "Monthly",
         "question": "Monthly/Weekly Chart Context:",
         "options": [
-            "No context, dead/sideways",
-            "Old downtrend, no volume",
-            "Downtrend with volume, many levels",
-            "Recent volume surge, minor old resistance",
-            "Breakout: fresh volume, clean chart",
+            "No meaningful context, stock is flat or stuck in a sideways range for months",
+            "Persistent old downtrend, no significant volume, chart is weak",
+            "Stock is in a downtrend but shows increased volume, many old support/resistance levels still in play",
+            "Recent major volume surge, only minor old resistance levels remain, chart is turning bullish",
+            "Clean breakout from all previous levels, new volume highs, fresh uptrend, no visible resistance above",
         ],
         "weight": 0.08,
     },
@@ -140,11 +140,11 @@ CRITERIA = [
         "name": "VolProfile",
         "question": "Volume Profile:",
         "options": [
-            "Flat/no structure",
-            "Choppy, many clusters",
-            "Many clusters, some resistance",
-            "Good clusters, little overhead",
-            "Clean cluster, no overhead",
+            "Flat volume profile, no visible structure or key levels",
+            "Very choppy, many volume clusters, no dominant levels, hard to read",
+            "Several volume clusters present, some act as resistance but the profile is still tradeable",
+            "Good, clear volume clusters with little overhead, price can move cleanly through important levels",
+            "Clean, dominant volume cluster supporting current price, no overhead resistance, easy for price to move up",
         ],
         "weight": 0.08,
     },
@@ -161,7 +161,6 @@ CRITERIA = [
         "weight": 0.09,
     },
 ]
-CATALYST_WEIGHT = 0.10
 
 def heat_level(score):
     if score >= 4.5:
@@ -194,17 +193,17 @@ with st.form(key="stock_form", clear_on_submit=True):
         "Select all relevant catalysts/news/technical/price triggers (multiple allowed):",
         options=[cat["name"] for cat in CATALYSTS]
     )
+    # Unbegrenzter Catalyst-Score: einfach Summe, kein max!
     catalyst_score = sum(cat["score"] for cat in CATALYSTS if cat["name"] in selected_catalysts)
-    catalyst_score = min(max(catalyst_score, 0), 1.0)
-    catalyst_points = round(catalyst_score * 5, 2)
+    catalyst_points = round(catalyst_score, 2)
     submit = st.form_submit_button("Save Stock & Add to Ranking")
 
 if submit and ticker:
     base_score = sum(
         criteria_points[crit['name']] * crit['weight'] for crit in CRITERIA
     )
-    weighted_score = base_score + catalyst_points * CATALYST_WEIGHT
-    score_normalized = round(weighted_score, 2)
+    # Kein Gewicht, keine Begrenzung!
+    score_normalized = round(base_score + catalyst_points, 2)
     stock_entry = {
         "Ticker": ticker,
         **criteria_points,
