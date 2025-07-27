@@ -229,7 +229,7 @@ if st.session_state.stock_scores:
     df = pd.DataFrame(st.session_state.stock_scores)
     ordered_cols = [
         "Ticker", "RVOL", "ATR", "Float", "FloatPct", "PreMarket", "Technicals",
-        "Monthly", "VolProfile", "Spread", "Catalyst", "Score"
+        "Monthly", "VolProfile", "Spread", "Catalyst", "Score", "Level"
     ]
     df = df[ordered_cols]
     df["Level"] = df["Score"].apply(heat_level)
