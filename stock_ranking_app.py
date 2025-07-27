@@ -249,7 +249,7 @@ if st.session_state.stock_scores:
                 required=True,
                 disabled=True,
                 help="Stock symbol",
-                pinned="left"  # This will freeze the Ticker column!
+                pinned="left"
             ),
         }
     )
