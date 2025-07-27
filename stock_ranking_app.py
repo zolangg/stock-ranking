@@ -148,7 +148,8 @@ if st.session_state.stock_scores:
     df = pd.DataFrame(st.session_state.stock_scores)
     df = df.sort_values("Score", ascending=False).reset_index(drop=True)
     df["Level"] = df["Score"].apply(heat_level)
-    styled = df.style.applymap(color_level, subset=["Level"])
+    df["Score"] = df["Score"].astype(float).round(2)
+    styled = df.style.format({"Score": "{:.2f}"}).applymap(color_level, subset=["Level"])
     st.dataframe(styled, use_container_width=True)
     csv = df.to_csv(index=False).encode()
     st.download_button(
