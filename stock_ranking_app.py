@@ -121,11 +121,35 @@ if submit and ticker:
 
 st.write("---")
 st.header("Ranking")
+
+def heat_level(score):
+    if score >= 4.35:
+        return "A+"
+    elif score >= 4.0:
+        return "A"
+    elif score >= 3.7:
+        return "B"
+    elif score >= 3.3:
+        return "C"
+    else:
+        return "D"
+
+def color_level(val):
+    color_map = {
+        "A+": "background-color: #fa7268; color: white",  # kräftig rot/orange
+        "A":  "background-color: #ffe156; color: black",  # gelb
+        "B":  "background-color: #6ee7b7; color: black",  # grün
+        "C":  "background-color: #60a5fa; color: white",  # blau
+        "D":  "background-color: #e5e7eb; color: black"   # grau
+    }
+    return color_map.get(val, "")
+
 if st.session_state.stock_scores:
     df = pd.DataFrame(st.session_state.stock_scores)
     df = df.sort_values("Score", ascending=False).reset_index(drop=True)
-    st.dataframe(df, use_container_width=True)
-    # Optional: Download-Link
+    df["Level"] = df["Score"].apply(heat_level)
+    styled = df.style.applymap(color_level, subset=["Level"])
+    st.dataframe(styled, use_container_width=True)
     csv = df.to_csv(index=False).encode()
     st.download_button(
         "Tabelle als CSV herunterladen",
