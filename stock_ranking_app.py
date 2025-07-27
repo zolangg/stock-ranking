@@ -63,7 +63,7 @@ CRITERIA = [
             "4 – Hoch (5–10)",
             "5 – Extrem hoch (>10)",
         ],
-        "weight": 0.16,
+        "weight": 0.18,
     },
     {
         "name": "ATR",
@@ -75,7 +75,7 @@ CRITERIA = [
             "4 – Hoch (0.5–1.0 $)",
             "5 – Sehr groß (>1.0 $)",
         ],
-        "weight": 0.07,
+        "weight": 0.08,
     },
     {
         "name": "Float",
@@ -87,7 +87,7 @@ CRITERIA = [
             "4 – Niedrig (10–25 Mio.)",
             "5 – Sehr niedrig (<10 Mio.)",
         ],
-        "weight": 0.08,
+        "weight": 0.09,
     },
     {
         "name": "FloatPct",
@@ -99,7 +99,7 @@ CRITERIA = [
             "4 – 10–20%",
             "5 – >20%"
         ],
-        "weight": 0.09,
+        "weight": 0.10,
     },
     {
         "name": "PreMarket",
@@ -111,7 +111,7 @@ CRITERIA = [
             "4 – Guter Move, aber leichte Unsauberkeiten",
             "5 – Klarer, starker Move, klare Trigger",
         ],
-        "weight": 0.09,
+        "weight": 0.10,
     },
     {
         "name": "Technicals",
@@ -123,7 +123,7 @@ CRITERIA = [
             "4 – Klares Muster, wenig Overhead",
             "5 – Kein Overhead, Gap-Up, Blue-Sky",
         ],
-        "weight": 0.09,
+        "weight": 0.10,
     },
     {
         "name": "Monthly",
@@ -135,7 +135,7 @@ CRITERIA = [
             "4 – Großer Volumenanstieg, leichte alte Widerstände",
             "5 – Dead-Chart, frischer Volumenpeak, Breakout",
         ],
-        "weight": 0.07,
+        "weight": 0.08,
     },
     {
         "name": "VolProfile",
@@ -147,7 +147,7 @@ CRITERIA = [
             "4 – Gute Cluster, wenig Overhead",
             "5 – Klares Volumencluster, keine Overhead-Resistance",
         ],
-        "weight": 0.07,
+        "weight": 0.08,
     },
     {
         "name": "Spread",
@@ -159,10 +159,10 @@ CRITERIA = [
             "4 – Eng (0.5–1%)",
             "5 – Extrem eng (<0.5%)"
         ],
-        "weight": 0.08,
+        "weight": 0.09,
     },
 ]
-NEWS_WEIGHT = 0.20
+CATALYST_WEIGHT = 0.10
 
 if "stock_scores" not in st.session_state:
     st.session_state.stock_scores = []
@@ -188,9 +188,8 @@ if submit and ticker:
     base_score = sum(
         criteria_points[crit['name']] * crit['weight'] for crit in CRITERIA
     )
-    weighted_score = base_score + catalyst_points * NEWS_WEIGHT
-    max_score = sum(crit['weight'] * 5 for crit in CRITERIA) + 5 * NEWS_WEIGHT
-    score_normalized = round(weighted_score / max_score * 5, 2)
+    weighted_score = base_score + catalyst_points * CATALYST_WEIGHT
+    score_normalized = round(weighted_score, 2)
     stock_entry = {
         "Ticker": ticker,
         **criteria_points,
@@ -205,7 +204,7 @@ st.write("---")
 st.header("Ranking")
 
 def heat_level(score):
-    if score >= 4.35:
+    if score >= 4.5:
         return "A+"
     elif score >= 4.0:
         return "A"
@@ -227,13 +226,11 @@ def color_level(val):
     return color_map.get(val, "")
 
 if st.session_state.stock_scores:
-    # Reihenfolge der Spalten so sortieren, dass Float und FloatPct nebeneinander stehen
     df = pd.DataFrame(st.session_state.stock_scores)
     ordered_cols = [
         "Ticker", "RVOL", "ATR", "Float", "FloatPct", "PreMarket", "Technicals",
         "Monthly", "VolProfile", "Spread", "Catalyst", "Catalyst_Types", "Score"
     ]
-    # Füge ggf. Level-Spalte hinzu
     df = df[ordered_cols]
     df["Level"] = df["Score"].apply(heat_level)
     df["Score"] = df["Score"].astype(float).round(2)
