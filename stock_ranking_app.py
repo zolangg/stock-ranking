@@ -15,19 +15,7 @@ CRITERIA = [
             "4 – Hoch (5–10)",
             "5 – Extrem hoch (>10)",
         ],
-        "weight": 0.2,
-    },
-    {
-        "name": "ProjVol",
-        "question": "Wie hoch ist das projizierte Tagesvolumen (Projected Volume)?",
-        "options": [
-            "1 – Sehr gering (<2 Mio.)",
-            "2 – Gering (2–5 Mio.)",
-            "3 – Mittel (5–10 Mio.)",
-            "4 – Hoch (10–20 Mio.)",
-            "5 – Extrem hoch (>20 Mio.)",
-        ],
-        "weight": 0.2,
+        "weight": 0.24,
     },
     {
         "name": "ATR",
@@ -39,7 +27,7 @@ CRITERIA = [
             "4 – Hoch (0.5–1.0 $)",
             "5 – Sehr groß (>1.0 $)",
         ],
-        "weight": 0.1,
+        "weight": 0.14,
     },
     {
         "name": "Float",
@@ -51,7 +39,7 @@ CRITERIA = [
             "4 – Niedrig (10–25 Mio.)",
             "5 – Sehr niedrig (<10 Mio.)",
         ],
-        "weight": 0.1,
+        "weight": 0.12,
     },
     {
         "name": "PreMarket",
@@ -63,7 +51,7 @@ CRITERIA = [
             "4 – Guter Move, aber leichte Unsauberkeiten",
             "5 – Klarer, starker Move, klare Trigger",
         ],
-        "weight": 0.1,
+        "weight": 0.14,
     },
     {
         "name": "Technicals",
@@ -75,7 +63,7 @@ CRITERIA = [
             "4 – Klares Muster, wenig Overhead",
             "5 – Kein Overhead, Gap-Up, Blue-Sky",
         ],
-        "weight": 0.1,
+        "weight": 0.14,
     },
     {
         "name": "Monthly",
@@ -87,7 +75,7 @@ CRITERIA = [
             "4 – Großer Volumenanstieg, leichte alte Widerstände",
             "5 – Dead-Chart, frischer Volumenpeak, Breakout",
         ],
-        "weight": 0.1,
+        "weight": 0.12,
     },
     {
         "name": "VolProfile",
@@ -99,7 +87,7 @@ CRITERIA = [
             "4 – Gute Cluster, wenig Overhead",
             "5 – Klares Volumencluster, keine Overhead-Resistance",
         ],
-        "weight": 0.05,
+        "weight": 0.1,
     },
 ]
 NEWS_BONUS = 1
