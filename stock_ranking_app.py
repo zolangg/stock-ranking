@@ -1,4 +1,4 @@
-import streamlit as st
+uimport streamlit as st
 import pandas as pd
 
 st.header("Premarket Stock Ranking")
@@ -237,11 +237,15 @@ if st.session_state.stock_scores:
     df = df.sort_values("Score", ascending=False).reset_index(drop=True)
     df["Level"] = df["Score"].apply(heat_level)
     df["Score"] = df["Score"].astype(float).round(2)
+
+    # Für die Anzeige: Gestylte Tabelle
     styled = df.style.format({"Score": "{:.2f}"}).applymap(color_level, subset=["Level"])
     st.dataframe(styled, use_container_width=True)
-    csv = df.to_csv(index=False).encode()
+
+    # Für den Download: Unstylierten DataFrame nehmen!
+    csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "Tabelle als CSV herunterladen",
+        label="Tabelle als CSV herunterladen",
         data=csv,
         file_name="stock_ranking.csv",
         mime="text/csv"
