@@ -67,9 +67,9 @@ CRITERIA = [
         "question": "Average True Range (ATR, $):",
         "options": [
             "1 – < $0.10 (no range, not tradeable)",
-            "2 – $0.10 – $0.20 (tight, limited opportunity)",
-            "3 – $0.20 – $0.50 (average, can work)",
-            "4 – $0.50 – $1.00 (wide, high potential)",
+            "2 – $0.10 - $0.20 (tight, limited opportunity)",
+            "3 – $0.20 - $0.50 (average, can work)",
+            "4 – $0.50 - $1.00 (wide, high potential)",
             "5 – > $1.00 (huge range, big moves possible)",
         ],
         "weight": 0.08,
