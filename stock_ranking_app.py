@@ -3,9 +3,8 @@ import pandas as pd
 
 st.header("Premarket Stock Ranking")
 
-# 1:1 Catalyst-Liste aus dem PDF – KEINE Eigenkreationen
 CATALYSTS = [
-    # NEWS CATALYSTS
+    # NEWS
     {"name": "Unusually good/bad earnings report (surprise!)", "score": 1.0},
     {"name": "Better/worse than expected guidance reported", "score": 0.9},
     {"name": "Market can’t put a ceiling on earnings (growth stocks)", "score": 0.9},
@@ -31,8 +30,7 @@ CATALYSTS = [
     {"name": "Honored for excellence in performance or product innovation", "score": 0.2},
     {"name": "Paid-off debt", "score": 0.3},
     {"name": "Anchor/Sympathy Play", "score": 0.2},
-
-    # TECHNICAL CATALYSTS
+    # TECHNICAL
     {"name": "Anchored/2-Day VWAP", "score": 0.4},
     {"name": "Moving Average", "score": 0.3},
     {"name": "Candlestick Pattern", "score": 0.3},
@@ -42,8 +40,7 @@ CATALYSTS = [
     {"name": "Moving higher with unusually strong Options Volume", "score": 0.5},
     {"name": "Break-out/-down Angle", "score": 0.4},
     {"name": "Support/Resistance Levels", "score": 0.3},
-
-    # PRICE CATALYSTS
+    # PRICE
     {"name": "Overnight gap of ±3% and min. 10% of Average Daily Volume", "score": 0.7},
     {"name": "Held bid in an up-trending stock visible on Level 2 and Time, Sales", "score": 0.6},
     {"name": "Gap fill", "score": 0.3},
@@ -55,7 +52,6 @@ CATALYSTS = [
     {"name": "Breakout", "score": 0.7},
 ]
 
-# Hauptkriterien (wie vorhin, ggf. Gewichte leicht angepasst)
 CRITERIA = [
     {
         "name": "RVOL",
@@ -67,7 +63,7 @@ CRITERIA = [
             "4 – Hoch (5–10)",
             "5 – Extrem hoch (>10)",
         ],
-        "weight": 0.17,
+        "weight": 0.16,
     },
     {
         "name": "ATR",
@@ -79,7 +75,7 @@ CRITERIA = [
             "4 – Hoch (0.5–1.0 $)",
             "5 – Sehr groß (>1.0 $)",
         ],
-        "weight": 0.08,
+        "weight": 0.07,
     },
     {
         "name": "Float",
@@ -90,6 +86,18 @@ CRITERIA = [
             "3 – Mittel (25–50 Mio.)",
             "4 – Niedrig (10–25 Mio.)",
             "5 – Sehr niedrig (<10 Mio.)",
+        ],
+        "weight": 0.08,
+    },
+    {
+        "name": "FloatPct",
+        "question": "Wie viel Prozent des Floats wurden Premarket bereits gehandelt?",
+        "options": [
+            "1 – <2%",
+            "2 – 2–5%",
+            "3 – 5–10%",
+            "4 – 10–20%",
+            "5 – >20%"
         ],
         "weight": 0.09,
     },
@@ -127,7 +135,7 @@ CRITERIA = [
             "4 – Großer Volumenanstieg, leichte alte Widerstände",
             "5 – Dead-Chart, frischer Volumenpeak, Breakout",
         ],
-        "weight": 0.06,
+        "weight": 0.07,
     },
     {
         "name": "VolProfile",
@@ -139,7 +147,7 @@ CRITERIA = [
             "4 – Gute Cluster, wenig Overhead",
             "5 – Klares Volumencluster, keine Overhead-Resistance",
         ],
-        "weight": 0.06,
+        "weight": 0.07,
     },
     {
         "name": "Spread",
@@ -153,19 +161,8 @@ CRITERIA = [
         ],
         "weight": 0.08,
     },
-    {
-        "name": "FloatPct",
-        "question": "Wie viel Prozent des Floats wurden Premarket bereits gehandelt?",
-        "options": [
-            "1 – <2%",
-            "2 – 2–5%",
-            "3 – 5–10%",
-            "4 – 10–20%",
-            "5 – >20%"
-        ],
-        "weight": 0.08,
-    },
 ]
+NEWS_WEIGHT = 0.20
 
 if "stock_scores" not in st.session_state:
     st.session_state.stock_scores = []
@@ -178,32 +175,28 @@ with st.form(key="stock_form", clear_on_submit=True):
                        format_func=lambda x: x[1], key=crit["name"])
         criteria_points[crit["name"]] = idx[0]
     
-    # --- Catalyst Bewertung als Multiselect ---
     selected_catalysts = st.multiselect(
         "Wähle alle News/Technicals/Price-Katalysatoren (Mehrfachauswahl möglich):",
         options=[cat["name"] for cat in CATALYSTS]
     )
-    # Score addieren (Deckelung: maximal 1.0)
     catalyst_score = sum(cat["score"] for cat in CATALYSTS if cat["name"] in selected_catalysts)
     catalyst_score = min(max(catalyst_score, 0), 1.0)
     catalyst_points = round(catalyst_score * 5, 2)
-    catalyst_points = catalyst_score * 5   # auf 1–5 Skala
-    
-    criteria_points["Catalyst"] = catalyst_points
     submit = st.form_submit_button("Stock bewerten & speichern")
 
 if submit and ticker:
-    weighted_score = (
-        sum(
-            criteria_points[crit['name']] * crit['weight'] for crit in CRITERIA
-        ) +
-        catalyst_points * 0.20  # Catalyst als Extra-Gewichtung
-    ) / (1 + 0.20) # normieren, damit max Score ≈ 5 bleibt
+    base_score = sum(
+        criteria_points[crit['name']] * crit['weight'] for crit in CRITERIA
+    )
+    weighted_score = base_score + catalyst_points * NEWS_WEIGHT
+    max_score = sum(crit['weight'] * 5 for crit in CRITERIA) + 5 * NEWS_WEIGHT
+    score_normalized = round(weighted_score / max_score * 5, 2)
     stock_entry = {
         "Ticker": ticker,
         **criteria_points,
+        "Catalyst": catalyst_points,
         "Catalyst_Types": ', '.join(selected_catalysts) if selected_catalysts else "None",
-        "Score": round(weighted_score, 2)
+        "Score": score_normalized
     }
     st.session_state.stock_scores.append(stock_entry)
     st.success(f"Stock {ticker} gespeichert!")
@@ -234,12 +227,18 @@ def color_level(val):
     return color_map.get(val, "")
 
 if st.session_state.stock_scores:
+    # Reihenfolge der Spalten so sortieren, dass Float und FloatPct nebeneinander stehen
     df = pd.DataFrame(st.session_state.stock_scores)
-    df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+    ordered_cols = [
+        "Ticker", "RVOL", "ATR", "Float", "FloatPct", "PreMarket", "Technicals",
+        "Monthly", "VolProfile", "Spread", "Catalyst", "Catalyst_Types", "Score"
+    ]
+    # Füge ggf. Level-Spalte hinzu
+    df = df[ordered_cols]
     df["Level"] = df["Score"].apply(heat_level)
     df["Score"] = df["Score"].astype(float).round(2)
     if "Catalyst" in df.columns:
-        df["Catalyst"] = df["Catalyst"].astype(float).round(2)   # <- Catalyst auf 2 Nachkommastellen
+        df["Catalyst"] = df["Catalyst"].astype(float).round(2)
     styled = df.style.format({"Score": "{:.2f}", "Catalyst": "{:.2f}"}).applymap(color_level, subset=["Level"])
     st.dataframe(styled, use_container_width=True)
     csv = df.to_csv(index=False).encode("utf-8")
