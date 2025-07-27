@@ -236,8 +236,24 @@ if st.session_state.stock_scores:
     df["Score"] = df["Score"].astype(float).round(2)
     if "Catalyst" in df.columns:
         df["Catalyst"] = df["Catalyst"].astype(float).round(2)
-    styled = df.style.format({"Score": "{:.2f}", "Catalyst": "{:.2f}"}).applymap(color_level, subset=["Level"])
-    st.dataframe(styled, use_container_width=True)
+    
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_order=ordered_cols,
+        column_config={
+            "Ticker": st.column_config.Column(
+                label="Ticker",
+                width="small",
+                required=True,
+                disabled=True,
+                help="Stock symbol",
+                pinned="left"  # This will freeze the Ticker column!
+            ),
+        }
+    )
+
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download ranking as CSV",
