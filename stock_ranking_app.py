@@ -182,13 +182,13 @@ with st.form(key="stock_form", clear_on_submit=True):
     ticker = st.text_input("Stock ticker (symbol)", max_chars=10).strip().upper()
     criteria_points = {}
     for crit in CRITERIA:
-    idx = st.radio(
-        crit["question"],
-        options=list(enumerate(crit["options"], 1)),
-        format_func=lambda x: x[1],
-        key=crit["name"]
-    )
-    criteria_points[crit["name"]] = idx[0]
+        idx = st.radio(
+            crit["question"],
+            options=list(enumerate(crit["options"], 1)),
+            format_func=lambda x: x[1],
+            key=crit["name"]
+        )
+        criteria_points[crit["name"]] = idx[0]
 
     selected_catalysts = st.multiselect(
         "Select all relevant catalysts/news/technical/price triggers (multiple allowed):",
