@@ -247,8 +247,6 @@ if st.session_state.stock_scores:
     )
 
     # --- Zeile löschen ---
-    st.write("---")
-    st.header("Stock aus Ranking entfernen")
 
     ticker_list = [entry["Ticker"] for entry in st.session_state.stock_scores]
     if len(ticker_list) > 0:
