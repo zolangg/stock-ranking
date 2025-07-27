@@ -232,13 +232,24 @@ if st.session_state.stock_scores:
         "Monthly", "VolProfile", "Spread", "Catalyst", "Catalyst_Types", "Score"
     ]
     df = df[ordered_cols]
-    df["Level"] = df["Score"].apply(heat_level)
     df["Score"] = df["Score"].astype(float).round(2)
     if "Catalyst" in df.columns:
         df["Catalyst"] = df["Catalyst"].astype(float).round(2)
-    styled = df.style.format({"Score": "{:.2f}", "Catalyst": "{:.2f}"}).applymap(color_level, subset=["Level"])
-    st.dataframe(styled, use_container_width=True)
-    csv = df.to_csv(index=False).encode("utf-8")
+
+    # --- NEU: Tabelle editierbar machen!
+    edited_df = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="editable_table"
+    )
+
+    # Grading nach dem Editieren neu berechnen!
+    edited_df["Level"] = edited_df["Score"].apply(heat_level)
+    styled = edited_df.style.format({"Score": "{:.2f}", "Catalyst": "{:.2f}"}).applymap(color_level, subset=["Level"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    csv = edited_df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Tabelle als CSV herunterladen",
         data=csv,
