@@ -62,7 +62,7 @@ CRITERIA = [
             "5.0 – 10.0 (high, strong in-play stock)",
             "Over 10.0 (exceptional volume, extreme attention)",
         ],
-        "weight": 0.18,
+        "weight": 0.20,
     },
     {
         "name": "ATR",
@@ -74,7 +74,7 @@ CRITERIA = [
             "0.50 – 1.00 (wide, high potential)",
             "Over 1.00 (huge range, big moves possible)",
         ],
-        "weight": 0.08,
+        "weight": 0.09,
     },
     {
         "name": "Float",
@@ -86,7 +86,7 @@ CRITERIA = [
             "10M – 25M (low, can squeeze)",
             "<10M (ultra low, explosive potential)",
         ],
-        "weight": 0.09,
+        "weight": 0.10,
     },
     {
         "name": "FloatPct",
@@ -98,7 +98,7 @@ CRITERIA = [
             "30% – 100% (strong, clear in-play momentum)",
             "Over 100% (exceptional: full float rotation, extreme momentum)",
         ],
-        "weight": 0.10,
+        "weight": 0.11,
     },
     {
     "name": "PreMarket",
@@ -110,7 +110,7 @@ CRITERIA = [
         "Clean, directional move in premarket, clear trend, but with minor noise or some unclear moments",
         "Strong, continuous premarket trend with obvious and clean trigger levels, easy to spot inflection points",
     ],
-    "weight": 0.10,
+    "weight": 0.11,
     },
     {
         "name": "Technicals",
@@ -122,7 +122,7 @@ CRITERIA = [
             "Clear chart pattern (e.g. flag, breakout setup), minimal overhead resistance, structure is easy to interpret",
             "Perfect technicals: no resistance above, clean breakout or gap-up, 'blue sky' setup with obvious potential",
         ],
-        "weight": 0.10,
+        "weight": 0.11,
     },
     {
         "name": "Monthly",
@@ -134,7 +134,7 @@ CRITERIA = [
             "Recent major volume surge, only minor old resistance levels remain, chart is turning bullish",
             "Clean breakout from all previous levels, new volume highs, fresh uptrend, no visible resistance above",
         ],
-        "weight": 0.08,
+        "weight": 0.09,
     },
     {
         "name": "VolProfile",
@@ -146,7 +146,7 @@ CRITERIA = [
             "Good, clear volume clusters with little overhead, price can move cleanly through important levels",
             "Clean, dominant volume cluster supporting current price, no overhead resistance, easy for price to move up",
         ],
-        "weight": 0.08,
+        "weight": 0.09,
     },
     {
         "name": "Spread",
@@ -158,7 +158,7 @@ CRITERIA = [
             "0.5% – 1% (tight, good fills)",
             "<0.5% (super tight, ideal)",
         ],
-        "weight": 0.09,
+        "weight": 0.1,
     },
 ]
 
