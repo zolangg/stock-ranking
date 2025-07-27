@@ -29,6 +29,7 @@ CATALYSTS = [
     {"name": "Honored for excellence or innovation", "score": 0.2},
     {"name": "Debt paid off", "score": 0.3},
     {"name": "Anchor/Sympathy Play", "score": 0.2},
+    # TECHNICAL
     {"name": "Anchored/2-Day VWAP", "score": 0.4},
     {"name": "Moving Average", "score": 0.3},
     {"name": "Candlestick Pattern", "score": 0.3},
@@ -38,6 +39,7 @@ CATALYSTS = [
     {"name": "Unusual options volume", "score": 0.5},
     {"name": "Break-out or break-down angle", "score": 0.4},
     {"name": "Key support/resistance level", "score": 0.3},
+    # PRICE
     {"name": "Overnight gap of ±3% and at least 10% of ADV", "score": 0.7},
     {"name": "Held bid in uptrend visible in Level 2/T&S", "score": 0.6},
     {"name": "Gap fill", "score": 0.3},
@@ -55,9 +57,9 @@ CRITERIA = [
         "question": "Relative Volume (RVOL):",
         "options": [
             "1 – Under 1.0 (very low, no real attention)",
-            "2 – 1.0 – 2.0 (low, weak setup)",
-            "3 – 2.0 – 5.0 (moderate, typical smallcap premarket)",
-            "4 – 5.0 – 10.0 (high, strong in-play stock)",
+            "2 – 1.0–2.0 (low, weak setup)",
+            "3 – 2.0–5.0 (moderate, typical smallcap premarket)",
+            "4 – 5.0–10.0 (high, strong in-play stock)",
             "5 – Over 10.0 (exceptional volume, extreme attention)",
         ],
         "weight": 0.18,
@@ -66,11 +68,11 @@ CRITERIA = [
         "name": "ATR",
         "question": "Average True Range (ATR) in USD:",
         "options": [
-            "1 – Less than 0.10 (no range, not tradeable)",
-            "2 – 0.10 – 0.20 (tight, limited opportunity)",
-            "3 – 0.20 – 0.50 (average, can work)",
-            "4 – 0.50 – 1.00 (wide, high potential)",
-            "5 – Over 1.00 (huge range, big moves possible)",
+            "1 – Less than $0.10 (no range, not tradeable)",
+            "2 – $0.10 – $0.20 (tight, limited opportunity)",
+            "3 – $0.20 – $0.50 (average, can work)",
+            "4 – $0.50 – $1.00 (wide, high potential)",
+            "5 – Over $1.00 (huge range, big moves possible)",
         ],
         "weight": 0.08,
     },
@@ -79,9 +81,9 @@ CRITERIA = [
         "question": "Public Float (shares):",
         "options": [
             "1 – >100M (very high, hard to move)",
-            "2 – 50M – 100M (high, slow mover)",
-            "3 – 25M – 50M (medium, can move)",
-            "4 – 10M – 25M (low, can squeeze)",
+            "2 – 50M–100M (high, slow mover)",
+            "3 – 25M–50M (medium, can move)",
+            "4 – 10M–25M (low, can squeeze)",
             "5 – <10M (ultra low, explosive potential)",
         ],
         "weight": 0.09,
@@ -91,9 +93,9 @@ CRITERIA = [
         "question": "Premarket Volume as % of Float:",
         "options": [
             "1 – <2% (very low, weak setup)",
-            "2 – 2% – 10% (low, not in-play)",
-            "3 – 10% – 30% (solid, gaining traction)",
-            "4 – 30% – 100% (strong, clear in-play momentum)",
+            "2 – 2%–10% (low, not in-play)",
+            "3 – 10%–30% (solid, gaining traction)",
+            "4 – 30%–100% (strong, clear in-play momentum)",
             "5 – Over 100% (exceptional: full float rotation, extreme momentum)",
         ],
         "weight": 0.10,
@@ -151,15 +153,27 @@ CRITERIA = [
         "question": "Bid-Ask Spread:",
         "options": [
             "1 – >3% (very wide, untradeable)",
-            "2 – 2% – 3% (wide, risky)",
-            "3 – 1% – 2% (average, manageable)",
-            "4 – 0.5% – 1% (tight, good fills)",
+            "2 – 2%–3% (wide, risky)",
+            "3 – 1%–2% (average, manageable)",
+            "4 – 0.5%–1% (tight, good fills)",
             "5 – <0.5% (super tight, ideal)",
         ],
         "weight": 0.09,
     },
 ]
 CATALYST_WEIGHT = 0.10
+
+def heat_level(score):
+    if score >= 4.5:
+        return "A+"
+    elif score >= 4.0:
+        return "A"
+    elif score >= 3.7:
+        return "B"
+    elif score >= 3.3:
+        return "C"
+    else:
+        return "D"
 
 if "stock_scores" not in st.session_state:
     st.session_state.stock_scores = []
@@ -168,8 +182,9 @@ with st.form(key="stock_form", clear_on_submit=True):
     ticker = st.text_input("Stock ticker (symbol)", max_chars=10).strip().upper()
     criteria_points = {}
     for crit in CRITERIA:
+        st.markdown(f"### {crit['question']}")
         idx = st.radio(
-            crit["question"],
+            "",
             options=list(enumerate(crit["options"], 1)),
             format_func=lambda x: x[1],
             key=crit["name"]
@@ -203,28 +218,6 @@ if submit and ticker:
 st.write("---")
 st.header("Current Stock Ranking")
 
-def heat_level(score):
-    if score >= 4.5:
-        return "A+"
-    elif score >= 4.0:
-        return "A"
-    elif score >= 3.7:
-        return "B"
-    elif score >= 3.3:
-        return "C"
-    else:
-        return "D"
-
-def color_level(val):
-    color_map = {
-        "A+": "background-color: #fa7268; color: white",
-        "A":  "background-color: #ffe156; color: black",
-        "B":  "background-color: #6ee7b7; color: black",
-        "C":  "background-color: #60a5fa; color: white",
-        "D":  "background-color: #e5e7eb; color: black"
-    }
-    return color_map.get(val, "")
-
 if st.session_state.stock_scores:
     df = pd.DataFrame(st.session_state.stock_scores)
     df["Score"] = df["Score"].astype(float).round(2)
@@ -236,8 +229,7 @@ if st.session_state.stock_scores:
         "Ticker", "RVOL", "ATR", "Float", "FloatPct", "PreMarket", "Technicals",
         "Monthly", "VolProfile", "Spread", "Catalyst", "Score", "Level"
     ]
-
-    # 1. Main DataFrame: Pinned Ticker, no colors
+    
     st.dataframe(
         df[ordered_cols],
         use_container_width=True,
@@ -255,12 +247,6 @@ if st.session_state.stock_scores:
         }
     )
 
-    # 2. Show grading with colors for Level (read-only view)
-    styled = df[ordered_cols].style.format({"Score": "{:.2f}", "Catalyst": "{:.2f}"}).applymap(color_level, subset=["Level"])
-    st.write("### Grading Color Table (no pinned columns)")
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    # CSV Export with Level
     csv = df[ordered_cols].to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download ranking as CSV",
@@ -271,6 +257,7 @@ if st.session_state.stock_scores:
 
     # --- Delete row ---
     st.write("---")
+    st.header("Remove Stock from Ranking")
 
     ticker_list = [entry["Ticker"] for entry in st.session_state.stock_scores]
     if len(ticker_list) > 0:
@@ -278,6 +265,7 @@ if st.session_state.stock_scores:
         if st.button("Delete this stock from ranking"):
             del_idx = ticker_list.index(delete_ticker)
             st.session_state.stock_scores.pop(del_idx)
+            st.success(f"Stock {delete_ticker} removed! Table and export updated.")
     else:
         st.info("No stocks saved yet — nothing to remove.")
 
