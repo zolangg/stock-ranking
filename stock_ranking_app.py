@@ -235,26 +235,74 @@ if st.session_state.stock_scores:
     df["Score"] = df["Score"].astype(float).round(2)
     if "Catalyst" in df.columns:
         df["Catalyst"] = df["Catalyst"].astype(float).round(2)
+    df["Level"] = df["Score"].apply(heat_level)
 
-    # --- NEU: Tabelle editierbar machen!
-    edited_df = st.data_editor(
-        df,
-        num_rows="dynamic",
-        use_container_width=True,
-        key="editable_table"
-    )
-
-    # Grading nach dem Editieren neu berechnen!
-    edited_df["Level"] = edited_df["Score"].apply(heat_level)
-    styled = edited_df.style.format({"Score": "{:.2f}", "Catalyst": "{:.2f}"}).applymap(color_level, subset=["Level"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    csv = edited_df.to_csv(index=False).encode("utf-8")
+    styled = df.style.format({"Score": "{:.2f}", "Catalyst": "{:.2f}"}).applymap(color_level, subset=["Level"])
+    st.dataframe(styled, use_container_width=True)
+    csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Tabelle als CSV herunterladen",
         data=csv,
         file_name="stock_ranking.csv",
         mime="text/csv"
     )
+
+    # --- NEU: Editier-Section ---
+    st.write("---")
+    st.header("Bereits gespeicherten Stock bearbeiten")
+
+    # Dropdown für Auswahl nach Ticker (du kannst auch nach Index gehen)
+    ticker_list = [entry["Ticker"] for entry in st.session_state.stock_scores]
+    if len(ticker_list) > 0:
+        edit_ticker = st.selectbox("Zu bearbeitender Ticker", ticker_list)
+        # Hole das Dict der ausgewählten Zeile
+        edit_idx = ticker_list.index(edit_ticker)
+        entry = st.session_state.stock_scores[edit_idx]
+
+        # Bearbeite im Fragebogen – alles vorbefüllt!
+        with st.form(key="edit_stock_form"):
+            new_criteria_points = {}
+            for crit in CRITERIA:
+                default_idx = int(entry[crit["name"]]) - 1
+                idx = st.radio(
+                    crit["question"],
+                    options=list(enumerate(crit["options"], 1)),
+                    format_func=lambda x: x[1],
+                    key=f"edit_{crit['name']}",
+                    index=default_idx
+                )
+                new_criteria_points[crit["name"]] = idx[0]
+
+            # Catalyst & Multiselect
+            default_cats = entry["Catalyst_Types"].split(", ") if entry["Catalyst_Types"] != "None" else []
+            new_selected_catalysts = st.multiselect(
+                "Wähle alle News/Technicals/Price-Katalysatoren (Mehrfachauswahl möglich):",
+                options=[cat["name"] for cat in CATALYSTS],
+                default=default_cats
+            )
+            new_catalyst_score = sum(cat["score"] for cat in CATALYSTS if cat["name"] in new_selected_catalysts)
+            new_catalyst_score = min(max(new_catalyst_score, 0), 1.0)
+            new_catalyst_points = round(new_catalyst_score * 5, 2)
+            submit_edit = st.form_submit_button("Änderungen speichern")
+
+        if submit_edit:
+            # Score neu berechnen (wie beim Anlegen)
+            new_base_score = sum(
+                new_criteria_points[crit['name']] * crit['weight'] for crit in CRITERIA
+            )
+            new_weighted_score = new_base_score + new_catalyst_points * CATALYST_WEIGHT
+            new_score_normalized = round(new_weighted_score, 2)
+            # Neues Dict bauen
+            new_entry = {
+                "Ticker": entry["Ticker"],  # Ticker bleibt gleich!
+                **new_criteria_points,
+                "Catalyst": new_catalyst_points,
+                "Catalyst_Types": ', '.join(new_selected_catalysts) if new_selected_catalysts else "None",
+                "Score": new_score_normalized
+            }
+            # Ersetze alten Eintrag
+            st.session_state.stock_scores[edit_idx] = new_entry
+            st.success(f"Stock {entry['Ticker']} wurde aktualisiert! Seite ggf. neu laden, um Änderungen zu sehen.")
+
 else:
     st.info("Noch keine Stocks bewertet. Fülle den Fragebogen oben aus!")
