@@ -162,6 +162,18 @@ CRITERIA = [
     },
 ]
 
+st.sidebar.header("Set Criteria Weights")
+
+weights = {}
+for crit in CRITERIA:
+    weights[crit["name"]] = st.sidebar.slider(
+        label=crit["question"],
+        min_value=0.0,
+        max_value=0.5,
+        value=crit["weight"],
+        step=0.01
+    )
+
 def heat_level(score):
     if score >= 4.5:
         return "A+"
@@ -200,9 +212,8 @@ with st.form(key="stock_form", clear_on_submit=True):
 
 if submit and ticker:
     base_score = sum(
-        criteria_points[crit['name']] * crit['weight'] for crit in CRITERIA
+        criteria_points[crit['name']] * weights[crit['name']] for crit in CRITERIA
     )
-    # Kein Gewicht, keine Begrenzung!
     score_normalized = round(base_score + catalyst_points, 2)
     stock_entry = {
         "Ticker": ticker,
