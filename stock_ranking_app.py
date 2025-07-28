@@ -173,6 +173,14 @@ for crit in CRITERIA:
         value=crit["weight"],
         step=0.01
     )
+    
+    news_weight = st.sidebar.slider(
+    label="Catalyst (News) Weight",
+    min_value=0.0,
+    max_value=2.0,
+    value=1.0,
+    step=0.05
+)
 
 def heat_level(score):
     if score >= 4.5:
@@ -214,7 +222,7 @@ if submit and ticker:
     base_score = sum(
         criteria_points[crit['name']] * weights[crit['name']] for crit in CRITERIA
     )
-    score_normalized = round(base_score + catalyst_points, 2)
+    score_normalized = round(base_score + catalyst_points * news_weight, 2)
     stock_entry = {
         "Ticker": ticker,
         **criteria_points,
