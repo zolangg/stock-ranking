@@ -174,7 +174,7 @@ for crit in CRITERIA:
         step=0.01
     )
     
-    news_weight = st.sidebar.slider(
+news_weight = st.sidebar.slider(
     label="Catalyst (News) Weight",
     min_value=0.0,
     max_value=2.0,
