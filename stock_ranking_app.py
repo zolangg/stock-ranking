@@ -272,19 +272,5 @@ if st.session_state.stock_scores:
         mime="text/csv"
     )
 
-    # --- Delete row ---
-    st.write("---")
-    st.header("Remove Stock from Ranking")
-
-    ticker_list = [entry["Ticker"] for entry in st.session_state.stock_scores]
-    if len(ticker_list) > 0:
-        delete_ticker = st.selectbox("Select ticker to remove", ticker_list, key="delete_ticker")
-        if st.button("Delete this stock from ranking"):
-            del_idx = ticker_list.index(delete_ticker)
-            st.session_state.stock_scores.pop(del_idx)
-            st.success(f"Stock {delete_ticker} removed! Table and export updated.")
-    else:
-        st.info("No stocks saved yet — nothing to remove.")
-
 else:
     st.info("No stocks have been ranked yet. Please fill out the form above!")
