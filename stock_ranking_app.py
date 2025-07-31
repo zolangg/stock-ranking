@@ -242,14 +242,16 @@ if "prev_news_weight" not in st.session_state or st.session_state["prev_news_wei
     recalc = True
 st.session_state["prev_news_weight"] = news_weight
 
-def heat_level(score):
-    if score >= 5:
+def heat_level(score, mean, std):
+    if score > mean + 2*std:
+        return "A++"
+    elif score > mean + std:
         return "A+"
-    elif score >= 4.5:
+    elif score > mean:
         return "A"
-    elif score >= 4:
+    elif score > mean - std:
         return "B"
-    elif score >= 3.5:
+    elif score > mean - 2*std:
         return "C"
     else:
         return "D"
@@ -307,7 +309,7 @@ if st.session_state.stock_scores:
     df["Score"] = df["Score"].astype(float).round(2)
     if "Catalyst" in df.columns:
         df["Catalyst"] = df["Catalyst"].astype(float).round(2)
-    df["Level"] = df["Score"].apply(heat_level)
+    df["Level"] = df["Score"].apply(lambda x: heat_level(x, mean, std))
 
     ordered_cols = [
         "Ticker", "RVOL", "ATR", "Float", "FloatPct", "GapStruct", "LevelStruct",
