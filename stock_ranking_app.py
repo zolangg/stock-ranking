@@ -312,26 +312,30 @@ if st.session_state.stock_scores:
     df["Level"] = df["Score"].apply(heat_level)
 
     ordered_cols = [
-        "Ticker", "RVOL", "ATR", "Float", "FloatPct", "GapStruct", "LevelStruct",
-        "Monthly", "Spread", "Catalyst", "Score", "Level"
+        "Ticker", "Score", "Level", "RVOL", "ATR", "Float", "FloatPct", "GapStruct", "LevelStruct",
+        "Monthly", "Spread", "Catalyst"
     ]
     
     st.dataframe(
-        df[ordered_cols],
-        use_container_width=True,
-        hide_index=True,
-        column_order=ordered_cols,
-        column_config={
-            "Ticker": st.column_config.Column(
-                label="Ticker",
-                width="small",
-                required=True,
-                disabled=True,
-                help="Stock symbol",
-                pinned="left"
-            ),
-        }
-    )
+    df[ordered_cols],
+    use_container_width=True,
+    hide_index=True,
+    column_order=ordered_cols,
+    column_config={
+        "Ticker": st.column_config.Column(
+            label="Ticker",
+            pinned="left"
+        ),
+        "Score": st.column_config.Column(
+            label="Score",
+            pinned="left"
+        ),
+        "Level": st.column_config.Column(
+            label="Level",
+            pinned="left"
+        ),
+      }
+   )
 
     csv = df[ordered_cols].to_csv(index=False).encode("utf-8")
     st.download_button(
