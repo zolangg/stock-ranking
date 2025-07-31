@@ -243,13 +243,13 @@ if "prev_news_weight" not in st.session_state or st.session_state["prev_news_wei
 st.session_state["prev_news_weight"] = news_weight
 
 def heat_level(score):
-    if score >= 4.5:
+    if score >= 5:
         return "A+"
-    elif score >= 4.0:
+    elif score >= 4.5:
         return "A"
-    elif score >= 3.7:
+    elif score >= 4:
         return "B"
-    elif score >= 3.3:
+    elif score >= 3.5:
         return "C"
     else:
         return "D"
