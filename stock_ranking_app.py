@@ -251,7 +251,7 @@ def heat_level(score):
         return "A"
     elif score > 4.0:
         return "B"
-    elif score >= 3.5:
+    elif score >= 3.0:
         return "C"
     else:
         return "D"
