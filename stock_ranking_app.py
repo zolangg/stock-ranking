@@ -242,26 +242,19 @@ if "prev_news_weight" not in st.session_state or st.session_state["prev_news_wei
     recalc = True
 st.session_state["prev_news_weight"] = news_weight
 
-if st.session_state.stock_scores:
-    df = pd.DataFrame(st.session_state.stock_scores)
-    mean = df['Score'].mean()
-    std = df['Score'].std()
-    st.write(f"Mean (Durchschnitt): {mean:.2f}")
-    st.write(f"Standardabweichung: {std:.2f}")
-    def heat_level(score, mean, std):
-        if score > mean + 2*std:
-            return "A++"
-        elif score > mean + std:
-            return "A+"
-        elif score > mean:
-            return "A"
-        elif score > mean - std:
-            return "B"
-        elif score > mean - 2*std:
-            return "C"
-        else:
-            return "D"
-    df["Level"] = df["Score"].apply(lambda x: heat_level(x, mean, std))
+def heat_level(score):
+    if score > 6.0:
+        return "A++"
+    elif score > 5.5:
+        return "A+"
+    elif score > 4.8:
+        return "A"
+    elif score > 4.0:
+        return "B"
+    elif score >= 3.5:
+        return "C"
+    else:
+        return "D"
 
 if "stock_scores" not in st.session_state:
     st.session_state.stock_scores = []
@@ -316,7 +309,7 @@ if st.session_state.stock_scores:
     df["Score"] = df["Score"].astype(float).round(2)
     if "Catalyst" in df.columns:
         df["Catalyst"] = df["Catalyst"].astype(float).round(2)
-    df["Level"] = df["Score"].apply(lambda x: heat_level(x, mean, std))
+    df["Level"] = df["Score"].apply(heat_level)
 
     ordered_cols = [
         "Ticker", "RVOL", "ATR", "Float", "FloatPct", "GapStruct", "LevelStruct",
