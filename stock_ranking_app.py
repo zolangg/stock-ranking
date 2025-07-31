@@ -154,7 +154,7 @@ CRITERIA = [
         "weight": 0.15,
     },
     {
-    "name": "Gap Structure",
+    "name": "GapStruct",
     "question": "Gap & Trend Development:",
     "options": [
         "Immediate full reversal after gap; price gives back all gains in one move down.",
@@ -168,7 +168,7 @@ CRITERIA = [
     "weight": 0.15,
     },
     {
-    "name": "Level Structure",
+    "name": "LevelStruct",
     "question": "Price Levels:",
     "options": [
         "Fails at every key level; unable to hold or reclaim any support.",
@@ -182,7 +182,7 @@ CRITERIA = [
     "weight": 0.15,
     },
     {
-    "name": "Monthly/Weekly",
+    "name": "Monthly",
     "question": "Monthly/Weekly Chart Context:",
     "options": [
         "Sharp, accelerating downtrend; new lows form repeatedly, no support visible.",
@@ -310,8 +310,8 @@ if st.session_state.stock_scores:
     df["Level"] = df["Score"].apply(heat_level)
 
     ordered_cols = [
-        "Ticker", "RVOL", "ATR", "Float", "FloatPct", "PreMarket", "Technicals",
-        "Monthly", "VolProfile", "Spread", "Catalyst", "Score", "Level"
+        "Ticker", "RVOL", "ATR", "Float", "FloatPct", "GapStruct", "LevelStruct",
+        "Monthly", "Spread", "Catalyst", "Score", "Level"
     ]
     
     st.dataframe(
