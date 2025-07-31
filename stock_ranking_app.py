@@ -226,24 +226,35 @@ CRITERIA = [
 ]
 
 st.sidebar.header("Set Criteria Weights")
-
 weights = {}
+recalc = False
 for crit in CRITERIA:
-    weights[crit["name"]] = st.sidebar.slider(
+    new_weight = st.sidebar.slider(
         label=crit["question"],
         min_value=0.0,
         max_value=0.5,
         value=crit["weight"],
-        step=0.01
+        step=0.01,
+        key=f"weight_{crit['name']}"
     )
-    
+    if "weights" not in st.session_state:
+        st.session_state["weights"] = {}
+    if st.session_state["weights"].get(crit["name"], crit["weight"]) != new_weight:
+        recalc = True
+    weights[crit["name"]] = new_weight
+    st.session_state["weights"][crit["name"]] = new_weight
+
 news_weight = st.sidebar.slider(
     label="Catalyst (News) Weight",
     min_value=0.0,
     max_value=2.0,
     value=1.0,
-    step=0.05
+    step=0.05,
+    key="news_weight"
 )
+if "prev_news_weight" not in st.session_state or st.session_state["prev_news_weight"] != news_weight:
+    recalc = True
+st.session_state["prev_news_weight"] = news_weight
 
 def heat_level(score):
     if score >= 4.5:
@@ -259,6 +270,14 @@ def heat_level(score):
 
 if "stock_scores" not in st.session_state:
     st.session_state.stock_scores = []
+
+# --- Score RECALC after every weight/catalyst slider move ---
+if recalc and st.session_state.stock_scores:
+    for stock in st.session_state.stock_scores:
+        base_score = sum(
+            stock[crit['name']] * weights[crit['name']] for crit in CRITERIA
+        )
+        stock["Score"] = round(base_score + stock["Catalyst"] * news_weight, 2)
 
 with st.form(key="stock_form", clear_on_submit=True):
     ticker = st.text_input("Stock ticker (symbol)", max_chars=10).strip().upper()
@@ -276,7 +295,6 @@ with st.form(key="stock_form", clear_on_submit=True):
         "Select all relevant catalysts/news/technical/price triggers (multiple allowed):",
         options=[cat["name"] for cat in CATALYSTS]
     )
-    # Unbegrenzter Catalyst-Score: einfach Summe, kein max!
     catalyst_score = sum(cat["score"] for cat in CATALYSTS if cat["name"] in selected_catalysts)
     catalyst_points = round(catalyst_score, 2)
     submit = st.form_submit_button("Save Stock & Add to Ranking")
@@ -334,6 +352,5 @@ if st.session_state.stock_scores:
         file_name="stock_ranking.csv",
         mime="text/csv"
     )
-
 else:
     st.info("No stocks have been ranked yet. Please fill out the form above!")
