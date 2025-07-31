@@ -109,7 +109,7 @@ CRITERIA = [
             "15.0 – 25.0",
             "Over 25.0",
         ],
-        "weight": 0.08,
+        "weight": 0.18,
     },
     {
         "name": "ATR",
@@ -137,7 +137,7 @@ CRITERIA = [
             "3M - 10M",
             "Under 3M",
         ],
-        "weight": 0.06,
+        "weight": 0.1,
     },
     {
         "name": "FloatPct",
@@ -151,7 +151,7 @@ CRITERIA = [
             "50% – 100%",
             "Over 100%",
         ],
-        "weight": 0.08,
+        "weight": 0.15,
     },
     {
     "name": "PreMarket",
@@ -193,7 +193,7 @@ CRITERIA = [
         "Uprise begins; price breaks out of base, first higher highs.",
         "Clear uptrend; price moves above all previous resistance, blue sky on the long-term chart.",
     ],
-    "weight": 0.06,
+    "weight": 0.1,
     },
     {
     "name": "VolProfile",
