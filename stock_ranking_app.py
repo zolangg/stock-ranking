@@ -123,7 +123,7 @@ CRITERIA = [
             "0.60 – 1.00",
             "Over 1.00",
         ],
-        "weight": 0.08,
+        "weight": 0.1,
     },
     {
         "name": "Float",
@@ -137,7 +137,7 @@ CRITERIA = [
             "3M - 10M",
             "Under 3M",
         ],
-        "weight": 0.1,
+        "weight": 0.05,
     },
     {
         "name": "FloatPct",
@@ -165,7 +165,7 @@ CRITERIA = [
         "Steady uptrend; only minor pullbacks.",
         "Exceptionally clean uptrend.",
     ],
-    "weight": 0.15,
+    "weight": 0.12,
     },
     {
     "name": "LevelStruct",
@@ -193,7 +193,7 @@ CRITERIA = [
         "Uptrend initiates: breakout from base, first higher highs established.",
         "Sustained uptrend: price makes consecutive higher highs, all resistance is cleared.",
     ],
-    "weight": 0.15,
+    "weight": 0.12,
     },
     {
         "name": "Spread",
