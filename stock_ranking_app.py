@@ -151,7 +151,7 @@ CRITERIA = [
             "50% – 100%",
             "Over 100%",
         ],
-        "weight": 0.15,
+        "weight": 0.1,
     },
     {
     "name": "GapStruct",
@@ -165,7 +165,7 @@ CRITERIA = [
         "Steady uptrend; only minor pullbacks.",
         "Exceptionally clean uptrend.",
     ],
-    "weight": 0.12,
+    "weight": 0.15,
     },
     {
     "name": "LevelStruct",
@@ -193,7 +193,7 @@ CRITERIA = [
         "Uptrend initiates: breakout from base, first higher highs established.",
         "Sustained uptrend: price makes consecutive higher highs, all resistance is cleared.",
     ],
-    "weight": 0.12,
+    "weight": 0.10,
     },
     {
         "name": "Spread",
