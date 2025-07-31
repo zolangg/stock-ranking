@@ -242,19 +242,26 @@ if "prev_news_weight" not in st.session_state or st.session_state["prev_news_wei
     recalc = True
 st.session_state["prev_news_weight"] = news_weight
 
-def heat_level(score, mean, std):
-    if score > mean + 2*std:
-        return "A++"
-    elif score > mean + std:
-        return "A+"
-    elif score > mean:
-        return "A"
-    elif score > mean - std:
-        return "B"
-    elif score > mean - 2*std:
-        return "C"
-    else:
-        return "D"
+if st.session_state.stock_scores:
+    df = pd.DataFrame(st.session_state.stock_scores)
+    mean = df['Score'].mean()
+    std = df['Score'].std()
+    st.write(f"Mean (Durchschnitt): {mean:.2f}")
+    st.write(f"Standardabweichung: {std:.2f}")
+    def heat_level(score, mean, std):
+        if score > mean + 2*std:
+            return "A++"
+        elif score > mean + std:
+            return "A+"
+        elif score > mean:
+            return "A"
+        elif score > mean - std:
+            return "B"
+        elif score > mean - 2*std:
+            return "C"
+        else:
+            return "D"
+    df["Level"] = df["Score"].apply(lambda x: heat_level(x, mean, std))
 
 if "stock_scores" not in st.session_state:
     st.session_state.stock_scores = []
