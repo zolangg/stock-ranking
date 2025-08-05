@@ -196,6 +196,20 @@ CRITERIA = [
     "weight": 0.10,
     },
     {
+    "name": "DilutionRisk",
+    "question": "Dilution & Overhead Supply Risk (SEC Filings):",
+    "options": [
+        "High risk: Recent S-1/F-1 or EFFECT for offering, active ATM or pending S-1/F-1, large shelf not yet used, many in-the-money warrants, urgent cash need. Massive overhang possible.",
+        "ATM or Shelf registered and active, several warrant/convertible filings near current price, cash need in the next 3–6 months.",
+        "ATM/Shelf active but only partially used, some warrants/options in or near the money, moderate cash need in 6–9 months.",
+        "Shelf/ATM mostly exhausted or expiring, few new warrants/options above price, cash buffer for 9–12 months.",
+        "Minimal overhang: Only a few OTM warrants/options, no active ATM, shelf nearly expired, company is cash-positive.",
+        "No active ATM, no shelf, no EFFECT, very few warrants/options, no recent dilution filings, cash position is strong.",
+        "No shelf, ATM, warrants, or converts; no dilution-related filings, strong cash position. No overhang or dilution risk.",
+    ],
+    "weight": 0.08,
+    },
+    {
         "name": "Spread",
         "question": "Bid-Ask Spread:",
         "options": [
