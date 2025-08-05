@@ -107,19 +107,19 @@ CRITERIA = [
         ],
         "weight": 0.10,
     },
-    {
-        "name": "DilutionRisk",
-        "question": "Dilution & Overhead Supply Risk (SEC Filings):",
-        "options": [
-            "High risk: Recent S-1/F-1 or EFFECT for offering, active ATM or pending S-1/F-1, large shelf not yet used, many in-the-money warrants, urgent cash need. Massive overhang possible.",
-            "ATM or Shelf registered and active, several warrant/convertible filings near current price, cash need in the next 3–6 months.",
-            "ATM/Shelf active but only partially used, some warrants/options in or near the money, moderate cash need in 6–9 months.",
-            "Shelf/ATM mostly exhausted or expiring, few new warrants/options above price, cash buffer for 9–12 months.",
-            "Minimal overhang: Only a few OTM warrants/options, no active ATM, shelf nearly expired, company is cash-positive.",
-            "No active ATM, no shelf, no EFFECT, very few warrants/options, no recent dilution filings, cash position is strong.",
-            "No shelf, ATM, warrants, or converts; no dilution-related filings, strong cash position. No overhang or dilution risk.",
-        ],
-        "weight": 0.08,
+   {
+    "name": "DilutionRisk",
+    "question": "Dilution & Overhead Supply Risk (SEC Filings):",
+    "options": [
+        "New or recently effective S-1/F-1 offering, active ATM program, or large shelf registration present. Many warrants or convertibles deeply in the money. Urgent cash need. Very high probability of new share issuance or aggressive selling at any time.",
+        "ATM or shelf is open with significant capacity remaining, or a secondary offering (S-1, F-1) is pending. Multiple warrants or convertibles near or slightly above current price. Cash needed within the next 3–6 months.",
+        "ATM or shelf is active but partly used. Some warrants/options at or just below current price. Cash runway 6–9 months. Company could raise cash soon.",
+        "Most shelf/ATM already used or expires soon. Only a few new warrants/options above current price. Cash likely for 9–12 months.",
+        "Minimal overhang. Only a few out-of-the-money warrants/options outstanding. No active ATM. Shelf nearly expired. Company is cash-positive for at least one year.",
+        "No active ATM, no open shelf, no effective offering. Only rare or far out-of-the-money warrants/options. No recent dilution filings. Strong cash position.",
+        "No shelf, ATM, warrants, convertibles, or dilution-related filings present. Company strongly cash-positive. No current or foreseeable dilution/overhang.",
+    ],
+    "weight": 0.08,
     },
     {
         "name": "Spread",
