@@ -241,34 +241,6 @@ CRITERIA = [
         ],
         "weight": 0.10,
     },
-    {
-    "name": "DilutionRisk",
-    "question": "Dilution & Overhead Supply Risk (SEC Filings):",
-    "options": [
-        "Active S-1/F-1 or ATM, large shelf unused, many in-the-money warrants, urgent cash need.",
-        "Open ATM/shelf with capacity, pending offering, warrants/converts near price, cash needed <6 months.",
-        "ATM/shelf partly used, some warrants/options near price, cash runway 6–9 months.",
-        "Shelf/ATM mostly used or expiring, few new warrants/options above price, cash for 9–12 months.",
-        "Minimal overhang: few OTM warrants/options, no active ATM, shelf nearly expired, cash for 1+ year.",
-        "No active ATM/shelf, only rare OTM warrants/options, no recent filings, strong cash.",
-        "No shelf, ATM, warrants, converts, or dilution filings; cash-rich, no overhang.",
-    ],
-    "weight": 0.08,
-    },
-    {
-        "name": "Spread",
-        "question": "Bid-Ask Spread:",
-        "options": [
-            "Over 5%",
-            "4%–5%",
-            "3%–4%",
-            "2%–3%",
-            "1%–2%",
-            "0.5%–1%",
-            "Under 0.5%",
-        ],
-        "weight": 0.05,
-    },
 ]
 
 # --- Sidebar for weights ---
@@ -304,15 +276,15 @@ if "prev_news_weight" not in st.session_state or st.session_state["prev_news_wei
 st.session_state["prev_news_weight"] = news_weight
 
 def heat_level(score):
-    if score >= 6.5:
+    if score >= 5.5:
         return "A++"
-    elif score >= 6:
+    elif score >= 5:
         return "A+"
-    elif score >= 5.3:
+    elif score >= 4.3:
         return "A"
-    elif score >= 4.5:
-        return "B"
     elif score >= 3.5:
+        return "B"
+    elif score >= 2.5:
         return "C"
     else:
         return "D"
@@ -375,7 +347,7 @@ if st.session_state.stock_scores:
 
     ordered_cols = [
         "Ticker", "Score", "Level", "RVOL", "ATR", "Float", "FloatPct", "GapStruct",
-        "LevelStruct", "Monthly", "DilutionRisk", "Spread", "Catalyst"
+        "LevelStruct", "Monthly", "Catalyst"
     ]
     
     st.dataframe(
