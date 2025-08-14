@@ -197,10 +197,14 @@ if "stock_scores" not in st.session_state:
 # -------------------------------
 if recalc and st.session_state.stock_scores:
     for stock in st.session_state.stock_scores:
-        base_score = sum(stock[crit['name']] * weights[crit['name']] for crit in CRITERIA)
-        # Recompute with both sliders applied again
+        base_score = sum(
+            stock.get(crit['name'], 0) * weights.get(crit['name'], crit['weight'])
+            for crit in CRITERIA
+        )
         stock["Score"] = round(
-            base_score + stock.get("Catalyst", 0.0) * news_weight + stock.get("Dilution", 0.0) * dilution_weight,
+            base_score
+            + stock.get("Catalyst", 0.0) * news_weight
+            + stock.get("Dilution", 0.0) * dilution_weight,
             2
         )
 
