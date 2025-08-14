@@ -173,15 +173,15 @@ st.session_state["prev_dilution_weight"] = dilution_weight
 # Grading
 # -------------------------------
 def heat_level(score: float) -> str:
-    if score >= 5.5:
+    if score >= 6.5:
         return "A++"
-    elif score >= 5.0:
+    elif score >= 6.0:
         return "A+"
-    elif score >= 4.3:
+    elif score >= 5.3:
         return "A"
-    elif score >= 3.5:
+    elif score >= 4.5:
         return "B"
-    elif score >= 2.5:
+    elif score >= 3.5:
         return "C"
     else:
         return "D"
