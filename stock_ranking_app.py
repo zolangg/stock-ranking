@@ -51,16 +51,16 @@ CRITERIA = [
         "weight": 0.05,
     },
     {
-        "name": "FloatRot",
-        "question": "Float Rotation:",
+        "name": "FloatPct",
+        "question": "Premarket Volume as % of Float:",
         "options": [
-            "Under 0.02x",
-            "0.02× – 0.05×",
-            "0.05× – 0.10×",
-            "0.10× – 0.30×",
-            "0.30× – 0.80×",
-            "0.80× – 1.50×",
-            "Over 1.50×",
+            "Under 1%",
+            "1% – 3%",
+            "3% – 10%",
+            "10% – 25%",
+            "25% – 50%",
+            "50% – 100%",
+            "Over 100%",
         ],
         "weight": 0.10,
     },
@@ -156,19 +156,32 @@ if "prev_news_weight" not in st.session_state or st.session_state["prev_news_wei
     recalc = True
 st.session_state["prev_news_weight"] = news_weight
 
+# NEW: Dilution impact multiplier
+dilution_weight = st.sidebar.slider(
+    label="Dilution Impact Weight (× on slider value)",
+    min_value=0.0,
+    max_value=2.0,
+    value=1.0,
+    step=0.05,
+    key="dilution_weight"
+)
+if "prev_dilution_weight" not in st.session_state or st.session_state["prev_dilution_weight"] != dilution_weight:
+    recalc = True
+st.session_state["prev_dilution_weight"] = dilution_weight
+
 # -------------------------------
 # Grading
 # -------------------------------
 def heat_level(score: float) -> str:
-    if score >= 6.25:
+    if score >= 5.5:
         return "A++"
-    elif score >= 5.75:
+    elif score >= 5.0:
         return "A+"
-    elif score >= 5.05:
+    elif score >= 4.3:
         return "A"
-    elif score >= 4.25:
+    elif score >= 3.5:
         return "B"
-    elif score >= 3.25:
+    elif score >= 2.5:
         return "C"
     else:
         return "D"
@@ -185,7 +198,11 @@ if "stock_scores" not in st.session_state:
 if recalc and st.session_state.stock_scores:
     for stock in st.session_state.stock_scores:
         base_score = sum(stock[crit['name']] * weights[crit['name']] for crit in CRITERIA)
-        stock["Score"] = round(base_score + stock["Catalyst"] * news_weight, 2)
+        # Recompute with both sliders applied again
+        stock["Score"] = round(
+            base_score + stock.get("Catalyst", 0.0) * news_weight + stock.get("Dilution", 0.0) * dilution_weight,
+            2
+        )
 
 # -------------------------------
 # Input form
@@ -213,16 +230,27 @@ with st.form(key="stock_form", clear_on_submit=True):
         key="catalyst_slider"
     )
 
+    # NEW: Dilution slider: -1.0 (heavy overhang/active ATM/S-1) to +1.0 (supportive: ATM terminated, buyback)
+    dilution_points = st.slider(
+        "Dilution Impact (−1.0 = Heavy Overhang … +1.0 = Supportive)",
+        min_value=-1.0,
+        max_value=1.0,
+        value=0.0,
+        step=0.05,
+        key="dilution_slider"
+    )
+
     submit = st.form_submit_button("Save Stock & Add to Ranking")
 
 if submit and ticker:
     base_score = sum(criteria_points[crit['name']] * weights[crit['name']] for crit in CRITERIA)
-    score_total = round(base_score + catalyst_points * news_weight, 2)
+    score_total = round(base_score + catalyst_points * news_weight + dilution_points * dilution_weight, 2)
 
     stock_entry = {
         "Ticker": ticker,
         **criteria_points,            # each criterion 1..7
         "Catalyst": round(catalyst_points, 2),
+        "Dilution": round(dilution_points, 2),
         "Score": score_total
     }
     st.session_state.stock_scores.append(stock_entry)
@@ -241,15 +269,17 @@ if st.session_state.stock_scores:
     df["Score"] = pd.to_numeric(df["Score"], errors="coerce").round(2)
     if "Catalyst" in df.columns:
         df["Catalyst"] = pd.to_numeric(df["Catalyst"], errors="coerce").round(2)
+    if "Dilution" in df.columns:
+        df["Dilution"] = pd.to_numeric(df["Dilution"], errors="coerce").round(2)
 
     # Grading
     df["Level"] = df["Score"].apply(heat_level)
 
     ordered_cols = [
-        "Ticker", "Score", "Level",              # pinned left
+        "Ticker", "Score", "Level",                 # pinned left
         "RVOL", "ATR", "Float", "FloatPct", "ShortInterest",
         "GapStruct", "LevelStruct", "Monthly",
-        "Catalyst"
+        "Catalyst", "Dilution"
     ]
 
     # Safeguard if something missing
