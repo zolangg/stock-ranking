@@ -96,7 +96,7 @@ for k in q_weights:
     q_weights[k] = q_weights[k] / qual_sum
 
 # -------------------------------
-# Point mappers
+# Mappers & labels
 # -------------------------------
 def pts_rvol(x: float) -> int:
     cuts = [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]
@@ -171,25 +171,33 @@ with tab_add:
 
     c_top = st.columns([1.2, 1.2, 1.0])
 
+    # Basics
     with c_top[0]:
         st.markdown("**Basics**")
-        ticker   = st.text_input("Ticker", "", key="in_ticker", help="Stock symbol, e.g., **BSLK**.")
+        ticker   = st.text_input("Ticker", "", key="in_ticker",
+                                 help="Stock symbol, e.g., **BSLK**.")
         rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1, key="in_rvol",
                                    help="Relative Volume = current volume ÷ typical volume. Example: **10** means 10× usual.")
         atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f", key="in_atr",
                                    help="Average True Range in dollars. Example: **0.40** ≈ 40¢ daily range.")
 
+    # Float / SI / PM volume + NEW: Target, PM VWAP, Market Cap
     with c_top[1]:
-        st.markdown("**Float & Short Interest**")
+        st.markdown("**Float, SI & Volume**")
         float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0, key="in_float_m",
                                    help="Tradable shares (in millions). Example: **25** = 25,000,000 shares.")
         si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5, key="in_si_pct",
                                    help="Shorted shares as a % of float. Example: **12** = 12%.")
         pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1, key="in_pm_vol_m",
                                    help="Shares traded in premarket (in millions). Example: **5** = 5,000,000.")
-
+        target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=1.0, value=150.0, step=5.0, key="in_target_vol_m",
+                                       help="Your day-volume goal for the ticker, e.g., **150**–**200**M.")
     with c_top[2]:
-        st.markdown("**Context Modifiers**")
+        st.markdown("**Price, Cap & Modifiers**")
+        pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f", key="in_pm_vwap",
+                                   help="Average premarket price (VWAP) to convert PM volume → **$ volume**.")
+        mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=100.0, step=5.0, key="in_mc_m",
+                                   help="Approximate market cap in **millions** of USD.")
         catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05, key="in_catalyst",
                                     help="Strength of news/catalyst. **+1.0** strong positive (FDA, earnings beat), **−1.0** strong negative.")
         dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05, key="in_dilution",
@@ -198,7 +206,6 @@ with tab_add:
     st.markdown("---")
     st.markdown("**Qualitative Context**")
 
-    # Radios in 3 columns with help text
     q_cols = st.columns(3)
     qual_points = {}
     for i, crit in enumerate(QUAL_CRITERIA):
@@ -215,28 +222,37 @@ with tab_add:
     submitted = st.button("Add / Score", type="primary", use_container_width=True)
 
     if submitted and ticker:
-        # Points
+        # ---- Points (numeric) ----
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
         p_fr    = pts_fr(pm_vol_m, float_m)
         p_float = pts_float(float_m)
 
-        # Numeric block (0..7 -> %)
         num_0_7 = (w_rvol*p_rvol) + (w_atr*p_atr) + (w_si*p_si) + (w_fr*p_fr) + (w_float*p_float)
         num_pct = (num_0_7/7.0)*100.0
 
-        # Qualitative block (0..7 -> %)
+        # ---- Points (qualitative) ----
         qual_0_7 = sum(q_weights[c["name"]] * qual_points[c["name"]] for c in QUAL_CRITERIA)
-        qual_pct = (qual_0_7/7.0)*100.0
+        qual_pct = (d := (qual_0_7/7.0)*100.0)
 
-        # Combine & modifiers
+        # ---- Combine + modifiers ----
         combo_pct = 0.5*num_pct + 0.5*qual_pct
-        final_score = round(combo_pct + st.session_state.news_weight*st.session_state.in_catalyst*10
-                            + st.session_state.dil_weight*st.session_state.in_dilution*10, 2)
+        final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
 
-        # Save row
-        row = {"Ticker": ticker, "Odds": odds_label(final_score), "Level": grade(final_score)}
+        # ---- Diagnostics ----
+        pm_pct_target = 100.0 * pm_vol_m / target_vol_m if target_vol_m > 0 else 0.0
+        pm_float_pct  = 100.0 * pm_vol_m / float_m     if float_m     > 0 else 0.0
+        pm_dollar_vol_m = pm_vol_m * pm_vwap  # in $ millions, since pm_vol_m is in millions
+        pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
+
+        # Save row (include numeric OddsScore for sorting)
+        row = {
+            "Ticker": ticker,
+            "Odds": odds_label(final_score),
+            "OddsScore": final_score,
+            "Level": grade(final_score),
+        }
         st.session_state.rows.append(row)
 
         # Save last (for preview)
@@ -248,14 +264,19 @@ with tab_add:
             "Dilution": round(dilution_points,2),
             "Final": final_score,
             "Level": grade(final_score),
-            "Odds": odds_label(final_score)
+            "Odds": odds_label(final_score),
+            # diagnostics
+            "PM_Target_%": round(pm_pct_target,1),
+            "PM_Float_%": round(pm_float_pct,1),
+            "PM_$Vol_M": round(pm_dollar_vol_m,2),
+            "PM$ / MC_%": round(pm_dollar_vs_mc_pct,1),
         }
 
         # Flash & reset inputs
         st.session_state.flash = f"Saved {ticker} – Final Score {final_score} ({row['Level']})"
         for k in [
             "in_ticker","in_rvol","in_atr","in_float_m","in_si_pct","in_pm_vol_m",
-            "in_catalyst","in_dilution"
+            "in_target_vol_m","in_pm_vwap","in_mc_m","in_catalyst","in_dilution"
         ] + [f"qual_{c['name']}" for c in QUAL_CRITERIA]:
             if k in st.session_state:
                 del st.session_state[k]
@@ -267,19 +288,30 @@ with tab_add:
         l = st.session_state.last
         cA, cB, cC, cD = st.columns(4)
         cA.metric("Last Ticker", l["Ticker"])
-        cA.caption("The most recently added symbol.")
+        cA.caption("Most recently added symbol.")
         cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
-        cB.caption("Score from **RVOL, ATR, SI, PM Float Rotation, Float size**.")
+        cB.caption("From **RVOL, ATR, SI, PM Float Rotation, Float size**.")
         cC.metric("Qual Block", f'{l["Qual_%"]}%')
-        cC.caption("Score from **GapStruct, LevelStruct, Monthly** (weighted).")
+        cC.caption("From **GapStruct, LevelStruct, Monthly** (weighted).")
         cD.metric("Final Score", f'{l["Final"]} ({l["Level"]})')
         cD.caption("Combined numeric/qual + modifiers (Catalyst & Dilution).")
+
+        st.markdown("##### Premarket Diagnostics")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("PM % of Target", f'{l["PM_Target_%"]}%')
+        d1.caption("PM volume ÷ target day volume × 100. Example: PM **20M** vs target **150M** → **13.3%**.")
+        d2.metric("PM Float %", f'{l["PM_Float_%"]}%')
+        d2.caption("PM volume ÷ float × 100. Example: PM **5M** vs float **25M** → **20%**.")
+        d3.metric("PM $Vol (M)", f'{l["PM_$Vol_M"]}')
+        d3.caption("PM shares (M) × PM VWAP ($). Example: **5M × $5 = $25M**.")
+        d4.metric("PM$ / MC", f'{l["PM$ / MC_%"]}%')
+        d4.caption("PM dollar volume ÷ market cap × 100. Example: **$25M** on **$500M** → **5%**.")
 
 with tab_rank:
     st.subheader("Current Ranking")
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
-        df = df.sort_values("Odds", ascending=False).reset_index(drop=True)
+        df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
 
         st.dataframe(
             df[["Ticker","Odds","Level"]],
