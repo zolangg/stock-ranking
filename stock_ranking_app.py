@@ -308,7 +308,7 @@ with tab_rank:
     st.subheader("Current Ranking")
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
-        df = df.sort_values("OddScore", ascending=False).reset_index(drop=True)
+        df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
 
         st.dataframe(
             df[["Ticker","Odds","Level"]],
