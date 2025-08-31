@@ -17,7 +17,7 @@ if "last" not in st.session_state:
 if "flash" not in st.session_state:
     st.session_state.flash = None
 
-# Flash message from previous submit
+# Flash from prior submit
 if st.session_state.flash:
     st.success(st.session_state.flash)
     st.session_state.flash = None
@@ -33,43 +33,43 @@ QUAL_CRITERIA = [
             "Gap fully reversed: price loses >80% of gap.",
             "Choppy reversal: price loses 50–80% of gap.",
             "Partial retracement: price loses 25–50% of gap.",
-            "Sideways consolidation: gap holds, price moves within top 25% of gap.",
+            "Sideways consolidation: gap holds, price within top 25% of gap.",
             "Uptrend with deep pullbacks (>30% retrace).",
             "Uptrend with moderate pullbacks (10–30% retrace).",
             "Clean uptrend, only minor pullbacks (<10%).",
         ],
         "weight": 0.15,
-        "help": "How well the gap holds and trends. Higher choices = cleaner hold/trend.",
+        "help": "How well the gap holds and trends.",
     },
     {
         "name": "LevelStruct",
         "question": "Key Price Levels:",
         "options": [
             "Fails at all major support/resistance; cannot hold any key level.",
-            "Briefly holds or reclaims a level but loses it quickly; repeated failures.",
-            "Holds one support but unable to break any resistance; capped below a key level.",
-            "Breaks above resistance but cannot stay above; repeatedly dips below reclaimed level.",
+            "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
+            "Holds one support but unable to break resistance; capped below a key level.",
+            "Breaks above resistance but cannot stay; dips below reclaimed level.",
             "Breaks and holds one major level; most resistance remains above.",
             "Breaks and holds several major levels; clears most overhead resistance.",
-            "Breaks and holds above all resistance; blue sky, no levels overhead.",
+            "Breaks and holds above all resistance; blue sky.",
         ],
         "weight": 0.15,
-        "help": "How many key levels it breaks and holds. Higher choices = stronger structure.",
+        "help": "Break/hold behavior at key levels.",
     },
     {
         "name": "Monthly",
         "question": "Monthly/Weekly Chart Context:",
         "options": [
-            "Sharp, accelerating downtrend; price makes new lows repeatedly.",
-            "Persistent downtrend; decline continues but slows, still making lower lows.",
-            "Downtrend loses momentum; price begins to flatten, lower lows shallow.",
-            "Clear base forms; price consolidates sideways, volatility drops.",
-            "Bottom confirmed; price sets a clear higher low after base.",
-            "Uptrend begins; price breaks out of base and forms higher highs.",
-            "Sustained uptrend; price makes consecutive higher highs, blue sky above.",
+            "Sharp, accelerating downtrend; new lows repeatedly.",
+            "Persistent downtrend; still lower lows.",
+            "Downtrend losing momentum; flattening.",
+            "Clear base; sideways consolidation.",
+            "Bottom confirmed; higher low after base.",
+            "Uptrend begins; breaks out of base.",
+            "Sustained uptrend; higher highs, blue sky.",
         ],
         "weight": 0.10,
-        "help": "Bigger-picture bias. Higher choices = healthier higher-timeframe context.",
+        "help": "Higher-timeframe bias.",
     },
 ]
 
@@ -77,30 +77,25 @@ QUAL_CRITERIA = [
 # Sidebar: Weights & Modifiers
 # -------------------------------
 st.sidebar.header("Numeric Weights")
-w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01, key="w_rvol",
-                            help="Relative Volume weight. RVOL = current volume ÷ typical (e.g., 10 = 10× usual).")
-w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01, key="w_atr",
-                            help="Average True Range weight. Example: 0.40 means ~40¢ daily range.")
-w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, 0.15, 0.01, key="w_si",
-                            help="Short Interest weight (as % of float).")
-w_fr    = st.sidebar.slider("PM Float Rotation (%)", 0.0, 1.0, 0.45, 0.01, key="w_fr",
-                            help="Weight for Premarket Float Rotation = PM Volume ÷ Float × 100.")
-w_float = st.sidebar.slider("Public Float (penalty/bonus)", 0.0, 1.0, 0.05, 0.01, key="w_float",
-                            help="Weight for float size points (smaller float → more points).")
+w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01, key="w_rvol", help="Relative volume weight.")
+w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01, key="w_atr",  help="ATR weight.")
+w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, 0.15, 0.01, key="w_si", help="Short interest weight.")
+w_fr    = st.sidebar.slider("PM Float Rotation (%)", 0.0, 1.0, 0.45, 0.01, key="w_fr", help="PM float rotation weight.")
+w_float = st.sidebar.slider("Public Float (penalty/bonus)", 0.0, 1.0, 0.05, 0.01, key="w_float", help="Float size points weight.")
 
 st.sidebar.header("Qualitative Weights")
 q_weights = {}
 for crit in QUAL_CRITERIA:
     q_weights[crit["name"]] = st.sidebar.slider(
         crit["name"], 0.0, 1.0, crit["weight"], 0.01, key=f"wq_{crit['name']}",
-        help=f"Weight for: {crit['name']}."
+        help=f"Weight for {crit['name']}."
     )
 
 st.sidebar.header("Modifiers")
 news_weight = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight",
-                                help="Multiplier applied to the Catalyst slider value (−1.0…+1.0) × 10.")
+                                help="Multiplier on Catalyst slider value.")
 dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05, key="dil_weight",
-                                    help="Multiplier applied to the Dilution slider value (−1.0…+1.0) × 10.")
+                                    help="Multiplier on Dilution slider value.")
 
 # Normalize blocks separately
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
@@ -162,93 +157,61 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # -------------------------------
-# Helper: reset inputs (Option B)
-# -------------------------------
-def reset_form():
-    keys = [
-        "in_ticker","in_rvol","in_atr","in_float_m","in_si_pct","in_pm_vol_m",
-        "in_target_vol_m","in_pm_vwap","in_mc_m","in_catalyst","in_dilution",
-        # qualitative radios:
-        *[f"qual_{c['name']}" for c in QUAL_CRITERIA]
-    ]
-    for k in keys:
-        if k in st.session_state:
-            del st.session_state[k]
-    st.rerun()
-
-# -------------------------------
-# Tabs: Add / Ranking
+# Tabs
 # -------------------------------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 with tab_add:
     st.subheader("Enter Inputs")
 
-    c_top = st.columns([1.2, 1.2, 1.0])
+    # ---------- OPTION A: form that clears on submit ----------
+    with st.form("add_form", clear_on_submit=True):
+        c_top = st.columns([1.2, 1.2, 1.0])
 
-    # Basics
-    with c_top[0]:
-        st.markdown("**Basics**")
-        ticker   = st.text_input("Ticker", "", key="in_ticker",
-                                 help="Stock symbol, e.g., **BSLK**.")
-        rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1, key="in_rvol",
-                                   help="Relative Volume = current volume ÷ typical volume. Example: **10** = 10× usual.")
-        atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f", key="in_atr",
-                                   help="Average True Range in dollars. Example: **0.40** ≈ 40¢ daily range.")
+        # Basics
+        with c_top[0]:
+            st.markdown("**Basics**")
+            ticker   = st.text_input("Ticker", "").strip().upper()
+            rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1)
+            atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f")
 
-    # Float / SI / PM volume + Target
-    with c_top[1]:
-        st.markdown("**Float, SI & Volume**")
-        float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0, key="in_float_m",
-                                   help="Tradable shares (in millions). Example: **25** = 25,000,000 shares.")
-        si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5, key="in_si_pct",
-                                   help="Shorted shares as a % of float. Example: **12** = 12%.")
-        pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1, key="in_pm_vol_m",
-                                   help="Shares traded in premarket (in millions). Example: **5** = 5,000,000.")
-        target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=1.0, value=150.0, step=5.0, key="in_target_vol_m",
-                                       help="Your day-volume goal for the ticker, e.g., **150**–**200**M.")
+        # Float / SI / PM volume + Target
+        with c_top[1]:
+            st.markdown("**Float, SI & Volume**")
+            float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0)
+            si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5)
+            pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1)
+            target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=1.0, value=150.0, step=5.0)
 
-    # Price, Cap & Modifiers
-    with c_top[2]:
-        st.markdown("**Price, Cap & Modifiers**")
-        pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f", key="in_pm_vwap",
-                                   help="Average premarket price (VWAP) to convert PM volume → **$ volume**.")
-        mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=100.0, step=5.0, key="in_mc_m",
-                                   help="Approximate market cap in **millions** of USD.")
-        catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05, key="in_catalyst",
-                                    help="Strength of news/catalyst. **+1.0** strong positive (FDA, earnings beat), **−1.0** strong negative.")
-        dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05, key="in_dilution",
-                                    help="Dilution/overhang context. **−1.0** heavy ATM/S-1, **+1.0** supportive (ATM ended, buyback).")
+        # Price, Cap & Modifiers
+        with c_top[2]:
+            st.markdown("**Price, Cap & Modifiers**")
+            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f")
+            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=100.0, step=5.0)
+            catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
+            dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
 
-    st.markdown("---")
-    st.markdown("**Qualitative Context**")
+        st.markdown("---")
+        st.markdown("**Qualitative Context**")
 
-    q_cols = st.columns(3)
-    qual_points = {}
-    for i, crit in enumerate(QUAL_CRITERIA):
-        with q_cols[i % 3]:
-            choice = st.radio(
-                crit["question"],
-                options=list(enumerate(crit["options"], 1)),
-                format_func=lambda x: x[1],
-                key=f"qual_{crit['name']}",
-                help=crit.get("help", None)
-            )
-            qual_points[crit["name"]] = choice[0]  # 1..7
+        q_cols = st.columns(3)
+        qual_points = {}
+        for i, crit in enumerate(QUAL_CRITERIA):
+            with q_cols[i % 3]:
+                choice = st.radio(
+                    crit["question"],
+                    options=list(enumerate(crit["options"], 1)),
+                    format_func=lambda x: x[1],
+                    key=f"qual_{crit['name']}",
+                    help=crit.get("help", None)
+                )
+                qual_points[crit["name"]] = choice[0]  # 1..7
 
-    # Buttons row: primary submit + white reset
-    b1, b2 = st.columns([0.6, 0.4])
-    with b1:
-        submitted = st.button("Add / Score", type="primary", use_container_width=True)
-    with b2:
-        reset_clicked = st.button("Reset form", use_container_width=True, help="Clear all inputs back to defaults.")
+        submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
-    if reset_clicked:
-        reset_form()
-
-    # Scoring
+    # ---------- Scoring after submit ----------
     if submitted and ticker:
-        # ---- Points (numeric) ----
+        # Numeric points
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
@@ -258,15 +221,21 @@ with tab_add:
         num_0_7 = (w_rvol*p_rvol) + (w_atr*p_atr) + (w_si*p_si) + (w_fr*p_fr) + (w_float*p_float)
         num_pct = (num_0_7/7.0)*100.0
 
-        # ---- Points (qualitative) ----
+        # Qualitative points
         qual_0_7 = sum(q_weights[c["name"]] * qual_points[c["name"]] for c in QUAL_CRITERIA)
         qual_pct = (qual_0_7/7.0)*100.0
 
-        # ---- Combine + modifiers ----
+        # Combine + modifiers
         combo_pct = 0.5*num_pct + 0.5*qual_pct
         final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
 
-        # ---- Save row (with numeric score for sorting) ----
+        # Diagnostics (for preview)
+        pm_pct_target = 100.0 * pm_vol_m / target_vol_m if target_vol_m > 0 else 0.0
+        pm_float_pct  = 100.0 * pm_vol_m / float_m     if float_m     > 0 else 0.0
+        pm_dollar_vol_m = pm_vol_m * pm_vwap
+        pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
+
+        # Save row
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
@@ -275,12 +244,7 @@ with tab_add:
         }
         st.session_state.rows.append(row)
 
-        # ---- Diagnostics for the preview card ----
-        pm_pct_target = 100.0 * pm_vol_m / target_vol_m if target_vol_m > 0 else 0.0
-        pm_float_pct  = 100.0 * pm_vol_m / float_m     if float_m     > 0 else 0.0
-        pm_dollar_vol_m = pm_vol_m * pm_vwap
-        pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
-
+        # Save last for preview card
         st.session_state.last = {
             "Ticker": ticker,
             "Numeric_%": round(num_pct,2),
@@ -297,8 +261,9 @@ with tab_add:
         }
 
         st.session_state.flash = f"Saved {ticker} – Final Score {final_score} ({row['Level']})"
+        st.experimental_rerun()
 
-    # Preview card
+    # Preview card (after rerun)
     if st.session_state.last:
         st.markdown("---")
         l = st.session_state.last
@@ -330,16 +295,14 @@ with tab_rank:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Ticker": st.column_config.TextColumn("Ticker", help="Stock symbol you entered."),
+                "Ticker": st.column_config.TextColumn("Ticker", help="Symbol."),
                 "Odds": st.column_config.TextColumn(
                     "Odds",
-                    help=("Qualitative label from Final Score:\n"
-                          "• Very High (≥85)\n• High (≥70)\n• Moderate (≥55)\n• Low (≥40)\n• Very Low (<40)")
+                    help="Qualitative label from Final Score."
                 ),
                 "Level": st.column_config.TextColumn(
                     "Level",
-                    help=("Letter grade from Final Score:\n"
-                          "A++ (≥85), A+ (≥80), A (≥70), B (≥60), C (≥45), D (<45)")
+                    help="Letter grade from Final Score."
                 ),
             }
         )
@@ -357,6 +320,6 @@ with tab_rank:
             if st.button("Clear Ranking", use_container_width=True):
                 st.session_state.rows = []
                 st.session_state.last = None
-                st.rerun()
+                st.experimental_rerun()
     else:
         st.info("No rows yet. Add a stock in the **Add Stock** tab.")
