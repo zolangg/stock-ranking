@@ -311,7 +311,7 @@ with tab_rank:
         df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
 
         st.dataframe(
-            df[["Ticker","Odds","Level","Final", "Numeric_%","Qual_%"]],
+            df[["Ticker","Odds","Level","Final","Numeric_%","Qual_%"]],
             use_container_width=True,
             hide_index=True,
             column_config={
