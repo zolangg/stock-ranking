@@ -121,6 +121,15 @@ def pts_float(float_m: float) -> int:
         if float_m > th: return p
     return 7
 
+def odds_label(score: float) -> str:
+    if score >= 85: return "Very High Odds"
+    elif score >= 70: return "High Odds"
+    elif score >= 55: return "Moderate Odds"
+    elif score >= 40: return "Low Odds"
+    else: return "Very Low Odds"
+
+df["Odds"] = df["Score"].apply(odds_label)
+
 # -------------------------------
 # Grading
 # -------------------------------
@@ -202,7 +211,7 @@ with tab_add:
         combo_pct = 0.5*num_pct + 0.5*qual_pct
         final_score = round(combo_pct + catalyst_points*news_weight*10 + dilution_points*dilution_weight*10, 2)
 
-        row = {"Ticker": ticker, "Score": final_score, "Level": grade(final_score)}
+        row = {"Ticker": ticker, "Odds": odds_label(final_score), "Level": grade(final_score)}
         st.session_state.rows.append(row)
         st.session_state.last = {
             "Ticker": ticker,
@@ -233,7 +242,7 @@ with tab_rank:
         df = df.sort_values("Score", ascending=False).reset_index(drop=True)
 
         st.dataframe(
-            df[["Ticker","Score","Level"]],
+            df[["Ticker","Odds","Level"]],
             use_container_width=True,
             hide_index=True
         )
