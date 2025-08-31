@@ -337,7 +337,7 @@ with tab_rank:
 
         st.download_button(
             "Download CSV",
-            df[["Ticker","Odds","Level"]].to_csv(index=False).encode("utf-8"),
+            df[["Ticker","Odds","Level","Final","Numeric_%","Qual_%"]].to_csv(index=False).encode("utf-8"),
             "ranking.csv",
             "text/csv",
             use_container_width=True
