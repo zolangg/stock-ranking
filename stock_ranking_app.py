@@ -1,6 +1,13 @@
 import streamlit as st
 import pandas as pd
 
+# Compat helper: use st.rerun if available, else experimental_rerun if present
+def do_rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+        
 # -------------------------------
 # Page setup
 # -------------------------------
@@ -261,7 +268,7 @@ with tab_add:
         }
 
         st.session_state.flash = f"Saved {ticker} – Final Score {final_score} ({row['Level']})"
-        st.experimental_rerun()
+        do_rerun()
 
     # Preview card (after rerun)
     if st.session_state.last:
@@ -320,6 +327,6 @@ with tab_rank:
             if st.button("Clear Ranking", use_container_width=True):
                 st.session_state.rows = []
                 st.session_state.last = None
-                st.experimental_rerun()
+                do_rerun()
     else:
         st.info("No rows yet. Add a stock in the **Add Stock** tab.")
