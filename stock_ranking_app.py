@@ -8,6 +8,28 @@ st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
 
 # -------------------------------
+# Session state init
+# -------------------------------
+if "rows" not in st.session_state:
+    st.session_state.rows = []
+if "last" not in st.session_state:
+    st.session_state.last = None
+if "flash" not in st.session_state:
+    st.session_state.flash = None
+# Option A: key-salt for auto-reset of inputs after submit
+if "salt" not in st.session_state:
+    st.session_state.salt = 0
+
+def k(base: str) -> str:
+    """Build a transient widget key using the salt."""
+    return f"{base}_{st.session_state.salt}"
+
+# Flash message from previous submit
+if st.session_state.flash:
+    st.success(st.session_state.flash)
+    st.session_state.flash = None
+
+# -------------------------------
 # Qualitative criteria (kept)
 # -------------------------------
 QUAL_CRITERIA = [
@@ -92,8 +114,8 @@ num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
 
 qual_sum = max(1e-9, sum(q_weights.values()))
-for k in q_weights:
-    q_weights[k] = q_weights[k] / qual_sum
+for kq in q_weights:
+    q_weights[kq] = q_weights[kq] / qual_sum
 
 # -------------------------------
 # Mappers & labels
@@ -147,34 +169,6 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # -------------------------------
-# Session state
-# -------------------------------
-if "rows" not in st.session_state:
-    st.session_state.rows = []
-if "last" not in st.session_state:
-    st.session_state.last = None
-if "flash" not in st.session_state:
-    st.session_state.flash = None
-
-# show flash from previous submit
-if st.session_state.flash:
-    st.success(st.session_state.flash)
-    st.session_state.flash = None
-
-# -------------------------------
-# Reset helper (Option B core)
-# -------------------------------
-def reset_inputs_and_rerun():
-    keys = [
-        "in_ticker","in_rvol","in_atr","in_float_m","in_si_pct","in_pm_vol_m",
-        "in_target_vol_m","in_pm_vwap","in_mc_m","in_catalyst","in_dilution",
-        *[f"qual_{c['name']}" for c in QUAL_CRITERIA]
-    ]
-    for k in keys:
-        st.session_state.pop(k, None)
-    st.rerun()
-
-# -------------------------------
 # Tabs: Add / Ranking
 # -------------------------------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -187,35 +181,35 @@ with tab_add:
     # Basics
     with c_top[0]:
         st.markdown("**Basics**")
-        ticker   = st.text_input("Ticker", "", key="in_ticker",
+        ticker   = st.text_input("Ticker", "", key=k("in_ticker"),
                                  help="Stock symbol, e.g., **BSLK**.")
-        rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1, key="in_rvol",
+        rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1, key=k("in_rvol"),
                                    help="Relative Volume = current volume ÷ typical volume. Example: **10** = 10× usual.")
-        atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f", key="in_atr",
+        atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f", key=k("in_atr"),
                                    help="Average True Range in dollars. Example: **0.40** ≈ 40¢ daily range.")
 
     # Float / SI / PM volume + Target
     with c_top[1]:
         st.markdown("**Float, SI & Volume**")
-        float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0, key="in_float_m",
+        float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0, key=k("in_float_m"),
                                    help="Tradable shares (in millions). Example: **25** = 25,000,000 shares.")
-        si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5, key="in_si_pct",
+        si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5, key=k("in_si_pct"),
                                    help="Shorted shares as a % of float. Example: **12** = 12%.")
-        pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1, key="in_pm_vol_m",
+        pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1, key=k("in_pm_vol_m"),
                                    help="Shares traded in premarket (in millions). Example: **5** = 5,000,000.")
-        target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=1.0, value=150.0, step=5.0, key="in_target_vol_m",
+        target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=1.0, value=150.0, step=5.0, key=k("in_target_vol_m"),
                                        help="Your day-volume goal for the ticker, e.g., **150**–**200**M.")
 
     # Price, Cap & Modifiers
     with c_top[2]:
         st.markdown("**Price, Cap & Modifiers**")
-        pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f", key="in_pm_vwap",
+        pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f", key=k("in_pm_vwap"),
                                    help="Average premarket price (VWAP) to convert PM volume → **$ volume**.")
-        mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=100.0, step=5.0, key="in_mc_m",
+        mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=100.0, step=5.0, key=k("in_mc_m"),
                                    help="Approximate market cap in **millions** of USD.")
-        catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05, key="in_catalyst",
+        catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05, key=k("in_catalyst"),
                                     help="Strength of news/catalyst. **+1.0** strong positive (FDA, earnings beat), **−1.0** strong negative.")
-        dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05, key="in_dilution",
+        dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05, key=k("in_dilution"),
                                     help="Dilution/overhang context. **−1.0** heavy ATM/S-1, **+1.0** supportive (ATM ended, buyback).")
 
     st.markdown("---")
@@ -229,12 +223,13 @@ with tab_add:
                 crit["question"],
                 options=list(enumerate(crit["options"], 1)),
                 format_func=lambda x: x[1],
-                key=f"qual_{crit['name']}",
+                key=k(f"qual_{crit['name']}"),
                 help=crit.get("help", None)
             )
             qual_points[crit["name"]] = choice[0]  # 1..7
 
-    submitted = st.button("Add / Score", type="primary", use_container_width=True)
+    # Submit (Option A doesn't rerun; just bumps salt)
+    submitted = st.button("Add / Score", type="primary", use_container_width=True, key=k("submit"))
 
     if submitted and ticker:
         # ---- Points (numeric) ----
@@ -285,12 +280,11 @@ with tab_add:
             "PM$ / MC_%": round(pm_dollar_vs_mc_pct,1),
         }
 
-        # ---- Flash + Option B reset ----
+        # Flash and bump salt to reset inputs next render
         st.session_state.flash = f"Saved {ticker} – Final Score {final_score} ({row['Level']})"
-        reset_inputs_and_rerun()
+        st.session_state.salt += 1  # <-- Option A reset trigger
 
-    # Preview card (won't show right after submit because of rerun;
-    # but will show next time if you comment out the reset)
+    # Preview card (will show with the last saved values)
     if st.session_state.last:
         st.markdown("---")
         l = st.session_state.last
