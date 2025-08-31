@@ -308,10 +308,10 @@ with tab_rank:
     st.subheader("Current Ranking")
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
-        df = df.sort_values("Final", ascending=False).reset_index(drop=True)
+        df = df.sort_values("OddScore", ascending=False).reset_index(drop=True)
 
         st.dataframe(
-            df[["Ticker","Odds","Level","Final","Numeric_%","Qual_%"]],
+            df[["Ticker","Odds","Level"]],
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -329,15 +329,12 @@ with tab_rank:
                     help=("Letter grade from Final Score:\n"
                           "A++ (≥85), A+ (≥80), A (≥70), B (≥60), C (≥45), D (<45)")
                 ),
-                 "Final":     st.column_config.NumberColumn("Final",     format="%.2f"),
-                 "Numeric_%": st.column_config.NumberColumn("Numeric %", format="%.2f"),
-                 "Qual_%":    st.column_config.NumberColumn("Qual %",    format="%.2f"),
             }
         )
 
         st.download_button(
             "Download CSV",
-            df[["Ticker","Odds","Level","Final","Numeric_%","Qual_%"]].to_csv(index=False).encode("utf-8"),
+            df[["Ticker","Odds","Level"]].to_csv(index=False).encode("utf-8"),
             "ranking.csv",
             "text/csv",
             use_container_width=True
