@@ -167,35 +167,33 @@ if st.session_state.flash:
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 with tab_add:
-    st.subheader("Enter Inputs")
+    st.subheader("Numeric Context")
 
     c_top = st.columns([1.2, 1.2, 1.0])
 
     # Basics
     with c_top[0]:
-        st.markdown("**Basics**")
         ticker   = st.text_input("Ticker", "", key="in_ticker",
                                  help="Stock symbol, e.g., **BSLK**.")
         rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1, key="in_rvol",
                                    help="Relative Volume = current volume ÷ typical volume. Example: **10** means 10× usual.")
         atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f", key="in_atr",
                                    help="Average True Range in dollars. Example: **0.40** ≈ 40¢ daily range.")
-
-    # Float / SI / PM volume + NEW: Target, PM VWAP, Market Cap
-    with c_top[1]:
-        st.markdown("**Float, SI & Volume**")
         float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0, key="in_float_m",
                                    help="Tradable shares (in millions). Example: **25** = 25,000,000 shares.")
+        
+    # Float / SI / PM volume + NEW: Target, PM VWAP, Market Cap
+    with c_top[1]:
         si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5, key="in_si_pct",
                                    help="Shorted shares as a % of float. Example: **12** = 12%.")
         pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1, key="in_pm_vol_m",
                                    help="Shares traded in premarket (in millions). Example: **5** = 5,000,000.")
         target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=1.0, value=150.0, step=5.0, key="in_target_vol_m",
                                        help="Your day-volume goal for the ticker, e.g., **150**–**200**M.")
-    with c_top[2]:
-        st.markdown("**Price, Cap & Modifiers**")
-        pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f", key="in_pm_vwap",
+         pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f", key="in_pm_vwap",
                                    help="Average premarket price (VWAP) to convert PM volume → **$ volume**.")
+        
+    with c_top[2]:
         mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=100.0, step=5.0, key="in_mc_m",
                                    help="Approximate market cap in **millions** of USD.")
         catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05, key="in_catalyst",
