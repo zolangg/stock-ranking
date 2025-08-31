@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 
-st.set_page_config(page_title="Premarket Stock Ranking – Hybrid", layout="wide")
-st.header("Premarket Stock Ranking – Hybrid (Numeric + Qualitative)")
+st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
+st.header("Premarket Stock Ranking")
 
 # -------------------------------
 # Qualitative criteria (kept)
@@ -55,7 +55,6 @@ QUAL_CRITERIA = [
 # -------------------------------
 # Sidebar weights (numeric block)
 # -------------------------------
-st.sidebar.header("Weights – Numeric metrics")
 w_rvol  = st.sidebar.slider("Weight: RVOL", 0.0, 1.0, 0.20, 0.01)
 w_atr   = st.sidebar.slider("Weight: ATR ($)", 0.0, 1.0, 0.15, 0.01)
 w_si    = st.sidebar.slider("Weight: Short Interest (%)", 0.0, 1.0, 0.15, 0.01)
@@ -151,7 +150,6 @@ with st.form("row_form", clear_on_submit=True):
         catalyst_points = st.slider("Catalyst Impact (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
         dilution_points = st.slider("Dilution Impact (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
 
-    st.subheader("Qualitative (keep original picks)")
     qual_points = {}
     for crit in QUAL_CRITERIA:
         choice = st.radio(
