@@ -284,26 +284,23 @@ with tab_add:
     if st.session_state.last:
         st.markdown("---")
         l = st.session_state.last
+        st.markdown("##### Scoring")
         cA, cB, cC, cD = st.columns(4)
         cA.metric("Last Ticker", l["Ticker"])
-        cA.caption("Most recently added symbol.")
         cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
-        cB.caption("From **RVOL, ATR, SI, PM Float Rotation, Float size**.")
         cC.metric("Qual Block", f'{l["Qual_%"]}%')
-        cC.caption("From **GapStruct, LevelStruct, Monthly** (weighted).")
         cD.metric("Final Score", f'{l["Final"]} ({l["Level"]})')
-        cD.caption("Combined numeric/qual + modifiers (Catalyst & Dilution).")
 
         st.markdown("##### Premarket Diagnostics")
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("PM % of Target", f'{l["PM_Target_%"]}%')
-        d1.caption("PM volume ÷ target day volume × 100. Example: PM **20M** vs target **150M** → **13.3%**.")
+        d1.caption("PM volume ÷ target day volume × 100.")
         d2.metric("PM Float %", f'{l["PM_Float_%"]}%')
-        d2.caption("PM volume ÷ float × 100. Example: PM **5M** vs float **25M** → **20%**.")
-        d3.metric("PM $Vol (M)", f'{l["PM_$Vol_M"]}')
-        d3.caption("PM shares (M) × PM VWAP ($). Example: **5M × $5 = $25M**.")
-        d4.metric("PM$ / MC", f'{l["PM$ / MC_%"]}%')
-        d4.caption("PM dollar volume ÷ market cap × 100. Example: **$25M** on **$500M** → **5%**.")
+        d2.caption("PM volume ÷ float × 100.")
+        d3.metric("PM $Vol", f'{l["PM_$Vol_M"]}')
+        d3.caption("PM volume × PM VWAP.")
+        d4.metric("PM $Vol / MC", f'{l["PM$ / MC_%"]}%')
+        d4.caption("PM dollar volume ÷ market cap × 100.")
 
 with tab_rank:
     st.subheader("Current Ranking")
