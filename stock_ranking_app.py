@@ -1,58 +1,13 @@
 import streamlit as st
 import pandas as pd
 
-st.set_page_config(page_title="Premarket Stock Ranking Tool", layout="wide")
-st.header("Premarket Stock Ranking Tool")
+st.set_page_config(page_title="Premarket Stock Ranking – Hybrid", layout="wide")
+st.header("Premarket Stock Ranking – Hybrid (Numeric + Qualitative)")
 
 # -------------------------------
-# Criteria (7-point scales) - unchanged
+# Qualitative criteria (kept)
 # -------------------------------
-CRITERIA = [
-    {
-        "name": "RVOL",
-        "question": "Relative Volume (RVOL):",
-        "options": [
-            "3.0 – 4.0","4.0 – 5.0","5.0 – 7.0","7.0 – 10.0",
-            "10.0 – 15.0","15.0 – 25.0","Over 25.0",
-        ],
-        "weight": 0.15,
-    },
-    {
-        "name": "ATR",
-        "question": "Average True Range (ATR) in USD:",
-        "options": [
-            "Under 0.05","0.05 – 0.10","0.10 – 0.20","0.20 – 0.35",
-            "0.35 – 0.60","0.60 – 1.00","Over 1.00",
-        ],
-        "weight": 0.10,
-    },
-    {
-        "name": "Float",
-        "question": "Public Float (shares):",
-        "options": [
-            "Over 200M","100M – 200M","50M – 100M","25M – 50M",
-            "10M – 25M","3M – 10M","Under 3M",
-        ],
-        "weight": 0.05,
-    },
-    {
-        "name": "FloatPct",
-        "question": "Premarket Volume as % of Float:",
-        "options": [
-            "Under 1%","1% – 3%","3% – 10%","10% – 25%",
-            "25% – 50%","50% – 100%","Over 100%",
-        ],
-        "weight": 0.10,
-    },
-    {
-        "name": "ShortInterest",
-        "question": "Short Interest (% of float):",
-        "options": [
-            "Under 2%","2% – 5%","5% – 10%","10% – 15%",
-            "15% – 20%","20% – 30%","Over 30%",
-        ],
-        "weight": 0.08,
-    },
+QUAL_CRITERIA = [
     {
         "name": "GapStruct",
         "question": "Gap & Trend Development:",
@@ -98,259 +53,185 @@ CRITERIA = [
 ]
 
 # -------------------------------
-# Sidebar: weight controls
+# Sidebar weights (numeric block)
 # -------------------------------
-st.sidebar.header("Set Criteria Weights")
-weights = {}
-recalc = False
-for crit in CRITERIA:
-    new_weight = st.sidebar.slider(
-        label=crit["question"],
-        min_value=0.0,
-        max_value=0.5,
-        value=crit["weight"],
-        step=0.01,
-        key=f"weight_{crit['name']}"
+st.sidebar.header("Weights – Numeric metrics")
+w_rvol  = st.sidebar.slider("Weight: RVOL", 0.0, 1.0, 0.20, 0.01)
+w_atr   = st.sidebar.slider("Weight: ATR ($)", 0.0, 1.0, 0.15, 0.01)
+w_si    = st.sidebar.slider("Weight: Short Interest (%)", 0.0, 1.0, 0.15, 0.01)
+w_fr    = st.sidebar.slider("Weight: PM Float Rotation (%)", 0.0, 1.0, 0.45, 0.01)
+w_float = st.sidebar.slider("Weight: Public Float (informational or penalty)", 0.0, 1.0, 0.05, 0.01)
+
+st.sidebar.header("Weights – Qualitative criteria")
+q_weights = {}
+for crit in QUAL_CRITERIA:
+    q_weights[crit["name"]] = st.sidebar.slider(
+        f"Weight: {crit['name']}", 0.0, 1.0, crit["weight"], 0.01
     )
-    if "weights" not in st.session_state:
-        st.session_state["weights"] = {}
-    if st.session_state["weights"].get(crit["name"], crit["weight"]) != new_weight:
-        recalc = True
-    weights[crit["name"]] = new_weight
-    st.session_state["weights"][crit["name"]] = new_weight
 
-news_weight = st.sidebar.slider(
-    label="Catalyst (News) Weight (× on slider value)",
-    min_value=0.0, max_value=2.0, value=1.0, step=0.05, key="news_weight"
-)
-if "prev_news_weight" not in st.session_state or st.session_state["prev_news_weight"] != news_weight:
-    recalc = True
-st.session_state["prev_news_weight"] = news_weight
+st.sidebar.header("Modifiers")
+news_weight = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05)
+dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05)
 
-dilution_weight = st.sidebar.slider(
-    label="Dilution Impact Weight (× on slider value)",
-    min_value=0.0, max_value=2.0, value=1.0, step=0.05, key="dilution_weight"
-)
-if "prev_dilution_weight" not in st.session_state or st.session_state["prev_dilution_weight"] != dilution_weight:
-    recalc = True
-st.session_state["prev_dilution_weight"] = dilution_weight
+# Normalize numeric+qual group weights separately to preserve proportions
+num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
+w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
 
-# NEW: PM Odds weights + thresholds
-st.sidebar.header("PM Odds (Numeric) — Weight & Thresholds")
-pm_weight = st.sidebar.slider(
-    "PMOdds Weight (applied to 0–7 PMOdds subscore)",
-    min_value=0.0, max_value=1.5, value=0.40, step=0.05, key="pm_weight"
-)
-if "prev_pm_weight" not in st.session_state or st.session_state["prev_pm_weight"] != pm_weight:
-    recalc = True
-st.session_state["prev_pm_weight"] = pm_weight
+qual_sum = max(1e-9, sum(q_weights.values()))
+for k in q_weights:
+    q_weights[k] = q_weights[k] / qual_sum
 
-# Thresholds for scaling (feel free to tweak)
-th_pct_target_hi = st.sidebar.slider("PM Vol % of Target: High marker", 0.05, 0.30, 0.15, 0.01)
-th_dv_mc_hi      = st.sidebar.slider("$ DollarVol / MarketCap: High marker", 0.01, 0.20, 0.10, 0.01)
-th_pct_float_hi  = st.sidebar.slider("PM Vol % of Float: High marker", 0.02, 0.50, 0.10, 0.01)
+# -------------------------------
+# Mapping helpers (numeric → 1..7)
+# -------------------------------
+def pts_rvol(x: float) -> int:
+    cuts = [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]
+    for th, p in cuts:
+        if x < th: return p
+    return 7
+
+def pts_atr(x: float) -> int:
+    cuts = [(0.05,1),(0.10,2),(0.20,3),(0.35,4),(0.60,5),(1.00,6)]
+    for th, p in cuts:
+        if x < th: return p
+    return 7
+
+def pts_si(x: float) -> int:
+    cuts = [(2,1),(5,2),(10,3),(15,4),(20,5),(30,6)]
+    for th, p in cuts:
+        if x < th: return p
+    return 7
+
+def pts_fr(pm_vol_m: float, float_m: float) -> int:
+    if float_m <= 0: 
+        return 1
+    pct = 100.0 * pm_vol_m / float_m
+    cuts = [(1,1),(3,2),(10,3),(25,4),(50,5),(100,6)]
+    for th, p in cuts:
+        if pct < th: return p
+    return 7
+
+# Optional: Float penalty (smaller float = higher points)
+def pts_float(float_m: float) -> int:
+    cuts = [(200,2),(100,3),(50,4),(35,5),(10,6)]
+    if float_m <= 3: return 7
+    for th, p in cuts:
+        if float_m > th: return p
+    return 7
 
 # -------------------------------
 # Grading
 # -------------------------------
-def heat_level(score: float) -> str:
-    if score >= 6.0:
-        return "A++"
-    elif score >= 5.5:
-        return "A+"
-    elif score >= 4.8:
-        return "A"
-    elif score >= 3.9:
-        return "B"
-    elif score >= 2.9:
-        return "C"
-    else:
-        return "D"
+def grade(score_pct: float) -> str:
+    return "A++" if score_pct >= 85 else "A+" if score_pct >= 80 else "A" if score_pct >= 70 else "B" if score_pct >= 60 else "C" if score_pct >= 45 else "D"
 
 # -------------------------------
 # Session state
 # -------------------------------
-if "stock_scores" not in st.session_state:
-    st.session_state.stock_scores = []
-
-# -------------------------------
-# Recalculate scores on weight changes
-# -------------------------------
-if recalc and st.session_state.stock_scores:
-    for stock in st.session_state.stock_scores:
-        base_score = sum(
-            stock.get(crit['name'], 0) * weights.get(crit['name'], crit['weight'])
-            for crit in CRITERIA
-        )
-        # Recompute PMOdds if inputs exist
-        pm_odds = stock.get("PMOdds", 0.0)
-        stock["Score"] = round(
-            base_score
-            + stock.get("Catalyst", 0.0) * news_weight
-            + stock.get("Dilution", 0.0) * dilution_weight
-            + pm_odds * pm_weight,
-            2
-        )
-
-# -------------------------------
-# Helpers for PMOdds scaling (0..7)
-# -------------------------------
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-def scale_linear(x, hi, max_points):
-    """Map x from 0..hi to 0..max_points (cap)."""
-    if x is None:
-        return 0.0
-    return clamp((x / hi) * max_points, 0.0, max_points)
+if "rows" not in st.session_state:
+    st.session_state.rows = []
 
 # -------------------------------
 # Input form
 # -------------------------------
-with st.form(key="stock_form", clear_on_submit=True):
-    ticker = st.text_input("Stock ticker (symbol)", max_chars=10).strip().upper()
+with st.form("row_form", clear_on_submit=True):
+    c1, c2, c3 = st.columns([1.2,1.2,1.2])
 
-    criteria_points = {}
-    for crit in CRITERIA:
-        idx = st.radio(
+    with c1:
+        ticker   = st.text_input("Ticker", "").strip().upper()
+        rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1)
+        atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f")
+
+    with c2:
+        float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0)
+        si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5)
+
+    with c3:
+        pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1)
+        catalyst_points = st.slider("Catalyst Impact (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
+        dilution_points = st.slider("Dilution Impact (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
+
+    st.subheader("Qualitative (keep original picks)")
+    qual_points = {}
+    for crit in QUAL_CRITERIA:
+        choice = st.radio(
             crit["question"],
             options=list(enumerate(crit["options"], 1)),
             format_func=lambda x: x[1],
-            key=crit["name"]
+            key=f"qual_{crit['name']}"
         )
-        criteria_points[crit["name"]] = idx[0]  # 1..7
+        qual_points[crit["name"]] = choice[0]  # 1..7
 
-    # Catalyst & Dilution sliders (existing)
-    catalyst_points = st.slider(
-        "Catalyst Impact (−1.0 = Strong Negative … +1.0 = Strong Positive)",
-        min_value=-1.0, max_value=1.0, value=0.0, step=0.05, key="catalyst_slider"
-    )
-    dilution_points = st.slider(
-        "Dilution Impact (−1.0 = Heavy Overhang … +1.0 = Supportive)",
-        min_value=-1.0, max_value=1.0, value=0.0, step=0.05, key="dilution_slider"
-    )
-
-    st.markdown("### PM Odds (numeric inputs)")
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
-        pm_vol_m = st.number_input("PM Volume (M shares)", min_value=0.0, value=0.0, step=0.1, format="%.2f")
-    with col2:
-        pm_price = st.number_input("PM VWAP / Avg Price ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-    with col3:
-        mcap_m = st.number_input("Market Cap (M $)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
-    with col4:
-        float_m = st.number_input("Float (M shares)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
-    with col5:
-        target_m = st.number_input("Target Daily Volume (M)", min_value=1.0, value=150.0, step=10.0, format="%.0f")
-
-    submit = st.form_submit_button("Save Stock & Add to Ranking")
-
-def compute_pm_odds(pm_vol_m, pm_price, mcap_m, float_m, target_m, catalyst_points):
-    # Safeguards
-    target_m = target_m if target_m and target_m > 0 else None
-    mcap_m   = mcap_m   if mcap_m   and mcap_m   > 0 else None
-    float_m  = float_m  if float_m  and float_m  > 0 else None
-    pm_vol_m = pm_vol_m if pm_vol_m and pm_vol_m > 0 else 0.0
-    pm_price = pm_price if pm_price and pm_price > 0 else 0.0
-
-    # Metrics
-    pct_target = (pm_vol_m / target_m) if target_m else None                # 0..1+
-    dv_over_mc = ((pm_vol_m * 1e6 * pm_price) / (mcap_m * 1e6)) if mcap_m else None
-    pct_float  = (pm_vol_m / float_m) if float_m else None
-
-    # Points (cap each bucket)
-    pts_target = scale_linear(pct_target, th_pct_target_hi, 3.0)  # 0..3
-    pts_dvmc   = scale_linear(dv_over_mc, th_dv_mc_hi,     2.0)  # 0..2
-    pts_pff    = scale_linear(pct_float,  th_pct_float_hi, 2.0)  # 0..2
-
-    # Catalyst boost (only positive catalyst adds up to +1)
-    cat_boost = clamp(max(0.0, catalyst_points), 0.0, 1.0)       # 0..1
-
-    pm_odds = clamp(pts_target + pts_dvmc + pts_pff + cat_boost, 0.0, 7.0)
-    return pm_odds, pct_target, dv_over_mc, pct_float
-
-if submit and ticker:
-    # Base criteria score
-    base_score = sum(criteria_points[crit['name']] * weights[crit['name']] for crit in CRITERIA)
-
-    # PMOdds calc
-    pm_odds, pct_target, dv_over_mc, pct_float = compute_pm_odds(
-        pm_vol_m, pm_price, mcap_m, float_m, target_m, catalyst_points
-    )
-
-    score_total = round(
-        base_score
-        + catalyst_points * news_weight
-        + dilution_points * dilution_weight
-        + pm_odds * pm_weight,
-        2
-    )
-
-    stock_entry = {
-        "Ticker": ticker,
-        **criteria_points,            # each criterion 1..7
-        "Catalyst": round(catalyst_points, 2),
-        "Dilution": round(dilution_points, 2),
-        # PM metrics & subscore
-        "PM Vol (M)": round(pm_vol_m, 2),
-        "PM Price": round(pm_price, 2),
-        "MktCap (M)": round(mcap_m, 2),
-        "Float (M)": round(float_m, 2),
-        "Target (M)": round(target_m, 2),
-        "PM%Target": round((pct_target or 0)*100, 2),
-        "$Vol/MC %": round((dv_over_mc or 0)*100, 2),
-        "PM%Float": round((pct_float or 0)*100, 2),
-        "PMOdds": round(pm_odds, 2),
-        "Score": score_total
-    }
-    st.session_state.stock_scores.append(stock_entry)
-    st.success(f"Stock {ticker} saved!")
+    submitted = st.form_submit_button("Add / Score")
 
 # -------------------------------
-# Table & CSV
+# Scoring
+# -------------------------------
+if submitted and ticker:
+    p_rvol  = pts_rvol(rvol)
+    p_atr   = pts_atr(atr_usd)
+    p_si    = pts_si(si_pct)
+    p_fr    = pts_fr(pm_vol_m, float_m)
+    p_float = pts_float(float_m)
+
+    # numeric block (scaled to 0–100)
+    num_0_7 = (w_rvol*p_rvol) + (w_atr*p_atr) + (w_si*p_si) + (w_fr*p_fr) + (w_float*p_float)
+    num_pct = (num_0_7/7.0)*100.0
+
+    # qualitative block (normalize by the weights you set)
+    qual_0_7 = 0.0
+    for crit in QUAL_CRITERIA:
+        qual_0_7 += q_weights[crit["name"]] * qual_points[crit["name"]]
+    qual_pct = (qual_0_7/7.0)*100.0
+
+    # combine blocks 50/50 by default (tweak here if you want)
+    combo_pct = 0.5*num_pct + 0.5*qual_pct
+
+    # add modifiers
+    final_score = round(combo_pct + catalyst_points*news_weight*10 + dilution_points*dilution_weight*10, 2)
+
+    row = {
+        "Ticker": ticker,
+        # numeric
+        "RVOL": rvol, "RVOL_pts": p_rvol,
+        "ATR_$": atr_usd, "ATR_pts": p_atr,
+        "Float_M": float_m, "Float_pts": p_float,
+        "SI_%": si_pct, "SI_pts": p_si,
+        "PM_Vol_M": pm_vol_m,
+        "PM_FloatRot_%": (0.0 if float_m<=0 else round(100.0*pm_vol_m/float_m, 2)), "FR_pts": p_fr,
+        # qualitative picks
+        **{f"{k}_pts": v for k,v in qual_points.items()},
+        # block scores
+        "Numeric_%": round(num_pct,2),
+        "Qual_%": round(qual_pct,2),
+        "Catalyst": round(catalyst_points,2),
+        "Dilution": round(dilution_points,2),
+        "Score": final_score,
+        "Level": grade(final_score),
+    }
+    st.session_state.rows.append(row)
+    st.success(f"Saved {ticker} – Final Score {final_score} ({row['Level']})")
+
+# -------------------------------
+# Table & export
 # -------------------------------
 st.write("---")
-st.header("Current Stock Ranking")
+st.subheader("Ranking")
+if st.session_state.rows:
+    df = pd.DataFrame(st.session_state.rows)
 
-if st.session_state.stock_scores:
-    df = pd.DataFrame(st.session_state.stock_scores)
-
-    # Ensure numeric types present
-    for c in ["Score","Catalyst","Dilution","PMOdds","PM Vol (M)","PM Price","MktCap (M)","Float (M)","Target (M)","PM%Target","$Vol/MC %","PM%Float"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # Grading
-    df["Level"] = df["Score"].apply(heat_level)
-
-    ordered_cols = [
+    cols = [
         "Ticker","Score","Level",
-        "PMOdds","PM%Target","$Vol/MC %","PM%Float",
-        "PM Vol (M)","PM Price","MktCap (M)","Float (M)","Target (M)",
-        "RVOL","ATR","Float","FloatPct","ShortInterest","GapStruct","LevelStruct","Monthly",
-        "Catalyst","Dilution"
+        "Numeric_%","Qual_%",
+        "RVOL","RVOL_pts","ATR_$","ATR_pts",
+        "Float_M","Float_pts","SI_%","SI_pts",
+        "PM_Vol_M","PM_FloatRot_%","FR_pts",
+        "GapStruct_pts","LevelStruct_pts","Monthly_pts",
+        "Catalyst","Dilution",
     ]
-    existing_cols = [c for c in ordered_cols if c in df.columns]
-    df = df[existing_cols]
-
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_order=existing_cols,
-        column_config={
-            "Ticker": st.column_config.Column(label="Ticker", pinned="left"),
-            "Score":  st.column_config.Column(label="Score",  pinned="left"),
-            "Level":  st.column_config.Column(label="Level",  pinned="left"),
-        }
-    )
-
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download ranking as CSV",
-        data=csv,
-        file_name="stock_ranking.csv",
-        mime="text/csv"
-    )
+    cols = [c for c in cols if c in df.columns]
+    st.dataframe(df[cols], use_container_width=True, hide_index=True)
+    st.download_button("Download CSV", df[cols].to_csv(index=False).encode("utf-8"),
+                       "ranking_hybrid.csv", "text/csv")
 else:
-    st.info("No stocks have been ranked yet. Please fill out the form above!")
+    st.info("Add a stock above to see the ranking.")
