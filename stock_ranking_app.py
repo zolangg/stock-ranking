@@ -192,16 +192,6 @@ if submitted and ticker:
 
     row = {
         "Ticker": ticker,
-        # numeric
-        "RVOL": p_rvol,
-        "ATR": p_atr,
-        "Float": p_float,
-        "SI": p_si,
-        "FloatRot": p_fr,
-        # qualitative picks
-        **{f"{k}_pts": v for k,v in qual_points.items()},
-        "Catalyst": round(catalyst_points,2),
-        "Dilution": round(dilution_points,2),
         "Score": final_score,
         "Level": grade(final_score),
     }
@@ -217,12 +207,7 @@ if st.session_state.rows:
     df = pd.DataFrame(st.session_state.rows)
 
     cols = [
-        "Ticker","Score","Level",
-        "RVOL","ATR",
-        "Float","SI",
-        "FloatRot",
-        "GapStruct","LevelStruct","Monthly",
-        "Catalyst","Dilution",
+        "Ticker","Score","Level"
     ]
     cols = [c for c in cols if c in df.columns]
     st.dataframe(df[cols], use_container_width=True, hide_index=True)
