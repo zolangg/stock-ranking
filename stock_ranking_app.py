@@ -156,10 +156,23 @@ if "last" not in st.session_state:
 if "flash" not in st.session_state:
     st.session_state.flash = None
 
-# Show flash from previous submit
+# show flash from previous submit
 if st.session_state.flash:
     st.success(st.session_state.flash)
     st.session_state.flash = None
+
+# -------------------------------
+# Reset helper (Option B core)
+# -------------------------------
+def reset_inputs_and_rerun():
+    keys = [
+        "in_ticker","in_rvol","in_atr","in_float_m","in_si_pct","in_pm_vol_m",
+        "in_target_vol_m","in_pm_vwap","in_mc_m","in_catalyst","in_dilution",
+        *[f"qual_{c['name']}" for c in QUAL_CRITERIA]
+    ]
+    for k in keys:
+        st.session_state.pop(k, None)
+    st.rerun()
 
 # -------------------------------
 # Tabs: Add / Ranking
@@ -177,11 +190,11 @@ with tab_add:
         ticker   = st.text_input("Ticker", "", key="in_ticker",
                                  help="Stock symbol, e.g., **BSLK**.")
         rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1, key="in_rvol",
-                                   help="Relative Volume = current volume ÷ typical volume. Example: **10** means 10× usual.")
+                                   help="Relative Volume = current volume ÷ typical volume. Example: **10** = 10× usual.")
         atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f", key="in_atr",
                                    help="Average True Range in dollars. Example: **0.40** ≈ 40¢ daily range.")
 
-    # Float / SI / PM volume + NEW: Target, PM VWAP, Market Cap
+    # Float / SI / PM volume + Target
     with c_top[1]:
         st.markdown("**Float, SI & Volume**")
         float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0, key="in_float_m",
@@ -192,6 +205,8 @@ with tab_add:
                                    help="Shares traded in premarket (in millions). Example: **5** = 5,000,000.")
         target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=1.0, value=150.0, step=5.0, key="in_target_vol_m",
                                        help="Your day-volume goal for the ticker, e.g., **150**–**200**M.")
+
+    # Price, Cap & Modifiers
     with c_top[2]:
         st.markdown("**Price, Cap & Modifiers**")
         pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f", key="in_pm_vwap",
@@ -234,19 +249,13 @@ with tab_add:
 
         # ---- Points (qualitative) ----
         qual_0_7 = sum(q_weights[c["name"]] * qual_points[c["name"]] for c in QUAL_CRITERIA)
-        qual_pct = (d := (qual_0_7/7.0)*100.0)
+        qual_pct = (qual_0_7/7.0)*100.0
 
         # ---- Combine + modifiers ----
         combo_pct = 0.5*num_pct + 0.5*qual_pct
         final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
 
-        # ---- Diagnostics ----
-        pm_pct_target = 100.0 * pm_vol_m / target_vol_m if target_vol_m > 0 else 0.0
-        pm_float_pct  = 100.0 * pm_vol_m / float_m     if float_m     > 0 else 0.0
-        pm_dollar_vol_m = pm_vol_m * pm_vwap  # in $ millions, since pm_vol_m is in millions
-        pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
-        
-        # Save row (include numeric OddsScore for sorting)
+        # ---- Save row (with numeric score for sorting) ----
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
@@ -255,7 +264,12 @@ with tab_add:
         }
         st.session_state.rows.append(row)
 
-        # Save last (for preview)
+        # ---- Diagnostics for the preview card ----
+        pm_pct_target = 100.0 * pm_vol_m / target_vol_m if target_vol_m > 0 else 0.0
+        pm_float_pct  = 100.0 * pm_vol_m / float_m     if float_m     > 0 else 0.0
+        pm_dollar_vol_m = pm_vol_m * pm_vwap
+        pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
+
         st.session_state.last = {
             "Ticker": ticker,
             "Numeric_%": round(num_pct,2),
@@ -265,24 +279,18 @@ with tab_add:
             "Final": final_score,
             "Level": grade(final_score),
             "Odds": odds_label(final_score),
-            # diagnostics
             "PM_Target_%": round(pm_pct_target,1),
             "PM_Float_%": round(pm_float_pct,1),
             "PM_$Vol_M": round(pm_dollar_vol_m,2),
             "PM$ / MC_%": round(pm_dollar_vs_mc_pct,1),
         }
 
-        # Flash & reset inputs
+        # ---- Flash + Option B reset ----
         st.session_state.flash = f"Saved {ticker} – Final Score {final_score} ({row['Level']})"
-        for k in [
-            "in_ticker","in_rvol","in_atr","in_float_m","in_si_pct","in_pm_vol_m",
-            "in_target_vol_m","in_pm_vwap","in_mc_m","in_catalyst","in_dilution"
-        ] + [f"qual_{c['name']}" for c in QUAL_CRITERIA]:
-            if k in st.session_state:
-                del st.session_state[k]
-        st.rerun()
+        reset_inputs_and_rerun()
 
-    # Preview card for last added item
+    # Preview card (won't show right after submit because of rerun;
+    # but will show next time if you comment out the reset)
     if st.session_state.last:
         st.markdown("---")
         l = st.session_state.last
@@ -291,7 +299,6 @@ with tab_add:
         cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
         cC.metric("Qual Block", f'{l["Qual_%"]}%')
         cD.metric("Final Score", f'{l["Final"]} ({l["Level"]})')
-       
 
         st.markdown("##### Premarket Diagnostics")
         d1, d2, d3, d4 = st.columns(4)
@@ -299,8 +306,8 @@ with tab_add:
         d1.caption("PM volume ÷ target day volume × 100.")
         d2.metric("PM Float %", f'{l["PM_Float_%"]}%')
         d2.caption("PM volume ÷ float × 100.")
-        d3.metric("PM $Vol", f'{l["PM_$Vol_M"]}')
-        d3.caption("PM Vol × PM VWAP.")
+        d3.metric("PM $Vol (M)", f'{l["PM_$Vol_M"]}')
+        d3.caption("PM Vol × PM VWAP (in $ millions).")
         d4.metric("PM $Vol / MC", f'{l["PM$ / MC_%"]}%')
         d4.caption("PM dollar volume ÷ market cap × 100.")
 
@@ -315,13 +322,10 @@ with tab_rank:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Ticker": st.column_config.TextColumn(
-                    "Ticker",
-                    help="Stock symbol you entered."
-                ),
+                "Ticker": st.column_config.TextColumn("Ticker", help="Stock symbol you entered."),
                 "Odds": st.column_config.TextColumn(
                     "Odds",
-                    help=("Qualitative label derived from Final Score:\n"
+                    help=("Qualitative label from Final Score:\n"
                           "• Very High (≥85)\n• High (≥70)\n• Moderate (≥55)\n• Low (≥40)\n• Very Low (<40)")
                 ),
                 "Level": st.column_config.TextColumn(
