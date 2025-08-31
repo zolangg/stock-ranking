@@ -193,17 +193,13 @@ if submitted and ticker:
     row = {
         "Ticker": ticker,
         # numeric
-        "RVOL": rvol, "RVOL_pts": p_rvol,
-        "ATR_$": atr_usd, "ATR_pts": p_atr,
-        "Float_M": float_m, "Float_pts": p_float,
-        "SI_%": si_pct, "SI_pts": p_si,
-        "PM_Vol_M": pm_vol_m,
-        "PM_FloatRot_%": (0.0 if float_m<=0 else round(100.0*pm_vol_m/float_m, 2)), "FR_pts": p_fr,
+        "RVOL": p_rvol,
+        "ATR": p_atr,
+        "Float": p_float,
+        "SI": p_si,
+        "FloatRot": p_fr,
         # qualitative picks
         **{f"{k}_pts": v for k,v in qual_points.items()},
-        # block scores
-        "Numeric_%": round(num_pct,2),
-        "Qual_%": round(qual_pct,2),
         "Catalyst": round(catalyst_points,2),
         "Dilution": round(dilution_points,2),
         "Score": final_score,
@@ -222,11 +218,10 @@ if st.session_state.rows:
 
     cols = [
         "Ticker","Score","Level",
-        "Numeric_%","Qual_%",
-        "RVOL","RVOL_pts","ATR_$","ATR_pts",
-        "Float_M","Float_pts","SI_%","SI_pts",
-        "PM_Vol_M","PM_FloatRot_%","FR_pts",
-        "GapStruct_pts","LevelStruct_pts","Monthly_pts",
+        "RVOL","ATR",
+        "Float","SI",
+        "FloatRot",
+        "GapStruct","LevelStruct","Monthly",
         "Catalyst","Dilution",
     ]
     cols = [c for c in cols if c in df.columns]
