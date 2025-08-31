@@ -247,9 +247,15 @@ with tab_add:
         # Save row (include numeric OddsScore for sorting)
         row = {
             "Ticker": ticker,
+            "Final": round(final_score, 2),
             "Odds": odds_label(final_score),
             "OddsScore": final_score,
-            "Level": grade(final_score),
+            "Numeric_%": round(num_pct, 2),
+            "Qual_%": round(qual_pct, 2),
+            "PM_Target_%": round(pm_pct_target, 1),
+            "PM_Float_%": round(pm_float_pct, 1),
+            "PM_$Vol_M": round(pm_dollar_vol_m, 2),
+            "PM_$Vol/MC_%": round(pm_dollar_vs_mc_pct, 1),
         }
         st.session_state.rows.append(row)
 
@@ -306,10 +312,22 @@ with tab_rank:
     st.subheader("Current Ranking")
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
-        df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
+        df = df.sort_values("Final", ascending=False).reset_index(drop=True)
 
+        show_cols = [
+            "Ticker",
+            "Numeric_%",
+            "Qual_%",
+            "Final",
+            "PM_Target_%",
+            "PM_Float_%",
+            "PM_$Vol_M",
+            "PM_$Vol/MC_%"
+        ]
+        show_cols = [c for c in show_cols if c in df.columns]
+        
         st.dataframe(
-            df[["Ticker","Odds","Level"]],
+            df[show_cols],
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -322,11 +340,16 @@ with tab_rank:
                     help=("Qualitative label derived from Final Score:\n"
                           "• Very High (≥85)\n• High (≥70)\n• Moderate (≥55)\n• Low (≥40)\n• Very Low (<40)")
                 ),
-                "Level": st.column_config.TextColumn(
-                    "Level",
-                    help=("Letter grade from Final Score:\n"
-                          "A++ (≥85), A+ (≥80), A (≥70), B (≥60), C (≥45), D (<45)")
+                "Final": st.column_config.TextColumn(
+                    "Final",
+                         format="%.2f"
                 ),
+                "Numeric_%": st.column_config.NumberColumn("Numeric %", format="%.2f"),
+                "Qual_%":    st.column_config.NumberColumn("Qual %",    format="%.2f"),
+                "PM_Target_%": st.column_config.NumberColumn("PM % of Target", format="%.1f"),
+                "PM_Float_%":  st.column_config.NumberColumn("PM Float %",     format="%.1f"),
+                "PM_$Vol_M":   st.column_config.NumberColumn("PM $Vol (M)",    format="%.2f"),
+                "PM$/MC_%":    st.column_config.NumberColumn("PM $/MC %",      format="%.1f"),
             }
         )
 
