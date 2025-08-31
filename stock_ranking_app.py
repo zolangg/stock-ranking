@@ -190,7 +190,7 @@ with tab_add:
                                    help="Shares traded in premarket (in millions). Example: **5** = 5,000,000.")
         target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=1.0, value=150.0, step=5.0, key="in_target_vol_m",
                                        help="Your day-volume goal for the ticker, e.g., **150**–**200**M.")
-         pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f", key="in_pm_vwap",
+        pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f", key="in_pm_vwap",
                                    help="Average premarket price (VWAP) to convert PM volume → **$ volume**.")
         
     with c_top[2]:
