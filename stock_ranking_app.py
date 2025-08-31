@@ -128,8 +128,6 @@ def odds_label(score: float) -> str:
     elif score >= 40: return "Low Odds"
     else: return "Very Low Odds"
 
-df["Odds"] = df["Score"].apply(odds_label)
-
 # -------------------------------
 # Grading
 # -------------------------------
