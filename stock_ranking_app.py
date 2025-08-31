@@ -167,33 +167,35 @@ if st.session_state.flash:
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 with tab_add:
-    st.subheader("Numeric Context")
+    st.subheader("Enter Inputs")
 
     c_top = st.columns([1.2, 1.2, 1.0])
 
     # Basics
     with c_top[0]:
+        st.markdown("**Basics**")
         ticker   = st.text_input("Ticker", "", key="in_ticker",
                                  help="Stock symbol, e.g., **BSLK**.")
         rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1, key="in_rvol",
                                    help="Relative Volume = current volume ÷ typical volume. Example: **10** means 10× usual.")
         atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f", key="in_atr",
                                    help="Average True Range in dollars. Example: **0.40** ≈ 40¢ daily range.")
-        float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0, key="in_float_m",
-                                   help="Tradable shares (in millions). Example: **25** = 25,000,000 shares.")
-        
+
     # Float / SI / PM volume + NEW: Target, PM VWAP, Market Cap
     with c_top[1]:
+        st.markdown("**Float, SI & Volume**")
+        float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0, key="in_float_m",
+                                   help="Tradable shares (in millions). Example: **25** = 25,000,000 shares.")
         si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5, key="in_si_pct",
                                    help="Shorted shares as a % of float. Example: **12** = 12%.")
         pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1, key="in_pm_vol_m",
                                    help="Shares traded in premarket (in millions). Example: **5** = 5,000,000.")
         target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=1.0, value=150.0, step=5.0, key="in_target_vol_m",
                                        help="Your day-volume goal for the ticker, e.g., **150**–**200**M.")
+    with c_top[2]:
+        st.markdown("**Price, Cap & Modifiers**")
         pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f", key="in_pm_vwap",
                                    help="Average premarket price (VWAP) to convert PM volume → **$ volume**.")
-        
-    with c_top[2]:
         mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=100.0, step=5.0, key="in_mc_m",
                                    help="Approximate market cap in **millions** of USD.")
         catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05, key="in_catalyst",
@@ -247,15 +249,9 @@ with tab_add:
         # Save row (include numeric OddsScore for sorting)
         row = {
             "Ticker": ticker,
-            "Final": round(final_score, 2),
             "Odds": odds_label(final_score),
             "OddsScore": final_score,
-            "Numeric_%": round(num_pct, 2),
-            "Qual_%": round(qual_pct, 2),
-            "PM_Target_%": round(pm_pct_target, 1),
-            "PM_Float_%": round(pm_float_pct, 1),
-            "PM_$Vol_M": round(pm_dollar_vol_m, 2),
-            "PM_$Vol/MC_%": round(pm_dollar_vs_mc_pct, 1),
+            "Level": grade(final_score),
         }
         st.session_state.rows.append(row)
 
@@ -290,12 +286,12 @@ with tab_add:
     if st.session_state.last:
         st.markdown("---")
         l = st.session_state.last
-        st.markdown("##### Scoring")
         cA, cB, cC, cD = st.columns(4)
         cA.metric("Last Ticker", l["Ticker"])
         cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
         cC.metric("Qual Block", f'{l["Qual_%"]}%')
         cD.metric("Final Score", f'{l["Final"]} ({l["Level"]})')
+       
 
         st.markdown("##### Premarket Diagnostics")
         d1, d2, d3, d4 = st.columns(4)
@@ -304,7 +300,7 @@ with tab_add:
         d2.metric("PM Float %", f'{l["PM_Float_%"]}%')
         d2.caption("PM volume ÷ float × 100.")
         d3.metric("PM $Vol", f'{l["PM_$Vol_M"]}')
-        d3.caption("PM volume × PM VWAP.")
+        d3.caption("PM Vol × PM VWAP.")
         d4.metric("PM $Vol / MC", f'{l["PM$ / MC_%"]}%')
         d4.caption("PM dollar volume ÷ market cap × 100.")
 
@@ -312,22 +308,10 @@ with tab_rank:
     st.subheader("Current Ranking")
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
-        df = df.sort_values("Final", ascending=False).reset_index(drop=True)
+        df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
 
-        show_cols = [
-            "Ticker",
-            "Numeric_%",
-            "Qual_%",
-            "Final",
-            "PM_Target_%",
-            "PM_Float_%",
-            "PM_$Vol_M",
-            "PM_$Vol/MC_%"
-        ]
-        show_cols = [c for c in show_cols if c in df.columns]
-        
         st.dataframe(
-            df[show_cols],
+            df[["Ticker","Odds","Level","Final", "Numeric_%","Qual_%"]],
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -340,16 +324,14 @@ with tab_rank:
                     help=("Qualitative label derived from Final Score:\n"
                           "• Very High (≥85)\n• High (≥70)\n• Moderate (≥55)\n• Low (≥40)\n• Very Low (<40)")
                 ),
-                "Final": st.column_config.TextColumn(
-                    "Final",
-                         format="%.2f"
+                "Level": st.column_config.TextColumn(
+                    "Level",
+                    help=("Letter grade from Final Score:\n"
+                          "A++ (≥85), A+ (≥80), A (≥70), B (≥60), C (≥45), D (<45)")
                 ),
-                "Numeric_%": st.column_config.NumberColumn("Numeric %", format="%.2f"),
-                "Qual_%":    st.column_config.NumberColumn("Qual %",    format="%.2f"),
-                "PM_Target_%": st.column_config.NumberColumn("PM % of Target", format="%.1f"),
-                "PM_Float_%":  st.column_config.NumberColumn("PM Float %",     format="%.1f"),
-                "PM_$Vol_M":   st.column_config.NumberColumn("PM $Vol (M)",    format="%.2f"),
-                "PM$/MC_%":    st.column_config.NumberColumn("PM $/MC %",      format="%.1f"),
+                 "Final":     st.column_config.NumberColumn("Final",     format="%.2f"),
+                 "Numeric_%": st.column_config.NumberColumn("Numeric %", format="%.2f"),
+                 "Qual_%":    st.column_config.NumberColumn("Qual %",    format="%.2f"),
             }
         )
 
