@@ -1,9 +1,6 @@
 import streamlit as st
 import pandas as pd
 
-# ==============================
-# App setup
-# ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.header("Premarket Stock Ranking")
 
@@ -55,28 +52,28 @@ QUAL_CRITERIA = [
     },
 ]
 
-# ==============================
-# Sidebar weights (numeric block)
-# ==============================
+# -------------------------------
+# Sidebar weights — numeric block
+# -------------------------------
 st.sidebar.header("Weights — Numeric factors")
-w_rvol  = st.sidebar.slider("Weight: RVOL", 0.0, 1.0, 0.20, 0.01)
-w_atr   = st.sidebar.slider("Weight: ATR ($)", 0.0, 1.0, 0.15, 0.01)
-w_si    = st.sidebar.slider("Weight: Short Interest (%)", 0.0, 1.0, 0.15, 0.01)
-w_fr    = st.sidebar.slider("Weight: PM Float Rotation (%)", 0.0, 1.0, 0.45, 0.01)
-w_float = st.sidebar.slider("Weight: Public Float (penalty/information)", 0.0, 1.0, 0.05, 0.01)
+w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01)
+w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01)
+w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, 0.15, 0.01)
+w_fr    = st.sidebar.slider("PM Float Rotation (%)", 0.0, 1.0, 0.45, 0.01)
+w_float = st.sidebar.slider("Public Float (penalty/info)", 0.0, 1.0, 0.05, 0.01)
 
 st.sidebar.header("Weights — Qualitative factors")
 q_weights = {}
 for crit in QUAL_CRITERIA:
     q_weights[crit["name"]] = st.sidebar.slider(
-        f"Weight: {crit['name']}", 0.0, 1.0, crit["weight"], 0.01
+        f"{crit['name']}", 0.0, 1.0, crit["weight"], 0.01
     )
 
 st.sidebar.header("Modifiers")
 news_weight = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05)
 dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05)
 
-# Normalize numeric+qual weights separately to preserve proportions within each block
+# Normalize numeric+qual weights separately
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
 
@@ -84,9 +81,9 @@ qual_sum = max(1e-9, sum(q_weights.values()))
 for k in q_weights:
     q_weights[k] = q_weights[k] / qual_sum
 
-# ==============================
-# Mappers (numeric → 1..7 points)
-# ==============================
+# -------------------------------
+# Scoring mappers (numeric → 1..7)
+# -------------------------------
 def pts_rvol(x: float) -> int:
     cuts = [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]
     for th, p in cuts:
@@ -106,7 +103,7 @@ def pts_si(x: float) -> int:
     return 7
 
 def pts_fr(pm_vol_m: float, float_m: float) -> int:
-    if float_m <= 0: 
+    if float_m <= 0:
         return 1
     pct = 100.0 * pm_vol_m / float_m
     cuts = [(1,1),(3,2),(10,3),(25,4),(50,5),(100,6)]
@@ -122,9 +119,9 @@ def pts_float(float_m: float) -> int:
         if float_m > th: return p
     return 7
 
-# ==============================
-# Grading & Odds labels
-# ==============================
+# -------------------------------
+# Labels
+# -------------------------------
 def grade(score_pct: float) -> str:
     return "A++" if score_pct >= 85 else "A+" if score_pct >= 80 else "A" if score_pct >= 70 else "B" if score_pct >= 60 else "C" if score_pct >= 45 else "D"
 
@@ -135,47 +132,49 @@ def odds_label(score_pct: float) -> str:
     elif score_pct >= 40: return "Low Odds"
     else: return "Very Low Odds"
 
-# ==============================
+# -------------------------------
 # Session state
-# ==============================
+# -------------------------------
 if "rows" not in st.session_state:
     st.session_state.rows = []
 
-# ==============================
-# Input form
-# ==============================
+# -------------------------------
+# Input form (NEW order)
+# -------------------------------
 with st.form("row_form", clear_on_submit=True):
-    c1, c2, c3 = st.columns([1.2,1.2,1.2])
+    c1, c2, c3 = st.columns([1.2,1.2,1.4])
 
     with c1:
         ticker   = st.text_input("Ticker", "").strip().upper()
-        rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1)
-        atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f")
+        pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1)
+        float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0)
+        fr_pct_preview = (pm_vol_m/float_m*100.0) if float_m > 0 else 0.0
+        st.caption(f"PM Float Rotation preview: **{fr_pct_preview:.2f}%**")
 
     with c2:
-        float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0)
+        rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1)
+        atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f")
         si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5)
 
     with c3:
-        pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1)
         catalyst_points = st.slider("Catalyst Impact (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
         dilution_points = st.slider("Dilution Impact (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
-
-    qual_points = {}
-    for crit in QUAL_CRITERIA:
-        choice = st.radio(
-            crit["question"],
-            options=list(enumerate(crit["options"], 1)),
-            format_func=lambda x: x[1],
-            key=f"qual_{crit['name']}"
-        )
-        qual_points[crit["name"]] = choice[0]  # 1..7
+        st.write("—")
+        qual_points = {}
+        for crit in QUAL_CRITERIA:
+            choice = st.radio(
+                crit["question"],
+                options=list(enumerate(crit["options"], 1)),
+                format_func=lambda x: x[1],
+                key=f"qual_{crit['name']}"
+            )
+            qual_points[crit["name"]] = choice[0]  # 1..7
 
     submitted = st.form_submit_button("Add / Rank")
 
-# ==============================
+# -------------------------------
 # Scoring
-# ==============================
+# -------------------------------
 if submitted and ticker:
     p_rvol  = pts_rvol(rvol)
     p_atr   = pts_atr(atr_usd)
@@ -183,40 +182,41 @@ if submitted and ticker:
     p_fr    = pts_fr(pm_vol_m, float_m)
     p_float = pts_float(float_m)
 
-    # numeric block (0–7, then to 0–100)
+    # numeric (0–7 → 0–100)
     num_0_7 = (w_rvol*p_rvol) + (w_atr*p_atr) + (w_si*p_si) + (w_fr*p_fr) + (w_float*p_float)
     num_pct = (num_0_7/7.0)*100.0
 
-    # qualitative block (0–7, then to 0–100)
+    # qualitative (0–7 → 0–100)
     qual_0_7 = sum(q_weights[k] * qual_points[k] for k in q_weights)
     qual_pct = (qual_0_7/7.0)*100.0
 
-    # combine blocks (50/50 default)
+    # combine (50/50)
     combo_pct = 0.5*num_pct + 0.5*qual_pct
 
-    # modifiers (each ±10 max when slider at ±1.0 and weight=1.0)
+    # modifiers (each ±10 max when slider ±1 and weight=1)
     final_score = round(combo_pct + catalyst_points*news_weight*10 + dilution_points*dilution_weight*10, 2)
 
     row = {
         "Ticker": ticker,
+        "PM Vol(M)": pm_vol_m,
+        "Float(M)": float_m,
+        "FloatRot(%)": round(fr_pct_preview, 2),
+        "RVOL": rvol,
+        "SI(%)": si_pct,
+        "ATR": atr_usd,
         "Odds": odds_label(final_score),
         "Level": grade(final_score),
-        # Optional: keep internals hidden in table but available for export/debug
+        # keep internals for details/export
         "Score": final_score,
-        "RVOL": rvol,
-        "ATR": atr_usd,
-        "Float(M)": float_m,
-        "SI(%)": si_pct,
-        "PM Vol(M)": pm_vol_m,
         "CatalystMod": round(catalyst_points*news_weight*10, 2),
         "DilutionMod": round(dilution_points*dilution_weight*10, 2),
     }
     st.session_state.rows.append(row)
     st.success(f"Saved {ticker} — {row['Odds']} (Level {row['Level']})")
 
-# ==============================
-# Table & export
-# ==============================
+# -------------------------------
+# Table & export (NEW order)
+# -------------------------------
 st.write("---")
 st.subheader("Current Ranking")
 
@@ -225,10 +225,16 @@ if st.session_state.rows:
 
     show_details = st.toggle("Show detailed columns", value=False)
 
-    base_cols = ["Ticker", "Odds", "Level"]
-    detail_cols = base_cols + [
-        "Score","RVOL","ATR","Float(M)","SI(%)","PM Vol(M)","CatalystMod","DilutionMod"
+    # New default order (lean, action-first)
+    base_cols = [
+        "Ticker", "Odds",
+        "PM Vol(M)", "Float(M)", "FloatRot(%)",
+        "RVOL", "SI(%)", "ATR",
+        "Level"
     ]
+
+    # Detailed order adds internals
+    detail_cols = base_cols + ["Score", "CatalystMod", "DilutionMod"]
 
     cols = detail_cols if show_details else base_cols
     cols = [c for c in cols if c in df.columns]
