@@ -120,15 +120,14 @@ def pts_float(float_m: float) -> int:
     return 7
 
 # -------------------------------
-# Odds engine (your heuristic)
+# Odds engine (heuristics)
 # -------------------------------
 def odds_from_pm_heuristics(pm_vol_m: float,
                             float_m: float,
                             pm_avg_price: float,
                             mktcap_m: float,
                             target_day_vol_m: float,
-                            catalyst_points: float) -> tuple[float, str]:
-    # 1) PM share of target
+                            catalyst_points: float):
     pm_share_pct = 100.0 * (pm_vol_m / max(1e-9, target_day_vol_m))
     if pm_share_pct < 1:   s1 = 5
     elif pm_share_pct < 3: s1 = 20
@@ -137,9 +136,8 @@ def odds_from_pm_heuristics(pm_vol_m: float,
     elif pm_share_pct < 25:s1 = 80
     else:                  s1 = 95
 
-    # 2) PM DollarVol / MarketCap
-    pm_dolv = pm_vol_m * 1_000_000 * pm_avg_price   # dollars
-    mc_dol  = mktcap_m * 1_000_000                  # dollars
+    pm_dolv = pm_vol_m * 1_000_000 * pm_avg_price
+    mc_dol  = mktcap_m * 1_000_000
     ratio_pct = 100.0 * (pm_dolv / max(1e-9, mc_dol))
     if ratio_pct < 1:    s2 = 5
     elif ratio_pct < 3:  s2 = 25
@@ -148,7 +146,6 @@ def odds_from_pm_heuristics(pm_vol_m: float,
     elif ratio_pct < 20: s2 = 85
     else:                s2 = 95
 
-    # 3) PM Float rotation (% of float)
     fr_pct = 100.0 * (pm_vol_m / max(1e-9, float_m))
     if fr_pct < 1:    s3 = 10
     elif fr_pct < 3:  s3 = 25
@@ -159,9 +156,6 @@ def odds_from_pm_heuristics(pm_vol_m: float,
     else:             s3 = 100
 
     base = 0.4*s1 + 0.3*s2 + 0.3*s3
-
-    # 4) Catalyst adjustment (−1 … +1), scaled by sidebar news_weight*10 later in main
-    # Here we keep base (0–100) and return catalyst separately for final combine
     score = min(100.0, max(0.0, base + catalyst_points * 10.0))
 
     label = ("Very High Odds" if score >= 85 else
@@ -237,7 +231,7 @@ with tab_add:
     submitted = st.button("Add / Score", type="primary", use_container_width=True)
 
     if submitted and ticker:
-        # Numeric/qual preview (not used for ranking, but shown on card)
+        # Numeric/qual preview
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
@@ -257,19 +251,19 @@ with tab_add:
             pm_avg_price=pm_avg_price,
             mktcap_m=mktcap_m,
             target_day_vol_m=target_day_vol_m,
-            catalyst_points=catalyst_points * news_weight  # catalyst scaled by sidebar
+            catalyst_points=catalyst_points * news_weight
         )
-        # Light dilution adjustment on odds (optional, small)
         odds_score = min(100.0, max(0.0, base_odds + dilution_points * dilution_weight * 5.0))
 
-        row = {
+        # Append row (new schema)
+        st.session_state.rows.append({
             "Ticker": ticker,
             "Odds": odds_label,
             "OddsScore": round(odds_score, 2),
             "Level": grade(odds_score),
-        }
-        st.session_state.rows.append(row)
+        })
 
+        # Last card snapshot (safe keys)
         st.session_state.last = {
             "Ticker": ticker,
             "Numeric_%": round(num_pct,2),
@@ -283,26 +277,35 @@ with tab_add:
             "PM Float %": round(100.0 * pm_vol_m / max(1e-9, float_m), 2),
         }
 
-        st.success(f"Saved {ticker} – {odds_label} (OddsScore {row['OddsScore']})")
+        st.success(f"Saved {ticker} – {odds_label} (OddsScore {round(odds_score,2)})")
 
-    if st.session_state.last:
+    # Preview card (robust to old schema)
+    l = st.session_state.last or {}
+    if l:
         st.markdown("---")
-        l = st.session_state.last
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Last Ticker", l["Ticker"])
-        c2.metric("Odds", f"{l['Odds']} ({l['OddsScore']})")
-        c3.metric("PM % of Target", f"{l['PM%Target']}%")
-        c4.metric("PM$ / MC", f"{l['PM$ / MC%']}%")
+        c1.metric("Last Ticker", l.get("Ticker","—"))
+        c2.metric("Odds", f"{l.get('Odds','—')} ({l.get('OddsScore','—')})")
+        c3.metric("PM % of Target", f"{l.get('PM%Target','—')}%")
+        c4.metric("PM$ / MC", f"{l.get('PM$ / MC%','—')}%")
         cA, cB, cC = st.columns(3)
-        cA.metric("PM Float %", f"{l['PM Float %']}%")
-        cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
-        cC.metric("Qual Block", f'{l["Qual_%"]}%')
+        cA.metric("PM Float %", f"{l.get('PM Float %','—')}%")
+        cB.metric("Numeric Block", f"{l.get('Numeric_%','—')}%")
+        cC.metric("Qual Block", f"{l.get('Qual_%','—')}%")
 
 with tab_rank:
     st.subheader("Current Ranking")
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
-        df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
+
+        # Ensure new columns exist for any older rows
+        for col in ["Odds","OddsScore","Level"]:
+            if col not in df.columns:
+                df[col] = None
+
+        # Sort safely even if some OddsScore are missing
+        df["OddsScore"] = pd.to_numeric(df["OddsScore"], errors="coerce")
+        df = df.sort_values("OddsScore", ascending=False, na_position="last").reset_index(drop=True)
 
         st.dataframe(
             df[["Ticker","Odds","OddsScore","Level"]],
@@ -323,6 +326,9 @@ with tab_rank:
             if st.button("Clear Ranking", use_container_width=True):
                 st.session_state.rows = []
                 st.session_state.last = None
-                st.experimental_rerun()
+                try:
+                    st.rerun()
+                except Exception:
+                    st.experimental_rerun()
     else:
         st.info("No rows yet. Add a stock in the **Add Stock** tab.")
