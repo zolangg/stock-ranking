@@ -237,7 +237,7 @@ with tab_rank:
     st.subheader("Current Ranking")
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
-        df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+        df = df.sort_values("Odds", ascending=False).reset_index(drop=True)
 
         st.dataframe(
             df[["Ticker","Odds","Level"]],
@@ -247,7 +247,7 @@ with tab_rank:
 
         st.download_button(
             "Download CSV",
-            df[["Ticker","Score","Level"]].to_csv(index=False).encode("utf-8"),
+            df[["Ticker","Odds","Level"]].to_csv(index=False).encode("utf-8"),
             "ranking.csv",
             "text/csv",
             use_container_width=True
