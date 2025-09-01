@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 
-# ---------- Markdown table helper (no external deps) ----------
+# ---------- Markdown table helper (no tabulate required) ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     keep_cols = [c for c in cols if c in df.columns]
     if not keep_cols:
@@ -18,15 +18,14 @@ def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
         for c in keep_cols:
             v = row[c]
             if isinstance(v, float):
-                # pretty print floats; show int if float is "effectively" whole
+                # show integers without .00, otherwise 2 decimals
                 cells.append(f"{v:.2f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v))}")
             else:
                 cells.append(str(v))
         lines.append("| " + " | ".join(cells) + " |")
-
     return "\n".join(lines)
 
-# ---------- Compat rerun helper ----------
+# ---------- Compat rerun ----------
 def do_rerun():
     if hasattr(st, "rerun"):
         st.rerun()
@@ -98,29 +97,26 @@ QUAL_CRITERIA = [
     },
 ]
 
-# ---------- Sidebar weights & modifiers ----------
+# ---------- Sidebar: weights & modifiers ----------
 st.sidebar.header("Numeric Weights")
-w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01, key="w_rvol",  help="Relative volume weight.")
-w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01, key="w_atr",  help="ATR weight.")
-w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, 0.15, 0.01, key="w_si", help="Short interest weight.")
-w_fr    = st.sidebar.slider("PM Float Rotation (%)", 0.0, 1.0, 0.45, 0.01, key="w_fr", help="PM float rotation weight.")
-w_float = st.sidebar.slider("Public Float (penalty/bonus)", 0.0, 1.0, 0.05, 0.01, key="w_float", help="Float size points weight.")
+w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01, key="w_rvol")
+w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01, key="w_atr")
+w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, 0.15, 0.01, key="w_si")
+w_fr    = st.sidebar.slider("PM Float Rotation (%)", 0.0, 1.0, 0.45, 0.01, key="w_fr")
+w_float = st.sidebar.slider("Public Float (penalty/bonus)", 0.0, 1.0, 0.05, 0.01, key="w_float")
 
 st.sidebar.header("Qualitative Weights")
 q_weights = {}
 for crit in QUAL_CRITERIA:
     q_weights[crit["name"]] = st.sidebar.slider(
-        crit["name"], 0.0, 1.0, crit["weight"], 0.01, key=f"wq_{crit['name']}",
-        help=f"Weight for {crit['name']}."
+        crit["name"], 0.0, 1.0, crit["weight"], 0.01, key=f"wq_{crit['name']}"
     )
 
 st.sidebar.header("Modifiers")
-news_weight = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight",
-                                help="Multiplier on Catalyst slider value.")
-dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05, key="dil_weight",
-                                    help="Multiplier on Dilution slider value.")
+news_weight = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight")
+dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05, key="dil_weight")
 
-# Normalize blocks separately (preserve proportions)
+# Normalize blocks separately
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
 
@@ -183,7 +179,7 @@ tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 with tab_add:
     st.subheader("Numeric Context")
 
-    # Option A: form that clears on submit
+    # OPTION A: form that clears on submit
     with st.form("add_form", clear_on_submit=True):
         c_top = st.columns([1.2, 1.2, 1.0])
 
@@ -194,7 +190,7 @@ with tab_add:
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f")
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0)
 
-        # Float / SI / PM volume + Target + PM VWAP
+        # Float / SI / PM volume + Target
         with c_top[1]:
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5)
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1)
@@ -251,14 +247,11 @@ with tab_add:
         pm_dollar_vol_m = pm_vol_m * pm_vwap
         pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
 
-        level = grade(final_score)
-        odds  = odds_label(final_score)
-
-        # Save row (incl. diagnostics & blocks)
+        # Save row (INCLUDES Level + diagnostics)
         row = {
             "Ticker": ticker,
-            "Odds": odds,
-            "Level": level,
+            "Odds": odds_label(final_score),
+            "Level": grade(final_score),
             "OddsScore": final_score,
             "Numeric_%": round(num_pct, 2),
             "Qual_%": round(qual_pct, 2),
@@ -269,11 +262,9 @@ with tab_add:
             "PM$ / MC_%": round(pm_dollar_vs_mc_pct, 1),
         }
         st.session_state.rows.append(row)
+        st.session_state.last = row
 
-        # Save last for preview card
-        st.session_state.last = row.copy()
-
-        st.session_state.flash = f"Saved {ticker} – Odds {odds} (Score {final_score}, {level})"
+        st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
         do_rerun()
 
     # Preview card
@@ -284,7 +275,7 @@ with tab_add:
         cA.metric("Last Ticker", l["Ticker"])
         cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
         cC.metric("Qual Block", f'{l["Qual_%"]}%')
-        cD.metric("Final Score / Level", f'{l["FinalScore"]} ({l["Level"]})')
+        cD.metric("Final Score", f'{l["FinalScore"]} ({l["Level"]})')
 
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("PM % of Target", f'{l["PM_Target_%"]}%')
@@ -299,7 +290,8 @@ with tab_add:
 with tab_rank:
     st.subheader("Current Ranking")
     if st.session_state.rows:
-        df = pd.DataFrame(st.session_state.rows).sort_values("OddsScore", ascending=False).reset_index(drop=True)
+        df = pd.DataFrame(st.session_state.rows)
+        df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
 
         cols_to_show = [
             "Ticker","Odds","Level",
@@ -307,33 +299,40 @@ with tab_rank:
             "PM_Target_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"
         ]
 
+        # --- Normalize to avoid KeyError for legacy rows ---
+        for c in cols_to_show:
+            if c not in df.columns:
+                df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
+
+        # Reorder
+        df = df[cols_to_show]
+
         st.dataframe(
-            df[cols_to_show],
+            df,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Ticker": st.column_config.TextColumn("Ticker", help="Symbol."),
-                "Odds": st.column_config.TextColumn("Odds", help="Qualitative label from Final Score."),
-                "Level": st.column_config.TextColumn("Level", help="Letter grade from Final Score."),
-                "Numeric_%": st.column_config.NumberColumn("Numeric_%", help="Numeric block (0–100).", format="%.2f"),
-                "Qual_%": st.column_config.NumberColumn("Qual_%", help="Qualitative block (0–100).", format="%.2f"),
-                "FinalScore": st.column_config.NumberColumn("FinalScore", help="Final combined score (0–100).", format="%.2f"),
-                "PM_Target_%": st.column_config.NumberColumn("PM % of Target", help="PM vol ÷ target vol × 100.", format="%.1f"),
-                "PM_Float_%": st.column_config.NumberColumn("PM Float %", help="PM vol ÷ float × 100.", format="%.1f"),
-                "PM_$Vol_M": st.column_config.NumberColumn("PM $Vol (M)", help="PM shares × PM VWAP (millions).", format="%.2f"),
-                "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", help="PM $ vol ÷ market cap × 100.", format="%.1f"),
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "Odds": st.column_config.TextColumn("Odds"),
+                "Level": st.column_config.TextColumn("Level"),
+                "Numeric_%": st.column_config.NumberColumn("Numeric_%", format="%.2f"),
+                "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
+                "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
+                "PM_Target_%": st.column_config.NumberColumn("PM % of Target", format="%.1f"),
+                "PM_Float_%": st.column_config.NumberColumn("PM Float %", format="%.1f"),
+                "PM_$Vol_M": st.column_config.NumberColumn("PM $Vol (M)", format="%.2f"),
+                "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
             }
         )
 
         st.download_button(
             "Download CSV",
-            df[cols_to_show].to_csv(index=False).encode("utf-8"),
+            df.to_csv(index=False).encode("utf-8"),
             "ranking.csv",
             "text/csv",
             use_container_width=True
         )
 
-        # Markdown view (copy/paste into notes)
         st.markdown("### 📋 Ranking (Markdown view)")
         st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
 
