@@ -2,19 +2,24 @@ import streamlit as st
 import pandas as pd
 
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
-    sub = df[cols].copy().fillna("")
-    # Header
-    header = "| " + " | ".join(cols) + " |"
-    sep    = "| " + " | ".join(["---"] * len(cols)) + " |"
+    # keep only columns that exist
+    keep_cols = [c for c in cols if c in df.columns]
+    if not keep_cols:
+        return "| (no data) |\n| --- |"
+
+    sub = df.loc[:, keep_cols].copy().fillna("")
+
+    # header + separator
+    header = "| " + " | ".join(keep_cols) + " |"
+    sep    = "| " + " | ".join(["---"] * len(keep_cols)) + " |"
     lines = [header, sep]
 
-    # Rows
+    # rows
     for _, row in sub.iterrows():
         cells = []
-        for c in cols:
+        for c in keep_cols:
             v = row[c]
             if isinstance(v, float):
-                # format nicely: ints as no-decimal, otherwise 2 decimals
                 cells.append(f"{v:.2f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v))}")
             else:
                 cells.append(str(v))
@@ -338,8 +343,11 @@ with tab_rank:
             use_container_width=True
         )
 
+       
+        cols_requested = ["Ticker", "Odds", "Level", "OddsScore", "PM_Target_%", "PM_Float_%", "PM_$Vol_M", "PM$ / MC_%"]
+        cols_to_show   = [c for c in cols_requested if c in df.columns]
+        
         st.markdown("### 📋 Ranking (Markdown view)")
-        cols_to_show = ["Ticker", "Odds", "Level"]  # same columns you show above
         st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
 
         c1, c2 = st.columns([0.25, 0.75])
