@@ -319,7 +319,6 @@ with tab_rank:
             "Numeric_%","Qual_%","FinalScore",
             "PM_Target_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"
         ]
-        ]
 
         st.dataframe(
             df[cols_to_show],
