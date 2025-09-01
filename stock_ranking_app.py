@@ -287,7 +287,7 @@ with tab_rank:
         df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
 
         cols_to_show = [
-            "Ticker","Odds","OddsScore",
+            "Ticker","Odds",
             "Numeric_%","Qual_%","FinalScore",
             "PM_Target_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"
         ]
@@ -299,7 +299,6 @@ with tab_rank:
             column_config={
                 "Ticker": st.column_config.TextColumn("Ticker", help="Symbol."),
                 "Odds": st.column_config.TextColumn("Odds", help="Qualitative label from Final Score."),
-                "OddsScore": st.column_config.NumberColumn("OddsScore", help="Numeric Final Score used for sorting.", format="%.2f"),
                 "Numeric_%": st.column_config.NumberColumn("Numeric_%", help="Numeric block contribution (0–100).", format="%.2f"),
                 "Qual_%": st.column_config.NumberColumn("Qual_%", help="Qualitative block contribution (0–100).", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", help="Final combined score (0–100).", format="%.2f"),
