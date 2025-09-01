@@ -199,7 +199,7 @@ with tab_add:
 
         # Price, Cap & Modifiers
         with c_top[2]:
-            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0, step=5.0)
+            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
             dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
 
