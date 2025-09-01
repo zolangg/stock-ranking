@@ -258,14 +258,15 @@ with tab_add:
         # Combine + modifiers
         combo_pct = 0.5*num_pct + 0.5*qual_pct
         final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
-
+        level = grade(final_score)  # << add this
+        
         # Diagnostics
         pm_pct_target = 100.0 * pm_vol_m / target_vol_m if target_vol_m > 0 else 0.0
         pm_float_pct  = 100.0 * pm_vol_m / float_m     if float_m     > 0 else 0.0
         pm_dollar_vol_m = pm_vol_m * pm_vwap
         pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
-
-        # Save row (INCLUDING diagnostics & blocks)
+        
+        # Save row (INCLUDING diagnostics & blocks + Level)
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
@@ -273,17 +274,18 @@ with tab_add:
             "Numeric_%": round(num_pct, 2),
             "Qual_%": round(qual_pct, 2),
             "FinalScore": final_score,
+            "Level": level,  # << add this
             "PM_Target_%": round(pm_pct_target, 1),
             "PM_Float_%": round(pm_float_pct, 1),
             "PM_$Vol_M": round(pm_dollar_vol_m, 2),
             "PM$ / MC_%": round(pm_dollar_vs_mc_pct, 1),
         }
         st.session_state.rows.append(row)
-
-        # Save last for preview card
-        st.session_state.last = row | {"Level": grade(final_score)}
-
-        st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
+        
+        # Save last for preview card (row already has Level)
+        st.session_state.last = row
+        
+        st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']} • {row['Level']})"
         do_rerun()
 
     # Preview card (after rerun)
@@ -294,7 +296,7 @@ with tab_add:
         cA.metric("Last Ticker", l["Ticker"])
         cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
         cC.metric("Qual Block", f'{l["Qual_%"]}%')
-        cD.metric("Final Score", f'{l["FinalScore"]}')
+        cD.metric("Final Score", f'{l["FinalScore"]} ({l["Level"]})')
 
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("PM % of Target", f'{l["PM_Target_%"]}%')
@@ -313,9 +315,10 @@ with tab_rank:
         df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
 
         cols_to_show = [
-            "Ticker","Odds",
+            "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
             "PM_Target_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"
+        ]
         ]
 
         st.dataframe(
@@ -328,6 +331,7 @@ with tab_rank:
                 "Numeric_%": st.column_config.NumberColumn("Numeric_%", help="Numeric block contribution (0–100).", format="%.2f"),
                 "Qual_%": st.column_config.NumberColumn("Qual_%", help="Qualitative block contribution (0–100).", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", help="Final combined score (0–100).", format="%.2f"),
+                "Level": st.column_config.TextColumn("Level", help="Letter grade from Final Score."),
                 "PM_Target_%": st.column_config.NumberColumn("PM % of Target", help="PM vol ÷ target vol × 100.", format="%.1f"),
                 "PM_Float_%": st.column_config.NumberColumn("PM Float %", help="PM vol ÷ float × 100.", format="%.1f"),
                 "PM_$Vol_M": st.column_config.NumberColumn("PM $Vol (M)", help="PM shares × PM VWAP (millions).", format="%.2f"),
