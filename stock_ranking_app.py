@@ -1,6 +1,27 @@
 import streamlit as st
 import pandas as pd
 
+def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
+    sub = df[cols].copy().fillna("")
+    # Header
+    header = "| " + " | ".join(cols) + " |"
+    sep    = "| " + " | ".join(["---"] * len(cols)) + " |"
+    lines = [header, sep]
+
+    # Rows
+    for _, row in sub.iterrows():
+        cells = []
+        for c in cols:
+            v = row[c]
+            if isinstance(v, float):
+                # format nicely: ints as no-decimal, otherwise 2 decimals
+                cells.append(f"{v:.2f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v))}")
+            else:
+                cells.append(str(v))
+        lines.append("| " + " | ".join(cells) + " |")
+
+    return "\n".join(lines)
+
 # Compat helper: use st.rerun if available, else experimental_rerun if present
 def do_rerun():
     if hasattr(st, "rerun"):
@@ -318,8 +339,8 @@ with tab_rank:
         )
 
         st.markdown("### 📋 Ranking (Markdown view)")
-        md_table = df[cols_to_show].to_markdown(index=False)
-        st.code(md_table, language="markdown")
+        cols_to_show = ["Ticker", "Odds", "Level"]  # same columns you show above
+        st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
 
         c1, c2 = st.columns([0.25, 0.75])
         with c1:
