@@ -193,7 +193,6 @@ with tab_add:
         # Float / SI / PM volume + Target
         with c_top[1]:
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.5)
-            si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.5)
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.1)
             target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=0.0, value=150.0, step=5.0)
             pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
