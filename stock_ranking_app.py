@@ -317,6 +317,10 @@ with tab_rank:
             use_container_width=True
         )
 
+        st.markdown("### 📋 Ranking (Markdown view)")
+        md_table = df[cols_to_show].to_markdown(index=False)
+        st.code(md_table, language="markdown")
+
         c1, c2 = st.columns([0.25, 0.75])
         with c1:
             if st.button("Clear Ranking", use_container_width=True):
