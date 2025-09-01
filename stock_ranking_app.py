@@ -7,7 +7,7 @@ def do_rerun():
         st.rerun()
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
-        
+
 # -------------------------------
 # Page setup
 # -------------------------------
@@ -181,14 +181,14 @@ with tab_add:
             rvol     = st.number_input("RVOL", min_value=0.0, value=5.0, step=0.1)
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.40, step=0.01, format="%.2f")
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=25.0, step=1.0)
-        
+
         # Float / SI / PM volume + Target
         with c_top[1]:
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=12.0, step=0.5)
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=5.0, step=0.1)
             target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=1.0, value=150.0, step=5.0)
             pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=5.00, step=0.05, format="%.2f")
-        
+
         # Price, Cap & Modifiers
         with c_top[2]:
             mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=100.0, step=5.0)
@@ -233,38 +233,31 @@ with tab_add:
         combo_pct = 0.5*num_pct + 0.5*qual_pct
         final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
 
-        # Diagnostics (for preview)
+        # Diagnostics
         pm_pct_target = 100.0 * pm_vol_m / target_vol_m if target_vol_m > 0 else 0.0
         pm_float_pct  = 100.0 * pm_vol_m / float_m     if float_m     > 0 else 0.0
         pm_dollar_vol_m = pm_vol_m * pm_vwap
         pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
 
-        # Save row
+        # Save row (INCLUDING diagnostics & blocks)
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
             "OddsScore": final_score,
-            "Level": grade(final_score),
+            "Numeric_%": round(num_pct, 2),
+            "Qual_%": round(qual_pct, 2),
+            "FinalScore": final_score,
+            "PM_Target_%": round(pm_pct_target, 1),
+            "PM_Float_%": round(pm_float_pct, 1),
+            "PM_$Vol_M": round(pm_dollar_vol_m, 2),
+            "PM$ / MC_%": round(pm_dollar_vs_mc_pct, 1),
         }
         st.session_state.rows.append(row)
 
         # Save last for preview card
-        st.session_state.last = {
-            "Ticker": ticker,
-            "Numeric_%": round(num_pct,2),
-            "Qual_%": round(qual_pct,2),
-            "Catalyst": round(catalyst_points,2),
-            "Dilution": round(dilution_points,2),
-            "Final": final_score,
-            "Level": grade(final_score),
-            "Odds": odds_label(final_score),
-            "PM_Target_%": round(pm_pct_target,1),
-            "PM_Float_%": round(pm_float_pct,1),
-            "PM_$Vol_M": round(pm_dollar_vol_m,2),
-            "PM$ / MC_%": round(pm_dollar_vs_mc_pct,1),
-        }
+        st.session_state.last = row | {"Level": grade(final_score)}
 
-        st.session_state.flash = f"Saved {ticker} – Final Score {final_score} ({row['Level']})"
+        st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
         do_rerun()
 
     # Preview card (after rerun)
@@ -275,7 +268,7 @@ with tab_add:
         cA.metric("Last Ticker", l["Ticker"])
         cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
         cC.metric("Qual Block", f'{l["Qual_%"]}%')
-        cD.metric("Final Score", f'{l["Final"]} ({l["Level"]})')
+        cD.metric("Final Score", f'{l["FinalScore"]}')
 
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("PM % of Target", f'{l["PM_Target_%"]}%')
@@ -293,26 +286,33 @@ with tab_rank:
         df = pd.DataFrame(st.session_state.rows)
         df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
 
+        cols_to_show = [
+            "Ticker","Odds","OddsScore",
+            "Numeric_%","Qual_%","FinalScore",
+            "PM_Target_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"
+        ]
+
         st.dataframe(
-            df[["Ticker","Odds","Level"]],
+            df[cols_to_show],
             use_container_width=True,
             hide_index=True,
             column_config={
                 "Ticker": st.column_config.TextColumn("Ticker", help="Symbol."),
-                "Odds": st.column_config.TextColumn(
-                    "Odds",
-                    help="Qualitative label from Final Score."
-                ),
-                "Level": st.column_config.TextColumn(
-                    "Level",
-                    help="Letter grade from Final Score."
-                ),
+                "Odds": st.column_config.TextColumn("Odds", help="Qualitative label from Final Score."),
+                "OddsScore": st.column_config.NumberColumn("OddsScore", help="Numeric Final Score used for sorting.", format="%.2f"),
+                "Numeric_%": st.column_config.NumberColumn("Numeric_%", help="Numeric block contribution (0–100).", format="%.2f"),
+                "Qual_%": st.column_config.NumberColumn("Qual_%", help="Qualitative block contribution (0–100).", format="%.2f"),
+                "FinalScore": st.column_config.NumberColumn("FinalScore", help="Final combined score (0–100).", format="%.2f"),
+                "PM_Target_%": st.column_config.NumberColumn("PM % of Target", help="PM vol ÷ target vol × 100.", format="%.1f"),
+                "PM_Float_%": st.column_config.NumberColumn("PM Float %", help="PM vol ÷ float × 100.", format="%.1f"),
+                "PM_$Vol_M": st.column_config.NumberColumn("PM $Vol (M)", help="PM shares × PM VWAP (millions).", format="%.2f"),
+                "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", help="PM $ vol ÷ market cap × 100.", format="%.1f"),
             }
         )
 
         st.download_button(
             "Download CSV",
-            df[["Ticker","Odds","Level"]].to_csv(index=False).encode("utf-8"),
+            df[cols_to_show].to_csv(index=False).encode("utf-8"),
             "ranking.csv",
             "text/csv",
             use_container_width=True
