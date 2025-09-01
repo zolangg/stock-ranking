@@ -186,16 +186,17 @@ with tab_add:
         # Basics
         with c_top[0]:
             ticker   = st.text_input("Ticker", "").strip().upper()
-            rvol     = st.number_input("RVOL", min_value=0.0, value=0, step=0.1)
-            atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0, step=0.01, format="%.2f")
-            float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0, step=1.0)
+            rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.1)
+            atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=1.0)
 
         # Float / SI / PM volume + Target
         with c_top[1]:
-            si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0, step=0.5)
-            pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0, step=0.1)
-            target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=0, value=150.0, step=5.0)
-            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0, step=0.05, format="%.2f")
+            si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.5)
+            si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.5)
+            pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.1)
+            target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=0.0, value=150.0, step=5.0)
+            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
 
         # Price, Cap & Modifiers
         with c_top[2]:
