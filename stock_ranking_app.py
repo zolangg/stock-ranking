@@ -320,7 +320,10 @@ with tab_add:
         final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
 
         # Diagnostics (updated: rotation ×, no $ metrics)
-        pm_pct_of_pred = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
+        pred_vol_m = st.session_state.last.get("PredVol_M", 0.0)
+        pm_pct_of_pred = (
+            100.0 * pm_vol_m / pred_vol_m if pred_vol_m and pred_vol_m > 0 else 0.0
+        )
         pm_float_rot_x = pm_vol_m / float_m if float_m > 0 else 0.0
 
         # Save row
