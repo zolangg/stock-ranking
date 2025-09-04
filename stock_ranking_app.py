@@ -338,18 +338,18 @@ with tab_rank:
         df = pd.DataFrame(st.session_state.rows)
         df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
 
+        # --- Updated columns for the new model ---
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
             "PredVol_M","PM_%_of_Pred","PM_FloatRot_x"
         ]
 
-        # --- Normalize to avoid KeyError for legacy rows ---
+        # Normalize to avoid KeyError for legacy rows
         for c in cols_to_show:
             if c not in df.columns:
                 df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
 
-        # Reorder
         df = df[cols_to_show]
 
         st.dataframe(
@@ -379,7 +379,7 @@ with tab_rank:
 
         st.markdown("### 📋 Ranking (Markdown view)")
         st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
-
+        
         c1, c2 = st.columns([0.25, 0.75])
         with c1:
             if st.button("Clear Ranking", use_container_width=True):
