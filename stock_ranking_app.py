@@ -281,16 +281,17 @@ with tab_add:
         # Basics
         with c_top[0]:
             ticker   = st.text_input("Ticker", "").strip().upper()
-            rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.1)
+            rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=1.0)
+            float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+
 
         # Float / SI / PM volume
         with c_top[1]:
-            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
-            si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.5)
-            pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.1)
-            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
+            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.0001, format="%.4f")  # finer step
 
         # Cap & Modifiers
         with c_top[2]:
@@ -442,9 +443,10 @@ with tab_rank:
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
         df = df.loc[:, ~df.columns.duplicated(keep="first")]
-        if "OddsScore" in df.columns:
-            df = df.sort_values("OddsScore", ascending=False)
-        df = df.reset_index(drop=True)
+
+        # Always sort by FinalScore highest first
+        if "FinalScore" in df.columns:
+            df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
         cols_to_show = [
             "Ticker","Odds","Level",
