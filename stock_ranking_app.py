@@ -224,14 +224,13 @@ with tab_add:
 
         # Float / SI / PM volume + Target
         with c_top[1]:
+            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.5)
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.1)
-            target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=0.0, value=150.0, step=5.0)
             pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
 
         # Price, Cap & Modifiers
         with c_top[2]:
-            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
             dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
 
@@ -274,7 +273,6 @@ with tab_add:
         final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
 
         # Diagnostics (kept)
-        pm_pct_target = 100.0 * pm_vol_m / target_vol_m if target_vol_m > 0 else 0.0
         pm_float_pct  = 100.0 * pm_vol_m / float_m     if float_m     > 0 else 0.0
         pm_dollar_vol_m = pm_vol_m * pm_vwap
         pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
@@ -296,7 +294,6 @@ with tab_add:
             "Qual_%": round(qual_pct, 2),
             "FinalScore": final_score,
             # existing diagnostics
-            "PM_Target_%": round(pm_pct_target, 1),
             "PM_Float_%": round(pm_float_pct, 1),
             "PM_$Vol_M": round(pm_dollar_vol_m, 2),
             "PM$ / MC_%": round(pm_dollar_vs_mc_pct, 1),
@@ -339,8 +336,6 @@ if st.session_state.last:
     cD.metric("Final Score", f'{fmt_num(l.get("FinalScore"))} ({l.get("Level","—")})')
 
     d1, d2, d3, d4 = st.columns(4)
-    d1.metric("PM % of Target",   fmt_pct(l.get("PM_Target_%")))
-    d1.caption("PM volume ÷ target day volume × 100.")
     d2.metric("PM Float %",       fmt_pct(l.get("PM_Float_%")))
     d2.caption("PM volume ÷ float × 100.")
     d3.metric("PM $Vol (M)",      fmt_num(l.get("PM_$Vol_M")))
@@ -362,7 +357,7 @@ with tab_rank:
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
-            "PM_Target_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%",
+            "PM_Float_%","PM_$Vol_M","PM$ / MC_%",
             # NEW columns visible in ranking
             "Pred_DayVol_M","PM_Pred_%"
         ]
