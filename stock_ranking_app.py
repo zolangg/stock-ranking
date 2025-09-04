@@ -303,7 +303,7 @@ with tab_add:
             "Pred_DayVol_M": round(pred_day_vol_m, 2),
             "PM_Pred_%": round(pm_pred_pct, 1),
         }
-                st.session_state.rows.append(row)
+        st.session_state.rows.append(row)
         st.session_state.last = row
 
         st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
