@@ -121,11 +121,6 @@ blend_qual    = 1.0 - blend_numeric
 news_weight = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight")
 dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05, key="dil_weight")
 
-# NEW: Model controls for refit (FR scale and smooth catalyst strength)
-st.sidebar.header("Model Controls")
-fr_scale = st.sidebar.slider("FR scale (PM/Float → FloatRotation)", 0.1, 50.0, 10.353218, 0.01)
-k_smooth = st.sidebar.slider("Catalyst strength k (smooth)", 0.00, 0.75, 0.20, 0.01)
-
 # Normalize blocks separately
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
@@ -184,46 +179,48 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # ---------- Model: predicted daily volume (M) ----------
-# REPLACED with refit model using FR_proxy = fr_scale * (PM/Float), NO separate ln(PM) term.
 def predict_day_volume_m(float_m: float, mc_m: float, si_pct: float,
                          atr_usd: float, rvol: float, pm_vol_m: float,
                          catalyst: float) -> float:
     """
-    Refit model (PM/Float FR, smooth catalyst):
-      ln(Y) =
-         5.248272
-       - 0.098493*ln(Float)
-       + 0.087067*ln(MarketCap)
-       - 0.285202*ln(SI+1)
-       - 1.264040*ln(ATR+1)
-       + 0.111584*ln(1 + fr_scale*(PM/Float))
-       + k_smooth * Catalyst
-
-    Notes:
-      - Float, MarketCap, PM in millions
-      - SI in percent points
+    EXP(
+       4.135
+     + 0.199*LN(Float)
+     + 0.037*LN(MarketCap)
+     + 0.428*LN(SI+1)
+     - 1.102*LN(ATR+1)
+     - 0.065*LN(RVOL+1)
+     + 0.402*LN(FloatRotation+1)
+     + 0.074*Catalyst
+     - 0.019*LN(PM)
+    )
+    Inputs:
+      - Float, MarketCap in millions
+      - SI as percent
       - ATR in $
-      - RVOL is ignored in this refit (kept in signature for compatibility)
-      - Catalyst in [-1, 1]; applied smoothly in log space
+      - RVOL unitless
+      - PM in millions (premarket volume)
+      - Catalyst in [-1, 1]
     """
     eps = 1e-9
     Float = max(float_m, eps)
     MarketCap = max(mc_m, eps)
     SI = max(si_pct, 0.0)
     ATR = max(atr_usd, 0.0)
+    RVOL = max(rvol, 0.0)
     PM = max(pm_vol_m, eps)
-
-    # PM-based Float Rotation proxy (calibrated)
-    FR_proxy = fr_scale * (PM / Float)
+    FloatRotation = pm_vol_m / max(float_m, eps)
 
     lin = (
-        5.248272
-        - 0.098493 * math.log(Float)
-        + 0.087067 * math.log(MarketCap)
-        - 0.285202 * math.log(SI + 1.0)
-        - 1.264040 * math.log(ATR + 1.0)
-        + 0.111584 * math.log(1.0 + FR_proxy)
-        + float(k_smooth) * float(catalyst)  # smooth catalyst effect
+        4.135
+        + 0.199 * math.log(Float)
+        + 0.037 * math.log(MarketCap)
+        + 0.428 * math.log(SI + 1.0)
+        - 1.102 * math.log(ATR + 1.0)
+        - 0.065 * math.log(RVOL + 1.0)
+        + 0.402 * math.log(FloatRotation + 1.0)
+        + 0.074 * float(catalyst)
+        - 0.019 * math.log(PM)
     )
     return float(math.exp(lin))  # millions of shares
 
@@ -342,7 +339,7 @@ with tab_add:
 
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("Predicted Day Vol (M)", f'{l["Pred_DayVol_M"]}')
-        d1.caption("Exponential model to predict volume.")
+        d1.caption("Model: EXP(…); units in millions of shares.")
         d2.metric("PM % of Predicted", f'{l["PM_Pred_%"]}%')
         d2.caption("Premarket volume ÷ predicted day volume × 100.")
         d3.metric("PM Float %", f'{l["PM_Float_%"]}%')
