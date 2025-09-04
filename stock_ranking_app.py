@@ -259,7 +259,7 @@ with tab_add:
         # Prediction replaces manual target volume
         pred_vol_m = predict_day_volume_m(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst_points)
 
-        with st.expander("🔎 Prediction debug (check units)"):
+    with st.expander("🔎 Prediction debug (check units)"):
     eps = 1e-12
     mc_m_dbg  = max(mc_m, eps)
     si_fr_dbg = max(si_pct, 0.0)/100.0
