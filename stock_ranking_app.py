@@ -310,31 +310,48 @@ with tab_add:
         st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
         do_rerun()
 
-    # Preview card
-    if st.session_state.last:
-        st.markdown("---")
-        l = st.session_state.last
-        cA, cB, cC, cD = st.columns(4)
-        cA.metric("Last Ticker", l["Ticker"])
-        cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
-        cC.metric("Qual Block", f'{l["Qual_%"]}%')
-        cD.metric("Final Score", f'{l["FinalScore"]} ({l["Level"]})')
+   # Preview card (robust to missing keys)
+if st.session_state.last:
+    st.markdown("---")
+    l = st.session_state.last
 
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("PM % of Target", f'{l["PM_Target_%"]}%')
-        d1.caption("PM volume ÷ target day volume × 100.")
-        d2.metric("PM Float %", f'{l["PM_Float_%"]}%')
-        d2.caption("PM volume ÷ float × 100.")
-        d3.metric("PM $Vol (M)", f'{l["PM_$Vol_M"]}')
-        d3.caption("PM Vol × PM VWAP (in $ millions).")
-        d4.metric("PM $Vol / MC", f'{l["PM$ / MC_%"]}%')
-        d4.caption("PM dollar volume ÷ market cap × 100.")
+    def fmt_num(x, dec=2):
+        try:
+            if x is None: return "—"
+            x = float(x)
+            if abs(x - round(x)) < 1e-9:
+                return f"{int(round(x))}"
+            return f"{x:.{dec}f}"
+        except Exception:
+            return str(x) if x is not None else "—"
 
-        # NEW: prediction quick glance
-        st.caption("—")
-        p1, p2 = st.columns(2)
-        p1.metric("Predicted Day Vol (M)", f'{l["Pred_DayVol_M"]}')
-        p2.metric("PM % of Predicted", f'{l["PM_Pred_%"]}%')
+    def fmt_pct(x, dec=1):
+        try:
+            if x is None: return "—"
+            return f"{float(x):.{dec}f}%"
+        except Exception:
+            return "—"
+
+    cA, cB, cC, cD = st.columns(4)
+    cA.metric("Last Ticker", l.get("Ticker", "—"))
+    cB.metric("Numeric Block", fmt_pct(l.get("Numeric_%")))
+    cC.metric("Qual Block", fmt_pct(l.get("Qual_%")))
+    cD.metric("Final Score", f'{fmt_num(l.get("FinalScore"))} ({l.get("Level","—")})')
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("PM % of Target",   fmt_pct(l.get("PM_Target_%")))
+    d1.caption("PM volume ÷ target day volume × 100.")
+    d2.metric("PM Float %",       fmt_pct(l.get("PM_Float_%")))
+    d2.caption("PM volume ÷ float × 100.")
+    d3.metric("PM $Vol (M)",      fmt_num(l.get("PM_$Vol_M")))
+    d3.caption("PM Vol × PM VWAP (in $ millions).")
+    d4.metric("PM $Vol / MC",     fmt_pct(l.get("PM$ / MC_%")))
+    d4.caption("PM dollar volume ÷ market cap × 100.")
+
+    st.caption("—")
+    p1, p2 = st.columns(2)
+    p1.metric("Predicted Day Vol (M)", fmt_num(l.get("Pred_DayVol_M")))
+    p2.metric("PM % of Predicted",     fmt_pct(l.get("PM_Pred_%")))
 
 with tab_rank:
     st.subheader("Current Ranking")
