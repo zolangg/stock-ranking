@@ -299,23 +299,38 @@ with tab_add:
         st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
         do_rerun()
 
-    # Preview card
-    if st.session_state.last:
-        st.markdown("---")
-        l = st.session_state.last
-        cA, cB, cC, cD = st.columns(4)
-        cA.metric("Last Ticker", l["Ticker"])
-        cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
-        cC.metric("Qual Block", f'{l["Qual_%"]}%')
-        cD.metric("Final Score", f'{l["FinalScore"]} ({l["Level"]})')
-
-        d1, d2, d3 = st.columns(3)
-        d1.metric("Predicted Day Volume (M)", f'{l["PredVol_M"]}')
-        d1.caption("Model-predicted total day shares (millions).")
-        d2.metric("PM % of Prediction", f'{l["PM_%_of_Pred"]}%')
-        d2.caption("PM volume ÷ predicted day volume × 100.")
-        d3.metric("PM Float Rotation", f'{l["PM_FloatRot_x"]}×')
-        d3.caption("Premarket volume ÷ float (×).")
+        # Preview card (legacy-safe)
+        if st.session_state.last:
+            st.markdown("---")
+            l = st.session_state.last
+        
+            # Pull values with safe fallbacks
+            pred_vol_m      = l.get("PredVol_M", None)
+            pm_pct_of_pred  = l.get("PM_%_of_Pred", None)
+            pm_rot_x        = l.get("PM_FloatRot_x", None)
+        
+            # Legacy fallback for rotation: convert old percent to × if present
+            if pm_rot_x is None and isinstance(l.get("PM_Float_%"), (int, float)):
+                try:
+                    pm_rot_x = round(float(l["PM_Float_%"]) / 100.0, 3)
+                except Exception:
+                    pm_rot_x = None
+        
+            cA, cB, cC, cD = st.columns(4)
+            cA.metric("Last Ticker", l.get("Ticker", "—"))
+            cB.metric("Numeric Block", f'{l["Numeric_%"]}%' if isinstance(l.get("Numeric_%"), (int, float)) else "—")
+            cC.metric("Qual Block", f'{l["Qual_%"]}%' if isinstance(l.get("Qual_%"), (int, float)) else "—")
+            cD.metric("Final Score",
+                      f'{l["FinalScore"]} ({l.get("Level","—")})' if isinstance(l.get("FinalScore"), (int, float)) else "—")
+        
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Predicted Day Volume (M)", f'{pred_vol_m}' if isinstance(pred_vol_m, (int, float)) else "—")
+            d2.metric("PM % of Prediction", f'{pm_pct_of_pred}%' if isinstance(pm_pct_of_pred, (int, float)) else "—")
+            d3.metric("PM Float Rotation", f'{pm_rot_x}×' if isinstance(pm_rot_x, (int, float)) else "—")
+        
+            d1.caption("Model-predicted total day shares (millions).")
+            d2.caption("PM volume ÷ predicted day volume × 100.")
+            d3.caption("Premarket volume ÷ float (×).")
 
 with tab_rank:
     st.subheader("Current Ranking")
