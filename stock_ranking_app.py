@@ -272,12 +272,11 @@ with tab_add:
         combo_pct = 0.5*num_pct + 0.5*qual_pct
         final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
 
-        # Diagnostics (kept)
-        pm_float_pct  = 100.0 * pm_vol_m / float_m     if float_m     > 0 else 0.0
-        pm_dollar_vol_m = pm_vol_m * pm_vwap
-        pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
-
-        # NEW: model prediction (added)
+       # Diagnostics (rotation is unitless; no percent)
+        pm_float_rot = pm_vol_m / float_m if float_m > 0 else 0.0
+        pm_dollar_vs_mc_pct = 100.0 * (pm_vol_m * pm_vwap) / mc_m if mc_m > 0 else 0.0
+        
+        # NEW: model prediction + PM % of predicted
         pred_day_vol_m = predict_day_volume_m(
             float_m=float_m, mc_m=mc_m, si_pct=si_pct,
             atr_usd=atr_usd, pm_vol_m=pm_vol_m, catalyst=catalyst_points
@@ -293,15 +292,18 @@ with tab_add:
             "Numeric_%": round(num_pct, 2),
             "Qual_%": round(qual_pct, 2),
             "FinalScore": final_score,
-            # existing diagnostics
-            "PM_Float_%": round(pm_float_pct, 1),
-            "PM_$Vol_M": round(pm_dollar_vol_m, 2),
+        
+            # Keep
             "PM$ / MC_%": round(pm_dollar_vs_mc_pct, 1),
-            # NEW fields
+        
+            # Change: rotation (unitless) instead of percent
+            "PM_FloatRot": round(pm_float_rot, 3),
+        
+            # Prediction fields
             "Pred_DayVol_M": round(pred_day_vol_m, 2),
             "PM_Pred_%": round(pm_pred_pct, 1),
         }
-        st.session_state.rows.append(row)
+                st.session_state.rows.append(row)
         st.session_state.last = row
 
         st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
@@ -336,12 +338,17 @@ if st.session_state.last:
     cD.metric("Final Score", f'{fmt_num(l.get("FinalScore"))} ({l.get("Level","—")})')
 
     d1, d2, d3, d4 = st.columns(4)
-    d2.metric("PM Float %",       fmt_pct(l.get("PM_Float_%")))
-    d2.caption("PM volume ÷ float × 100.")
-    d3.metric("PM $Vol (M)",      fmt_num(l.get("PM_$Vol_M")))
-    d3.caption("PM Vol × PM VWAP (in $ millions).")
-    d4.metric("PM $Vol / MC",     fmt_pct(l.get("PM$ / MC_%")))
-    d4.caption("PM dollar volume ÷ market cap × 100.")
+    d1.metric("PM Float Rotation", f'{l["PM_FloatRot"]}×')
+    d1.caption("Premarket volume ÷ float (unitless).")
+    
+    d2.metric("PM $Vol / MC", f'{l["PM$ / MC_%"]}%')
+    d2.caption("PM dollar volume ÷ market cap × 100.")
+    
+    d3.metric("Predicted Day Vol (M)", f'{l["Pred_DayVol_M"]}')
+    d3.caption("Exponential model prediction.")
+    
+    d4.metric("PM % of Predicted", f'{l["PM_Pred_%"]}%')
+    d4.caption("Premarket volume ÷ predicted day volume × 100.")
 
     st.caption("—")
     p1, p2 = st.columns(2)
@@ -357,8 +364,7 @@ with tab_rank:
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
-            "PM_Float_%","PM_$Vol_M","PM$ / MC_%",
-            # NEW columns visible in ranking
+            "PM_FloatRot","PM$ / MC_%",
             "Pred_DayVol_M","PM_Pred_%"
         ]
 
@@ -382,8 +388,7 @@ with tab_rank:
                 "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
                 "PM_Target_%": st.column_config.NumberColumn("PM % of Target", format="%.1f"),
-                "PM_Float_%": st.column_config.NumberColumn("PM Float %", format="%.1f"),
-                "PM_$Vol_M": st.column_config.NumberColumn("PM $Vol (M)", format="%.2f"),
+                "PM_FloatRot": st.column_config.NumberColumn("PM Float Rotation (×)", format="%.3f"),
                 "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
                 "Pred_DayVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
                 "PM_Pred_%": st.column_config.NumberColumn("PM % of Predicted", format="%.1f"),
