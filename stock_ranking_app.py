@@ -185,17 +185,26 @@ def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float, pm_vol_m: f
     )
     return float(math.exp(lnY))
     
-# ---------- Sanity check helpers ----------
 def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
     flags = []
-    # Units / ranges that often go wrong
+    # Unit sanity
     if mc_m > 50000: flags.append("⚠️ Market Cap looks > $50B — is it in *millions*?")
     if float_m > 10000: flags.append("⚠️ Float > 10,000M — is it in *millions*?")
     if pm_vol_m > 1000: flags.append("⚠️ PM volume > 1,000M — is it in *millions*?")
-    if si_pct > 100: flags.append("⚠️ Short interest > 100% — is SI entered as percent (e.g., 25.0)?")
+    if si_pct > 100: flags.append("⚠️ Short interest > 100% — enter SI as percent (e.g., 25.0).")
     if atr_usd > 20: flags.append("⚠️ ATR > $20 — double-check units.")
+
+    # Adaptive FR threshold by float size
     fr = (pm_vol_m / max(float_m, 1e-12)) if float_m > 0 else 0.0
-    if fr > 2.0: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× seems high (check PM/Float units).")
+    if float_m <= 1.0:
+        # micro-float: allow much higher rotations
+        if fr > 60: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× is extreme even for micro-float.")
+    elif float_m <= 5.0:
+        if fr > 20: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× is unusually high.")
+    elif float_m <= 20.0:
+        if fr > 10: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× is high.")
+    else:
+        if fr > 3.0: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× may indicate unit mismatch.")
     return flags
 
 def ln_terms_for_display(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst):
