@@ -2,24 +2,20 @@ import streamlit as st
 import pandas as pd
 import math
 
-# ---------- Markdown table helper (no tabulate required) ----------
+# ---------- Markdown table helper ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     keep_cols = [c for c in cols if c in df.columns]
     if not keep_cols:
         return "| (no data) |\n| --- |"
-
     sub = df.loc[:, keep_cols].copy().fillna("")
-
     header = "| " + " | ".join(keep_cols) + " |"
     sep    = "| " + " | ".join(["---"] * len(keep_cols)) + " |"
     lines = [header, sep]
-
     for _, row in sub.iterrows():
         cells = []
         for c in keep_cols:
             v = row[c]
             if isinstance(v, float):
-                # show integers without .00, otherwise 2 decimals
                 cells.append(f"{v:.2f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v))}")
             else:
                 cells.append(str(v))
@@ -51,51 +47,24 @@ if st.session_state.flash:
 
 # ---------- Qualitative criteria ----------
 QUAL_CRITERIA = [
-    {
-        "name": "GapStruct",
-        "question": "Gap & Trend Development:",
-        "options": [
-            "Gap fully reversed: price loses >80% of gap.",
-            "Choppy reversal: price loses 50–80% of gap.",
-            "Partial retracement: price loses 25–50% of gap.",
-            "Sideways consolidation: gap holds, price within top 25% of gap.",
-            "Uptrend with deep pullbacks (>30% retrace).",
-            "Uptrend with moderate pullbacks (10–30% retrace).",
-            "Clean uptrend, only minor pullbacks (<10%).",
-        ],
-        "weight": 0.15,
-        "help": "How well the gap holds and trends.",
-    },
-    {
-        "name": "LevelStruct",
-        "question": "Key Price Levels:",
-        "options": [
-            "Fails at all major support/resistance; cannot hold any key level.",
-            "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
-            "Holds one support but unable to break resistance; capped below a key level.",
-            "Breaks above resistance but cannot stay; dips below reclaimed level.",
-            "Breaks and holds one major level; most resistance remains above.",
-            "Breaks and holds several major levels; clears most overhead resistance.",
-            "Breaks and holds above all resistance; blue sky.",
-        ],
-        "weight": 0.15,
-        "help": "Break/hold behavior at key levels.",
-    },
-    {
-        "name": "Monthly",
-        "question": "Monthly/Weekly Chart Context:",
-        "options": [
-            "Sharp, accelerating downtrend; new lows repeatedly.",
-            "Persistent downtrend; still lower lows.",
-            "Downtrend losing momentum; flattening.",
-            "Clear base; sideways consolidation.",
-            "Bottom confirmed; higher low after base.",
-            "Uptrend begins; breaks out of base.",
-            "Sustained uptrend; higher highs, blue sky.",
-        ],
-        "weight": 0.10,
-        "help": "Higher-timeframe bias.",
-    },
+    {"name": "GapStruct","question": "Gap & Trend Development:",
+     "options": ["Gap fully reversed: price loses >80% of gap.","Choppy reversal: price loses 50–80% of gap.",
+                 "Partial retracement: price loses 25–50% of gap.","Sideways consolidation: gap holds, price within top 25% of gap.",
+                 "Uptrend with deep pullbacks (>30% retrace).","Uptrend with moderate pullbacks (10–30% retrace).",
+                 "Clean uptrend, only minor pullbacks (<10%)."],"weight": 0.15,
+     "help": "How well the gap holds and trends."},
+    {"name": "LevelStruct","question": "Key Price Levels:",
+     "options": ["Fails at all major support/resistance; cannot hold any key level.","Briefly holds/reclaims a level but loses it quickly; repeated failures.",
+                 "Holds one support but unable to break resistance; capped below a key level.","Breaks above resistance but cannot stay; dips below reclaimed level.",
+                 "Breaks and holds one major level; most resistance remains above.","Breaks and holds several major levels; clears most overhead resistance.",
+                 "Breaks and holds above all resistance; blue sky."],"weight": 0.15,
+     "help": "Break/hold behavior at key levels."},
+    {"name": "Monthly","question": "Monthly/Weekly Chart Context:",
+     "options": ["Sharp, accelerating downtrend; new lows repeatedly.","Persistent downtrend; still lower lows.",
+                 "Downtrend losing momentum; flattening.","Clear base; sideways consolidation.",
+                 "Bottom confirmed; higher low after base.","Uptrend begins; breaks out of base.",
+                 "Sustained uptrend; higher highs, blue sky."],"weight": 0.10,
+     "help": "Higher-timeframe bias."}
 ]
 
 # ---------- Sidebar: weights & modifiers ----------
@@ -114,17 +83,14 @@ for crit in QUAL_CRITERIA:
     )
 
 st.sidebar.header("Score Blend & Modifiers")
-# Flexible blend Numeric vs. Qualitative
 blend_numeric = st.sidebar.slider("Weight of Numeric Block (vs. Qualitative)", 0.0, 1.0, 0.50, 0.05)
 blend_qual    = 1.0 - blend_numeric
-
-news_weight = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight")
+news_weight   = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight")
 dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05, key="dil_weight")
 
 # Normalize blocks separately
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
-
 qual_sum = max(1e-9, sum(q_weights.values()))
 for k in q_weights:
     q_weights[k] = q_weights[k] / qual_sum
@@ -135,322 +101,177 @@ def pts_rvol(x: float) -> int:
     for th, p in cuts:
         if x < th: return p
     return 7
-
 def pts_atr(x: float) -> int:
     cuts = [(0.05,1),(0.10,2),(0.20,3),(0.35,4),(0.60,5),(1.00,6)]
     for th, p in cuts:
         if x < th: return p
     return 7
-
 def pts_si(x: float) -> int:
     cuts = [(2,1),(5,2),(10,3),(15,4),(20,5),(30,6)]
     for th, p in cuts:
         if x < th: return p
     return 7
-
 def pts_fr(pm_vol_m: float, float_m: float) -> int:
-    if float_m <= 0:
-        return 1
+    if float_m <= 0: return 1
     pct = 100.0 * pm_vol_m / float_m
     cuts = [(1,1),(3,2),(10,3),(25,4),(50,5),(100,6)]
     for th, p in cuts:
         if pct < th: return p
     return 7
-
 def pts_float(float_m: float) -> int:
     cuts = [(200,2),(100,3),(50,4),(35,5),(10,6)]
     if float_m <= 3: return 7
     for th, p in cuts:
         if float_m > th: return p
     return 7
-
 def odds_label(score: float) -> str:
     if score >= 85: return "Very High Odds"
     elif score >= 70: return "High Odds"
     elif score >= 55: return "Moderate Odds"
     elif score >= 40: return "Low Odds"
     else: return "Very Low Odds"
-
 def grade(score_pct: float) -> str:
-    return ("A++" if score_pct >= 85 else
-            "A+"  if score_pct >= 80 else
-            "A"   if score_pct >= 70 else
-            "B"   if score_pct >= 60 else
-            "C"   if score_pct >= 45 else "D")
+    return ("A++" if score_pct >= 85 else "A+" if score_pct >= 80 else
+            "A" if score_pct >= 70 else "B" if score_pct >= 60 else
+            "C" if score_pct >= 45 else "D")
 
 # ---------- Model: predicted daily volume (M) ----------
 def predict_day_volume_m(float_m: float, mc_m: float, si_pct: float,
                          atr_usd: float, rvol: float, pm_vol_m: float,
                          catalyst: float) -> float:
     """
-    EXP(
-       4.135
-     + 0.199*LN(Float)
-     + 0.037*LN(MarketCap)
-     + 0.428*LN(SI+1)
-     - 1.102*LN(ATR+1)
-     - 0.065*LN(RVOL+1)
-     + 0.402*LN(FloatRotation+1)
+    ln(Y) =
+       5.597780
+     - 0.015481*ln(MCap)
+     + 1.007036*ln(SI+1)
+     - 1.267843*ln(ATR+1)
+     + 0.114066*ln(1 + PM/Float)
      + 0.074*Catalyst
-     - 0.019*LN(PM)
-    )
-    Inputs:
-      - Float, MarketCap in millions
-      - SI as percent
-      - ATR in $
-      - RVOL unitless
-      - PM in millions (premarket volume)
-      - Catalyst in [-1, 1]
     """
     eps = 1e-9
     Float = max(float_m, eps)
-    MarketCap = max(mc_m, eps)
-    SI = max(si_pct, 0.0)
-    ATR = max(atr_usd, 0.0)
-    RVOL = max(rvol, 0.0)
-    PM = max(pm_vol_m, eps)
-    FloatRotation = pm_vol_m / max(float_m, eps)
-
-    lin = (
-        4.135
-        + 0.199 * math.log(Float)
-        + 0.037 * math.log(MarketCap)
-        + 0.428 * math.log(SI + 1.0)
-        - 1.102 * math.log(ATR + 1.0)
-        - 0.065 * math.log(RVOL + 1.0)
-        + 0.402 * math.log(FloatRotation + 1.0)
-        + 0.074 * float(catalyst)
-        - 0.019 * math.log(PM)
-    )
-    return float(math.exp(lin))  # millions of shares
+    MCap  = max(mc_m,   eps)
+    SI    = max(si_pct, 0.0)
+    ATR   = max(atr_usd,0.0)
+    PM    = max(pm_vol_m, eps)
+    FR = PM / Float
+    ln_y = (5.597780
+            - 0.015481 * math.log(MCap)
+            + 1.007036 * math.log(SI + 1.0)
+            - 1.267843 * math.log(ATR + 1.0)
+            + 0.114066 * math.log(1.0 + FR)
+            + 0.074 * float(catalyst))
+    return float(math.exp(ln_y))
 
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 with tab_add:
     st.subheader("Numeric Context")
-
     with st.form("add_form", clear_on_submit=True):
         c_top = st.columns([1.2, 1.2, 1.0])
-
-        # Basics
         with c_top[0]:
             ticker   = st.text_input("Ticker", "").strip().upper()
             rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.1)
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=1.0)
-
-        # Float / SI / PM volume
         with c_top[1]:
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.5)
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.1)
             pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
-
-        # Price, Cap & Modifiers
         with c_top[2]:
             mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
             dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
-
         st.markdown("---")
         st.subheader("Qualitative Context")
-
         q_cols = st.columns(3)
         qual_points = {}
         for i, crit in enumerate(QUAL_CRITERIA):
             with q_cols[i % 3]:
                 choice = st.radio(
-                    crit["question"],
-                    options=list(enumerate(crit["options"], 1)),
-                    format_func=lambda x: x[1],
-                    key=f"qual_{crit['name']}",
+                    crit["question"], options=list(enumerate(crit["options"], 1)),
+                    format_func=lambda x: x[1], key=f"qual_{crit['name']}",
                     help=crit.get("help", None)
                 )
-                qual_points[crit["name"]] = choice[0]  # 1..7
-
+                qual_points[crit["name"]] = choice[0]
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
-    # Scoring after submit
     if submitted and ticker:
-        # Numeric points
+        # Numeric score (RVOL stays here only)
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
         p_fr    = pts_fr(pm_vol_m, float_m)
         p_float = pts_float(float_m)
-
-        num_0_7 = (w_rvol*p_rvol) + (w_atr*p_atr) + (w_si*p_si) + (w_fr*p_fr) + (w_float*p_float)
+        num_0_7 = (w_rvol*p_rvol)+(w_atr*p_atr)+(w_si*p_si)+(w_fr*p_fr)+(w_float*p_float)
         num_pct = (num_0_7/7.0)*100.0
-
-        # Qualitative points
+        # Qualitative
         qual_0_7 = sum(q_weights[c["name"]] * qual_points[c["name"]] for c in QUAL_CRITERIA)
         qual_pct = (qual_0_7/7.0)*100.0
-
-        # Combine with flexible blend
         combo_pct = blend_numeric*num_pct + blend_qual*qual_pct
-
-        # Keep your original linear modifiers
         final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
         final_score = max(0.0, min(100.0, final_score))
-
-        # === Model prediction (no manual target) ===
-        pred_day_vol_m = predict_day_volume_m(
-            float_m=float_m, mc_m=mc_m, si_pct=si_pct,
-            atr_usd=atr_usd, rvol=rvol, pm_vol_m=pm_vol_m,
-            catalyst=catalyst_points
-        )
-
-        # Diagnostics (based on prediction)
-        pm_pred_pct  = 100.0 * pm_vol_m / pred_day_vol_m if pred_day_vol_m > 0 else 0.0
-        pm_float_pct = 100.0 * pm_vol_m / float_m        if float_m        > 0 else 0.0
+        # Prediction
+        pred_day_vol_m = predict_day_volume_m(float_m, mc_m, si_pct, atr_usd, rvol, pm_vol_m, catalyst_points)
+        pm_pred_pct  = 100.0*pm_vol_m/pred_day_vol_m if pred_day_vol_m>0 else 0.0
+        pm_float_pct = 100.0*pm_vol_m/float_m if float_m>0 else 0.0
         pm_dollar_vol_m = pm_vol_m * pm_vwap
-        pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
-
-        # Save row
-        row = {
-            "Ticker": ticker,
-            "Odds": odds_label(final_score),
-            "Level": grade(final_score),
-            "OddsScore": final_score,
-            "Numeric_%": round(num_pct, 2),
-            "Qual_%": round(qual_pct, 2),
-            "FinalScore": final_score,
-            "Pred_DayVol_M": round(pred_day_vol_m, 2),
-            "PM_Pred_%": round(pm_pred_pct, 1),
-            "PM_Float_%": round(pm_float_pct, 1),
-            "PM_$Vol_M": round(pm_dollar_vol_m, 2),
-            "PM$ / MC_%": round(pm_dollar_vs_mc_pct, 1),
-        }
-        st.session_state.rows.append(row)
-        st.session_state.last = row
-
-        st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
+        pm_dollar_vs_mc_pct = 100.0*pm_dollar_vol_m/mc_m if mc_m>0 else 0.0
+        row = {"Ticker": ticker,"Odds": odds_label(final_score),"Level": grade(final_score),
+               "OddsScore": final_score,"Numeric_%": round(num_pct,2),"Qual_%": round(qual_pct,2),
+               "FinalScore": final_score,"Pred_DayVol_M": round(pred_day_vol_m,2),
+               "PM_Pred_%": round(pm_pred_pct,1),"PM_Float_%": round(pm_float_pct,1),
+               "PM_$Vol_M": round(pm_dollar_vol_m,2),"PM$ / MC_%": round(pm_dollar_vs_mc_pct,1)}
+        st.session_state.rows.append(row); st.session_state.last=row
+        st.session_state.flash=f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
         do_rerun()
 
-    # Preview card
     if st.session_state.last:
         st.markdown("---")
         l = st.session_state.last
-        cA, cB, cC, cD = st.columns(4)
+        cA,cB,cC,cD = st.columns(4)
         cA.metric("Last Ticker", l["Ticker"])
         cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
         cC.metric("Qual Block", f'{l["Qual_%"]}%')
         cD.metric("Final Score", f'{l["FinalScore"]} ({l["Level"]})')
-
-        d1, d2, d3, d4 = st.columns(4)
+        d1,d2,d3,d4 = st.columns(4)
         d1.metric("Predicted Day Vol (M)", f'{l["Pred_DayVol_M"]}')
-        d1.caption("Model: EXP(…); units in millions of shares.")
+        d1.caption("Exponential model: ln(Y) = … using PM/Float rotation.")
         d2.metric("PM % of Predicted", f'{l["PM_Pred_%"]}%')
-        d2.caption("Premarket volume ÷ predicted day volume × 100.")
         d3.metric("PM Float %", f'{l["PM_Float_%"]}%')
-        d3.caption("Premarket volume ÷ float × 100.")
         d4.metric("PM $Vol / MC", f'{l["PM$ / MC_%"]}%')
-        d4.caption("PM dollar volume ÷ market cap × 100.")
 
 with tab_rank:
     st.subheader("Current Ranking")
-
-    # --- CSV import (columns auto-normalized) ---
     up = st.file_uploader("Import CSV (optional)", type=["csv"], accept_multiple_files=False, label_visibility="collapsed")
     if up is not None:
         try:
             df_in = pd.read_csv(up)
-            required = [
-                "Ticker","Odds","Level",
-                "Numeric_%","Qual_%","FinalScore",
-                "Pred_DayVol_M","PM_Pred_%","PM_Float_%",
-                "PM_$Vol_M","PM$ / MC_%"
-            ]
+            required = ["Ticker","Odds","Level","Numeric_%","Qual_%","FinalScore",
+                        "Pred_DayVol_M","PM_Pred_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"]
             for c in required:
                 if c not in df_in.columns:
                     df_in[c] = "" if c in ("Ticker","Odds","Level") else 0.0
             df_in = df_in[required]
             st.session_state.rows = df_in.to_dict(orient="records")
             st.success("Imported CSV into ranking.")
-        except Exception as e:
-            st.error(f"Failed to import CSV: {e}")
+        except Exception as e: st.error(f"Failed to import CSV: {e}")
 
     if st.session_state.rows:
-        df = pd.DataFrame(st.session_state.rows)
-
-        # Guard: duplicate column protection & sort preference
-        df = df.loc[:, ~df.columns.duplicated(keep="first")]
-
-        # Sort by OddsScore/FinalScore if present
-        if "OddsScore" in df.columns:
-            df = df.sort_values("OddsScore", ascending=False)
-        elif "FinalScore" in df.columns:
-            df = df.sort_values("FinalScore", ascending=False)
-        df = df.reset_index(drop=True)
-
-        cols_to_show = [
-            "Ticker","Odds","Level",
-            "Numeric_%","Qual_%","FinalScore",
-            "Pred_DayVol_M","PM_Pred_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"
-        ]
-
-        # --- Normalize to avoid KeyError for legacy rows ---
+        df = pd.DataFrame(st.session_state.rows).loc[:, ~pd.DataFrame(st.session_state.rows).columns.duplicated()]
+        if "OddsScore" in df.columns: df = df.sort_values("OddsScore", ascending=False)
+        elif "FinalScore" in df.columns: df = df.sort_values("FinalScore", ascending=False)
+        df=df.reset_index(drop=True)
+        cols_to_show=["Ticker","Odds","Level","Numeric_%","Qual_%","FinalScore",
+                      "Pred_DayVol_M","PM_Pred_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"]
         for c in cols_to_show:
-            if c not in df.columns:
-                df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
-        df = df[cols_to_show]
-
-        # ---- Editable table ----
-        st.caption("Edit cells inline, then click **Save edits**. Use quick delete buttons below for single rows.")
-        edited_df = st.data_editor(
-            df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Ticker": st.column_config.TextColumn("Ticker"),
-                "Odds": st.column_config.TextColumn("Odds"),
-                "Level": st.column_config.TextColumn("Level"),
-                "Numeric_%": st.column_config.NumberColumn("Numeric_%", format="%.2f"),
-                "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
-                "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
-                "Pred_DayVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
-                "PM_Pred_%": st.column_config.NumberColumn("PM % of Predicted", format="%.1f"),
-                "PM_Float_%": st.column_config.NumberColumn("PM Float %", format="%.1f"),
-                "PM_$Vol_M": st.column_config.NumberColumn("PM $Vol (M)", format="%.2f"),
-                "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
-            },
-            key="editor_ranking"
-        )
-
-        cbtns = st.columns([0.22, 0.22, 0.22, 0.34])
-        with cbtns[0]:
-            if st.button("Save edits", use_container_width=True):
-                st.session_state.rows = edited_df.to_dict(orient="records")
-                st.success("Edits saved.")
-        with cbtns[1]:
-            if st.button("Clear Ranking", type="secondary", use_container_width=True):
-                st.session_state.rows = []
-                st.session_state.last = None
-                do_rerun()
-
-        # ---- Quick delete buttons ----
-        st.markdown("#### Delete rows")
-        del_cols = st.columns(4)
-        show_delete = edited_df.head(12).reset_index(drop=True)
-        for i, r in show_delete.iterrows():
-            with del_cols[i % 4]:
-                label = r.get("Ticker", f"Row {i+1}")
-                if st.button(f"🗑️ {label}", key=f"del_{i}", use_container_width=True):
-                    keep = edited_df.drop(index=i).reset_index(drop=True)
-                    st.session_state.rows = keep.to_dict(orient="records")
-                    do_rerun()
-
-        # ---- Downloads & Markdown ----
-        st.download_button(
-            "Download CSV",
-            edited_df.to_csv(index=False).encode("utf-8"),
-            "ranking.csv",
-            "text/csv",
-            use_container_width=True
-        )
-
+            if c not in df.columns: df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
+        df=df[cols_to_show]
+        st.caption("Edit cells inline, then click **Save edits**.")
+        edited_df=st.data_editor(df,use_container_width=True,hide_index=True,key="editor_ranking")
+        if st.button("Save edits"): st.session_state.rows=edited_df.to_dict(orient="records"); st.success("Edits saved.")
+        st.download_button("Download CSV",edited_df.to_csv(index=False).encode("utf-8"),"ranking.csv","text/csv")
         st.markdown("### 📋 Ranking (Markdown view)")
         st.code(df_to_markdown_table(edited_df, cols_to_show), language="markdown")
-
-    else:
-        st.info("No rows yet. Add a stock in the **Add Stock** tab.")
+    else: st.info("No rows yet. Add a stock in the **Add Stock** tab.")
