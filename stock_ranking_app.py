@@ -176,32 +176,38 @@ def grade(score_pct: float) -> str:
             "B"   if score_pct >= 60 else
             "C"   if score_pct >= 45 else "D")
 
-# ---------- Prediction model ----------
-def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float, pm_vol_m: float, float_m: float, catalyst_points: float) -> float:
+# ---------- Prediction model (FIXED SIGNS & UNITS: all in millions, SI in %, ATR in $) ----------
+def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float,
+                         pm_vol_m: float, float_m: float, catalyst_points: float) -> float:
     """
     Predicted day volume in Millions of shares (Y).
 
-    ln(Y) = 5.597780
-            + 0.015481*ln(MCap)
-            + 1.007036*ln(SI+1)
-            + 1.267843*ln(ATR+1)
-            + 0.114066*ln(1 + PM/Float)
-            + 0.074*Catalyst
+    Correct model:
+    ln(Y) =
+       5.597780
+     - 0.015481*ln(MCap)
+     + 1.007036*ln(SI+1)
+     - 1.267843*ln(ATR+1)
+     + 0.114066*ln(1 + PM/Float)
+     + 0.074*Catalyst
     """
-    mc = max(mc_m, 1e-9)
-    si = max(si_pct, 0.0)
-    atr = max(atr_usd, 0.0)
-    fr = (pm_vol_m / max(float_m, 1e-9)) if float_m > 0 else 0.0
+    eps = 1e-9
+    mc   = max(mc_m, eps)              # in $ millions
+    si   = max(si_pct, 0.0)            # percent
+    atr  = max(atr_usd, 0.0)           # $
+    flt  = max(float_m, eps)           # in shares millions
+    pm   = max(pm_vol_m, 0.0)          # in shares millions
+    fr   = pm / flt                    # rotation ×
 
     lnY = (
         5.597780
-        + 0.015481 * math.log(mc)
+        - 0.015481 * math.log(mc)
         + 1.007036 * math.log(si + 1.0)
-        + 1.267843 * math.log(atr + 1.0)
+        - 1.267843 * math.log(atr + 1.0)
         + 0.114066 * math.log(1.0 + fr)
-        + 0.074 * catalyst_points
+        + 0.074 * float(catalyst_points)
     )
-    return float(math.exp(lnY))
+    return float(math.exp(lnY))  # millions of shares
 
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
