@@ -219,7 +219,7 @@ def ln_terms_for_display(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst):
     flt = max(float_m, eps)
     fr  = pm / flt
 
-    t0 = 5.597780
+    t0 = 5.307
     t1 = -0.015481 * math.log(mc)
     t2 =  1.007036 * math.log1p(si_fr)
     t3 = -1.267843 * math.log1p(atr)
