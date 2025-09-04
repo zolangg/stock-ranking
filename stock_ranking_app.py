@@ -338,7 +338,9 @@ if st.session_state.last:
     cD.metric("Final Score", f'{fmt_num(l.get("FinalScore"))} ({l.get("Level","—")})')
 
     d1, d2, d3, d4 = st.columns(4)
-    d1.metric("PM Float Rotation", f'{l["PM_FloatRot"]}×')
+    rot_val = l.get("PM_FloatRot", None)
+    rot_txt = f"{rot_val:.3f}×" if isinstance(rot_val, (int, float)) else "—"
+    d1.metric("PM Float Rotation", rot_txt)
     d1.caption("Premarket volume ÷ float (unitless).")
     
     d2.metric("PM $Vol / MC", f'{l["PM$ / MC_%"]}%')
