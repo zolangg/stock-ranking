@@ -189,6 +189,61 @@ def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float,
     )
     return float(math.exp(lnY))             # millions of shares
 
+# ---------- Sanity check helpers ----------
+def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
+    flags = []
+    # Units / ranges that often go wrong
+    if mc_m > 50000: flags.append("⚠️ Market Cap looks > $50B — is it in *millions*?")
+    if float_m > 10000: flags.append("⚠️ Float > 10,000M — is it in *millions*?")
+    if pm_vol_m > 1000: flags.append("⚠️ PM volume > 1,000M — is it in *millions*?")
+    if si_pct > 100: flags.append("⚠️ Short interest > 100% — is SI entered as percent (e.g., 25.0)?")
+    if atr_usd > 20: flags.append("⚠️ ATR > $20 — double-check units.")
+    fr = (pm_vol_m / max(float_m, 1e-12)) if float_m > 0 else 0.0
+    if fr > 2.0: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× seems high (check PM/Float units).")
+    return flags
+
+def ln_terms_for_display(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst):
+    eps = 1e-12
+    mc = max(mc_m, eps)
+    si_fr = max(si_pct, 0.0) / 100.0
+    atr = max(atr_usd, 0.0)
+    pm  = max(pm_vol_m, 0.0)
+    flt = max(float_m, eps)
+    fr  = pm / flt
+
+    t0 = 5.597780
+    t1 = -0.015481 * math.log(mc)
+    t2 =  1.007036 * math.log1p(si_fr)
+    t3 = -1.267843 * math.log1p(atr)
+    t4 =  0.114066 * math.log1p(fr)
+    t5 =  0.074    * float(catalyst)
+    lnY = t0 + t1 + t2 + t3 + t4 + t5
+    Y   = math.exp(lnY)
+
+    return {
+        "inputs_expected_units": {
+            "MCap (millions $)": mc_m,
+            "SI (%)": si_pct,
+            "ATR ($)": atr_usd,
+            "PM Volume (millions shares)": pm_vol_m,
+            "Float (millions shares)": float_m,
+            "Catalyst (-1..+1)": catalyst,
+        },
+        "derived": {
+            "FR = PM/Float (×)": fr
+        },
+        "ln_components": {
+            "base": t0,
+            "−0.015481 ln(MCap)": t1,
+            "+1.007036 ln(1+SI_frac)": t2,
+            "−1.267843 ln(1+ATR)": t3,
+            "+0.114066 ln(1+FR)": t4,
+            "+0.074 Catalyst": t5,
+            "lnY total": lnY
+        },
+        "Predicted Y (millions shares)": Y
+    }
+
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
@@ -281,6 +336,20 @@ with tab_add:
             "PM_FloatRot_x": round(pm_float_rot_x, 3),
             # Keep $Vol/MC (you said it's good)
             "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
+      
+            # ... your existing fields ...
+            "PredVol_M": round(pred_vol_m, 2),
+            "PM_%_of_Pred": round(pm_pct_of_pred, 1),
+            "PM_FloatRot_x": round(pm_float_rot_x, 3),
+            "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
+        
+            # store raw inputs for debug / sanity
+            "_MCap_M": mc_m,
+            "_SI_%": si_pct,
+            "_ATR_$": atr_usd,
+            "_PM_M": pm_vol_m,
+            "_Float_M": float_m,
+            "_Catalyst": float(catalyst_points),
         }
 
         st.session_state.rows.append(row)
@@ -307,6 +376,27 @@ with tab_add:
         d3.caption("Exponential model (PM/Float, SI, ATR, MCap, Catalyst).")
         d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
         d4.caption("PM volume ÷ predicted day volume × 100.")
+
+    # --- Sanity sniff test ---
+    with st.expander("🔎 Sanity sniff test (units & term contributions)"):
+        mc_m_dbg  = l.get("_MCap_M", 0.0)
+        si_pct_dbg= l.get("_SI_%", 0.0)
+        atr_dbg   = l.get("_ATR_$", 0.0)
+        pm_m_dbg  = l.get("_PM_M", 0.0)
+        flt_m_dbg = l.get("_Float_M", 0.0)
+        cat_dbg   = l.get("_Catalyst", 0.0)
+
+        # Flags
+        flags = sanity_flags(mc_m_dbg, si_pct_dbg, atr_dbg, pm_m_dbg, flt_m_dbg)
+        if flags:
+            for f in flags:
+                st.warning(f)
+        else:
+            st.success("Inputs look plausible at a glance.")
+
+        # Term-by-term breakdown
+        details = ln_terms_for_display(mc_m_dbg, si_pct_dbg, atr_dbg, pm_m_dbg, flt_m_dbg, cat_dbg)
+        st.write(details)
 
 # ---------- Ranking tab ----------
 with tab_rank:
