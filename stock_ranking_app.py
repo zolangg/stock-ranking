@@ -41,7 +41,7 @@ st.title("Premarket Stock Ranking")
 if "rows" not in st.session_state:
     st.session_state.rows = []
 if "last" not in st.session_state:
-    st.session_state.last = None
+    st.session_state.last = {}
 if "flash" not in st.session_state:
     st.session_state.flash = None
 
