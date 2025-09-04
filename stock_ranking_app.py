@@ -159,36 +159,32 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # ---------- Prediction model (fixed; SI as fraction; FR = PM/Float) ----------
-def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float,
-                         pm_vol_m: float, float_m: float, catalyst_points: float) -> float:
+def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float, pm_vol_m: float, float_m: float, catalyst_points: float) -> float:
     """
-    ln(Y) =
-       5.597780
-     - 0.015481*ln(MCap_M)
-     + 1.007036*ln(1 + SI_%/100)
-     - 1.267843*ln(1 + ATR_$)
-     + 0.114066*ln(1 + PM_M/Float_M)
-     + 0.074*Catalyst
-    All *_M in millions; SI in %, ATR in $; returns Y in millions of shares.
+    Predicted day volume in Millions of shares (Y).
+
+    ln(Y) = 5.307
+            - 0.015481*ln(MCap)
+            + 1.007036*ln(SI+1)
+            - 1.267843*ln(ATR+1)
+            + 0.114066*ln(1 + PM/Float)
+            + 0.074*Catalyst
     """
-    eps = 1e-12
-    mc_m   = max(mc_m,  eps)                # $ millions
-    si_fr  = max(si_pct, 0.0) / 100.0       # fraction
-    atr    = max(atr_usd, 0.0)              # $
-    pm_m   = max(pm_vol_m, 0.0)             # shares (millions)
-    float_m = max(float_m, eps)             # shares (millions)
-    fr     = pm_m / float_m                 # rotation ×
+    mc = max(mc_m, 1e-9)
+    si = max(si_pct, 0.0)
+    atr = max(atr_usd, 0.0)
+    fr = (pm_vol_m / max(float_m, 1e-9)) if float_m > 0 else 0.0
 
     lnY = (
-        5.597780
-        - 0.015481 * math.log(mc_m)
-        + 1.007036 * math.log1p(si_fr)
-        - 1.267843 * math.log1p(atr)
-        + 0.114066 * math.log1p(fr)
-        + 0.074    * float(catalyst_points)
+        5.307
+        - 0.015481 * math.log(mc)
+        + 1.007036 * math.log(si + 1.0)
+        - 1.267843 * math.log(atr + 1.0)
+        + 0.114066 * math.log(1.0 + fr)
+        + 0.074 * catalyst_points
     )
-    return float(math.exp(lnY))             # millions of shares
-
+    return float(math.exp(lnY))
+    
 # ---------- Sanity check helpers ----------
 def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
     flags = []
