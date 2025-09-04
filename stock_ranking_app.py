@@ -107,6 +107,11 @@ st.sidebar.header("Modifiers")
 news_weight     = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight")
 dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05, key="dil_weight")
 
+# --- Confidence (log-space) ---
+st.sidebar.header("Prediction Uncertainty")
+sigma_ln = st.sidebar.slider("Log-space σ (residual std dev)", 0.10, 1.50, 0.60, 0.01,
+                             help="Estimated std dev of residuals in ln(volume). 0.60 ≈ typical for your sheet.")
+
 # Normalize blocks separately
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
@@ -252,6 +257,17 @@ def ln_terms_for_display(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst):
         "Predicted Y (millions shares)": Y
     }
 
+def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
+    """
+    Given a point prediction in *millions* and log-space std dev (sigma_ln),
+    return (low, high) in millions for a two-sided CI using multiplier exp(±z·σ).
+    """
+    if pred_m <= 0:
+        return 0.0, 0.0
+    low  = pred_m * math.exp(-z * sigma_ln)
+    high = pred_m * math.exp( z * sigma_ln)
+    return low, high
+
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
@@ -302,6 +318,10 @@ with tab_add:
     if submitted and ticker:
         # === Prediction ===
         pred_vol_m = predict_day_volume_m(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst_points)
+
+        # Confidence bands (millions)
+        ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)    # ~68%
+        ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)   # ~95%
 
         # === Numeric points ===
         p_rvol  = pts_rvol(rvol)
@@ -358,6 +378,12 @@ with tab_add:
             "_PM_M": pm_vol_m,
             "_Float_M": float_m,
             "_Catalyst": float(catalyst_points),
+
+            "PredVol_M": round(pred_vol_m, 2),
+            "PredVol_CI68_L": round(ci68_l, 2),
+            "PredVol_CI68_U": round(ci68_u, 2),
+            "PredVol_CI95_L": round(ci95_l, 2),
+            "PredVol_CI95_U": round(ci95_u, 2),
         }
 
         st.session_state.rows.append(row)
@@ -381,7 +407,10 @@ with tab_add:
         d2.metric("PM $Vol / MC",      f"{l.get('PM$ / MC_%',0):.1f}%")
         d2.caption("PM dollar volume ÷ market cap × 100.")
         d3.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
-        d3.caption("Exponential model (PM/Float, SI, ATR, MCap, Catalyst).")
+        d3.caption(
+            f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
+            f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
+        )
         d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
         d4.caption("PM volume ÷ predicted day volume × 100.")
 
@@ -421,7 +450,7 @@ with tab_rank:
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
             "PM_FloatRot_x","PM$ / MC_%",
-            "PredVol_M","PM_%_of_Pred"
+            "PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM_%_of_Pred"
         ]
         for c in cols_to_show:
             if c not in df.columns:
@@ -442,6 +471,8 @@ with tab_rank:
                 "PM_FloatRot_x": st.column_config.NumberColumn("PM Float Rotation (×)", format="%.3f"),
                 "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
                 "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
+                "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
+                "PredVol_CI68_U": st.column_config.NumberColumn("Pred Vol CI68 High (M)", format="%.2f"),
                 "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
             }
         )
