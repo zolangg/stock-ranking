@@ -352,11 +352,6 @@ if st.session_state.last:
     d4.metric("PM % of Predicted", f'{l["PM_Pred_%"]}%')
     d4.caption("Premarket volume ÷ predicted day volume × 100.")
 
-    st.caption("—")
-    p1, p2 = st.columns(2)
-    p1.metric("Predicted Day Vol (M)", fmt_num(l.get("Pred_DayVol_M")))
-    p2.metric("PM % of Predicted",     fmt_pct(l.get("PM_Pred_%")))
-
 with tab_rank:
     st.subheader("Current Ranking")
     if st.session_state.rows:
