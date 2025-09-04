@@ -339,7 +339,7 @@ with tab_add:
 
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("Predicted Day Vol (M)", f'{l["Pred_DayVol_M"]}')
-        d1.caption("Model: EXP(…); units in millions of shares.")
+        d1.caption("Exponential model to predict volume.")
         d2.metric("PM % of Predicted", f'{l["PM_Pred_%"]}%')
         d2.caption("Premarket volume ÷ predicted day volume × 100.")
         d3.metric("PM Float %", f'{l["PM_Float_%"]}%')
