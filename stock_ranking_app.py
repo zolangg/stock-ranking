@@ -260,46 +260,46 @@ with tab_add:
         pred_vol_m = predict_day_volume_m(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst_points)
 
     with st.expander("🔎 Prediction debug (check units)"):
-    eps = 1e-12
-    mc_m_dbg  = max(mc_m, eps)
-    si_fr_dbg = max(si_pct, 0.0)/100.0
-    atr_dbg   = max(atr_usd, 0.0)
-    pm_m_dbg  = max(pm_vol_m, 0.0)
-    flt_m_dbg = max(float_m, eps)
-    fr_dbg    = pm_m_dbg / flt_m_dbg
-
-    t0 = 5.597780
-    t1 = -0.015481 * math.log(mc_m_dbg)
-    t2 =  1.007036 * math.log1p(si_fr_dbg)
-    t3 = -1.267843 * math.log1p(atr_dbg)
-    t4 =  0.114066 * math.log1p(fr_dbg)
-    t5 =  0.074    * float(catalyst_points)
-    lnY = t0 + t1 + t2 + t3 + t4 + t5
-    Y   = math.exp(lnY)
-
-    st.write({
-        "INPUTS (expected units)": {
-            "MCap (millions $)": mc_m,
-            "SI (%)": si_pct,
-            "ATR ($)": atr_usd,
-            "PM Volume (millions shares)": pm_vol_m,
-            "Float (millions shares)": float_m,
-            "Catalyst (-1..+1)": catalyst_points,
-        },
-        "Derived": {
-            "FR = PM/Float (×)": fr_dbg
-        },
-        "ln-components": {
-            "base": t0,
-            "-0.015481 ln(MCap)": t1,
-            "+1.007036 ln(1+SI_frac)": t2,
-            "-1.267843 ln(1+ATR)": t3,
-            "+0.114066 ln(1+FR)": t4,
-            "+0.074 Catalyst": t5,
-            "lnY total": lnY
-        },
-        "Predicted Y (millions shares)": Y
-    })
+        eps = 1e-12
+        mc_m_dbg  = max(mc_m, eps)
+        si_fr_dbg = max(si_pct, 0.0)/100.0
+        atr_dbg   = max(atr_usd, 0.0)
+        pm_m_dbg  = max(pm_vol_m, 0.0)
+        flt_m_dbg = max(float_m, eps)
+        fr_dbg    = pm_m_dbg / flt_m_dbg
+    
+        t0 = 5.597780
+        t1 = -0.015481 * math.log(mc_m_dbg)
+        t2 =  1.007036 * math.log1p(si_fr_dbg)
+        t3 = -1.267843 * math.log1p(atr_dbg)
+        t4 =  0.114066 * math.log1p(fr_dbg)
+        t5 =  0.074    * float(catalyst_points)
+        lnY = t0 + t1 + t2 + t3 + t4 + t5
+        Y   = math.exp(lnY)
+    
+        st.write({
+            "INPUTS (expected units)": {
+                "MCap (millions $)": mc_m,
+                "SI (%)": si_pct,
+                "ATR ($)": atr_usd,
+                "PM Volume (millions shares)": pm_vol_m,
+                "Float (millions shares)": float_m,
+                "Catalyst (-1..+1)": catalyst_points,
+            },
+            "Derived": {
+                "FR = PM/Float (×)": fr_dbg
+            },
+            "ln-components": {
+                "base": t0,
+                "-0.015481 ln(MCap)": t1,
+                "+1.007036 ln(1+SI_frac)": t2,
+                "-1.267843 ln(1+ATR)": t3,
+                "+0.114066 ln(1+FR)": t4,
+                "+0.074 Catalyst": t5,
+                "lnY total": lnY
+            },
+            "Predicted Y (millions shares)": Y
+        })
 
         # Numeric points
         p_rvol  = pts_rvol(rvol)
