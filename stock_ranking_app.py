@@ -179,48 +179,44 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # ---------- Model: predicted daily volume (M) ----------
+# Refit WITH ATR and PM Float (AK): FR_PM = PM / PM_Float.
+# Catalyst applied in classic linear way: + 0.074*Catalyst (no k manipulator).
 def predict_day_volume_m(float_m: float, mc_m: float, si_pct: float,
                          atr_usd: float, rvol: float, pm_vol_m: float,
-                         catalyst: float) -> float:
+                         catalyst: float, pm_float_m: float = None) -> float:
     """
-    EXP(
-       4.135
-     + 0.199*LN(Float)
-     + 0.037*LN(MarketCap)
-     + 0.428*LN(SI+1)
-     - 1.102*LN(ATR+1)
-     - 0.065*LN(RVOL+1)
-     + 0.402*LN(FloatRotation+1)
+    ln(Y) =
+       5.848386
+     - 0.115956*ln(Float)
+     + 0.067580*ln(MarketCap)
+     + 0.264010*ln(SI+1)
+     - 1.394843*ln(ATR+1)
+     - 0.034064*ln(1 + PM/PM_Float)
      + 0.074*Catalyst
-     - 0.019*LN(PM)
-    )
-    Inputs:
-      - Float, MarketCap in millions
-      - SI as percent
-      - ATR in $
-      - RVOL unitless
-      - PM in millions (premarket volume)
-      - Catalyst in [-1, 1]
+
+    Units:
+      Float, MarketCap, PM, PM_Float in millions; SI in percent; ATR in dollars.
+      RVOL accepted for compatibility but not used in this refit.
+      Catalyst in [-1, +1], linear bump.
     """
     eps = 1e-9
-    Float = max(float_m, eps)
-    MarketCap = max(mc_m, eps)
-    SI = max(si_pct, 0.0)
-    ATR = max(atr_usd, 0.0)
-    RVOL = max(rvol, 0.0)
-    PM = max(pm_vol_m, eps)
-    FloatRotation = pm_vol_m / max(float_m, eps)
+    Float     = max(float_m, eps)
+    MarketCap = max(mc_m,   eps)
+    SI        = max(si_pct, 0.0)
+    ATR       = max(atr_usd,0.0)
+    PM        = max(pm_vol_m, eps)
+    PM_Float  = max(pm_float_m or 0.0, eps)
+
+    FR_PM = PM / PM_Float
 
     lin = (
-        4.135
-        + 0.199 * math.log(Float)
-        + 0.037 * math.log(MarketCap)
-        + 0.428 * math.log(SI + 1.0)
-        - 1.102 * math.log(ATR + 1.0)
-        - 0.065 * math.log(RVOL + 1.0)
-        + 0.402 * math.log(FloatRotation + 1.0)
-        + 0.074 * float(catalyst)
-        - 0.019 * math.log(PM)
+        5.848385538946521
+        - 0.1159560779176112 * math.log(Float)
+        + 0.0675798113174062 * math.log(MarketCap)
+        + 0.2640104140937609 * math.log(SI + 1.0)
+        - 1.3948434913776924 * math.log(ATR + 1.0)
+        - 0.0340638899526851 * math.log(1.0 + FR_PM)
+        + 0.074 * float(catalyst)  # classic linear catalyst effect
     )
     return float(math.exp(lin))  # millions of shares
 
@@ -231,7 +227,7 @@ with tab_add:
     st.subheader("Numeric Context")
 
     with st.form("add_form", clear_on_submit=True):
-        c_top = st.columns([1.2, 1.2, 1.0])
+        c_top = st.columns([1.2, 1.2, 1.2])
 
         # Basics
         with c_top[0]:
@@ -246,9 +242,10 @@ with tab_add:
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.1)
             pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
 
-        # Price, Cap & Modifiers
+        # Price, Cap & Modifiers (+ PM Float)
         with c_top[2]:
-            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
+            mc_m       = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
+            pm_float_m = st.number_input("PM Float (Millions)", min_value=0.0, value=0.0, step=0.1)
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
             dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
 
@@ -297,7 +294,7 @@ with tab_add:
         pred_day_vol_m = predict_day_volume_m(
             float_m=float_m, mc_m=mc_m, si_pct=si_pct,
             atr_usd=atr_usd, rvol=rvol, pm_vol_m=pm_vol_m,
-            catalyst=catalyst_points
+            catalyst=catalyst_points, pm_float_m=pm_float_m
         )
 
         # Diagnostics (based on prediction)
@@ -339,7 +336,7 @@ with tab_add:
 
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("Predicted Day Vol (M)", f'{l["Pred_DayVol_M"]}')
-        d1.caption("Model: EXP(…); units in millions of shares.")
+        d1.caption("Exponential model to predict volume.")
         d2.metric("PM % of Predicted", f'{l["PM_Pred_%"]}%')
         d2.caption("Premarket volume ÷ predicted day volume × 100.")
         d3.metric("PM Float %", f'{l["PM_Float_%"]}%')
