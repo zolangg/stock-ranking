@@ -176,35 +176,36 @@ def grade(score_pct: float) -> str:
             "B"   if score_pct >= 60 else
             "C"   if score_pct >= 45 else "D")
 
-# ---------- Prediction model (fixed SI scaling) ----------
+# Strict model: expects MCap, Float, PM all in *millions*; SI in percent; ATR in dollars; Catalyst in [-1,1]
 def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float,
                          pm_vol_m: float, float_m: float, catalyst_points: float) -> float:
     """
     ln(Y) =
        5.597780
-     - 0.015481*ln(MCap)
-     + 1.007036*ln(1 + SI_frac)      # SI_frac = SI_% / 100
-     - 1.267843*ln(ATR+1)
-     + 0.114066*ln(1 + PM/Float)
+     - 0.015481*ln(MCap_M)
+     + 1.007036*ln(1 + SI_%/100)
+     - 1.267843*ln(1 + ATR_$)
+     + 0.114066*ln(1 + PM_M / Float_M)
      + 0.074*Catalyst
+    All *_M are in millions of shares or $ millions.
     """
-    eps = 1e-9
-    mc  = max(mc_m, eps)                   # millions $
-    si_frac = max(si_pct, 0.0) / 100.0     # convert percent -> fraction
-    atr = max(atr_usd, 0.0)                # $
-    flt = max(float_m, eps)                # millions shares
-    pm  = max(pm_vol_m, 0.0)               # millions shares
-    fr  = pm / flt                         # rotation ×
+    eps = 1e-12
+    mc_m  = max(mc_m,  eps)                 # $ millions
+    si_fr = max(si_pct, 0.0) / 100.0        # fraction
+    atr   = max(atr_usd, 0.0)               # $
+    pm_m  = max(pm_vol_m, 0.0)              # shares (millions)
+    flt_m = max(float_m,  eps)              # shares (millions)
+    fr    = pm_m / flt_m                    # rotation ×
 
     lnY = (
         5.597780
-        - 0.015481 * math.log(mc)
-        + 1.007036 * math.log(1.0 + si_frac)
-        - 1.267843 * math.log(1.0 + atr)
-        + 0.114066 * math.log(1.0 + fr)
+        - 0.015481 * math.log(mc_m)
+        + 1.007036 * math.log1p(si_fr)      # ln(1+si)
+        - 1.267843 * math.log1p(atr)        # ln(1+atr)
+        + 0.114066 * math.log1p(fr)         # ln(1+fr)
         + 0.074 * float(catalyst_points)
     )
-    return float(math.exp(lnY))  # millions of shares
+    return float(math.exp(lnY))              # shares (millions)
 
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -257,6 +258,48 @@ with tab_add:
     if submitted and ticker:
         # Prediction replaces manual target volume
         pred_vol_m = predict_day_volume_m(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst_points)
+
+        with st.expander("🔎 Prediction debug (check units)"):
+    eps = 1e-12
+    mc_m_dbg  = max(mc_m, eps)
+    si_fr_dbg = max(si_pct, 0.0)/100.0
+    atr_dbg   = max(atr_usd, 0.0)
+    pm_m_dbg  = max(pm_vol_m, 0.0)
+    flt_m_dbg = max(float_m, eps)
+    fr_dbg    = pm_m_dbg / flt_m_dbg
+
+    t0 = 5.597780
+    t1 = -0.015481 * math.log(mc_m_dbg)
+    t2 =  1.007036 * math.log1p(si_fr_dbg)
+    t3 = -1.267843 * math.log1p(atr_dbg)
+    t4 =  0.114066 * math.log1p(fr_dbg)
+    t5 =  0.074    * float(catalyst_points)
+    lnY = t0 + t1 + t2 + t3 + t4 + t5
+    Y   = math.exp(lnY)
+
+    st.write({
+        "INPUTS (expected units)": {
+            "MCap (millions $)": mc_m,
+            "SI (%)": si_pct,
+            "ATR ($)": atr_usd,
+            "PM Volume (millions shares)": pm_vol_m,
+            "Float (millions shares)": float_m,
+            "Catalyst (-1..+1)": catalyst_points,
+        },
+        "Derived": {
+            "FR = PM/Float (×)": fr_dbg
+        },
+        "ln-components": {
+            "base": t0,
+            "-0.015481 ln(MCap)": t1,
+            "+1.007036 ln(1+SI_frac)": t2,
+            "-1.267843 ln(1+ATR)": t3,
+            "+0.114066 ln(1+FR)": t4,
+            "+0.074 Catalyst": t5,
+            "lnY total": lnY
+        },
+        "Predicted Y (millions shares)": Y
+    })
 
         # Numeric points
         p_rvol  = pts_rvol(rvol)
