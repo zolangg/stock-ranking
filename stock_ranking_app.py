@@ -2,20 +2,24 @@ import streamlit as st
 import pandas as pd
 import math
 
-# ---------- Markdown table helper ----------
+# ---------- Markdown table helper (no tabulate required) ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     keep_cols = [c for c in cols if c in df.columns]
     if not keep_cols:
         return "| (no data) |\n| --- |"
+
     sub = df.loc[:, keep_cols].copy().fillna("")
+
     header = "| " + " | ".join(keep_cols) + " |"
     sep    = "| " + " | ".join(["---"] * len(keep_cols)) + " |"
     lines = [header, sep]
+
     for _, row in sub.iterrows():
         cells = []
         for c in keep_cols:
             v = row[c]
             if isinstance(v, float):
+                # show integers without .00, otherwise 2 decimals
                 cells.append(f"{v:.2f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v))}")
             else:
                 cells.append(str(v))
@@ -110,12 +114,17 @@ for crit in QUAL_CRITERIA:
     )
 
 st.sidebar.header("Score Blend & Modifiers")
+# Flexible blend Numeric vs. Qualitative
 blend_numeric = st.sidebar.slider("Weight of Numeric Block (vs. Qualitative)", 0.0, 1.0, 0.50, 0.05)
 blend_qual    = 1.0 - blend_numeric
+
+news_weight = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight")
+dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05, key="dil_weight")
 
 # Normalize blocks separately
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
+
 qual_sum = max(1e-9, sum(q_weights.values()))
 for k in q_weights:
     q_weights[k] = q_weights[k] / qual_sum
@@ -140,7 +149,8 @@ def pts_si(x: float) -> int:
     return 7
 
 def pts_fr(pm_vol_m: float, float_m: float) -> int:
-    if float_m <= 0: return 1
+    if float_m <= 0:
+        return 1
     pct = 100.0 * pm_vol_m / float_m
     cuts = [(1,1),(3,2),(10,3),(25,4),(50,5),(100,6)]
     for th, p in cuts:
@@ -172,32 +182,34 @@ def grade(score_pct: float) -> str:
 def predict_day_volume_m(float_m: float, mc_m: float, si_pct: float,
                          atr_usd: float, rvol: float, pm_vol_m: float,
                          catalyst: float) -> float:
-    """Implements:
-    EXP( 4.135
-        + 0.199*LN(Float)
-        + 0.037*LN(MarketCap)
-        + 0.428*LN(SI+1)
-        - 1.102*LN(ATR+1)
-        - 0.065*LN(RVOL+1)
-        + 0.402*LN(FloatRotation+1)
-        + 0.074*Catalyst
-        - 0.019*LN(PM) )
-    All inputs:
-      - Float, MarketCap in *millions*
-      - SI as percent (e.g., 20 for 20%)
+    """
+    EXP(
+       4.135
+     + 0.199*LN(Float)
+     + 0.037*LN(MarketCap)
+     + 0.428*LN(SI+1)
+     - 1.102*LN(ATR+1)
+     - 0.065*LN(RVOL+1)
+     + 0.402*LN(FloatRotation+1)
+     + 0.074*Catalyst
+     - 0.019*LN(PM)
+    )
+    Inputs:
+      - Float, MarketCap in millions
+      - SI as percent
       - ATR in $
       - RVOL unitless
-      - PM = premarket volume in *millions*
+      - PM in millions (premarket volume)
       - Catalyst in [-1, 1]
     """
     eps = 1e-9
     Float = max(float_m, eps)
     MarketCap = max(mc_m, eps)
-    SI = max(si_pct, 0.0)               # percent
+    SI = max(si_pct, 0.0)
     ATR = max(atr_usd, 0.0)
     RVOL = max(rvol, 0.0)
     PM = max(pm_vol_m, eps)
-    FloatRotation = pm_vol_m / max(float_m, eps)  # unitless (times of float traded in PM)
+    FloatRotation = pm_vol_m / max(float_m, eps)
 
     lin = (
         4.135
@@ -210,7 +222,7 @@ def predict_day_volume_m(float_m: float, mc_m: float, si_pct: float,
         + 0.074 * float(catalyst)
         - 0.019 * math.log(PM)
     )
-    return float(math.exp(lin))  # returns millions of shares (predicted day volume)
+    return float(math.exp(lin))  # millions of shares
 
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -238,6 +250,7 @@ with tab_add:
         with c_top[2]:
             mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
+            dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
 
         st.markdown("---")
         st.subheader("Qualitative Context")
@@ -273,20 +286,21 @@ with tab_add:
         qual_0_7 = sum(q_weights[c["name"]] * qual_points[c["name"]] for c in QUAL_CRITERIA)
         qual_pct = (qual_0_7/7.0)*100.0
 
-        # Blend score (unchanged logic)
-        base_pct = blend_numeric*num_pct + (1.0 - blend_numeric)*qual_pct
+        # Combine with flexible blend
+        combo_pct = blend_numeric*num_pct + blend_qual*qual_pct
 
-        # Final score (keep previous smooth clip)
-        final_score = max(0.0, min(100.0, round(base_pct, 2)))
+        # Keep your original linear modifiers
+        final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
+        final_score = max(0.0, min(100.0, final_score))
 
-        # === New: predicted day volume (M) from your model ===
+        # === Model prediction (no manual target) ===
         pred_day_vol_m = predict_day_volume_m(
             float_m=float_m, mc_m=mc_m, si_pct=si_pct,
             atr_usd=atr_usd, rvol=rvol, pm_vol_m=pm_vol_m,
             catalyst=catalyst_points
         )
 
-        # Diagnostics (now use the prediction)
+        # Diagnostics (based on prediction)
         pm_pred_pct  = 100.0 * pm_vol_m / pred_day_vol_m if pred_day_vol_m > 0 else 0.0
         pm_float_pct = 100.0 * pm_vol_m / float_m        if float_m        > 0 else 0.0
         pm_dollar_vol_m = pm_vol_m * pm_vwap
@@ -335,8 +349,34 @@ with tab_add:
 
 with tab_rank:
     st.subheader("Current Ranking")
+
+    # --- CSV import (columns auto-normalized) ---
+    up = st.file_uploader("Import CSV (optional)", type=["csv"], accept_multiple_files=False, label_visibility="collapsed")
+    if up is not None:
+        try:
+            df_in = pd.read_csv(up)
+            required = [
+                "Ticker","Odds","Level",
+                "Numeric_%","Qual_%","FinalScore",
+                "Pred_DayVol_M","PM_Pred_%","PM_Float_%",
+                "PM_$Vol_M","PM$ / MC_%"
+            ]
+            for c in required:
+                if c not in df_in.columns:
+                    df_in[c] = "" if c in ("Ticker","Odds","Level") else 0.0
+            df_in = df_in[required]
+            st.session_state.rows = df_in.to_dict(orient="records")
+            st.success("Imported CSV into ranking.")
+        except Exception as e:
+            st.error(f"Failed to import CSV: {e}")
+
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
+
+        # Guard: duplicate column protection & sort preference
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
+        # Sort by OddsScore/FinalScore if present
         if "OddsScore" in df.columns:
             df = df.sort_values("OddsScore", ascending=False)
         elif "FinalScore" in df.columns:
@@ -349,13 +389,15 @@ with tab_rank:
             "Pred_DayVol_M","PM_Pred_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"
         ]
 
-        # Normalize for legacy rows
+        # --- Normalize to avoid KeyError for legacy rows ---
         for c in cols_to_show:
             if c not in df.columns:
                 df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
         df = df[cols_to_show]
 
-        st.dataframe(
+        # ---- Editable table ----
+        st.caption("Edit cells inline, then click **Save edits**. Use quick delete buttons below for single rows.")
+        edited_df = st.data_editor(
             df,
             use_container_width=True,
             hide_index=True,
@@ -371,25 +413,44 @@ with tab_rank:
                 "PM_Float_%": st.column_config.NumberColumn("PM Float %", format="%.1f"),
                 "PM_$Vol_M": st.column_config.NumberColumn("PM $Vol (M)", format="%.2f"),
                 "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
-            }
+            },
+            key="editor_ranking"
         )
 
+        cbtns = st.columns([0.22, 0.22, 0.22, 0.34])
+        with cbtns[0]:
+            if st.button("Save edits", use_container_width=True):
+                st.session_state.rows = edited_df.to_dict(orient="records")
+                st.success("Edits saved.")
+        with cbtns[1]:
+            if st.button("Clear Ranking", type="secondary", use_container_width=True):
+                st.session_state.rows = []
+                st.session_state.last = None
+                do_rerun()
+
+        # ---- Quick delete buttons ----
+        st.markdown("#### Delete rows")
+        del_cols = st.columns(4)
+        show_delete = edited_df.head(12).reset_index(drop=True)
+        for i, r in show_delete.iterrows():
+            with del_cols[i % 4]:
+                label = r.get("Ticker", f"Row {i+1}")
+                if st.button(f"🗑️ {label}", key=f"del_{i}", use_container_width=True):
+                    keep = edited_df.drop(index=i).reset_index(drop=True)
+                    st.session_state.rows = keep.to_dict(orient="records")
+                    do_rerun()
+
+        # ---- Downloads & Markdown ----
         st.download_button(
             "Download CSV",
-            df.to_csv(index=False).encode("utf-8"),
+            edited_df.to_csv(index=False).encode("utf-8"),
             "ranking.csv",
             "text/csv",
             use_container_width=True
         )
 
         st.markdown("### 📋 Ranking (Markdown view)")
-        st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
+        st.code(df_to_markdown_table(edited_df, cols_to_show), language="markdown")
 
-        c1, c2 = st.columns([0.25, 0.75])
-        with c1:
-            if st.button("Clear Ranking", use_container_width=True):
-                st.session_state.rows = []
-                st.session_state.last = None
-                do_rerun()
     else:
         st.info("No rows yet. Add a stock in the **Add Stock** tab.")
