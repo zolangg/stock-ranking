@@ -404,7 +404,7 @@ with tab_add:
 
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("PM Float Rotation", f"{l.get('PM_FloatRot_x',0):.3f}×")
-        d1.caption("Premarket volume ÷ float (unitless).")
+        d1.caption("Premarket volume ÷ float.")
         d2.metric("PM $Vol / MC",      f"{l.get('PM$ / MC_%',0):.1f}%")
         d2.caption("PM dollar volume ÷ market cap × 100.")
         d3.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
