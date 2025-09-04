@@ -7,19 +7,15 @@ def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     keep_cols = [c for c in cols if c in df.columns]
     if not keep_cols:
         return "| (no data) |\n| --- |"
-
     sub = df.loc[:, keep_cols].copy().fillna("")
-
     header = "| " + " | ".join(keep_cols) + " |"
     sep    = "| " + " | ".join(["---"] * len(keep_cols)) + " |"
     lines = [header, sep]
-
     for _, row in sub.iterrows():
         cells = []
         for c in keep_cols:
             v = row[c]
             if isinstance(v, float):
-                # show integers without .00, otherwise 2 decimals
                 cells.append(f"{v:.2f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v))}")
             else:
                 cells.append(str(v))
@@ -114,20 +110,16 @@ for crit in QUAL_CRITERIA:
     )
 
 st.sidebar.header("Score Blend & Modifiers")
-# Flexible blend Numeric vs. Qualitative
 blend_numeric = st.sidebar.slider("Weight of Numeric Block (vs. Qualitative)", 0.0, 1.0, 0.50, 0.05)
 blend_qual    = 1.0 - blend_numeric
-
 news_weight = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight")
 dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05, key="dil_weight")
 
 # Normalize blocks separately
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
-
 qual_sum = max(1e-9, sum(q_weights.values()))
-for k in q_weights:
-    q_weights[k] = q_weights[k] / qual_sum
+for k in q_weights: q_weights[k] = q_weights[k] / qual_sum
 
 # ---------- Mappers & labels ----------
 def pts_rvol(x: float) -> int:
@@ -149,8 +141,7 @@ def pts_si(x: float) -> int:
     return 7
 
 def pts_fr(pm_vol_m: float, float_m: float) -> int:
-    if float_m <= 0:
-        return 1
+    if float_m <= 0: return 1
     pct = 100.0 * pm_vol_m / float_m
     cuts = [(1,1),(3,2),(10,3),(25,4),(50,5),(100,6)]
     for th, p in cuts:
@@ -179,46 +170,43 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # ---------- Model: predicted daily volume (M) ----------
-# Refit WITH ATR and PM Float (AK): FR_PM = PM / PM_Float.
-# Catalyst applied in classic linear way: + 0.074*Catalyst (no k manipulator).
+# Uses AH/PM Float Rotation when provided; else falls back to PM/Float.
+# No direct Float term. With ATR. No RVOL. Catalyst linear (+0.074*Catalyst).
 def predict_day_volume_m(float_m: float, mc_m: float, si_pct: float,
-                         atr_usd: float, rvol: float, pm_vol_m: float,
-                         catalyst: float, pm_float_m: float = None) -> float:
+                         atr_usd: float, pm_vol_m: float,
+                         catalyst: float, ahpm_vol_m: float = 0.0) -> float:
     """
     ln(Y) =
-       5.848386
-     - 0.115956*ln(Float)
-     + 0.067580*ln(MarketCap)
-     + 0.264010*ln(SI+1)
-     - 1.394843*ln(ATR+1)
-     - 0.034064*ln(1 + PM/PM_Float)
+       5.5977803421
+     - 0.0154807614*ln(MarketCap)
+     + 1.0070356968*ln(SI+1)
+     - 1.2678433356*ln(ATR+1)
+     + 0.1140656010*ln(1 + FR_AHPM)
      + 0.074*Catalyst
 
-    Units:
-      Float, MarketCap, PM, PM_Float in millions; SI in percent; ATR in dollars.
-      RVOL accepted for compatibility but not used in this refit.
-      Catalyst in [-1, +1], linear bump.
+    FR_AHPM = (AH+PM Volume)/Float  if ahpm_vol_m>0  else  PM/Float
+
+    Units: Float/PM/AHPM/MCap in millions; SI in %; ATR in $; Catalyst ∈ [-1,1]
     """
     eps = 1e-9
     Float     = max(float_m, eps)
-    MarketCap = max(mc_m,   eps)
+    MCap      = max(mc_m,   eps)
     SI        = max(si_pct, 0.0)
     ATR       = max(atr_usd,0.0)
     PM        = max(pm_vol_m, eps)
-    PM_Float  = max(pm_float_m or 0.0, eps)
+    AHPM      = max(ahpm_vol_m, 0.0)
 
-    FR_PM = PM / PM_Float
+    FR = (AHPM/Float) if AHPM > 0 else (PM/Float)
 
-    lin = (
-        5.848385538946521
-        - 0.1159560779176112 * math.log(Float)
-        + 0.0675798113174062 * math.log(MarketCap)
-        + 0.2640104140937609 * math.log(SI + 1.0)
-        - 1.3948434913776924 * math.log(ATR + 1.0)
-        - 0.0340638899526851 * math.log(1.0 + FR_PM)
-        + 0.074 * float(catalyst)  # classic linear catalyst effect
+    ln_y = (
+        5.5977803421250165
+        - 0.015480761413403987 * math.log(MCap)
+        + 1.0070356968441065  * math.log(SI + 1.0)
+        - 1.2678433355888992  * math.log(ATR + 1.0)
+        + 0.11406560099229812 * math.log(1.0 + FR)
+        + 0.074 * float(catalyst)
     )
-    return float(math.exp(lin))  # millions of shares
+    return float(math.exp(ln_y))
 
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -227,27 +215,25 @@ with tab_add:
     st.subheader("Numeric Context")
 
     with st.form("add_form", clear_on_submit=True):
-        c_top = st.columns([1.2, 1.2, 1.2])
+        c_top = st.columns([1.3, 1.3, 1.3])
 
         # Basics
         with c_top[0]:
             ticker   = st.text_input("Ticker", "").strip().upper()
-            rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.1)
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=1.0)
 
-        # Float / SI / PM volume
+        # SI / PM / AH+PM
         with c_top[1]:
-            si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.5)
-            pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.1)
-            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
+            si_pct     = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.5)
+            pm_vol_m   = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.1)
+            ahpm_vol_m = st.number_input("AH+PM Volume (Millions) (optional)", min_value=0.0, value=0.0, step=0.1)
 
-        # Price, Cap & Modifiers (+ PM Float)
+        # Market cap / VWAP / modifiers
         with c_top[2]:
-            mc_m       = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
-            pm_float_m = st.number_input("PM Float (Millions)", min_value=0.0, value=0.0, step=0.1)
+            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
+            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
-            dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
 
         st.markdown("---")
         st.subheader("Qualitative Context")
@@ -269,8 +255,8 @@ with tab_add:
 
     # Scoring after submit
     if submitted and ticker:
-        # Numeric points
-        p_rvol  = pts_rvol(rvol)
+        # Numeric points (RVOL kept only for your scoring block UI)
+        p_rvol  = pts_rvol(0.0)  # RVOL not input anymore; set to neutral if you prefer: st.sidebar still shows weight
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
         p_fr    = pts_fr(pm_vol_m, float_m)
@@ -283,21 +269,21 @@ with tab_add:
         qual_0_7 = sum(q_weights[c["name"]] * qual_points[c["name"]] for c in QUAL_CRITERIA)
         qual_pct = (qual_0_7/7.0)*100.0
 
-        # Combine with flexible blend
-        combo_pct = blend_numeric*num_pct + blend_qual*qual_pct
+        # Blend
+        combo_pct = blend_numeric*num_pct + (1.0-blend_numeric)*qual_pct
 
-        # Keep your original linear modifiers
-        final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
+        # Linear modifiers
+        final_score = round(combo_pct + news_weight*catalyst_points*10, 2)
         final_score = max(0.0, min(100.0, final_score))
 
-        # === Model prediction (no manual target) ===
+        # === Prediction ===
         pred_day_vol_m = predict_day_volume_m(
             float_m=float_m, mc_m=mc_m, si_pct=si_pct,
-            atr_usd=atr_usd, rvol=rvol, pm_vol_m=pm_vol_m,
-            catalyst=catalyst_points, pm_float_m=pm_float_m
+            atr_usd=atr_usd, pm_vol_m=pm_vol_m,
+            catalyst=catalyst_points, ahpm_vol_m=ahpm_vol_m
         )
 
-        # Diagnostics (based on prediction)
+        # Diagnostics
         pm_pred_pct  = 100.0 * pm_vol_m / pred_day_vol_m if pred_day_vol_m > 0 else 0.0
         pm_float_pct = 100.0 * pm_vol_m / float_m        if float_m        > 0 else 0.0
         pm_dollar_vol_m = pm_vol_m * pm_vwap
@@ -320,7 +306,6 @@ with tab_add:
         }
         st.session_state.rows.append(row)
         st.session_state.last = row
-
         st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
         do_rerun()
 
@@ -336,7 +321,7 @@ with tab_add:
 
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("Predicted Day Vol (M)", f'{l["Pred_DayVol_M"]}')
-        d1.caption("Exponential model to predict volume.")
+        d1.caption("Exponential model with AH/PM float rotation.")
         d2.metric("PM % of Predicted", f'{l["PM_Pred_%"]}%')
         d2.caption("Premarket volume ÷ predicted day volume × 100.")
         d3.metric("PM Float %", f'{l["PM_Float_%"]}%')
@@ -347,7 +332,6 @@ with tab_add:
 with tab_rank:
     st.subheader("Current Ranking")
 
-    # --- CSV import (columns auto-normalized) ---
     up = st.file_uploader("Import CSV (optional)", type=["csv"], accept_multiple_files=False, label_visibility="collapsed")
     if up is not None:
         try:
@@ -369,11 +353,7 @@ with tab_rank:
 
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
-
-        # Guard: duplicate column protection & sort preference
         df = df.loc[:, ~df.columns.duplicated(keep="first")]
-
-        # Sort by OddsScore/FinalScore if present
         if "OddsScore" in df.columns:
             df = df.sort_values("OddsScore", ascending=False)
         elif "FinalScore" in df.columns:
@@ -386,14 +366,12 @@ with tab_rank:
             "Pred_DayVol_M","PM_Pred_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"
         ]
 
-        # --- Normalize to avoid KeyError for legacy rows ---
         for c in cols_to_show:
             if c not in df.columns:
                 df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
         df = df[cols_to_show]
 
-        # ---- Editable table ----
-        st.caption("Edit cells inline, then click **Save edits**. Use quick delete buttons below for single rows.")
+        st.caption("Edit cells inline, then click **Save edits**.")
         edited_df = st.data_editor(
             df,
             use_container_width=True,
@@ -425,19 +403,6 @@ with tab_rank:
                 st.session_state.last = None
                 do_rerun()
 
-        # ---- Quick delete buttons ----
-        st.markdown("#### Delete rows")
-        del_cols = st.columns(4)
-        show_delete = edited_df.head(12).reset_index(drop=True)
-        for i, r in show_delete.iterrows():
-            with del_cols[i % 4]:
-                label = r.get("Ticker", f"Row {i+1}")
-                if st.button(f"🗑️ {label}", key=f"del_{i}", use_container_width=True):
-                    keep = edited_df.drop(index=i).reset_index(drop=True)
-                    st.session_state.rows = keep.to_dict(orient="records")
-                    do_rerun()
-
-        # ---- Downloads & Markdown ----
         st.download_button(
             "Download CSV",
             edited_df.to_csv(index=False).encode("utf-8"),
