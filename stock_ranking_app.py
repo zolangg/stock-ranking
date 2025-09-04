@@ -159,29 +159,32 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # ---------- Prediction model (fixed; SI as fraction; FR = PM/Float) ----------
-def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float, pm_vol_m: float, float_m: float, catalyst_points: float) -> float:
+def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float,
+                         pm_vol_m: float, float_m: float, catalyst_points: float) -> float:
     """
-    Predicted day volume in Millions of shares (Y).
-
     ln(Y) = 5.307
-            - 0.015481*ln(MCap)
-            + 1.007036*ln(SI+1)
-            - 1.267843*ln(ATR+1)
-            + 0.114066*ln(1 + PM/Float)
+            - 0.015481*ln(MCap_M)
+            + 1.007036*ln(1 + SI_frac)      # SI_frac = SI_% / 100
+            - 1.267843*ln(1 + ATR_$)
+            + 0.114066*ln(1 + PM_M/Float_M)
             + 0.074*Catalyst
+    Returns Y in millions of shares.
     """
-    mc = max(mc_m, 1e-9)
-    si = max(si_pct, 0.0)
-    atr = max(atr_usd, 0.0)
-    fr = (pm_vol_m / max(float_m, 1e-9)) if float_m > 0 else 0.0
+    eps = 1e-12
+    mc   = max(mc_m, eps)                 # $ millions
+    si_f = max(si_pct, 0.0) / 100.0       # convert % -> fraction
+    atr  = max(atr_usd, 0.0)              # $
+    pm   = max(pm_vol_m, 0.0)             # shares (millions)
+    flt  = max(float_m, eps)              # shares (millions)
+    fr   = pm / flt                       # rotation ×
 
     lnY = (
         5.307
         - 0.015481 * math.log(mc)
-        + 1.007036 * math.log(si + 1.0)
-        - 1.267843 * math.log(atr + 1.0)
-        + 0.114066 * math.log(1.0 + fr)
-        + 0.074 * catalyst_points
+        + 1.007036 * math.log1p(si_f) 
+        - 1.267843 * math.log1p(atr)
+        + 0.114066 * math.log1p(fr)
+        + 0.074    * float(catalyst_points)
     )
     return float(math.exp(lnY))
     
