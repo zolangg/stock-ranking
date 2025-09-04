@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import math
 
 # ---------- Markdown table helper (no tabulate required) ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
@@ -102,7 +103,7 @@ st.sidebar.header("Numeric Weights")
 w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01, key="w_rvol")
 w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01, key="w_atr")
 w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, 0.15, 0.01, key="w_si")
-w_fr    = st.sidebar.slider("PM Float Rotation (%)", 0.0, 1.0, 0.45, 0.01, key="w_fr")
+w_fr    = st.sidebar.slider("PM Float Rotation (×)", 0.0, 1.0, 0.45, 0.01, key="w_fr")
 w_float = st.sidebar.slider("Public Float (penalty/bonus)", 0.0, 1.0, 0.05, 0.01, key="w_float")
 
 st.sidebar.header("Qualitative Weights")
@@ -144,12 +145,14 @@ def pts_si(x: float) -> int:
     return 7
 
 def pts_fr(pm_vol_m: float, float_m: float) -> int:
+    # Rotation (×): pm_vol / float
     if float_m <= 0:
         return 1
-    pct = 100.0 * pm_vol_m / float_m
-    cuts = [(1,1),(3,2),(10,3),(25,4),(50,5),(100,6)]
+    rot = pm_vol_m / float_m  # ×
+    # thresholds equivalent to 1%, 3%, 10%, 25%, 50%, 100% as rotation
+    cuts = [(0.01,1),(0.03,2),(0.10,3),(0.25,4),(0.50,5),(1.00,6)]
     for th, p in cuts:
-        if pct < th: return p
+        if rot < th: return p
     return 7
 
 def pts_float(float_m: float) -> int:
@@ -173,13 +176,40 @@ def grade(score_pct: float) -> str:
             "B"   if score_pct >= 60 else
             "C"   if score_pct >= 45 else "D")
 
+# ---------- Prediction model ----------
+def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float, pm_vol_m: float, float_m: float, catalyst_points: float) -> float:
+    """
+    Predicted day volume in Millions of shares (Y).
+
+    ln(Y) = 5.597780
+            + 0.015481*ln(MCap)
+            + 1.007036*ln(SI+1)
+            + 1.267843*ln(ATR+1)
+            + 0.114066*ln(1 + PM/Float)
+            + 0.074*Catalyst
+    """
+    mc = max(mc_m, 1e-9)
+    si = max(si_pct, 0.0)
+    atr = max(atr_usd, 0.0)
+    fr = (pm_vol_m / max(float_m, 1e-9)) if float_m > 0 else 0.0
+
+    lnY = (
+        5.597780
+        + 0.015481 * math.log(mc)
+        + 1.007036 * math.log(si + 1.0)
+        + 1.267843 * math.log(atr + 1.0)
+        + 0.114066 * math.log(1.0 + fr)
+        + 0.074 * catalyst_points
+    )
+    return float(math.exp(lnY))
+
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 with tab_add:
     st.subheader("Numeric Context")
 
-    # OPTION A: form that clears on submit
+    # Form that clears on submit
     with st.form("add_form", clear_on_submit=True):
         c_top = st.columns([1.2, 1.2, 1.0])
 
@@ -190,14 +220,13 @@ with tab_add:
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=1.0)
 
-        # Float / SI / PM volume + Target
+        # Float / SI / PM volume (Target removed)
         with c_top[1]:
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.5)
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.1)
-            target_vol_m = st.number_input("Target Day Volume (Millions)", min_value=0.0, value=150.0, step=5.0)
             pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
 
-        # Price, Cap & Modifiers
+        # Cap & Modifiers
         with c_top[2]:
             mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=5.0)
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
@@ -223,6 +252,9 @@ with tab_add:
 
     # Scoring after submit
     if submitted and ticker:
+        # Prediction replaces manual target volume
+        pred_vol_m = predict_day_volume_m(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst_points)
+
         # Numeric points
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
@@ -241,13 +273,11 @@ with tab_add:
         combo_pct = 0.5*num_pct + 0.5*qual_pct
         final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
 
-        # Diagnostics
-        pm_pct_target = 100.0 * pm_vol_m / target_vol_m if target_vol_m > 0 else 0.0
-        pm_float_pct  = 100.0 * pm_vol_m / float_m     if float_m     > 0 else 0.0
-        pm_dollar_vol_m = pm_vol_m * pm_vwap
-        pm_dollar_vs_mc_pct = 100.0 * pm_dollar_vol_m / mc_m if mc_m > 0 else 0.0
+        # Diagnostics (updated: rotation ×, no $ metrics)
+        pm_pct_of_pred = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
+        pm_float_rot_x = pm_vol_m / float_m if float_m > 0 else 0.0
 
-        # Save row (INCLUDES Level + diagnostics)
+        # Save row
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
@@ -256,10 +286,9 @@ with tab_add:
             "Numeric_%": round(num_pct, 2),
             "Qual_%": round(qual_pct, 2),
             "FinalScore": final_score,
-            "PM_Target_%": round(pm_pct_target, 1),
-            "PM_Float_%": round(pm_float_pct, 1),
-            "PM_$Vol_M": round(pm_dollar_vol_m, 2),
-            "PM$ / MC_%": round(pm_dollar_vs_mc_pct, 1),
+            "PredVol_M": round(pred_vol_m, 2),
+            "PM_%_of_Pred": round(pm_pct_of_pred, 1),
+            "PM_FloatRot_x": round(pm_float_rot_x, 3),
         }
         st.session_state.rows.append(row)
         st.session_state.last = row
@@ -267,25 +296,38 @@ with tab_add:
         st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
         do_rerun()
 
-    # Preview card
+    # Preview card (legacy-safe)
     if st.session_state.last:
         st.markdown("---")
         l = st.session_state.last
-        cA, cB, cC, cD = st.columns(4)
-        cA.metric("Last Ticker", l["Ticker"])
-        cB.metric("Numeric Block", f'{l["Numeric_%"]}%')
-        cC.metric("Qual Block", f'{l["Qual_%"]}%')
-        cD.metric("Final Score", f'{l["FinalScore"]} ({l["Level"]})')
 
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("PM % of Target", f'{l["PM_Target_%"]}%')
-        d1.caption("PM volume ÷ target day volume × 100.")
-        d2.metric("PM Float %", f'{l["PM_Float_%"]}%')
-        d2.caption("PM volume ÷ float × 100.")
-        d3.metric("PM $Vol (M)", f'{l["PM_$Vol_M"]}')
-        d3.caption("PM Vol × PM VWAP (in $ millions).")
-        d4.metric("PM $Vol / MC", f'{l["PM$ / MC_%"]}%')
-        d4.caption("PM dollar volume ÷ market cap × 100.")
+        # Safe pulls for new/old rows
+        pred_vol_m      = l.get("PredVol_M", None)
+        pm_pct_of_pred  = l.get("PM_%_of_Pred", None)
+        pm_rot_x        = l.get("PM_FloatRot_x", None)
+
+        # Legacy fallback for rotation: convert old percent to × if present
+        if pm_rot_x is None and isinstance(l.get("PM_Float_%"), (int, float)):
+            try:
+                pm_rot_x = round(float(l["PM_Float_%"]) / 100.0, 3)
+            except Exception:
+                pm_rot_x = None
+
+        cA, cB, cC, cD = st.columns(4)
+        cA.metric("Last Ticker", l.get("Ticker", "—"))
+        cB.metric("Numeric Block", f'{l["Numeric_%"]}%' if isinstance(l.get("Numeric_%"), (int, float)) else "—")
+        cC.metric("Qual Block", f'{l["Qual_%"]}%' if isinstance(l.get("Qual_%"), (int, float)) else "—")
+        cD.metric("Final Score",
+                  f'{l["FinalScore"]} ({l.get("Level","—")})' if isinstance(l.get("FinalScore"), (int, float)) else "—")
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Predicted Day Volume (M)", f'{pred_vol_m}' if isinstance(pred_vol_m, (int, float)) else "—")
+        d2.metric("PM % of Prediction", f'{pm_pct_of_pred}%' if isinstance(pm_pct_of_pred, (int, float)) else "—")
+        d3.metric("PM Float Rotation", f'{pm_rot_x}×' if isinstance(pm_rot_x, (int, float)) else "—")
+
+        d1.caption("Model-predicted total day shares (millions).")
+        d2.caption("PM volume ÷ predicted day volume × 100.")
+        d3.caption("Premarket volume ÷ float (×).")
 
 with tab_rank:
     st.subheader("Current Ranking")
@@ -293,18 +335,18 @@ with tab_rank:
         df = pd.DataFrame(st.session_state.rows)
         df = df.sort_values("OddsScore", ascending=False).reset_index(drop=True)
 
+        # Columns for new model
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
-            "PM_Target_%","PM_Float_%","PM_$Vol_M","PM$ / MC_%"
+            "PredVol_M","PM_%_of_Pred","PM_FloatRot_x"
         ]
 
-        # --- Normalize to avoid KeyError for legacy rows ---
+        # Normalize to avoid KeyError for legacy rows
         for c in cols_to_show:
             if c not in df.columns:
                 df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
 
-        # Reorder
         df = df[cols_to_show]
 
         st.dataframe(
@@ -318,10 +360,9 @@ with tab_rank:
                 "Numeric_%": st.column_config.NumberColumn("Numeric_%", format="%.2f"),
                 "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
-                "PM_Target_%": st.column_config.NumberColumn("PM % of Target", format="%.1f"),
-                "PM_Float_%": st.column_config.NumberColumn("PM Float %", format="%.1f"),
-                "PM_$Vol_M": st.column_config.NumberColumn("PM $Vol (M)", format="%.2f"),
-                "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
+                "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
+                "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
+                "PM_FloatRot_x": st.column_config.NumberColumn("PM Float Rotation (×)", format="%.3f"),
             }
         )
 
