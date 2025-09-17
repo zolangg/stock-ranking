@@ -177,6 +177,15 @@ def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
     return pred_m*math.exp(-z*sigma_ln), pred_m*math.exp(z*sigma_ln)
 
 # ---------- FT probability model (premarket, exact coeffs) ----------
+# Guardrails to avoid saturation outside the training range
+FT_GAPF_FLOOR   = 0.01      # 1% gap minimum for log
+FT_PM_PCT_FLOOR = 0.02      # min 2% of day to avoid huge boost from tiny %
+FT_PM_PCT_CEIL  = 0.90      # cap at 90%
+FT_PM_VOL_FLOOR = 0.01      # 10k shares if units are millions (0.01M)
+FT_PM_VOL_CEIL  = 500.0     # cap premarket vol at 500M (safety)
+FT_FLOAT_FLOOR  = 0.1       # 0.1M min float to prevent exploding ln
+FT_TEMP         = 1.6       # temperature scaling (>1 flattens extremes slightly)
+
 def predict_ft_prob_premarket(float_m_shares, gap_pct, pm_vol_m, pm_vol_pct):
     """
     Uses ln(Gap frac), ln(PM Vol % of day), ln(Float M), ln(PM Vol M)
@@ -187,11 +196,18 @@ def predict_ft_prob_premarket(float_m_shares, gap_pct, pm_vol_m, pm_vol_pct):
       pm_vol_pct     : percent of expected day volume (proxy: 100 * PM_M / PredVol_M)
     """
     e = 1e-6
-    gap_f     = max(float(gap_pct or 0.0), 0.0) / 100.0
+
+    # ---- Guardrails (crucial fix for 100% saturation) ----
+    gap_f   = max(float(gap_pct or 0.0)/100.0, FT_GAPF_FLOOR)
+    pm_pct  = float(pm_vol_pct or 0.0)/100.0
+    pm_pct  = min(max(pm_pct, FT_PM_PCT_FLOOR), FT_PM_PCT_CEIL)
+    pm_m    = min(max(float(pm_vol_m or 0.0), FT_PM_VOL_FLOOR), FT_PM_VOL_CEIL)
+    flt_m   = max(float(float_m_shares or 0.0), FT_FLOAT_FLOOR)
+
     ln_gapf   = math.log(gap_f + e)
-    ln_pmvolF = math.log(max(float(pm_vol_pct or 0.0), 0.0)/100.0 + e)
-    ln_float  = math.log(max(float(float_m_shares or 0.0), 0.0) + e)
-    ln_pmvolM = math.log(max(float(pm_vol_m or 0.0), 0.0) + e)
+    ln_pmvolF = math.log(pm_pct + e)
+    ln_float  = math.log(flt_m + e)
+    ln_pmvolM = math.log(pm_m + e)
 
     # coefficients (final refit from pooled LASSO → logistic refit)
     B0       = 0.0
@@ -201,11 +217,18 @@ def predict_ft_prob_premarket(float_m_shares, gap_pct, pm_vol_m, pm_vol_pct):
     B_pmvolM =  0.5139398462880007
 
     lp = (B0 + B_gapf*ln_gapf + B_pmvolF*ln_pmvolF + B_float*ln_float + B_pmvolM*ln_pmvolM)
+
+    # Temperature scaling to avoid overconfident extremes
+    lp = lp / FT_TEMP
+
+    # stable sigmoid
     if lp >= 0:
-        p = 1.0/(1.0 + math.exp(-lp))
+        p = 1.0 / (1.0 + math.exp(-lp))
     else:
-        elp = math.exp(lp); p = elp/(1.0 + elp)
-    return max(0.0, min(1.0, p))
+        elp = math.exp(lp); p = elp / (1.0 + elp)
+
+    # Clamp to [1%, 99%] to keep UI sane
+    return max(0.01, min(0.99, p))
 
 def ft_label(p: float) -> str:
     if p >= 0.85: return "Very High FT odds"
@@ -214,7 +237,7 @@ def ft_label(p: float) -> str:
     if p >= 0.40: return "Low FT odds"
     return "Very Low FT odds"
 
-# ---------- Sanity & term breakdown (keep from your app) ----------
+# ---------- Sanity & term breakdown ----------
 def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
     flags = []
     if mc_m > 50000: flags.append("⚠️ Market Cap looks > $50B — is it in *millions*?")
@@ -233,41 +256,31 @@ def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
         if fr > 3.0: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× may indicate unit mismatch.")
     return flags
 
-def ln_terms_for_display(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst):
-    eps = 1e-12
-    mc = max(mc_m, eps)
-    si_fr = max(si_pct, 0.0) / 100.0
-    atr = max(atr_usd, 0.0)
-    pm  = max(pm_vol_m, 0.0)
-    flt = max(float_m, eps)
-    fr  = pm / flt
-    t0 = 5.307
-    t1 = -0.015481 * math.log(mc)
-    t2 =  1.007036 * math.log1p(si_fr)
-    t3 = -1.267843 * math.log1p(atr)
-    t4 =  0.114066 * math.log1p(fr)
-    t5 =  0.074    * float(catalyst)
-    lnY = t0 + t1 + t2 + t3 + t4 + t5
+def ln_terms_for_display_premarket(mc_m, gap_pct, atr_usd):
+    """
+    Term-by-term breakdown for the *premarket* daily-volume model:
+      ln(Y_M) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_frac) - 0.3878*ln(ATR_$)
+    """
+    e = 1e-6
+    mc  = max(float(mc_m or 0.0), 0.0)
+    gpF = max(float(gap_pct or 0.0), 0.0) / 100.0
+    atr = max(float(atr_usd or 0.0), 0.0)
+
+    t0 = 3.1435
+    t1 = 0.1608 * math.log(mc + e)
+    t2 = 0.6704 * math.log(gpF + e)
+    t3 = -0.3878 * math.log(atr + e)
+
+    lnY = t0 + t1 + t2 + t3
     Y   = math.exp(lnY)
+
     return {
-        "inputs_expected_units": {
-            "MCap (millions $)": mc_m,
-            "SI (%)": si_pct,
-            "ATR ($)": atr_usd,
-            "PM Volume (millions shares)": pm_vol_m,
-            "Float (millions shares)": float_m,
-            "Catalyst (-1..+1)": catalyst,
-        },
-        "derived": {
-            "FR = PM/Float (×)": fr
-        },
+        "inputs_expected_units": {"MCap (millions $)": mc_m, "Gap %": gap_pct, "ATR ($)": atr_usd},
         "ln_components": {
-            "base": t0,
-            "−0.015481 ln(MCap)": t1,
-            "+1.007036 ln(1+SI_frac)": t2,
-            "−1.267843 ln(1+ATR)": t3,
-            "+0.114066 ln(1+FR)": t4,
-            "+0.074 Catalyst": t5,
+            "base (const)": t0,
+            "+0.1608 · ln(MCap_M)": t1,
+            "+0.6704 · ln(Gap fraction)": t2,
+            "−0.3878 · ln(ATR_$)": t3,
             "lnY total": lnY
         },
         "Predicted Y (millions shares)": Y
@@ -327,10 +340,9 @@ with tab_add:
         ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)
 
         # --- FT probability ---
-        # Proxy PM Vol % if not directly provided: 100 * PM / Pred
-        pm_vol_pct = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
-        pm_vol_pct = max(0.0, min(100.0, pm_vol_pct))
-        ft_prob = predict_ft_prob_premarket(float_m, gap_pct, pm_vol_m, pm_vol_pct)
+        # Proxy PM Vol % of day: 100 * PM / Pred (then guardrails inside model)
+        pm_vol_pct_proxy = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
+        ft_prob = predict_ft_prob_premarket(float_m, gap_pct, pm_vol_m, pm_vol_pct_proxy)
         ft_pct  = round(100.0 * ft_prob, 1)
         ft_text = ft_label(ft_prob)
 
@@ -380,7 +392,7 @@ with tab_add:
             "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
 
             # FT
-            "PM_Vol_%": round(pm_vol_pct, 1),
+            "PM_Vol_%": round(min(max(pm_vol_pct_proxy, FT_PM_PCT_FLOOR*100), FT_PM_PCT_CEIL*100), 1),
             "FT_Prob_%": ft_pct,
             "FT_Label": ft_text,
 
@@ -422,7 +434,7 @@ with tab_add:
         e1.metric("FT Probability", f"{l.get('FT_Prob_%',0):.1f}%")
         e1.caption(l.get("FT_Label",""))
         e2.metric("PM Vol % of Day (proxy)", f"{l.get('PM_Vol_%',0):.1f}%")
-        e2.caption("Computed as 100 × PM_M / PredVol_M")
+        e2.caption("Computed as 100 × PM_M / PredVol_M (guardrailed)")
 
     # --- Sanity sniff test ---
     with st.expander("🔎 Sanity sniff test (units & term contributions)"):
@@ -431,7 +443,7 @@ with tab_add:
         atr_dbg   = l.get("_ATR_$", 0.0)
         pm_m_dbg  = l.get("_PM_M", 0.0)
         flt_m_dbg = l.get("_Float_M", 0.0)
-        cat_dbg   = l.get("_Catalyst", 0.0)
+        gap_dbg   = l.get("_Gap_%", 0.0)
 
         flags = sanity_flags(mc_m_dbg, si_pct_dbg, atr_dbg, pm_m_dbg, flt_m_dbg)
         if flags:
@@ -439,7 +451,7 @@ with tab_add:
         else:
             st.success("Inputs look plausible at a glance.")
 
-        details = ln_terms_for_display(mc_m_dbg, si_pct_dbg, atr_dbg, pm_m_dbg, flt_m_dbg, cat_dbg)
+        details = ln_terms_for_display_premarket(mc_m_dbg, gap_dbg, atr_dbg)
         st.write(details)
 
 # ---------- Ranking tab ----------
