@@ -215,7 +215,7 @@ def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
 def ln_terms_for_display(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst):
     eps = 1e-12
     mc = max(mc_m, eps)
-    si_fr = max(si_pct, 0.0) / 100.0
+    si_fr = max(si_zpct, 0.0) / 100.0
     atr = max(atr_usd, 0.0)
     pm  = max(pm_vol_m, 0.0)
     flt = max(float_m, eps)
