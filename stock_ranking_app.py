@@ -115,6 +115,16 @@ sigma_ln = st.sidebar.slider(
     help="Estimated std dev of residuals in ln(volume). 0.60 ≈ typical for your sheet."
 )
 
+# ----- FT calibration controls -----
+st.sidebar.header("FT Calibration")
+ft_base_rate = st.sidebar.slider("FT Base Rate (prior %)", 10, 90, 55, 1,
+                                 help="Your typical historical FT rate. Used as a prior.")
+ft_temperature = st.sidebar.slider("FT Temperature (↑=flatter)", 0.5, 3.0, 1.4, 0.1,
+                                   help=">1 makes probabilities less extreme; <1 makes them sharper.")
+fr_full_conf = st.sidebar.slider("FR for Full Confidence (×)", 0.1, 2.0, 0.6, 0.05,
+                                 help="Below this FR, blend FT odds toward the base rate."
+)
+
 # Normalize blocks separately
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_float)  # FR removed
 w_rvol, w_atr, w_si, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_float)]
@@ -174,63 +184,86 @@ def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float
     )
     return math.exp(ln_y)
 
-# ---------- FT probability (robust; uses PM volume input via Float Rotation) ----------
-# NOTE: Replace these with your trained coefficients once you refit.
-# These defaults are calibrated to avoid under-scoring strong FR/gap names early PM.
-FT_B0   = 0.35    # intercept (raised so good names don't start too low)
+# ---------- FT probability (logistic on ln1p flows) + calibration ----------
+# Coefficients: keep monotonic signs; replace with YOUR trained numbers when ready.
+FT_B0   = 0.15    # intercept (neutral-ish; final level is set by base-rate prior)
 FT_B_MK = -0.30   # ln(MCap M): bigger cap -> lower FT
-FT_B_AT = -0.18   # ln(ATR $):  more volatile -> slightly lower FT
-FT_B_GP =  1.10   # ln1p(Gap frac): bigger gap -> higher FT
-FT_B_FR =  1.25   # ln1p(FR): more float rotation -> higher FT
+FT_B_AT = -0.18   # ln(ATR $):  higher ATR -> lower FT
+FT_B_GP =  1.00   # ln1p(Gap frac): bigger gap -> higher FT
+FT_B_FR =  1.10   # ln1p(FR):       more float rotation -> higher FT
 FT_B_CT =  0.30   # Catalyst points (-1..+1)
 
 def _ln_pos(x: float, eps: float = 1e-6, lo: float = -6.0, hi: float = 12.0) -> float:
-    import math
     v = math.log(max(float(x) if x is not None else 0.0, 0.0) + eps)
     return max(lo, min(hi, v))
 
 def _ln1p_pos(x: float, lo: float = -6.0, hi: float = 12.0) -> float:
-    import math
     v = math.log1p(max(float(x) if x is not None else 0.0, 0.0))
     return max(lo, min(hi, v))
 
+def _sigmoid(z: float) -> float:
+    return 1.0/(1.0 + math.exp(-z))
+
+def _logit(p: float, eps: float = 1e-9) -> float:
+    p = min(max(p, eps), 1.0-eps)
+    return math.log(p/(1.0-p))
+
+def _calibrate(p_raw: float, base_rate: float, temperature: float) -> float:
+    """
+    Platt-like calibration in logit space with a base-rate prior and temperature.
+    """
+    # convert base rate (%) -> fraction
+    b = min(max(base_rate/100.0, 1e-6), 1.0-1e-6)
+    prior_logit = _logit(b)
+    raw_logit   = _logit(p_raw)
+    # shift toward prior, then flatten/sharpen by temperature
+    z = (raw_logit + prior_logit) / max(temperature, 1e-6)
+    return _sigmoid(z)
+
 def predict_ft_prob(mcap_m: float, gap_pct: float, atr_usd: float,
-                    pm_vol_m: float, float_m: float, catalyst_points: float) -> float:
+                    pm_vol_m: float, float_m: float, catalyst_points: float,
+                    base_rate_pct: float = 55.0, temperature: float = 1.4,
+                    fr_conf_full: float = 0.6) -> float:
     """
     Probability the breakout follows through.
-    Uses:
-      ln(MCap M), ln(ATR $), ln1p(Gap fraction), ln1p(Float Rotation), Catalyst
-    FR = PM Vol (M) / Float (M). All in *millions* for PM and Float.
-    Returns probability in [0.01, 0.99] (light clamp for UI stability).
+    Uses ln(MCap), ln(ATR), ln1p(Gap fraction), ln1p(FR), Catalyst.
+    FR = PM Vol (M) / Float (M). All *millions* for PM and Float.
+    Calibrates with a base-rate prior and temperature; blends to base rate if FR is tiny.
     """
-    import math
+    # --- Units & features ---
+    mc   = max(float(mcap_m) if mcap_m is not None else 0.0, 0.0)
+    atr  = max(float(atr_usd) if atr_usd is not None else 0.0, 0.0)
+    gapf = max(float(gap_pct) if gap_pct is not None else 0.0, 0.0)/100.0
+    flt  = max(float(float_m) if float_m is not None else 0.0, 0.0)
+    pm   = max(float(pm_vol_m) if pm_vol_m is not None else 0.0, 0.0)
 
-    # --- Units sanity inside the model (doesn't change UI) ---
-    mc   = max(float(mcap_m) if mcap_m is not None else 0.0, 0.0)           # $ millions
-    atr  = max(float(atr_usd) if atr_usd is not None else 0.0, 0.0)         # $
-    gapf = max(float(gap_pct) if gap_pct is not None else 0.0, 0.0) / 100.0 # fraction
-    flt  = max(float(float_m) if float_m is not None else 0.0, 0.0)         # M shares
-    pm   = max(float(pm_vol_m) if pm_vol_m is not None else 0.0, 0.0)       # M shares
+    fr = pm / max(flt, 1e-9)  # Float Rotation ×
 
-    # FR from inputs (no PredVol proxy)
-    fr = pm / max(flt, 1e-9)
+    ln_mcap  = _ln_pos(mc)
+    ln_atr   = _ln_pos(atr)
+    ln1p_gap = _ln1p_pos(gapf)
+    ln1p_fr  = _ln1p_pos(fr)
+    cat      = float(catalyst_points or 0.0)
 
-    # Transforms (log1p for flow features to avoid crushing near zero)
-    ln_mcap = _ln_pos(mc)
-    ln_atr  = _ln_pos(atr)
-    ln1p_gap= _ln1p_pos(gapf)
-    ln1p_fr = _ln1p_pos(fr)
-
-    cat = float(catalyst_points or 0.0)
-
+    # --- Raw logit ---
     logit = (FT_B0
              + FT_B_MK * ln_mcap
              + FT_B_AT * ln_atr
              + FT_B_GP * ln1p_gap
              + FT_B_FR * ln1p_fr
              + FT_B_CT * cat)
+    p_raw = _sigmoid(logit)
 
-    p = 1.0 / (1.0 + math.exp(-logit))
+    # --- Calibration: base-rate + temperature ---
+    p_cal = _calibrate(p_raw, base_rate_pct, temperature)
+
+    # --- Low-FR blend: if FR is small early PM, pull toward the base rate
+    # confidence goes 0 -> 1 as fr goes 0 -> fr_conf_full
+    conf = max(0.0, min(1.0, fr / max(fr_conf_full, 1e-6)))
+    b = min(max(base_rate_pct/100.0, 1e-6), 1.0-1e-6)
+    p = conf * p_cal + (1.0 - conf) * b
+
+    # gentle clamp for UI
     return max(0.01, min(0.99, p))
 
 def ft_bucket(p: float):
@@ -332,12 +365,15 @@ with tab_add:
         # === Prediction ===
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
 
-        # --- FT probability (uses user-input PM volume & float) ---
-        ft_p = predict_ft_prob(mc_m, gap_pct, atr_usd, pm_vol_m, float_m, catalyst_points)
+        # --- FT probability (calibrated; uses user-input PM volume & float) ---
+        ft_p = predict_ft_prob(
+            mc_m, gap_pct, atr_usd, pm_vol_m, float_m, catalyst_points,
+            base_rate_pct=ft_base_rate, temperature=ft_temperature, fr_conf_full=fr_full_conf
+        )
         ft_pct = round(100.0 * ft_p, 1)
-        ft_label = ("High FT" if ft_p >= 0.7 else
-                    "Moderate FT" if ft_p >= 0.5 else
-                    "Low FT")
+        ft_label = ("High FT" if ft_p >= 70/100 else
+                    "Moderate FT" if ft_p >= 50/100 else
+                    "Low FT")FT")
 
         # Confidence bands (millions)
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)    # ~68%
@@ -529,3 +565,5 @@ with tab_rank:
                 do_rerun()
     else:
         st.info("No rows yet. Add a stock in the **Add Stock** tab.")
+
+
