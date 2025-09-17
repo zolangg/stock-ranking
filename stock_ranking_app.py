@@ -165,6 +165,12 @@ def predict_day_volume_m_premarket(mcap_m, gap_pct, atr):
     Returns **millions of shares**.
     """
     e1 = e2 = e3 = 1e-6
+    # --- trained params (the ones we wired earlier) ---
+    b0, b1, b2 = -0.982, -1.241, 1.372
+    # Standardization is on ln(Float M + e_f) and ln(Gap fraction + e_g)
+    mu_f, sd_f = 2.34, 0.91      # Float mean/std in ln-space
+    mu_g, sd_g = -0.47, 0.56     # Gap (fraction) mean/std in ln-space
+    e_f,  e_g  = 1e-6, 1e-6
     gp = max(gap_pct, 0.0) / 100.0
     z_gap = (math.log(gp + e_g) - mu_g) / sd_g
     ln_y = (
@@ -181,13 +187,6 @@ def predict_ft_prob_premarket(float_m_shares, gap_pct):
     """
     import math
     import streamlit as st
-
-    # --- trained params (the ones we wired earlier) ---
-    b0, b1, b2 = -0.982, -1.241, 1.372
-    # Standardization is on ln(Float M + e_f) and ln(Gap fraction + e_g)
-    mu_f, sd_f = 2.34, 0.91      # Float mean/std in ln-space
-    mu_g, sd_g = -0.47, 0.56     # Gap (fraction) mean/std in ln-space
-    e_f,  e_g  = 1e-6, 1e-6
 
     # --- safe casting ---
     def _safe(x, default=0.0):
