@@ -373,7 +373,7 @@ with tab_add:
         ft_pct = round(100.0 * ft_p, 1)
         ft_label = ("High FT" if ft_p >= 70/100 else
                     "Moderate FT" if ft_p >= 50/100 else
-                    "Low FT")FT")
+                    "Low FT")
 
         # Confidence bands (millions)
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)    # ~68%
