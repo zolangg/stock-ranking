@@ -171,7 +171,7 @@ def predict_day_volume_m_premarket(mcap_m, gap_pct, atr):
         + 0.6704 * math.log(max(gap_pct,0)+e2)
         - 0.3878 * math.log(max(atr,0)+e3)
     )
-    return math.exp(ln_y)
+    return math.exp(ln_y) / 1e6
 
 def predict_ft_prob_premarket(float_m_shares, gap_pct):
     """
