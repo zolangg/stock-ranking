@@ -180,65 +180,75 @@ def predict_day_volume_m_premarket(mcap_m, gap_pct, atr):
         - 0.3878 * math.log(max(atr,0)+e3)
     )
     return math.exp(ln_y)  # already in **millions** per our model spec
+# ---------- Premarket Models (final, fixed units) ----------
+
+def predict_day_volume_m_premarket(mcap_m, gap_pct, atr_usd):
+    """
+    Premarket day-volume model (pooled log–log OLS).
+    Inputs:
+      - mcap_m: Market cap in millions $
+      - gap_pct: gap as PERCENT (e.g., 10 for 10%)
+      - atr_usd: ATR in $
+    Returns:
+      - predicted daily volume in **millions of shares**
+    """
+    import math
+    # convert % -> fraction (CRITICAL)
+    gp = max(float(gap_pct) if gap_pct is not None else 0.0, 0.0) / 100.0
+
+    # tiny eps for log
+    e1 = e2 = e3 = 1e-6
+
+    ln_y = (
+        3.1435
+        + 0.1608 * math.log(max(float(mcap_m) if mcap_m is not None else 0.0, 0.0) + e1)
+        + 0.6704 * math.log(gp + e2)
+        - 0.3878 * math.log(max(float(atr_usd) if atr_usd is not None else 0.0, 0.0) + e3)
+    )
+    # model outputs **millions** already
+    return math.exp(ln_y)
+
+
 def predict_ft_prob_premarket(float_m_shares, gap_pct):
     """
     Premarket FT probability (logistic) with robust input handling.
-    Returns probability in [0, 1].
+    Inputs:
+      - float_m_shares: public float in millions of shares
+      - gap_pct: gap as PERCENT (e.g., 10 for 10%)
+    Returns:
+      - probability in [0, 1]
     """
     import math
-    import streamlit as st
 
-    # --- safe casting ---
-    def _safe(x, default=0.0):
-        try:
-            v = float(x)
-            if math.isnan(v) or math.isinf(v):
-                return default
-            return v
-        except Exception:
-            return default
+    # trained params (standardized ln-features)
+    b0, b1, b2 = -0.982, -1.241, 1.372
+    mu_f, sd_f = 2.34, 0.91      # for ln(Float M + e_f)
+    mu_g, sd_g = -0.47, 0.56     # for ln(Gap fraction + e_g)
+    e_f = e_g = 1e-6
 
-    flt_m  = max(_safe(float_m_shares, 0.0), 0.0)          # millions
-    gp_pct = max(_safe(gap_pct, 0.0), 0.0)                  # percent input
-    gp     = gp_pct / 100.0                                 # → fraction (CRITICAL)
+    # safe casts
+    flt = max(float(float_m_shares) if float_m_shares is not None else 0.0, 0.0)
+    gp_pct = max(float(gap_pct) if gap_pct is not None else 0.0, 0.0)
+    gp = gp_pct / 100.0  # % -> fraction (CRITICAL)
 
-    # --- build standardized ln-features ---
-    # clamp stds to avoid /0, clamp inputs to avoid ln(<=0)
+    # guard stds
     sd_f = max(sd_f, 1e-9); sd_g = max(sd_g, 1e-9)
-    ln_float = math.log(flt_m + e_f)
-    ln_gap   = math.log(gp + e_g)
 
-    z_float = (ln_float - mu_f) / sd_f
-    z_gap   = (ln_gap   - mu_g) / sd_g
+    z_float = (math.log(flt + e_f) - mu_f) / sd_f
+    z_gap   = (math.log(gp  + e_g) - mu_g) / sd_g
 
-    # (Optional) clamp extreme z to avoid insane logits if something's off
+    # clamp extreme z just in case
     z_float = max(min(z_float, 6.0), -6.0)
     z_gap   = max(min(z_gap,   6.0), -6.0)
 
     lp = b0 + b1*z_float + b2*z_gap
-    # stabilize sigmoid for very large |lp|
+    # numerically stable sigmoid
     if lp >= 0:
         p = 1.0 / (1.0 + math.exp(-lp))
     else:
-        exp_lp = math.exp(lp)
-        p = exp_lp / (1.0 + exp_lp)
-
-    p = max(0.0, min(1.0, p))
-
-    # --- one-time debug to verify signals (remove after you confirm) ---
-    if st.session_state.get("_ft_debug_shown") is None:
-        with st.expander("FT model debug (one-time)"):
-            st.write({
-                "float_m(input)": flt_m,
-                "gap_pct(input)": gp_pct,
-                "gap_fraction": gp,
-                "ln_float": ln_float, "ln_gap": ln_gap,
-                "z_float": z_float,   "z_gap": z_gap,
-                "lp": lp,             "prob": p
-            })
-        st.session_state["_ft_debug_shown"] = True
-
-    return p
+        elp = math.exp(lp)
+        p = elp / (1.0 + elp)
+    return max(0.0, min(1.0, p))
 
 def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
     if pred_m <= 0: return 0.0, 0.0
