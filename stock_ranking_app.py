@@ -174,24 +174,23 @@ def predict_day_volume_m_premarket(mcap_m, gap_pct, atr):
         - 0.3878 * math.log(max(atr,0)+e3)
     )
     return math.exp(ln_y)  # already in **millions** per our model spec
-
 def predict_ft_prob_premarket(float_m_shares, gap_pct):
     """
     Premarket FT probability (logistic) with robust input handling.
-    Uses trained coefficients + standardization on ln-features.
-
     Returns probability in [0, 1].
     """
     import math
+    import streamlit as st
 
-    # --- trained params ---
-    e_f = 1e-6; e_g = 1e-6
-    mu_f, sd_f = 2.34, 0.91   # Float M Shares (ln scale) mean/std from training
-    mu_g, sd_g = -0.47, 0.56  # Gap fraction (ln scale) mean/std from training
+    # --- trained params (the ones we wired earlier) ---
     b0, b1, b2 = -0.982, -1.241, 1.372
+    # Standardization is on ln(Float M + e_f) and ln(Gap fraction + e_g)
+    mu_f, sd_f = 2.34, 0.91      # Float mean/std in ln-space
+    mu_g, sd_g = -0.47, 0.56     # Gap (fraction) mean/std in ln-space
+    e_f,  e_g  = 1e-6, 1e-6
 
-    # --- safe converters ---
-    def safe_float(x, default=0.0):
+    # --- safe casting ---
+    def _safe(x, default=0.0):
         try:
             v = float(x)
             if math.isnan(v) or math.isinf(v):
@@ -200,24 +199,47 @@ def predict_ft_prob_premarket(float_m_shares, gap_pct):
         except Exception:
             return default
 
-    flt = max(safe_float(float_m_shares, 0.0), 0.0)
-    gp_pct = safe_float(gap_pct, 0.0)
+    flt_m  = max(_safe(float_m_shares, 0.0), 0.0)          # millions
+    gp_pct = max(_safe(gap_pct, 0.0), 0.0)                  # percent input
+    gp     = gp_pct / 100.0                                 # → fraction (CRITICAL)
 
-    # Gap must be fraction (e.g., 10% -> 0.10), clamp to >=0
-    gp = max(gp_pct / 100.0, 0.0)
+    # --- build standardized ln-features ---
+    # clamp stds to avoid /0, clamp inputs to avoid ln(<=0)
+    sd_f = max(sd_f, 1e-9); sd_g = max(sd_g, 1e-9)
+    ln_float = math.log(flt_m + e_f)
+    ln_gap   = math.log(gp + e_g)
 
-    # guard against zero std and log domain
-    sd_f = max(sd_f, 1e-9)
-    sd_g = max(sd_g, 1e-9)
+    z_float = (ln_float - mu_f) / sd_f
+    z_gap   = (ln_gap   - mu_g) / sd_g
 
-    z_float = (math.log(flt + e_f) - mu_f) / sd_f
-    z_gap   = (math.log(gp  + e_g) - mu_g) / sd_g
+    # (Optional) clamp extreme z to avoid insane logits if something's off
+    z_float = max(min(z_float, 6.0), -6.0)
+    z_gap   = max(min(z_gap,   6.0), -6.0)
 
     lp = b0 + b1*z_float + b2*z_gap
-    p  = 1.0 / (1.0 + math.exp(-lp))
+    # stabilize sigmoid for very large |lp|
+    if lp >= 0:
+        p = 1.0 / (1.0 + math.exp(-lp))
+    else:
+        exp_lp = math.exp(lp)
+        p = exp_lp / (1.0 + exp_lp)
 
-    # clip just in case of extreme numerics
-    return max(0.0, min(1.0, p))
+    p = max(0.0, min(1.0, p))
+
+    # --- one-time debug to verify signals (remove after you confirm) ---
+    if st.session_state.get("_ft_debug_shown") is None:
+        with st.expander("FT model debug (one-time)"):
+            st.write({
+                "float_m(input)": flt_m,
+                "gap_pct(input)": gp_pct,
+                "gap_fraction": gp,
+                "ln_float": ln_float, "ln_gap": ln_gap,
+                "z_float": z_float,   "z_gap": z_gap,
+                "lp": lp,             "prob": p
+            })
+        st.session_state["_ft_debug_shown"] = True
+
+    return p
 
 def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
     if pred_m <= 0: return 0.0, 0.0
