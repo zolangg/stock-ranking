@@ -164,34 +164,31 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # ---------- Prediction model (fixed; SI as fraction; FR = PM/Float) ----------
-def predict_day_volume_m(mc_m: float, si_pct: float, atr_usd: float,
-                         pm_vol_m: float, float_m: float, catalyst_points: float) -> float:
+def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """
-    ln(Y) = 5.307
-            - 0.015481*ln(MCap_M)
-            + 1.007036*ln(1 + SI_frac)      # SI_frac = SI_% / 100
-            - 1.267843*ln(1 + ATR_$)
-            + 0.114066*ln(1 + PM_M/Float_M)
-            + 0.074*Catalyst
-    Returns Y in millions of shares.
+    Premarket day-volume model (pooled log–log OLS).
+    Inputs:
+      mcap_m  = market cap in millions of $
+      gap_pct = gap as PERCENT (e.g., 10 for 10%)
+      atr_usd = ATR in $
+    Returns:
+      predicted daily volume in **millions of shares**
     """
-    eps = 1e-12
-    mc   = max(mc_m, eps)                 # $ millions
-    si_f = max(si_pct, 0.0) / 100.0       # convert % -> fraction
-    atr  = max(atr_usd, 0.0)              # $
-    pm   = max(pm_vol_m, 0.0)             # shares (millions)
-    flt  = max(float_m, eps)              # shares (millions)
-    fr   = pm / flt                       # rotation ×
+    import math
+    # convert % -> fraction (CRITICAL)
+    gp = max(float(gap_pct) if gap_pct is not None else 0.0, 0.0) / 100.0
 
-    lnY = (
-        5.307
-        - 0.015481 * math.log(mc)
-        + 1.007036 * math.log1p(si_f) 
-        - 1.267843 * math.log1p(atr)
-        + 0.114066 * math.log1p(fr)
-        + 0.074    * float(catalyst_points)
+    # tiny eps for logs
+    e1 = e2 = e3 = 1e-6
+
+    ln_y = (
+        3.1435
+        + 0.1608 * math.log(max(float(mcap_m) if mcap_m is not None else 0.0, 0.0) + e1)
+        + 0.6704 * math.log(gp + e2)
+        - 0.3878 * math.log(max(float(atr_usd) if atr_usd is not None else 0.0, 0.0) + e3)
     )
-    return float(math.exp(lnY))
+    # model outputs **millions** already
+    return math.exp(ln_y)
     
 def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
     flags = []
@@ -284,7 +281,7 @@ with tab_add:
             rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-
+            gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
 
         # Float / SI / PM volume
         with c_top[1]:
@@ -318,7 +315,7 @@ with tab_add:
     # After submit
     if submitted and ticker:
         # === Prediction ===
-        pred_vol_m = predict_day_volume_m(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst_points)
+        pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
 
         # Confidence bands (millions)
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)    # ~68%
