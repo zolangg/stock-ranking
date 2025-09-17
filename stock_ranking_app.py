@@ -174,19 +174,24 @@ def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float
     )
     return math.exp(ln_y)
 
-# ---------- FT probability (logistic; uses PM volume input via Float Rotation) ----------
-# When you refit on your dataset, replace these with YOUR trained coefficients.
-FT_B0   = -0.55   # intercept
-FT_B_MK = -0.35   # ln(MCap)  -> bigger cap, lower FT
-FT_B_AT = -0.20   # ln(ATR)   -> higher ATR, lower FT
-FT_B_GP =  0.85   # ln(Gap f) -> bigger gap, higher FT
-FT_B_FR =  0.90   # ln(FR)    -> more float rotation, higher FT
-FT_B_CT =  0.35   # Catalyst  -> nudges odds up/down
+# ---------- FT probability (robust; uses PM volume input via Float Rotation) ----------
+# NOTE: Replace these with your trained coefficients once you refit.
+# These defaults are calibrated to avoid under-scoring strong FR/gap names early PM.
+FT_B0   = 0.35    # intercept (raised so good names don't start too low)
+FT_B_MK = -0.30   # ln(MCap M): bigger cap -> lower FT
+FT_B_AT = -0.18   # ln(ATR $):  more volatile -> slightly lower FT
+FT_B_GP =  1.10   # ln1p(Gap frac): bigger gap -> higher FT
+FT_B_FR =  1.25   # ln1p(FR): more float rotation -> higher FT
+FT_B_CT =  0.30   # Catalyst points (-1..+1)
 
-def _safe_log(x: float, eps: float = 1e-9, lo: float = -6.0, hi: float = 6.0) -> float:
-    """Stable log with mild clipping to prevent crazy logits on tiny/huge values."""
+def _ln_pos(x: float, eps: float = 1e-6, lo: float = -6.0, hi: float = 12.0) -> float:
     import math
     v = math.log(max(float(x) if x is not None else 0.0, 0.0) + eps)
+    return max(lo, min(hi, v))
+
+def _ln1p_pos(x: float, lo: float = -6.0, hi: float = 12.0) -> float:
+    import math
+    v = math.log1p(max(float(x) if x is not None else 0.0, 0.0))
     return max(lo, min(hi, v))
 
 def predict_ft_prob(mcap_m: float, gap_pct: float, atr_usd: float,
@@ -194,26 +199,35 @@ def predict_ft_prob(mcap_m: float, gap_pct: float, atr_usd: float,
     """
     Probability the breakout follows through.
     Uses:
-      - ln(MCap M), ln(ATR $), ln(Gap fraction), ln(FR), Catalyst
-    FR (float rotation) is computed from user inputs: FR = PM Vol (M) / Float (M).
+      ln(MCap M), ln(ATR $), ln1p(Gap fraction), ln1p(Float Rotation), Catalyst
+    FR = PM Vol (M) / Float (M). All in *millions* for PM and Float.
     Returns probability in [0.01, 0.99] (light clamp for UI stability).
     """
     import math
-    ln_mcap = _safe_log(mcap_m)
-    ln_atr  = _safe_log(atr_usd)
-    ln_gapf = _safe_log((gap_pct or 0.0)/100.0)
 
-    # FR = PM / Float (×), derived purely from inputs
-    fr = (pm_vol_m or 0.0) / max(float_m or 0.0, 1e-9)
-    ln_fr = _safe_log(fr)
+    # --- Units sanity inside the model (doesn't change UI) ---
+    mc   = max(float(mcap_m) if mcap_m is not None else 0.0, 0.0)           # $ millions
+    atr  = max(float(atr_usd) if atr_usd is not None else 0.0, 0.0)         # $
+    gapf = max(float(gap_pct) if gap_pct is not None else 0.0, 0.0) / 100.0 # fraction
+    flt  = max(float(float_m) if float_m is not None else 0.0, 0.0)         # M shares
+    pm   = max(float(pm_vol_m) if pm_vol_m is not None else 0.0, 0.0)       # M shares
+
+    # FR from inputs (no PredVol proxy)
+    fr = pm / max(flt, 1e-9)
+
+    # Transforms (log1p for flow features to avoid crushing near zero)
+    ln_mcap = _ln_pos(mc)
+    ln_atr  = _ln_pos(atr)
+    ln1p_gap= _ln1p_pos(gapf)
+    ln1p_fr = _ln1p_pos(fr)
 
     cat = float(catalyst_points or 0.0)
 
     logit = (FT_B0
              + FT_B_MK * ln_mcap
              + FT_B_AT * ln_atr
-             + FT_B_GP * ln_gapf
-             + FT_B_FR * ln_fr
+             + FT_B_GP * ln1p_gap
+             + FT_B_FR * ln1p_fr
              + FT_B_CT * cat)
 
     p = 1.0 / (1.0 + math.exp(-logit))
