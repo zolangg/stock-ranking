@@ -17,7 +17,7 @@ def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     for _, row in sub.iterrows():
         cells = []
         for c in keep:
-            v = row[c]
+            v = [c]
             if isinstance(v, float):
                 cells.append(f"{v:.2f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v))}")
             else:
@@ -272,7 +272,12 @@ with tab_add:
             "PredVol_CI95_U":round(ci95_u,2),
             "FT_Prob_%":ft_pct,
             "FT_Label":f"{ft_color} {ft_label}",
-            "_MCap_M":mc_m,"_SI_%":si_pct,"_ATR_$":atr_usd,"_PM_M":pm_vol_m,"_Float_M":float_m,"_Gap_%":gap_pct,"_Catalyst":float(catalyst_points)
+            "_MCap_M":mc_m,"_SI_%":si_pct,
+            "_ATR_$":atr_usd,"_PM_M":pm_vol_m,
+            "_Float_M":float_m,
+            "_Gap_%":gap_pct,
+            "_Catalyst":float(catalyst_points),
+            "_PM_VWAP": pm_vwap
         }
         st.session_state.rows.append(row)
         st.session_state.last=row
@@ -294,7 +299,8 @@ with tab_add:
         d2.metric("FT Probability",f"{l.get('FT_Prob_%',0):.1f}%")
         d2.caption(l.get("FT_Label","—"))
         d3.metric("PM Float Rotation",f"{(l.get('_PM_M',0)/max(l.get('_Float_M',1e-6),1e-6)):.3f}×")
-        d4.metric("PM $Vol / MC",f"{(l.get('_PM_M',0)*l.get('pm_vwap',1e-6)/max(l.get('_MCap_M',1e-6),1e-6))*100:.1f}%")
+        pm_dollar_vs_mc = 100.0 * (l.get("_PM_M", 0.0) * l.get("_PM_VWAP", 0.0)) / max(l.get("_MCap_M", 0.0), 1e-6)
+        d4.metric("PM $Vol / MC", f"{pm_dollar_vs_mc:.1f}%")
 
 # Ranking tab
 with tab_rank:
