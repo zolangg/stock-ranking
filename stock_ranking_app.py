@@ -208,46 +208,53 @@ def predict_day_volume_m_premarket(mcap_m, gap_pct, atr_usd):
     # model outputs **millions** already
     return math.exp(ln_y)
 
-
 def predict_ft_prob_premarket(float_m_shares, gap_pct):
     """
-    Premarket FT probability (logistic) with robust input handling.
+    Premarket FT probability (logistic) — NON-standardized form.
     Inputs:
-      - float_m_shares: public float in millions of shares
+      - float_m_shares: public float in millions
       - gap_pct: gap as PERCENT (e.g., 10 for 10%)
     Returns:
       - probability in [0, 1]
     """
     import math
 
-    # trained params (standardized ln-features)
-    b0, b1, b2 = -0.982, -1.241, 1.372
-    mu_f, sd_f = 2.34, 0.91      # for ln(Float M + e_f)
-    mu_g, sd_g = -0.47, 0.56     # for ln(Gap fraction + e_g)
+    # Convert % -> fraction (CRITICAL)
+    gp = max(float(gap_pct) if gap_pct is not None else 0.0, 0.0) / 100.0
+    fl = max(float(float_m_shares) if float_m_shares is not None else 0.0, 0.0)
+
+    # Tiny eps to keep logs defined
     e_f = e_g = 1e-6
 
-    # safe casts
-    flt = max(float(float_m_shares) if float_m_shares is not None else 0.0, 0.0)
-    gp_pct = max(float(gap_pct) if gap_pct is not None else 0.0, 0.0)
-    gp = gp_pct / 100.0  # % -> fraction (CRITICAL)
+    # Equivalent coefficients in NON-standardized ln-space.
+    # Derived from the standardized form we used earlier:
+    #   lp = b0 + b1*(lnF - mu_f)/sd_f + b2*(lnG - mu_g)/sd_g
+    # => lp = B0 + Bf*lnF + Bg*lnG, where:
+    #   Bf = b1/sd_f
+    #   Bg = b2/sd_g
+    #   B0 = b0 - b1*mu_f/sd_f - b2*mu_g/sd_g
+    #
+    # Using the last coefficients we had in-code:
+    b0, b1, b2 = -0.982, -1.241, 1.372
+    mu_f, sd_f = 2.34, 0.91
+    mu_g, sd_g = -0.47, 0.56
 
-    # guard stds
-    sd_f = max(sd_f, 1e-9); sd_g = max(sd_g, 1e-9)
+    Bf = b1 / sd_f                    # ≈ -1.364
+    Bg = b2 / sd_g                    # ≈  2.450
+    B0 = b0 - b1*mu_f/sd_f - b2*mu_g/sd_g  # ≈ 1.058
 
-    z_float = (math.log(flt + e_f) - mu_f) / sd_f
-    z_gap   = (math.log(gp  + e_g) - mu_g) / sd_g
+    lnF = math.log(fl + e_f)
+    lnG = math.log(gp + e_g)
 
-    # clamp extreme z just in case
-    z_float = max(min(z_float, 6.0), -6.0)
-    z_gap   = max(min(z_gap,   6.0), -6.0)
+    lp = B0 + Bf*lnF + Bg*lnG
 
-    lp = b0 + b1*z_float + b2*z_gap
-    # numerically stable sigmoid
+    # Numerically stable sigmoid
     if lp >= 0:
         p = 1.0 / (1.0 + math.exp(-lp))
     else:
         elp = math.exp(lp)
         p = elp / (1.0 + elp)
+
     return max(0.0, min(1.0, p))
 
 def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
