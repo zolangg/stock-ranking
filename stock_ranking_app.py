@@ -162,16 +162,17 @@ def grade(score_pct: float) -> str:
 def predict_day_volume_m_premarket(mcap_m, gap_pct, atr):
     """
     Premarket day-volume model (pooled log-log OLS).
-    Returns millions of shares.
+    Returns **millions of shares**.
     """
     e1 = e2 = e3 = 1e-6
+    gp = max(gap_pct, 0.0) / 100.0   # ← convert % to fraction (CRITICAL)
     ln_y = (
         3.1435
         + 0.1608 * math.log(max(mcap_m,0)+e1)
-        + 0.6704 * math.log(max(gap_pct,0)+e2)
+        + 0.6704 * math.log(gp+e2)         # use fraction here
         - 0.3878 * math.log(max(atr,0)+e3)
     )
-    return math.exp(ln_y) / 1e6
+    return math.exp(ln_y)  # already in **millions** per our model spec
 
 def predict_ft_prob_premarket(float_m_shares, gap_pct):
     """
