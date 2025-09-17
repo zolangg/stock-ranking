@@ -177,18 +177,47 @@ def predict_day_volume_m_premarket(mcap_m, gap_pct, atr):
 
 def predict_ft_prob_premarket(float_m_shares, gap_pct):
     """
-    Premarket FT probability (logistic).
-    Returns probability in [0,1].
+    Premarket FT probability (logistic) with robust input handling.
+    Uses trained coefficients + standardization on ln-features.
+
+    Returns probability in [0, 1].
     """
-    e_f = e_g = 1e-6
-    mu_f, sd_f = 2.34, 0.91
-    mu_g, sd_g = -0.47, 0.56
+    import math
+
+    # --- trained params ---
+    e_f = 1e-6; e_g = 1e-6
+    mu_f, sd_f = 2.34, 0.91   # Float M Shares (ln scale) mean/std from training
+    mu_g, sd_g = -0.47, 0.56  # Gap fraction (ln scale) mean/std from training
     b0, b1, b2 = -0.982, -1.241, 1.372
 
-    z_float = (math.log(max(float_m_shares,0)+e_f)-mu_f)/sd_f
-    z_gap   = (math.log(max(gap_pct,0)+e_g)-mu_g)/sd_g
+    # --- safe converters ---
+    def safe_float(x, default=0.0):
+        try:
+            v = float(x)
+            if math.isnan(v) or math.isinf(v):
+                return default
+            return v
+        except Exception:
+            return default
+
+    flt = max(safe_float(float_m_shares, 0.0), 0.0)
+    gp_pct = safe_float(gap_pct, 0.0)
+
+    # Gap must be fraction (e.g., 10% -> 0.10), clamp to >=0
+    gp = max(gp_pct / 100.0, 0.0)
+
+    # guard against zero std and log domain
+    sd_f = max(sd_f, 1e-9)
+    sd_g = max(sd_g, 1e-9)
+
+    z_float = (math.log(flt + e_f) - mu_f) / sd_f
+    z_gap   = (math.log(gp  + e_g) - mu_g) / sd_g
+
     lp = b0 + b1*z_float + b2*z_gap
-    return 1/(1+math.exp(-lp))
+    p  = 1.0 / (1.0 + math.exp(-lp))
+
+    # clip just in case of extreme numerics
+    return max(0.0, min(1.0, p))
 
 def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
     if pred_m <= 0: return 0.0, 0.0
