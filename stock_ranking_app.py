@@ -212,43 +212,22 @@ def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
         if fr > 3.0: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× may indicate unit mismatch.")
     return flags
 
-def ln_terms_for_display(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst):
-    eps = 1e-12
-    mc = max(mc_m, eps)
-    si_fr = max(si_zpct, 0.0) / 100.0
-    atr = max(atr_usd, 0.0)
-    pm  = max(pm_vol_m, 0.0)
-    flt = max(float_m, eps)
-    fr  = pm / flt
-
-    t0 = 5.307
-    t1 = -0.015481 * math.log(mc)
-    t2 =  1.007036 * math.log1p(si_fr)
-    t3 = -1.267843 * math.log1p(atr)
-    t4 =  0.114066 * math.log1p(fr)
-    t5 =  0.074    * float(catalyst)
-    lnY = t0 + t1 + t2 + t3 + t4 + t5
+def ln_terms_for_display(mcap_m, gap_pct, atr_usd):
+    e = 1e-6
+    # New premarket day-volume model (millions out)
+    # ln(Y) = 3.1435 + 0.1608 ln(MCap M) + 0.6704 ln(Gap_frac) − 0.3878 ln(ATR $)
+    t0 = 3.1435
+    t1 = 0.1608 * math.log(max(float(mcap_m or 0.0), 0.0) + e)
+    t2 = 0.6704 * math.log(max(float(gap_pct or 0.0), 0.0) / 100.0 + e)
+    t3 = -0.3878 * math.log(max(float(atr_usd or 0.0), 0.0) + e)
+    lnY = t0 + t1 + t2 + t3
     Y   = math.exp(lnY)
-
     return {
-        "inputs_expected_units": {
-            "MCap (millions $)": mc_m,
-            "SI (%)": si_pct,
-            "ATR ($)": atr_usd,
-            "PM Volume (millions shares)": pm_vol_m,
-            "Float (millions shares)": float_m,
-            "Catalyst (-1..+1)": catalyst,
-        },
-        "derived": {
-            "FR = PM/Float (×)": fr
-        },
         "ln_components": {
             "base": t0,
-            "−0.015481 ln(MCap)": t1,
-            "+1.007036 ln(1+SI_frac)": t2,
-            "−1.267843 ln(1+ATR)": t3,
-            "+0.114066 ln(1+FR)": t4,
-            "+0.074 Catalyst": t5,
+            "+0.1608 ln(MCap M)": t1,
+            "+0.6704 ln(Gap frac)": t2,
+            "−0.3878 ln(ATR $)": t3,
             "lnY total": lnY
         },
         "Predicted Y (millions shares)": Y
@@ -412,26 +391,27 @@ with tab_add:
         d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
         d4.caption("PM volume ÷ predicted day volume × 100.")
 
-    # --- Sanity sniff test ---
-    with st.expander("🔎 Sanity sniff test (units & term contributions)"):
-        mc_m_dbg  = l.get("_MCap_M", 0.0)
-        si_pct_dbg= l.get("_SI_%", 0.0)
-        atr_dbg   = l.get("_ATR_$", 0.0)
-        pm_m_dbg  = l.get("_PM_M", 0.0)
-        flt_m_dbg = l.get("_Float_M", 0.0)
-        cat_dbg   = l.get("_Catalyst", 0.0)
+# --- Sanity sniff test ---
+with st.expander("🔎 Sanity sniff test (units & term contributions)"):
+    mc_m_dbg  = l.get("_MCap_M", 0.0)
+    gap_dbg   = l.get("_Gap_%", 0.0)          # <- add this
+    atr_dbg   = l.get("_ATR_$", 0.0)
+    si_pct_dbg= l.get("_SI_%", 0.0)
+    pm_m_dbg  = l.get("_PM_M", 0.0)
+    flt_m_dbg = l.get("_Float_M", 0.0)
+    cat_dbg   = l.get("_Catalyst", 0.0)
 
-        # Flags
-        flags = sanity_flags(mc_m_dbg, si_pct_dbg, atr_dbg, pm_m_dbg, flt_m_dbg)
-        if flags:
-            for f in flags:
-                st.warning(f)
-        else:
-            st.success("Inputs look plausible at a glance.")
+    # Flags
+    flags = sanity_flags(mc_m_dbg, si_pct_dbg, atr_dbg, pm_m_dbg, flt_m_dbg)
+    if flags:
+        for f in flags:
+            st.warning(f)
+    else:
+        st.success("Inputs look plausible at a glance.")
 
-        # Term-by-term breakdown
-        details = ln_terms_for_display(mc_m_dbg, si_pct_dbg, atr_dbg, pm_m_dbg, flt_m_dbg, cat_dbg)
-        st.write(details)
+    # Term-by-term breakdown for the NEW day-volume model
+    details = ln_terms_for_display(mc_m_dbg, gap_dbg, atr_dbg)  # <- updated call
+    st.write(details)
 
 # ---------- Ranking tab ----------
 with tab_rank:
