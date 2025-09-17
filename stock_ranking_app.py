@@ -165,7 +165,8 @@ def predict_day_volume_m_premarket(mcap_m, gap_pct, atr):
     Returns **millions of shares**.
     """
     e1 = e2 = e3 = 1e-6
-    gp = max(gap_pct, 0.0) / 100.0   # ← convert % to fraction (CRITICAL)
+    gp = max(gap_pct, 0.0) / 100.0
+    z_gap = (math.log(gp + e_g) - mu_g) / sd_g
     ln_y = (
         3.1435
         + 0.1608 * math.log(max(mcap_m,0)+e1)
