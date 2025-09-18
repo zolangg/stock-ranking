@@ -1,7 +1,6 @@
-import json, math, subprocess, shutil
+import math
 import streamlit as st
 import pandas as pd
-import os
 
 # ---------- Page + light CSS ----------
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -22,25 +21,6 @@ st.markdown(
 )
 
 st.title("Premarket Stock Ranking")
-
-# Resolve absolute paths so CWD changes don't break us
-APP_DIR   = os.path.dirname(os.path.abspath(__file__))
-R_SCRIPT  = os.path.join(APP_DIR, "predict_bart_cli.R")
-MODELS_DIR = os.path.join(APP_DIR, "models")
-
-def _find_rscript():
-    # Try PATH first
-    path = shutil.which("Rscript")
-    if path:
-        return path
-    # Try common locations
-    for candidate in ("/usr/bin/Rscript", "/usr/local/bin/Rscript", "/opt/homebrew/bin/Rscript", "/opt/R/bin/Rscript"):
-        if os.path.exists(candidate):
-            return candidate
-    raise RuntimeError(
-        "Rscript not found on PATH. Install system R (r-base). "
-        "On Streamlit Cloud add '.streamlit/packages.txt' with 'r-base' and redeploy."
-    )
 
 # ---------- helpers ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
@@ -155,62 +135,124 @@ sigma_ln = st.sidebar.slider(
 )
 
 # ---------- numeric scorers ----------
-def call_bart_cli(rows: list[dict]) -> pd.DataFrame:
-    rscript = _find_rscript()
+def pts_rvol(x: float) -> int:
+    for th, p in [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]:
+        if x < th: return p
+    return 7
 
-    # Sanity checks to give clear errors
-    if not os.path.exists(R_SCRIPT):
-        raise RuntimeError(f"R script not found: {R_SCRIPT}")
-    needed = [
-        "bart_model_A_predDVol_ln.rds",
-        "bart_model_A_predictors.rds",
-        "bart_model_B_FT.rds",
-        "bart_model_B_predictors.rds",
-    ]
-    for f in needed:
-        fp = os.path.join(MODELS_DIR, f)
-        if not os.path.exists(fp):
-            raise RuntimeError(f"Missing model file: {fp}")
+def pts_atr(x: float) -> int:
+    for th, p in [(0.05,1),(0.10,2),(0.20,3),(0.35,4),(0.60,5),(1.00,6)]:
+        if x < th: return p
+    return 7
 
-    payload = []
-    for r in rows:
-        payload.append({
-            "PMVolM":  float(r.get("PMVolM", 0) or 0),
-            "PMDolM":  float(r.get("PMDolM", 0) or 0),
-            "FloatM":  float(r.get("FloatM", 0) or 0),
-            "GapPct":  float(r.get("GapPct", 0) or 0),
-            "ATR":     float(r.get("ATR", 0) or 0),
-            "MCapM":   float(r.get("MCapM", 0) or 0),
-            "Catalyst": float(r.get("Catalyst", 0) or 0),
-        })
+def pts_si(x: float) -> int:
+    for th, p in [(2,1),(5,2),(10,3),(15,4),(20,5),(30,6)]:
+        if x < th: return p
+    return 7
 
-    # Pass explicit models directory via arg (and env for good measure)
-    env = os.environ.copy()
-    env["MODELS_DIR"] = MODELS_DIR
+def pts_fr(pm_vol_m: float, float_m: float) -> int:
+    if float_m <= 0: return 1
+    rot = pm_vol_m / float_m
+    for th, p in [(0.01,1),(0.03,2),(0.10,3),(0.25,4),(0.50,5),(1.00,6)]:
+        if rot < th: return p
+    return 7
 
-    p = subprocess.run(
-        [rscript, R_SCRIPT, "--both", f"--models-dir={MODELS_DIR}"],
-        input=json.dumps(payload).encode("utf-8"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=APP_DIR,          # run from app root
-        env=env,
-        check=False,
+def pts_float(float_m: float) -> int:
+    if float_m <= 3: return 7
+    for th, p in [(200,2),(100,3),(50,4),(35,5),(10,6)]:
+        if float_m > th: return p
+    return 7
+
+def odds_label(score: float) -> str:
+    if score >= 85: return "Very High Odds"
+    elif score >= 70: return "High Odds"
+    elif score >= 55: return "Moderate Odds"
+    elif score >= 40: return "Low Odds"
+    else: return "Very Low Odds"
+
+def grade(score_pct: float) -> str:
+    return ("A++" if score_pct >= 85 else
+            "A+"  if score_pct >= 80 else
+            "A"   if score_pct >= 70 else
+            "B"   if score_pct >= 60 else
+            "C"   if score_pct >= 45 else "D")
+
+# ---------- FIXED-COEFFICIENT MODELS (no R, no training) ----------
+EPS = 1e-6
+
+# Model A (your two-predictor log-OLS)
+# ln(DVol_M) = 3.03047 − 0.22568*ln(ATR_$) + 0.46415*ln(PMVol_M)
+COEFFS_A = {"b0": 3.03047, "b_pm": 0.46415, "b_atr": -0.22568}
+
+def _eng_features_core(row: dict) -> dict:
+    """Feature engineering 1:1 with the R path."""
+    pm   = float(row.get("PMVolM", 0.0) or 0.0)
+    pmd  = float(row.get("PMDolM", 0.0) or 0.0)
+    flt  = float(row.get("FloatM", 0.0) or 0.0)
+    gap  = float(row.get("GapPct", 0.0) or 0.0)
+    atr  = float(row.get("ATR", 0.0) or 0.0)
+    mc   = float(row.get("MCapM", 0.0) or 0.0)
+    cat  = 1 if (row.get("Catalyst", 0) or 0) != 0 else 0
+
+    FR   = pm / max(flt, EPS)
+    ln_pm  = math.log(max(pm,  EPS))
+    ln_pmd = math.log(max(pmd, EPS))
+    ln_fr  = math.log(max(FR,  EPS))
+    ln_gap = math.log(max(gap, 0.0)/100.0 + EPS)
+    ln_atr = math.log(max(atr, EPS))
+    ln_mc  = math.log(max(mc,  EPS))
+    ln_pmd_per_mc = math.log(max(pmd / max(mc, EPS), EPS))
+
+    return dict(
+        FR=FR,
+        ln_pm=ln_pm,
+        ln_pmdol=ln_pmd,
+        ln_fr=ln_fr,
+        ln_gapf=ln_gap,
+        ln_atr=ln_atr,
+        ln_mcap=ln_mc,
+        Catalyst=cat,
+        ln_pmdol_per_mcap=ln_pmd_per_mc,
     )
-    if p.returncode != 0:
-        raise RuntimeError(
-            "R CLI failed.\n"
-            f"CWD: {APP_DIR}\n"
-            f"Rscript: {rscript}\n"
-            f"R script: {R_SCRIPT}\n"
-            f"Models dir arg: {MODELS_DIR}\n"
-            "STDERR:\n" + p.stderr.decode("utf-8", errors="ignore")
-        )
-    out = json.loads(p.stdout.decode("utf-8"))
-    df = pd.DataFrame(out)
-    if "PredVol_M" not in df.columns: df["PredVol_M"] = float("nan")
-    if "FT_Prob"   not in df.columns: df["FT_Prob"]   = float("nan")
-    return df
+
+def predict_predvol_fixed(row: dict) -> float:
+    feats = _eng_features_core(row)
+    ln_pred = COEFFS_A["b0"] + COEFFS_A["b_pm"]*feats["ln_pm"] + COEFFS_A["b_atr"]*feats["ln_atr"]
+    return float(math.exp(ln_pred))
+
+# Model B (logistic) — paste your actual coefficients when ready
+LOGIT_B = {
+    "intercept": -0.50,          # TODO: replace with your fitted value
+    "ln_pm":     0.35,
+    "ln_fr":     0.15,
+    "ln_gapf":   0.30,
+    "ln_atr":   -0.25,
+    "ln_mcap":  -0.10,
+    "Catalyst":  0.20,
+    "ln_pmdol":  0.10,
+    "ln_pmdol_per_mcap": 0.10,
+    "ln_predvol": 0.25,
+}
+def _sigmoid(z: float) -> float:
+    if z >= 0:
+        ez = math.exp(-z); return 1.0/(1.0+ez)
+    else:
+        ez = math.exp(z);  return ez/(1.0+ez)
+
+def predict_ft_prob_fixed(row: dict, pred_vol_m: float) -> float:
+    feats = _eng_features_core(row)
+    ln_predvol = math.log(max(pred_vol_m, EPS))
+    z = (LOGIT_B["intercept"]
+         + LOGIT_B["ln_pm"]     * feats["ln_pm"]
+         + LOGIT_B["ln_fr"]     * feats["ln_fr"]
+         + LOGIT_B["ln_gapf"]   * feats["ln_gapf"]
+         + LOGIT_B["ln_atr"]    * feats["ln_atr"]
+         + LOGIT_B["ln_mcap"]   * feats["ln_mcap"]
+         + LOGIT_B["Catalyst"]  * feats["Catalyst"]
+         + LOGIT_B["ln_pmdol"]  * feats["ln_pmdol"]
+         + LOGIT_B["ln_pmdol_per_mcap"] * feats["ln_pmdol_per_mcap"]
+         + LOGIT_B["ln_predvol"] * ln_predvol)
+    return float(_sigmoid(z))
 
 # ---------- UI ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -228,7 +270,7 @@ with tab_add:
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
 
-        # MIDDLE (reordered per your request)
+        # MIDDLE — per your order: Market Cap → Short Interest → Premarket Volume → PM VWAP
         with c_top[1]:
             mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
@@ -260,29 +302,18 @@ with tab_add:
         # compute PM $Vol (Millions) from inputs (shares in M × $)
         pm_dol_m = pm_vol_m * pm_vwap
 
-        # ---- BART predictions via R (Model A + B) ----
-        try:
-            cli_df = call_bart_cli([{
-                "PMVolM": pm_vol_m,
-                "PMDolM": pm_dol_m,
-                "FloatM": float_m,
-                "GapPct": gap_pct,
-                "ATR":    atr_usd,
-                "MCapM":  mc_m,
-                "Catalyst": 1 if catalyst_points > 0 else 0,
-            }])
-        except Exception as e:
-            st.error(
-                "Could not load BART models (.rds). Ensure R and required R packages are installed, "
-                "and place these files in the app folder:\n\n"
-                "• bart_model_A_predDVol_ln.rds\n• bart_model_A_predictors.rds\n"
-                "• bart_model_B_FT.rds\n• bart_model_B_predictors.rds\n\n"
-                "Also include predict_bart_cli.R.\n\nDetails:\n" + str(e)
-            )
-            st.stop()
-
-        pred_vol_m = float(cli_df.loc[0, "PredVol_M"])
-        ft_prob    = float(cli_df.loc[0, "FT_Prob"])
+        # ---- Fixed-coefficient predictions (no R) ----
+        base_row = {
+            "PMVolM": pm_vol_m,
+            "PMDolM": pm_dol_m,
+            "FloatM": float_m,
+            "GapPct": gap_pct,
+            "ATR":    atr_usd,
+            "MCapM":  mc_m,
+            "Catalyst": 1 if catalyst_points > 0 else 0,
+        }
+        pred_vol_m = predict_predvol_fixed(base_row)
+        ft_prob    = predict_ft_prob_fixed(base_row, pred_vol_m=pred_vol_m)
 
         # CI bands for predicted volume
         ci68_l = pred_vol_m * math.exp(-1.0 * sigma_ln)
@@ -331,7 +362,7 @@ with tab_add:
             "Qual_%": round(qual_pct, 2),
             "FinalScore": final_score,
 
-            # BART predictions
+            # Predictions
             "PredVol_M": round(pred_vol_m, 2),
             "PredVol_CI68_L": round(ci68_l, 2),
             "PredVol_CI68_U": round(ci68_u, 2),
