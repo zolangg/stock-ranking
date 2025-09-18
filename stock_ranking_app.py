@@ -317,21 +317,34 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str], draws=800, tune
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    # Build new design matrix
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
-
-    # Swap data -> sample posterior predictive for the observed ln-volume ("y_obs")
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["y_obs"],           # <-- use observed var, not "f"
+            var_names=["y_obs"],
             return_inferencedata=False,
             progressbar=False
         )
-    # y_obs are draws in ln-space; average over draws, then exp back to "millions"
-    ln_pred = np.asarray(ppc["y_obs"]).mean(axis=0)
-    return np.exp(ln_pred)
+
+    arr = np.asarray(ppc["y_obs"])
+    # Expected shapes: (chains, draws, n) OR (draws, n) OR (n,)
+    if arr.ndim == 3:
+        # chains × draws × n_obs  -> mean over chains & draws
+        ln_mean = arr.mean(axis=(0, 1))
+    elif arr.ndim == 2:
+        # draws × n_obs -> mean over draws
+        ln_mean = arr.mean(axis=0)
+    elif arr.ndim == 1:
+        # already n_obs
+        ln_mean = arr
+    else:
+        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
+
+    if ln_mean.shape[0] != X.shape[0]:
+        raise ValueError(f"predict_model_A length mismatch: {ln_mean.shape[0]} vs {X.shape[0]}")
+
+    return np.exp(ln_mean)
 
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
@@ -365,10 +378,27 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
-        # posterior predictive draws of Bernoulli y_obs; take mean as P(FT)
-        ppc = pm.sample_posterior_predictive(bundle["trace"], var_names=["y_obs"], progressbar=False)
-        y_draws = ppc["y_obs"]                       # shape: draws × n_obs
-        probs = y_draws.mean(axis=0)                 # Monte Carlo prob
+        ppc = pm.sample_posterior_predictive(
+            bundle["trace"],
+            var_names=["y_obs"],    # Bernoulli draws 0/1
+            return_inferencedata=False,
+            progressbar=False
+        )
+
+    arr = np.asarray(ppc["y_obs"])
+    # shapes: (chains, draws, n) or (draws, n) or (n,)
+    if arr.ndim == 3:
+        probs = arr.mean(axis=(0, 1))
+    elif arr.ndim == 2:
+        probs = arr.mean(axis=0)
+    elif arr.ndim == 1:
+        probs = arr.astype(float)
+    else:
+        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
+
+    if probs.shape[0] != X.shape[0]:
+        raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
+
     return probs.astype(float)
 
 def predict_model_B(bundle, Xnew: pd.DataFrame) -> np.ndarray:
