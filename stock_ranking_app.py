@@ -298,31 +298,28 @@ def _sample(draws, tune, chains, seed):
     )
 
 # ---------- BART training ----------
+# --------- Model A: BART regression (canonical pattern; no custom step) ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
                   draws=600, tune=400, trees=150, seed=42, chains=1):
     dfA = df_feats.dropna(subset=["ln_DVol"] + predictors).copy()
     if len(dfA) < 30:
         raise RuntimeError("Not enough rows to train Model A (need ≥30).")
 
-    # float64 & contiguous (PyMC/pymc-bart are picky)
+    # float64 + contiguous arrays (avoids dtype issues)
     X = np.ascontiguousarray(dfA[predictors].to_numpy(dtype=np.float64))
-    y = np.asarray(dfA["ln_DVol"].to_numpy(dtype=np.float64))
-
-    # FIX σ so there's only one free RV (the BART latent)
-    sigma_val = float(np.nanstd(y)) if np.isfinite(np.nanstd(y)) and np.nanstd(y) > 0 else 1.0
+    y = np.ascontiguousarray(dfA["ln_DVol"].to_numpy(dtype=np.float64))
 
     with pm.Model() as mA:
         X_A = pm.MutableData("X_A", X)
-        f = pmb.BART("f", X_A, y, m=trees)                 # the ONLY RV in this model
-        pm.Normal("y_obs", mu=f, sigma=sigma_val, observed=y)
+        f = pmb.BART("f", X_A, y, m=trees)      # latent mean (log-volume)
+        sigma = pm.HalfNormal("sigma", 1.0)     # canonical: sample σ as well
+        pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
 
-        # IMPORTANT: let PGBART auto-discover BART RVs — do NOT pass vars=[...]
         trace = pm.sample(
             draws=draws,
             tune=tune,
-            chains=1,             # keep 1 for Cloud stability
+            chains=1,          # 1 chain is fine on Streamlit Cloud
             cores=1,
-            step=[pmb.PGBART()],  # <-- this is the fix
             random_seed=seed,
             target_accept=0.9,
             init="adapt_diag",
@@ -356,6 +353,7 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         raise ValueError(f"predict_model_A length mismatch: {ln_mean.shape[0]} vs {X.shape[0]}")
     return np.exp(ln_mean)
 
+# --------- Model B: BART classification (canonical; no custom step) ----------
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=300, trees=60, chains=1, seed=123):
     dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
@@ -367,20 +365,18 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
         preds_B = preds_B + ["PredVol_M"]
 
     X = np.ascontiguousarray(dfB2[preds_B].to_numpy(dtype=np.float64))
-    y = (dfB2["FT_fac"].astype(str) == "FT").to_numpy(dtype=np.int8)  # {0,1}
+    y = (dfB2["FT_fac"].astype(str) == "FT").to_numpy(dtype=np.int8)
 
     with pm.Model() as mB:
         X_B = pm.MutableData("X_B", X)
-        f = pmb.BART("f", X_B, y, m=trees)                     # the ONLY RV
+        f = pmb.BART("f", X_B, y, m=trees)      # latent log-odds
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
-        # Same: auto-detect the BART RV
         trace = pm.sample(
             draws=draws,
             tune=tune,
             chains=1,
             cores=1,
-            step=[pmb.PGBART()],   # <-- this is the fix
             random_seed=seed,
             target_accept=0.9,
             init="adapt_diag",
