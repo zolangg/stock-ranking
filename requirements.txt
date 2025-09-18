@@ -6,7 +6,7 @@ numpy==1.26.4
 scipy==1.13.1
 pandas==2.2.2
 
-pytensor==2.20.0        # <-- compatible with PyMC 5.13.1
+pytensor>=2.20,<2.21    # <-- lets pip resolve 2.20.0
 arviz==0.18.0
 pymc==5.13.1
 pymc-bart==0.5.4
