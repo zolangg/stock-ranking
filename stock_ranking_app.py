@@ -437,14 +437,27 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                     draws=draws, tune=tune, trees=trees, seed=seed
                 )
 
-                # Use A to generate PredVol_M across eligible rows (uncapped, so predictions exist broadly)
-                okA_idx = df_all.dropna(subset=A_bundle["predictors"]).index
-                df_all_with_pred = df_all.copy()
-                if len(okA_idx) > 0:
-                    df_all_with_pred.loc[okA_idx, "PredVol_M"] = predict_model_A(A_bundle, df_all.loc[okA_idx])
-                else:
+                # --- Use A to generate PredVol_M across eligible rows
+                pred_cols = A_bundle["predictors"]
+                
+                # Build X on the exact rows that have all predictors present
+                okA = df_all[pred_cols].dropna().index
+                if len(okA) == 0:
                     st.error("No rows pass Model A predictors; cannot proceed to Model B.")
                     st.stop()
+                
+                Xnew = df_all.loc[okA]  # rows ready for prediction
+                preds = predict_model_A(A_bundle, Xnew)
+                
+                # Safety: ensure shape matches
+                preds = np.asarray(preds).reshape(-1)
+                if preds.shape[0] != len(okA):
+                    st.error(f"Internal mismatch: got {preds.shape[0]} preds for {len(okA)} rows.")
+                    st.stop()
+                
+                # Assign predictions back into df_all_with_pred
+                df_all_with_pred = df_all.copy()
+                df_all_with_pred.loc[okA, "PredVol_M"] = pd.Series(preds, index=okA, dtype="float64")
 
                 # Prep B data, cap with class balance
                 dfB = df_all_with_pred.dropna(subset=["FT_fac", "PredVol_M"]).copy()
