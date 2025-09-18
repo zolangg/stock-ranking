@@ -313,15 +313,17 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
         sigma = pm.Exponential("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
 
-        # Use BART stepper for f AND NUTS for sigma
-        steps = [pmb.PGBART(), pm.NUTS(vars=[sigma])]
+        steps = [
+            pmb.PGBART(vars=[f]),        # <-- tell BART stepper which var to handle
+            pm.NUTS(vars=[sigma]),       # <-- give sigma its own stepper
+        ]
 
         trace = pm.sample(
             draws=draws,
             tune=tune,
             chains=chains,
             cores=1,
-            step=steps,                 # <-- list of steppers
+            step=steps,                  # list of steppers
             target_accept=0.9,
             random_seed=seed,
             progressbar=True,
@@ -387,15 +389,14 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
         f = pmb.BART("f", X_B, y, m=trees)   # latent log-odds
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
-        # Robust across versions: pass a LIST and let it auto-detect bart vars
-        steps = [pmb.PGBART()]
+        steps = [pmb.PGBART(vars=[f])]       # <-- point the BART stepper at f
 
         trace = pm.sample(
             draws=draws,
             tune=tune,
             chains=chains,
             cores=1,
-            step=steps,                 # <-- list, auto-detect bart var(s)
+            step=steps,
             target_accept=0.9,
             random_seed=seed,
             progressbar=True,
