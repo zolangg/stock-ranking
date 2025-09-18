@@ -1,3 +1,6 @@
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import math, os
 import numpy as np
 import pandas as pd
