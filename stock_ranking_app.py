@@ -3,7 +3,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
-import math, os
+import math
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -238,17 +238,15 @@ def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
     else:
         out["Catalyst"] = (pd.to_numeric(out["Catalyst"], errors="coerce").fillna(0).astype(float) != 0).astype(int)
 
-    # FT factor
+    # FT factor label
     f = out["FT_raw"].astype(str).str.lower().str.strip()
-    out["FT_fac"] = np.where(f.isin(["ft","1","yes","y","true"]), "FT", "Fail")
+    out["FT_fac"] = np.where(f.isin(["ft","1","yes","y","true"]), "FT", "Fail").astype("category")
 
     return out
 
 def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     eps = 1e-6
     out = raw.copy()
-    # Fill PMDolM if missing (PMVolM * an implied vwap if present later)
-    # Here we leave PMDolM as provided; at input time in the UI we set it from PMVolM*VWAP.
     out["FR"]       = out["PMVolM"] / np.maximum(out["FloatM"].replace(0, np.nan), eps)
     out["ln_DVol"]  = np.log(np.maximum(out["DVolM"], eps))
     out["ln_pm"]    = np.log(np.maximum(out["PMVolM"], eps))
@@ -258,16 +256,15 @@ def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     out["ln_atr"]   = np.log(np.maximum(out["ATR"], eps))
     out["ln_mcap"]  = np.log(np.maximum(out["MCapM"], eps))
     out["ln_pmdol_per_mcap"] = np.log(np.maximum(out["PMDolM"] / np.maximum(out["MCapM"], eps), eps))
-    # ensure dtype
     out["Catalyst"] = (pd.to_numeric(out.get("Catalyst", 0), errors="coerce").fillna(0).astype(float) != 0).astype(int)
     out["FT_fac"]   = out["FT_fac"].astype("category")
     return out
 
-# ---- Predictor sets (must be defined BEFORE training is called)
-A_FEATURES_DEFAULT = ["ln_pm", "ln_pmdol", "ln_fr", "ln_gapf", "ln_atr", "ln_mcap", "Catalyst"]
-B_FEATURES_CORE    = ["ln_pm", "ln_fr", "ln_gapf", "ln_atr", "ln_mcap", "Catalyst", "ln_pmdol", "PredVol_M"]
+# ---- Predictor sets
+A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
+B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","ln_pmdol","PredVol_M"]
 
-# ---- Small helpers used by the cached trainers
+# ---- Small helpers
 def _assert_finite(name, arr):
     if not np.all(np.isfinite(arr)):
         bad = np.where(~np.isfinite(arr))
@@ -279,12 +276,7 @@ def _sample(draws, tune, chains, seed):
         target_accept=0.9, random_seed=seed, progressbar=False
     )
 
-# Predictor sets (mirror your R run)
-A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
-B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","ln_pmdol","PredVol_M"]
-
-# ---------- BART training (cached) ----------
-@st.cache_resource(show_spinner=True)
+# ---------- BART training ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str], draws=800, tune=800, trees=200, seed=42):
     dfA = df_feats.dropna(subset=["ln_DVol"] + predictors).copy()
     if len(dfA) < 30:
@@ -295,7 +287,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str], draws=800, tune
     with pm.Model() as mA:
         f = pmb.BART("f", X, y, m=trees)     # latent mean
         sigma = pm.Exponential("sigma", 1.0)
-        y_obs = pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
+        pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
         trace = pm.sample(draws=draws, tune=tune, chains=2, cores=1,
                           target_accept=0.9, random_seed=seed, progressbar=False)
     return {"model": mA, "trace": trace, "predictors": predictors}
@@ -304,30 +296,8 @@ def predict_model_A(bundle, Xnew: pd.DataFrame) -> np.ndarray:
     X = Xnew[bundle["predictors"]].to_numpy(dtype=float)
     with bundle["model"]:
         f_new = pmb.predict(bundle["trace"], X, kind="mean")
-    # convert ln -> level (millions)
-    return np.exp(f_new)
+    return np.exp(f_new)  # ln → level (millions)
 
-# Train A
-A_bundle = train_model_A(df_all, A_FEATURES_DEFAULT, draws=draws, tune=tune, trees=trees, seed=seed)
-
-# Make PredVol_M on all rows that can support A’s predictors
-okA_idx = df_all.dropna(subset=A_bundle["predictors"]).index
-df_all_with_pred = df_all.copy()
-if len(okA_idx) > 0:
-    df_all_with_pred.loc[okA_idx, "PredVol_M"] = predict_model_A(A_bundle, df_all.loc[okA_idx])
-else:
-    st.error("No rows pass Model A predictors; cannot proceed to Model B.")
-    st.stop()
-
-# Train B (now no unhashable args!)
-B_bundle = train_model_B(df_all_with_pred, B_FEATURES_CORE, draws=draws, tune=tune, trees=trees, seed=seed+1)
-
-# store both
-st.session_state["A_bundle"] = A_bundle
-st.session_state["B_bundle"] = B_bundle
-
-@st.cache_resource(show_spinner=True)
-@st.cache_resource(show_spinner=True)
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
     """df_feats_with_predvol MUST already contain a finite 'PredVol_M' column."""
@@ -380,13 +350,29 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 df_all = featurize(raw)
 
                 # Train A
-                A_bundle = train_model_A(df_all, A_FEATURES_DEFAULT, draws=draws, tune=tune, trees=trees, seed=seed)
-                # Train B (needs A preds)
-                B_bundle = train_model_B(df_all, B_FEATURES_CORE, A_bundle, draws=draws, tune=tune, trees=trees, seed=seed+1)
+                A_bundle = train_model_A(df_all, A_FEATURES_DEFAULT,
+                                         draws=draws, tune=tune, trees=trees, seed=seed)
+
+                # Use A to generate PredVol_M for rows that have all A predictors
+                okA_idx = df_all.dropna(subset=A_bundle["predictors"]).index
+                df_all_with_pred = df_all.copy()
+                if len(okA_idx) > 0:
+                    df_all_with_pred.loc[okA_idx, "PredVol_M"] = predict_model_A(
+                        A_bundle, df_all.loc[okA_idx]
+                    )
+                else:
+                    st.error("No rows pass Model A predictors; cannot proceed to Model B.")
+                    st.stop()
+
+                # Train B on the augmented frame
+                B_bundle = train_model_B(
+                    df_all_with_pred, B_FEATURES_CORE,
+                    draws=draws, tune=tune, trees=max(75, trees//3), seed=seed+1
+                )
 
                 st.session_state["A_bundle"] = A_bundle
                 st.session_state["B_bundle"] = B_bundle
-                st.success("BART models trained & cached for this session.")
+                st.success("BART models trained & stored for this session.")
 
 # ---------- UI: Add / Ranking ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -409,7 +395,7 @@ with tab_add:
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
 
-        # MIDDLE (order per your preference)
+        # MIDDLE
         with c_top[1]:
             mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
@@ -427,6 +413,7 @@ with tab_add:
         q_cols = st.columns(3)
         for i, crit in enumerate(QUAL_CRITERIA):
             with q_cols[i % 3]:
+                # value is (idx, text); we use idx later (1..7)
                 st.radio(
                     crit["question"],
                     options=list(enumerate(crit["options"], 1)),
@@ -453,13 +440,10 @@ with tab_add:
         }])
         feats = featurize(row)
 
-        A_bundle = st.session_state["A_bundle"]
-        B_bundle = st.session_state["B_bundle"]
-
         # Model A prediction (millions)
         pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
 
-        # For Model B, we must include PredVol_M feature
+        # Model B needs PredVol_M
         featsB = feats.copy()
         featsB["PredVol_M"] = pred_vol_m
         ft_prob = float(predict_model_B(B_bundle, featsB)[0])
