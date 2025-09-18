@@ -352,6 +352,9 @@ from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
 import pandas as pd
 
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.utils.class_weight import compute_class_weight
+
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
     """
@@ -369,21 +372,21 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
     X = dfB[preds_B].to_numpy(dtype=float)
     y = (dfB["FT_fac"].astype(str) == "FT").to_numpy(dtype=int)
 
-    # class weights for any imbalance
+    # Compute per-class weights, then map to per-sample weights
     classes = np.array([0, 1])
     cw = compute_class_weight(class_weight="balanced", classes=classes, y=y)
-    class_weight = {int(c): float(w) for c, w in zip(classes, cw)}
+    w0, w1 = float(cw[0]), float(cw[1])
+    sample_w = np.where(y == 1, w1, w0)
 
-    # a compact, strong default; tweak max_iter if you have many rows
+    # Compact, strong defaults; deterministic with random_state
     clf = HistGradientBoostingClassifier(
         max_depth=3,
         learning_rate=0.08,
         max_iter=250,
         l2_regularization=0.0,
         random_state=seed,
-        class_weight=class_weight
     )
-    clf.fit(X, y)
+    clf.fit(X, y, sample_weight=sample_w)
 
     return {"model": clf, "predictors": preds_B}
 
