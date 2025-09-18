@@ -351,7 +351,7 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
     """
     df_feats_with_predvol MUST already contain a finite 'PredVol_M' column.
     """
-    dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac","PredVol_M"]).copy()
+    dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
     if len(dfB2) < 30 or dfB2["FT_fac"].nunique() < 2:
         raise RuntimeError("Not enough labeled rows or only one class for Model B.")
 
@@ -366,11 +366,23 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
     _assert_finite("y_B", y)
 
     with pm.Model() as mB:
-        X_B = pm.MutableData("X_B", X)            # <— data container
-        f = pmb.BART("f", X_B, y, m=trees)        # latent logit
-        p = pm.Deterministic("p", pm.math.sigmoid(f))
-        pm.Bernoulli("y_obs", p=p, observed=y)
-        trace = _sample(draws, tune, chains, seed)
+        X_B = pm.MutableData("X_B", X)
+        # Latent log-odds
+        f = pmb.BART("f", X_B, y, m=trees)
+        # Use logit_p instead of p=sigmoid(f)
+        pm.Bernoulli("y_obs", logit_p=f, observed=y)
+
+        trace = pm.sample(
+            draws=draws,
+            tune=tune,
+            chains=chains,      # keep 1 for speed/stability on Cloud
+            cores=1,
+            target_accept=0.9,
+            random_seed=seed,
+            progressbar=True,
+            discard_tuned_samples=True,
+            compute_convergence_checks=False,
+        )
 
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
@@ -378,9 +390,10 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
+        # posterior predictive for Bernoulli draws (0/1); take mean as prob
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["y_obs"],    # Bernoulli draws 0/1
+            var_names=["y_obs"],
             return_inferencedata=False,
             progressbar=False
         )
@@ -400,12 +413,6 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
 
     return probs.astype(float)
-
-def predict_model_B(bundle, Xnew: pd.DataFrame) -> np.ndarray:
-    X = Xnew[bundle["predictors"]].to_numpy(dtype=float)
-    with bundle["model"]:
-        f_new = pmb.predict(bundle["trace"], X, kind="mean")  # latent
-    return expit(f_new)  # probability
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
     if n <= 0 or len(df) <= n: 
