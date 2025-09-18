@@ -1,4 +1,3 @@
-# apt.txt  (repo root)
 r-base
 libcurl4-openssl-dev
 libssl-dev
