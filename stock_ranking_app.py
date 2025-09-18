@@ -7,17 +7,13 @@ st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.markdown(
     """
     <style>
-      /* tighten default font and sizes so everything feels consistent */
       html, body, [class*="css"]  { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
       .smallcap { color:#6b7280; font-size:12px; margin-top:-8px; }
       .section-title { font-weight: 700; font-size: 1.05rem; letter-spacing:.2px; margin: 4px 0 8px 0; }
       .stMetric label { font-size: 0.85rem; font-weight: 600; color:#374151;}
       .stMetric [data-testid="stMetricValue"] { font-size: 1.15rem; }
-      /* radios look denser */
       div[role="radiogroup"] label p { font-size: 0.88rem; line-height:1.25rem; }
-      /* section dividers */
       .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 16px 0; }
-      /* sidebar spacing */
       section[data-testid="stSidebar"] .stSlider { margin-bottom: 6px; }
     </style>
     """,
@@ -26,9 +22,9 @@ st.markdown(
 
 st.title("Premarket Stock Ranking")
 
-R_SCRIPT = "./predict_bart_cli.R"  # must be present alongside this file
+R_SCRIPT = "./predict_bart_cli.R"  # must exist next to this file
 
-# ---------- Tiny helpers ----------
+# ---------- helpers ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     keep = [c for c in cols if c in df.columns]
     if not keep: return "| (no data) |\n| --- |"
@@ -53,7 +49,7 @@ def do_rerun():
         try: st.experimental_rerun()
         except Exception: pass
 
-# ---------- Session ----------
+# ---------- session ----------
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "flash" not in st.session_state: st.session_state.flash = None
@@ -61,7 +57,7 @@ if st.session_state.flash:
     st.success(st.session_state.flash)
     st.session_state.flash = None
 
-# ---------- Qualitative criteria (same structure you used) ----------
+# ---------- qualitative ----------
 QUAL_CRITERIA = [
     {
         "name": "GapStruct",
@@ -110,7 +106,7 @@ QUAL_CRITERIA = [
     },
 ]
 
-# ---------- Sidebar: weights & modifiers ----------
+# ---------- sidebar ----------
 st.sidebar.header("Numeric Weights")
 w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01)
 w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01)
@@ -140,7 +136,7 @@ sigma_ln = st.sidebar.slider(
     help="Used for CI bands around predicted day volume."
 )
 
-# ---------- Numeric scorers (unchanged) ----------
+# ---------- numeric scorers ----------
 def pts_rvol(x: float) -> int:
     for th, p in [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]:
         if x < th: return p
@@ -190,14 +186,13 @@ def call_bart_cli(rows: list[dict]) -> pd.DataFrame:
     payload = []
     for r in rows:
         payload.append({
-            # units must match the R fit: millions and percents/$ as shown
             "PMVolM": float(r.get("PMVolM", 0) or 0),
-            "PMDolM": float(r.get("PMDolM", 0) or 0),
+            "PMDolM": float(r.get("PMDolM", 0) or 0),  # computed from PMVolM * VWAP
             "FloatM": float(r.get("FloatM", 0) or 0),
             "GapPct": float(r.get("GapPct", 0) or 0),
             "ATR":    float(r.get("ATR", 0) or 0),
             "MCapM":  float(r.get("MCapM", 0) or 0),
-            "Catalyst": float(r.get("Catalyst", 0) or 0),  # 0/1 expected by wrapper
+            "Catalyst": float(r.get("Catalyst", 0) or 0),
         })
     p = subprocess.run(
         ["Rscript", R_SCRIPT, "--both"],
@@ -214,7 +209,7 @@ def call_bart_cli(rows: list[dict]) -> pd.DataFrame:
     if "FT_Prob"   not in df.columns: df["FT_Prob"]   = float("nan")
     return df
 
-# ---------- Tabs ----------
+# ---------- UI ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 with tab_add:
@@ -222,6 +217,7 @@ with tab_add:
     with st.form("add_form", clear_on_submit=True):
         c_top = st.columns([1.25, 1.25, 1.0])
 
+        # LEFT
         with c_top[0]:
             ticker   = st.text_input("Ticker", "").strip().upper()
             rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.01, format="%.2f")
@@ -229,12 +225,14 @@ with tab_add:
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
 
+        # MIDDLE (reordered per your request)
         with c_top[1]:
             mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            pm_dol_m = st.number_input("PM $ Volume (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.0001, format="%.4f")
 
+        # RIGHT
         with c_top[2]:
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
             dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
@@ -256,6 +254,9 @@ with tab_add:
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
     if submitted and ticker:
+        # compute PM $Vol (Millions) from inputs (shares in M × $)
+        pm_dol_m = pm_vol_m * pm_vwap
+
         # ---- BART predictions via R (Model A + B) ----
         try:
             cli_df = call_bart_cli([{
@@ -265,7 +266,7 @@ with tab_add:
                 "GapPct": gap_pct,
                 "ATR":    atr_usd,
                 "MCapM":  mc_m,
-                "Catalyst": 1 if catalyst_points > 0 else 0,  # binarize like the fitter
+                "Catalyst": 1 if catalyst_points > 0 else 0,
             }])
         except Exception as e:
             st.error(
@@ -295,15 +296,15 @@ with tab_add:
         num_0_7 = (w_rvol*p_rvol) + (w_atr*p_atr) + (w_si*p_si) + (w_fr*p_fr) + (w_float*p_float)
         num_pct = (num_0_7/7.0)*100.0
 
-        # ---- Qualitative points (weighted 1..7) ----
+        # ---- Qualitative (weighted 1..7) ----
         qual_0_7 = 0.0
         for crit in QUAL_CRITERIA:
             raw = st.session_state.get(f"qual_{crit['name']}", (1,))
-            sel = raw[0] if isinstance(raw, tuple) else raw  # 1..7
+            sel = raw[0] if isinstance(raw, tuple) else raw
             qual_0_7 += q_weights[crit["name"]] * float(sel)
         qual_pct = (qual_0_7/7.0)*100.0
 
-        # ---- Combine + modifiers (50/50 like before) ----
+        # ---- Combine + modifiers ----
         combo_pct   = 0.5*num_pct + 0.5*qual_pct
         final_score = round(
             combo_pct + news_weight*(1 if catalyst_points>0 else 0)*10 + dilution_weight*(dilution_points)*10, 2
@@ -340,8 +341,6 @@ with tab_add:
             # Compact diagnostics
             "PM_%_of_Pred": round(pm_pct_of_pred, 1),
             "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
-
-            # keep FR but drop from main table if you wish later
             "PM_FloatRot_x": round(pm_float_rot_x, 3),
 
             # raw
@@ -357,7 +356,7 @@ with tab_add:
         )
         do_rerun()
 
-    # ---------- Preview card (kept tidy; FT label in caption) ----------
+    # ---------- Preview card ----------
     l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
     if l:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
