@@ -13,6 +13,15 @@ st.title("Premarket Stock Ranking")
 try:
     from rpy2 import robjects as ro
     from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+    import rpy2.robjects as ro
+    
+    # Example: sending a pandas dataframe to R
+    import pandas as pd
+    df = pd.DataFrame({"x":[1,2,3]})
+    
+    with localconverter(ro.default_converter + pandas2ri.converter):
+        r_from_pd = ro.conversion.py2rpy(df)
     from rpy2.robjects.packages import importr
 except Exception as e:
     st.error("rpy2 is required. Install R + rpy2, and R packages 'dbarts' and 'BART'.")
