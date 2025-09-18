@@ -307,23 +307,23 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     X = dfA[predictors].to_numpy(dtype=float)
     y = dfA["ln_DVol"].to_numpy(dtype=float)
 
+    # Use a fixed observation noise (scale of log-volume). This avoids a second RV
+    # that would require a separate sampler and has caused step-assignment crashes.
+    sigma_val = float(np.nanstd(y))
+    if not np.isfinite(sigma_val) or sigma_val <= 0:
+        sigma_val = 1.0
+
     with pm.Model() as mA:
         X_A = pm.MutableData("X_A", X)
-        f = pmb.BART("f", X_A, y, m=trees)      # latent (log-volume)
-        sigma = pm.Exponential("sigma", 1.0)
-        pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
-
-        steps = [
-            pmb.PGBART(vars=[f]),        # <-- tell BART stepper which var to handle
-            pm.NUTS(vars=[sigma]),       # <-- give sigma its own stepper
-        ]
+        f = pmb.BART("f", X_A, y, m=trees)           # latent mean in log-space
+        pm.Normal("y_obs", mu=f, sigma=sigma_val, observed=y)
 
         trace = pm.sample(
             draws=draws,
             tune=tune,
             chains=chains,
             cores=1,
-            step=steps,                  # list of steppers
+            step=[pmb.PGBART(vars=[f])],             # <-- only BART stepper
             target_accept=0.9,
             random_seed=seed,
             progressbar=True,
@@ -386,17 +386,15 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
 
     with pm.Model() as mB:
         X_B = pm.MutableData("X_B", X)
-        f = pmb.BART("f", X_B, y, m=trees)   # latent log-odds
+        f = pmb.BART("f", X_B, y, m=trees)           # latent log-odds
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
-
-        steps = [pmb.PGBART(vars=[f])]       # <-- point the BART stepper at f
 
         trace = pm.sample(
             draws=draws,
             tune=tune,
             chains=chains,
             cores=1,
-            step=steps,
+            step=[pmb.PGBART(vars=[f])],             # <-- BART stepper
             target_accept=0.9,
             random_seed=seed,
             progressbar=True,
@@ -489,8 +487,10 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 dfA = _row_cap(dfA, int(capA)) if capA else dfA
 
                 # Train A
-                A_bundle = train_model_A(dfA, A_FEATURES_DEFAULT,
-                         draws=draws, tune=tune, trees=trees, seed=seed, chains=chains)
+                A_bundle = train_model_A(
+                dfA, A_FEATURES_DEFAULT,
+                draws=draws, tune=tune, trees=trees, seed=seed, chains=chains
+                )
 
                 # --- Use A to generate PredVol_M across eligible rows
                 pred_cols = A_bundle["predictors"]
