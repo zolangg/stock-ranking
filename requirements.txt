@@ -2,17 +2,14 @@ pip>=24
 setuptools>=68
 wheel
 
-# Core
 numpy==1.26.4
 scipy==1.13.1
 pandas==2.2.2
 
-# PyMC stack (compatible on py3.11)
-pytensor==2.25.4
+pytensor==2.20.0        # <-- compatible with PyMC 5.13.1
 arviz==0.18.0
 pymc==5.13.1
 pymc-bart==0.5.4
 
-# App
 openpyxl==3.1.5
 streamlit==1.37.1
