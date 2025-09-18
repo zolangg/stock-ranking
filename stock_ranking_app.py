@@ -300,7 +300,6 @@ def _sample(draws, tune, chains, seed):
 # ---------- BART training ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
                   draws=800, tune=800, trees=200, seed=42, chains=1):
-    # prepare data
     dfA = df_feats.dropna(subset=["ln_DVol"] + predictors).copy()
     if len(dfA) < 30:
         raise RuntimeError("Not enough rows to train Model A (need ≥30).")
@@ -310,32 +309,28 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     if not np.all(np.isfinite(X)) or not np.all(np.isfinite(y)):
         raise ValueError("Non-finite values in Model A training data.")
 
-    # fixed observation noise to avoid extra RV and step-assignment conflicts
-    sigma_val = float(np.nanstd(y))
-    if not np.isfinite(sigma_val) or sigma_val <= 0:
-        sigma_val = 1.0
+    # Fixed noise → avoid second RV
+    sigma_val = float(np.nanstd(y)) if np.isfinite(np.nanstd(y)) and np.nanstd(y) > 0 else 1.0
 
     with pm.Model() as mA:
         X_A = pm.MutableData("X_A", X)
-        f = pmb.BART("f", X_A, y, m=trees)      # latent log-volume
+        f = pmb.BART("f", X_A, y, m=trees)           # latent log-volume
         pm.Normal("y_obs", mu=f, sigma=sigma_val, observed=y)
 
-        # Try auto step-method assignment first; if it fails, retry with explicit PGBART
-        try:
-            trace = pm.sample(
-                draws=draws, tune=tune, chains=chains, cores=1,
-                target_accept=0.9, random_seed=seed, progressbar=True,
-                init="adapt_diag", discard_tuned_samples=True,
-                compute_convergence_checks=False,
-            )
-        except Exception:
-            trace = pm.sample(
-                draws=draws, tune=tune, chains=chains, cores=1,
-                step=pmb.PGBART(vars=[f]),
-                target_accept=0.9, random_seed=seed, progressbar=True,
-                init="adapt_diag", discard_tuned_samples=True,
-                compute_convergence_checks=False,
-            )
+        # Force PGBART & single chain (most robust across builds)
+        trace = pm.sample(
+            draws=draws,
+            tune=tune,
+            chains=1,                # <— hard-force one chain
+            cores=1,
+            step=pmb.PGBART(vars=[f]),
+            target_accept=0.9,
+            random_seed=seed,
+            progressbar=True,
+            init="adapt_diag",
+            discard_tuned_samples=True,
+            compute_convergence_checks=False,
+        )
 
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
                       
@@ -364,9 +359,6 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
 
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
-    """
-    BART classification: y ~ Bernoulli(logit_p=f), f ~ BART(X).
-    """
     dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
     if len(dfB2) < 30 or dfB2["FT_fac"].nunique() < 2:
         raise RuntimeError("Not enough labeled rows or only one class for Model B.")
@@ -382,24 +374,22 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
 
     with pm.Model() as mB:
         X_B = pm.MutableData("X_B", X)
-        f = pmb.BART("f", X_B, y, m=trees)      # latent log-odds
+        f = pmb.BART("f", X_B, y, m=trees)           # latent log-odds
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
-        try:
-            trace = pm.sample(
-                draws=draws, tune=tune, chains=chains, cores=1,
-                target_accept=0.9, random_seed=seed, progressbar=True,
-                init="adapt_diag", discard_tuned_samples=True,
-                compute_convergence_checks=False,
-            )
-        except Exception:
-            trace = pm.sample(
-                draws=draws, tune=tune, chains=chains, cores=1,
-                step=pmb.PGBART(vars=[f]),
-                target_accept=0.9, random_seed=seed, progressbar=True,
-                init="adapt_diag", discard_tuned_samples=True,
-                compute_convergence_checks=False,
-            )
+        trace = pm.sample(
+            draws=draws,
+            tune=tune,
+            chains=1,                # <— hard-force one chain
+            cores=1,
+            step=pmb.PGBART(vars=[f]),
+            target_accept=0.9,
+            random_seed=seed,
+            progressbar=True,
+            init="adapt_diag",
+            discard_tuned_samples=True,
+            compute_convergence_checks=False,
+        )
 
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
@@ -482,8 +472,8 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
 
                 # Train A
                 A_bundle = train_model_A(
-                    dfA, A_FEATURES_DEFAULT,
-                    draws=draws, tune=tune, trees=trees, seed=seed, chains=chains
+                dfA, A_FEATURES_DEFAULT,
+                draws=draws, tune=tune, trees=trees, seed=seed, chains=1
                 )
                 
                 # --- Use A to generate PredVol_M across eligible rows (INDEX-ALIGNED) ---
@@ -518,9 +508,9 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                     dfB_cap.drop(columns=["_y"]),
                     B_FEATURES_CORE,
                     draws=draws if not fast_mode else max(200, draws),
-                    tune=tune if not fast_mode else max(200, tune),
+                    tune=tune  if not fast_mode else max(200, tune),
                     trees=max(50, trees // (2 if not fast_mode else 3)),
-                    chains=chains,
+                    chains=1,
                     seed=seed+1
                 )
 
