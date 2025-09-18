@@ -473,26 +473,23 @@ with tab_add:
         d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
         d4.caption("PM volume ÷ predicted day volume × 100.")
 
-    # --- Sanity sniff test ---
-    with st.expander("🔎 Sanity sniff test (units & term contributions)"):
-        mc_m_dbg  = l.get("_MCap_M", 0.0)
-        gap_dbg   = l.get("_Gap_%", 0.0)
-        atr_dbg   = l.get("_ATR_$", 0.0)
-        si_pct_dbg= l.get("_SI_%", 0.0)
-        pm_m_dbg  = l.get("_PM_M", 0.0)
-        flt_m_dbg = l.get("_Float_M", 0.0)
-
-        # Flags
-        flags = sanity_flags(mc_m_dbg, si_pct_dbg, atr_dbg, pm_m_dbg, flt_m_dbg)
-        if flags:
-            for f in flags:
-                st.warning(f)
-        else:
-            st.success("Inputs look plausible at a glance.")
-
-        # Term-by-term breakdown for the NEW day-volume model
-        details = ln_terms_for_display(mc_m_dbg, gap_dbg, atr_dbg)
-        st.write(details)
+        st.markdown("---")
+        ft_prob = l.get("FT_Prob_%", None)
+        ft_label = l.get("FT_Label", "—")
+        
+        if ft_prob is not None:
+            st.markdown(
+                f"""
+                <div style="padding:1rem; border-radius:0.5rem; background-color:#f0f2f6;
+                            font-size:1.2rem; text-align:center;">
+                    <b>Follow-Through Probability:</b> {ft_prob:.1f}%  
+                    <br>
+                    <span style="font-size:1.4rem; color:#0072B5;"><b>{ft_label}</b></span>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        
 
 # ---------- Ranking tab ----------
 with tab_rank:
