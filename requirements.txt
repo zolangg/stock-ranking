@@ -3,8 +3,6 @@ pandas==2.2.2
 numpy==1.26.4
 scipy==1.11.4
 openpyxl==3.1.2
-
-# PyMC BART stack (versions that have manylinux wheels for Py 3.11)
 pytensor==2.14.2
 pymc==5.10.4
 pymc-bart==0.5.5
