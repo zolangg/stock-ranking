@@ -2,14 +2,20 @@ pip>=24
 setuptools>=68
 wheel
 
-numpy==1.26.4
+# Core (compatible with Py3.11 and pymc-bart 0.5.4)
+numpy==1.24.4
 scipy==1.13.1
 pandas==2.2.2
 
-pytensor>=2.20,<2.21    # <-- lets pip resolve 2.20.0
+# PyMC stack (mutually compatible)
+pytensor==2.20.0          # pymc 5.13.1 needs >=2.20,<2.21
 arviz==0.18.0
 pymc==5.13.1
 pymc-bart==0.5.4
 
+# pymc-bart pulls numba; pin to a wheel that works on Py3.11 + numpy 1.24
+numba==0.62.0
+
+# App deps
 openpyxl==3.1.5
 streamlit==1.37.1
