@@ -3,6 +3,9 @@ import os, math, time, json
 import numpy as np
 import pandas as pd
 import streamlit as st
+import re
+from sklearn.model_selection import KFold
+from sklearn.metrics import r2_score, mean_squared_error
 
 from typing import List, Dict
 
@@ -73,6 +76,62 @@ def do_rerun():
     except Exception:
         try: st.experimental_rerun()
         except Exception: pass
+
+def count_complete_rows(df: pd.DataFrame, cols: list[str]) -> int:
+    cols = [c for c in cols if c in df.columns]
+    if not cols:
+        return 0
+    return int(df[cols].dropna().shape[0])
+
+def largest_usable_subset(
+    df: pd.DataFrame,
+    candidate_feats: list[str],
+    target_col: str,
+    min_rows: int = 12,
+    max_loss_frac: float = 0.25,
+) -> list[str]:
+    """
+    Greedy: start with the single feature that yields the most usable rows, then
+    add features as long as we don't lose more than `max_loss_frac` of the current usable set.
+    """
+    cand = [c for c in candidate_feats if c in df.columns]
+    cand = [c for c in cand if df[c].notna().sum() > 0]
+    if not cand:
+        return []
+
+    # start from best single
+    best = None
+    best_n = -1
+    for c in cand:
+        n = count_complete_rows(df, [target_col, c])
+        if n > best_n:
+            best, best_n = [c], n
+
+    if best_n < min_rows:
+        return []  # even best single is too small
+
+    # try to add more
+    current = best[:]
+    current_n = best_n
+    remaining = [c for c in cand if c not in current]
+
+    improved = True
+    while improved and remaining:
+        improved = False
+        best_add = None
+        best_add_n = -1
+        for c in remaining:
+            n = count_complete_rows(df, [target_col] + current + [c])
+            # accept if we don't lose more than max_loss_frac of current_n
+            if n >= current_n * (1 - max_loss_frac) and n > best_add_n:
+                best_add = c
+                best_add_n = n
+        if best_add is not None and best_add_n >= min_rows:
+            current.append(best_add)
+            current_n = best_add_n
+            remaining = [c for c in remaining if c != best_add]
+            improved = True
+    return current
 
 # ==============================================
 # Qualitative criteria (your original)
@@ -201,6 +260,48 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # ==============================================
+# Featurize Helper
+# ==============================================
+
+def pick_col(nms, patterns):
+    nms_low = [str(x).lower() for x in nms]
+    for pat in patterns:
+        rx = re.compile(pat)
+        for i, name in enumerate(nms_low):
+            if rx.search(name):
+                return i
+    return None
+
+def map_columns_to_canonical(df: pd.DataFrame) -> pd.DataFrame:
+    nms = list(df.columns)
+
+    def col(name, pats):
+        idx = pick_col(nms, pats)
+        return df.columns[idx] if idx is not None else None
+
+    mapping = {
+        "PMVolM":  col(nms, [r"^pm\s*vol.*\(m\)$", r"^pm\s*vol.*m", r"^pm\s*vol(ume)?$"]),
+        "PMDolM":  col(nms, [r"^pm.*\$\s*vol.*\(m\)$", r"pm.*dollar.*\(m\)", r"pm\s*\$?\s*vol.*\(m\)"]),
+        "FloatM":  col(nms, [r"^float.*\(m\)$", r"^float.*m", r"^float$", r"public.*float"]),
+        "GapPct":  col(nms, [r"^gap.*%$", r"^gap_?pct$", r"\bgap\b"]),
+        "ATR":     col(nms, [r"^daily\s*atr$", r"^atr(\s*\$)?$", r"\batr\b"]),
+        "MCapM":   col(nms, [r"^market.?cap.*\(m\)$", r"mcap.*\(m\)", r"^market.?cap", r"^mcap\s*m?$"]),
+        "DVolM":   col(nms, [r"^daily\s*vol(ume)?\s*\(m\)$", r"^daily\s*vol(ume)?$", r"^d.*vol.*\(m\)$"]),
+        "Catalyst":col(nms, [r"^catalyst(flag|_?flag)?$", r"^catalyst$", r"^news$", r"catalyst.*score"]),
+        "FT":      col(nms, [r"^ft$", r"follow.?through", r"^ft_?label$", r"^label$"]),
+    }
+
+    out = df.copy()
+    for canon, src in mapping.items():
+        if src is not None and src in out.columns:
+            out.rename(columns={src: canon}, inplace=True)
+        else:
+            # create empty if not present, featurize() will handle
+            if canon not in out.columns:
+                out[canon] = np.nan
+    return out
+
+# ==============================================
 # Feature engineering (exactly like your R pipeline)
 # ==============================================
 def featurize(df: pd.DataFrame) -> pd.DataFrame:
@@ -267,44 +368,109 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.metrics import r2_score, roc_auc_score
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 
-def train_model_A(df_all: pd.DataFrame, feature_cols: List[str], use_xgb: bool=False):
-    dfA = df_all.dropna(subset=["ln_DVol"] + feature_cols).copy()
-    if len(dfA) < 30:
-        raise RuntimeError("Not enough rows to train Model A (need ≥30).")
+def train_model_A(df_all: pd.DataFrame, candidate_feats: list[str], use_xgb: bool = False):
+    import streamlit as st
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.linear_model import Ridge
 
-    X = dfA[feature_cols].values
-    y = dfA["ln_DVol"].values
+    target = "ln_DVol" if "ln_DVol" in df_all.columns else None
+    if target is None:
+        raise RuntimeError("Target column ln_DVol not found. Did featurize() run?")
+
+    # ---- Diagnostics: show how many rows survive by (target + feature)
+    st.write("#### Model A — data availability")
+    diag = []
+    for f in candidate_feats:
+        if f in df_all.columns:
+            n = count_complete_rows(df_all, [target, f])
+        else:
+            n = 0
+        diag.append({"feature": f, "usable_rows": n})
+    diag_df = pd.DataFrame(diag).sort_values("usable_rows", ascending=False)
+    st.dataframe(diag_df, use_container_width=True, hide_index=True)
+
+    # ---- Choose largest usable subset
+    feats = largest_usable_subset(
+        df_all,
+        candidate_feats,
+        target_col=target,
+        min_rows=12,          # allow smaller datasets
+        max_loss_frac=0.25    # avoid features that drop too many rows
+    )
+    if not feats:
+        raise RuntimeError("Too few rows to train Model A. Check inputs/column mapping.")
+
+    # Filter to complete cases on chosen subset
+    dfA = df_all[[target] + feats].dropna().copy()
+    nA = dfA.shape[0]
+
+    st.info(f"Model A: chosen predictors = {feats} · usable rows = {nA}")
+
+    X = dfA[feats].values
+    y = dfA[target].values
+
+    # ---- Pick model
+    model = None
+    model_name = None
 
     if use_xgb:
-        from xgboost import XGBRegressor
-        model = XGBRegressor(
-            n_estimators=700, max_depth=4, subsample=0.9, colsample_bytree=0.9,
-            learning_rate=0.05, reg_lambda=1.0, n_jobs=4, random_state=42
-        )
+        try:
+            from xgboost import XGBRegressor
+            model = XGBRegressor(
+                n_estimators=400,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_lambda=1.0,
+                objective="reg:squarederror",
+                n_jobs=0,
+            )
+            model_name = "XGBRegressor"
+        except Exception:
+            st.warning("xgboost not available; using RandomForestRegressor.")
+            model = RandomForestRegressor(
+                n_estimators=600, max_depth=None, min_samples_leaf=2, random_state=42
+            )
+            model_name = "RandomForestRegressor"
     else:
-        model = RandomForestRegressor(
-            n_estimators=900, max_depth=None, min_samples_leaf=2,
-            random_state=42, n_jobs=4
-        )
+        # if sample is small, prefer RF over linear;
+        # if very small (<20), fallback to Ridge to avoid overfitting trees
+        if nA >= 20:
+            model = RandomForestRegressor(
+                n_estimators=600, max_depth=None, min_samples_leaf=2, random_state=42
+            )
+            model_name = "RandomForestRegressor"
+        else:
+            model = Ridge(alpha=1.0)
+            model_name = "Ridge (small-sample fallback)"
 
-    k = 5 if len(dfA) >= 60 else 3
-    cv = KFold(n_splits=k, shuffle=True, random_state=42)
-    r2_cv = []
-    for tr, te in cv.split(X):
-        model.fit(X[tr], y[tr])
-        yhat = model.predict(X[te])
-        r2_cv.append(r2_score(y[te], yhat))
     model.fit(X, y)
-    yhat_in = model.predict(X)
-    r2_in = r2_score(y, yhat_in)
 
+    # Simple KFold CV for a quality check (don’t crash if too small)
+    try:
+        k = 5 if nA >= 50 else (3 if nA >= 20 else nA)
+        if 2 <= k < nA:
+            kf = KFold(n_splits=k, shuffle=True, random_state=123)
+            preds = np.full(nA, np.nan, dtype=float)
+            for tr, te in kf.split(X):
+                m = model.__class__(**getattr(model, "get_params", lambda: {})())
+                m.fit(X[tr], y[tr])
+                preds[te] = m.predict(X[te])
+            r2 = float(pd.Series(preds).corr(pd.Series(y)) ** 2)
+            rmse = float(np.sqrt(np.nanmean((preds - y) ** 2)))
+            st.success(f"Model A ({model_name}) — CV R²={r2:.3f}, RMSE_ln={rmse:.3f} (n={nA})")
+        else:
+            r2_in = r2_score(y, model.predict(X))
+            st.warning(f"Model A ({model_name}) — sample too small for CV; in-sample R²={r2_in:.3f} (n={nA})")
+    except Exception as e:
+        st.warning(f"Model A: CV failed: {e}")
+
+    # Return a small bundle used later by predictor
     return {
         "model": model,
-        "features": feature_cols,
-        "n": int(len(dfA)),
-        "r2_cv_mean": float(np.mean(r2_cv)),
-        "r2_cv_sd": float(np.std(r2_cv)),
-        "r2_in": float(r2_in),
+        "features": feats,     # fitted feature order
+        "target": target,
     }
 
 def train_model_B(df_all: pd.DataFrame, feature_cols_core: List[str], modelA: Dict, use_xgb: bool=False):
@@ -415,7 +581,8 @@ if train_btn:
         raw = pd.read_excel(up)
     else:
         raw = pd.read_csv(up)
-
+    
+    raw = map_columns_to_canonical(raw)   # <-- add this line
     df_all = featurize(raw)
 
     with st.spinner("Training Model A (ln DVol)…"):
