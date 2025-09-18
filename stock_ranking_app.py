@@ -346,73 +346,51 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
 
     return np.exp(ln_mean)
 
+# --- FAST + ROBUST: Model B via scikit-learn ---
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.utils.class_weight import compute_class_weight
+import numpy as np
+import pandas as pd
+
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
     """
-    df_feats_with_predvol MUST already contain a finite 'PredVol_M' column.
+    Replacement: Train Model B (FT vs Fail) with HistGradientBoostingClassifier.
+    Uses the same predictors (including PredVol_M). Fast, deterministic, no MCMC.
     """
-    dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
-    if len(dfB2) < 30 or dfB2["FT_fac"].nunique() < 2:
+    dfB = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
+    if len(dfB) < 30 or dfB["FT_fac"].nunique() < 2:
         raise RuntimeError("Not enough labeled rows or only one class for Model B.")
 
     preds_B = predictors_core.copy()
     if "PredVol_M" not in preds_B:
         preds_B = preds_B + ["PredVol_M"]
 
-    X = dfB2[preds_B].to_numpy(dtype=float)
-    y = (dfB2["FT_fac"].astype(str) == "FT").to_numpy(dtype=int)
+    X = dfB[preds_B].to_numpy(dtype=float)
+    y = (dfB["FT_fac"].astype(str) == "FT").to_numpy(dtype=int)
 
-    _assert_finite("X_B", X)
-    _assert_finite("y_B", y)
+    # class weights for any imbalance
+    classes = np.array([0, 1])
+    cw = compute_class_weight(class_weight="balanced", classes=classes, y=y)
+    class_weight = {int(c): float(w) for c, w in zip(classes, cw)}
 
-    with pm.Model() as mB:
-        X_B = pm.MutableData("X_B", X)
-        # Latent log-odds
-        f = pmb.BART("f", X_B, y, m=trees)
-        # Use logit_p instead of p=sigmoid(f)
-        pm.Bernoulli("y_obs", logit_p=f, observed=y)
+    # a compact, strong default; tweak max_iter if you have many rows
+    clf = HistGradientBoostingClassifier(
+        max_depth=3,
+        learning_rate=0.08,
+        max_iter=250,
+        l2_regularization=0.0,
+        random_state=seed,
+        class_weight=class_weight
+    )
+    clf.fit(X, y)
 
-        trace = pm.sample(
-            draws=draws,
-            tune=tune,
-            chains=chains,      # keep 1 for speed/stability on Cloud
-            cores=1,
-            target_accept=0.9,
-            random_seed=seed,
-            progressbar=True,
-            discard_tuned_samples=True,
-            compute_convergence_checks=False,
-        )
-
-    return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
+    return {"model": clf, "predictors": preds_B}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
-    with bundle["model"]:
-        pm.set_data({bundle["x_name"]: X})
-        # posterior predictive for Bernoulli draws (0/1); take mean as prob
-        ppc = pm.sample_posterior_predictive(
-            bundle["trace"],
-            var_names=["y_obs"],
-            return_inferencedata=False,
-            progressbar=False
-        )
-
-    arr = np.asarray(ppc["y_obs"])
-    # shapes: (chains, draws, n) or (draws, n) or (n,)
-    if arr.ndim == 3:
-        probs = arr.mean(axis=(0, 1))
-    elif arr.ndim == 2:
-        probs = arr.mean(axis=0)
-    elif arr.ndim == 1:
-        probs = arr.astype(float)
-    else:
-        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
-
-    if probs.shape[0] != X.shape[0]:
-        raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
-
-    return probs.astype(float)
+    proba = bundle["model"].predict_proba(X)[:, 1]  # P(FT)
+    return proba.astype(float)
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
     if n <= 0 or len(df) <= n: 
