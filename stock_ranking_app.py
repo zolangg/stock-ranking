@@ -405,6 +405,9 @@ with tab_add:
                     "Moderate FT" if ft_pct >= 55 else
                     "Low FT" if ft_pct >= 40 else
                     "Very Low FT")
+        
+        # NEW: fused display string
+        ft_display = f"{ft_pct:.1f}% ({ft_label})"
 
         row = {
             "Ticker": ticker,
@@ -414,7 +417,7 @@ with tab_add:
             "Numeric_%": round(num_pct, 2),
             "Qual_%": round(qual_pct, 2),
             "FinalScore": final_score,
-
+        
             # Prediction fields
             "PredVol_M": round(pred_vol_m, 2),
             "PredVol_CI68_L": round(ci68_l, 2),
@@ -422,14 +425,17 @@ with tab_add:
             "PredVol_CI95_L": round(ci95_l, 2),
             "PredVol_CI95_U": round(ci95_u, 2),
             "PM_%_of_Pred": round(pm_pct_of_pred, 1),
-            "PM_FloatRot_x": round(pm_float_rot_x, 3),
+        
+            # Keep $Vol/MC; hide Float Rotation from UI
             "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
-
+            "PM_FloatRot_x": round(pm_float_rot_x, 3),   # kept for CSV/sanity, not shown
+        
             # FT fields
-            "FT_Prob_%": ft_pct,
-            "FT_Label": ft_label,
-
-            # store raw inputs for debug / sanity
+            "FT": ft_display,                # <— fused display
+            "FT_Prob_%": ft_pct,             # keep for sorting/export
+            "FT_Label": ft_label,            # keep for export
+        
+            # raw inputs for debug / sanity
             "_MCap_M": mc_m,
             "_Gap_%": gap_pct,
             "_SI_%": si_pct,
@@ -444,7 +450,7 @@ with tab_add:
         st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
         do_rerun()
 
-    # ---------- Preview card (with ALL numbers you like) ----------
+    # ---------- Preview card ----------
     l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
     if l:
         st.markdown("---")
@@ -453,11 +459,11 @@ with tab_add:
         cB.metric("Numeric Block", f"{l.get('Numeric_%',0):.2f}%")
         cC.metric("Qual Block",    f"{l.get('Qual_%',0):.2f}%")
         cD.metric("Final Score",   f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
-
+    
+        # Row 2 — Float Rotation removed; FT fused takes its place
         d1, d2, d3, d4 = st.columns(4)
-        d1.metric("PM Float Rotation", f"{l.get('PM_FloatRot_x',0):.3f}×")
-        d1.caption("Premarket volume ÷ float.")
-        d2.metric("PM $Vol / MC",      f"{l.get('PM$ / MC_%',0):.1f}%")
+        d1.metric("FT", l.get("FT", "—"))                       # <— fused FT here
+        d2.metric("PM $Vol / MC", f"{l.get('PM$ / MC_%',0):.1f}%")
         d2.caption("PM dollar volume ÷ market cap × 100.")
         d3.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
         d3.caption(
@@ -466,10 +472,6 @@ with tab_add:
         )
         d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
         d4.caption("PM volume ÷ predicted day volume × 100.")
-
-        e1, e2 = st.columns(2)
-        e1.metric("FT Probability", f"{l.get('FT_Prob_%',0):.1f}%")
-        e2.metric("FT Label", l.get("FT_Label","—"))
 
     # --- Sanity sniff test ---
     with st.expander("🔎 Sanity sniff test (units & term contributions)"):
@@ -507,15 +509,15 @@ with tab_rank:
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
-            "PM_FloatRot_x","PM$ / MC_%",
+            "PM$ / MC_%",
             "PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM_%_of_Pred",
-            "FT_Prob_%","FT_Label"
+            "FT"   # <— fused
         ]
         for c in cols_to_show:
             if c not in df.columns:
-                df[c] = "" if c in ("Ticker","Odds","Level","FT_Label") else 0.0
+                df[c] = "" if c in ("Ticker","Odds","Level","FT") else 0.0
         df = df[cols_to_show]
-
+        
         st.dataframe(
             df,
             use_container_width=True,
@@ -527,14 +529,12 @@ with tab_rank:
                 "Numeric_%": st.column_config.NumberColumn("Numeric_%", format="%.2f"),
                 "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
-                "PM_FloatRot_x": st.column_config.NumberColumn("PM Float Rotation (×)", format="%.3f"),
                 "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
                 "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
                 "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
                 "PredVol_CI68_U": st.column_config.NumberColumn("Pred Vol CI68 High (M)", format="%.2f"),
                 "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
-                "FT_Prob_%": st.column_config.NumberColumn("FT Probability %", format="%.1f"),
-                "FT_Label": st.column_config.TextColumn("FT Label"),
+                "FT": st.column_config.TextColumn("FT (p/label)"),  # <— fused
             }
         )
 
