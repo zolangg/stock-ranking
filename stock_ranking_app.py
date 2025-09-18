@@ -362,57 +362,26 @@ def train_model_B(
     trees: int = 60,
     seed: int = 123,
 ):
-    """
-    BART classification: y ~ Bernoulli(logit_p=f(X)), f ~ BART.
-    Robust version with:
-      - strict input validation
-      - auto PGBART first; on failure, retry with explicit PGBART()
-      - actionable diagnostics if it still fails
-    """
-    # ---- 1) Build dataset
-    req_cols = ["FT_fac", "PredVol_M"]
-    missing = [c for c in req_cols if c not in df_feats_with_predvol.columns]
-    if missing:
-        raise RuntimeError(f"Model B missing required columns: {missing}")
-
+    # Build dataset
     preds_B = list(predictors_core)
     if "PredVol_M" not in preds_B:
         preds_B.append("PredVol_M")
 
-    # Keep rows with all predictors + label
     dfB = df_feats_with_predvol.dropna(subset=preds_B + ["FT_fac"]).copy()
     if len(dfB) < 30:
         raise RuntimeError(f"Not enough rows for Model B (have {len(dfB)}, need ≥30).")
 
-    # Label to {0,1}
-    y = (dfB["FT_fac"].astype(str).str.lower().isin(["ft", "1", "yes", "y", "true"])).astype(np.int8).to_numpy()
-    cls, counts = np.unique(y, return_counts=True)
-    if len(cls) < 2:
-        raise RuntimeError(f"Model B only has one class present (counts: {dict(zip(cls, counts))}). "
-                           f"Add more labeled data with both FT and Fail.")
+    X = np.ascontiguousarray(dfB[preds_B].to_numpy(dtype=np.float64))
+    y = (dfB["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(np.int8).to_numpy()
+    if len(np.unique(y)) < 2:
+        raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
-    # Features
-    X = dfB[preds_B].to_numpy(dtype=np.float64)
-    if X.ndim != 2 or X.shape[0] != y.shape[0]:
-        raise RuntimeError(f"X shape mismatch: X{X.shape}, y{y.shape}")
-
-    # Finite check
-    bad_mask = ~np.isfinite(X)
-    if bad_mask.any():
-        bad_rows = np.unique(np.where(bad_mask)[0])
-        bad_cols = [preds_B[j] for j in np.unique(np.where(bad_mask)[1])]
-        raise RuntimeError(
-            f"Model B has non-finite values in predictors. "
-            f"Rows (first 10): {bad_rows[:10].tolist()}, Cols: {bad_cols}"
-        )
-
-    # ---- 2) Build model
     with pm.Model() as mB:
-        X_B = pm.Data("X_B", np.ascontiguousarray(X))
-        f = pmb.BART("f", X_B, y, m=trees)          # the ONLY free RV
+        X_B = pm.Data("X_B", X)
+        f = pmb.BART("f", X_B, y, m=trees)      # the ONLY free RV
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
-        # ---- 3) Try auto sampler first
+        # 1) Try auto sampler (NO target_accept here — it's for NUTS)
         try:
             trace = pm.sample(
                 draws=draws,
@@ -420,41 +389,25 @@ def train_model_B(
                 chains=1,
                 cores=1,
                 random_seed=seed,
-                target_accept=0.9,
                 init="adapt_diag",
                 progressbar=True,
                 discard_tuned_samples=True,
                 compute_convergence_checks=False,
             )
         except Exception as e_auto:
-            # ---- 4) Retry forcing PGBART (no vars=... so it auto-binds to the BART RV)
-            try:
-                trace = pm.sample(
-                    draws=draws,
-                    tune=tune,
-                    chains=1,
-                    cores=1,
-                    step=[pmb.PGBART()],         # <- key retry
-                    random_seed=seed,
-                    target_accept=0.9,
-                    init="adapt_diag",
-                    progressbar=True,
-                    discard_tuned_samples=True,
-                    compute_convergence_checks=False,
-                )
-            except Exception as e_force:
-                raise RuntimeError(
-                    "Model B sampler assignment failed.\n"
-                    f"- Auto sampler error: {type(e_auto).__name__}: {e_auto}\n"
-                    f"- Forced PGBART error: {type(e_force).__name__}: {e_force}\n"
-                    f"Dataset stats: n={len(dfB)}, classes={dict(zip(cls, counts))}, "
-                    f"X.shape={X.shape}, preds={preds_B}"
-                ) from e_force
-
-        # One last sanity check
-        free = [rv.name for rv in mB.free_RVs]
-        if free != ["f"]:
-            raise RuntimeError(f"Unexpected free RVs for Model B: {free} (expected only 'f').")
+            # 2) Retry forcing PGBART explicitly (still NO target_accept)
+            trace = pm.sample(
+                draws=draws,
+                tune=tune,
+                chains=1,
+                cores=1,
+                step=[pmb.PGBART()],
+                random_seed=seed,
+                init="adapt_diag",
+                progressbar=True,
+                discard_tuned_samples=True,
+                compute_convergence_checks=False,
+            )
 
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
