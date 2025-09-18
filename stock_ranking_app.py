@@ -283,9 +283,18 @@ def _assert_finite(name, arr):
         raise ValueError(f"{name} contains non-finite values at indices {bad}.")
 
 def _sample(draws, tune, chains, seed):
+    # Light but stable defaults for speed
     return pm.sample(
-        draws=draws, tune=tune, chains=chains, cores=1,
-        target_accept=0.9, random_seed=seed, progressbar=False
+        draws=draws,
+        tune=tune,
+        chains=chains,         # keep 1 unless you really need R-hat
+        cores=1,               # Streamlit Cloud: 1 core prevents oversubscription
+        target_accept=0.85,    # a bit lower => fewer divergences, faster
+        progressbar=True,      # show progress so it doesn't feel "stuck"
+        random_seed=seed,
+        discard_tuned_samples=True,
+        jitter_max_retries=0,
+        compute_convergence_checks=False,
     )
 
 # ---------- BART training ----------
@@ -341,17 +350,47 @@ def predict_model_B(bundle, Xnew: pd.DataFrame) -> np.ndarray:
         f_new = pmb.predict(bundle["trace"], X, kind="mean")  # latent
     return expit(f_new)  # probability
 
+def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
+    if n <= 0 or len(df) <= n: 
+        return df
+    if y_col is None or y_col not in df.columns:
+        return df.sample(n=n, random_state=42)
+    # For classification (Model B): keep class balance
+    pos = df[df[y_col] == 1]
+    neg = df[df[y_col] == 0]
+    n_pos = max(1, int(n * len(pos) / max(1, len(df))))
+    n_neg = max(1, n - n_pos)
+    return pd.concat([
+        pos.sample(n=min(n_pos, len(pos)), random_state=42),
+        neg.sample(n=min(n_neg, len(neg)), random_state=42)
+    ], axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
+
+def _hash_df_for_cache(df: pd.DataFrame) -> int:
+    try:
+        return int(pd.util.hash_pandas_object(df, index=True).sum())
+    except Exception:
+        return len(df)  # fallback
+
 # ---------- TRAINING PANEL ----------
 with st.expander("⚙️ Train / Load BART models (Python-only)"):
     st.write("Upload your **PMH Database.xlsx** (sheet: _PMH BO Merged_) to retrain.")
     up = st.file_uploader("Upload Excel", type=["xlsx"], accept_multiple_files=False)
+
     col_a, col_b = st.columns(2)
     with col_a:
-        trees = st.slider("BART trees per model", 50, 400, 200, 25)
-        draws = st.slider("MCMC draws", 300, 1500, 800, 100)
+        fast_mode = st.toggle("Fast training mode", value=True, help="Cuts trees/draws and caps rows.")
+        trees = st.slider("BART trees per model", 25, 400, 200 if not fast_mode else 75, 25)
+        draws = st.slider("MCMC draws", 200, 1500, 800 if not fast_mode else 250, 50)
     with col_b:
-        tune  = st.slider("MCMC tune", 300, 1500, 800, 100)
+        tune  = st.slider("MCMC tune", 200, 1500, 800 if not fast_mode else 250, 50)
+        chains = 1 if fast_mode else st.slider("Chains", 1, 2, 2)
         seed  = st.number_input("Random seed", value=42, step=1)
+
+    # Row caps (apply after feature engineering)
+    capA = st.number_input("Max rows for Model A", min_value=0, value=1200 if fast_mode else 0,
+                           help="0 = no cap")
+    capB = st.number_input("Max rows for Model B (after PredVol_M)", min_value=0, value=600 if fast_mode else 0,
+                           help="0 = no cap")
 
     if st.button("Train models", use_container_width=True, type="primary"):
         if not up:
@@ -361,30 +400,47 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 raw = read_excel_dynamic(up)
                 df_all = featurize(raw)
 
-                # Train A
-                A_bundle = train_model_A(df_all, A_FEATURES_DEFAULT,
-                                         draws=draws, tune=tune, trees=trees, seed=seed)
+                # Optional cap for A
+                dfA = df_all.dropna(subset=["ln_DVol"] + A_FEATURES_DEFAULT)
+                dfA = _row_cap(dfA, int(capA)) if capA else dfA
 
-                # Use A to generate PredVol_M for rows that have all A predictors
+                # Train A
+                A_bundle = train_model_A(
+                    dfA, A_FEATURES_DEFAULT,
+                    draws=draws, tune=tune, trees=trees, seed=seed
+                )
+
+                # Use A to generate PredVol_M across eligible rows (uncapped, so predictions exist broadly)
                 okA_idx = df_all.dropna(subset=A_bundle["predictors"]).index
                 df_all_with_pred = df_all.copy()
                 if len(okA_idx) > 0:
-                    df_all_with_pred.loc[okA_idx, "PredVol_M"] = predict_model_A(
-                        A_bundle, df_all.loc[okA_idx]
-                    )
+                    df_all_with_pred.loc[okA_idx, "PredVol_M"] = predict_model_A(A_bundle, df_all.loc[okA_idx])
                 else:
                     st.error("No rows pass Model A predictors; cannot proceed to Model B.")
                     st.stop()
 
-                # Train B on the augmented frame
+                # Prep B data, cap with class balance
+                dfB = df_all_with_pred.dropna(subset=["FT_fac", "PredVol_M"]).copy()
+                # Convert FT_fac → 1/0 once here for the cap helper
+                dfB["_y"] = (dfB["FT_fac"].astype(str) == "FT").astype(int)
+                dfB_cap = _row_cap(dfB, int(capB), y_col="_y") if capB else dfB
+
+                # Train B
                 B_bundle = train_model_B(
-                    df_all_with_pred, B_FEATURES_CORE,
-                    draws=draws, tune=tune, trees=max(75, trees//3), seed=seed+1
+                    dfB_cap.drop(columns=["_y"]),
+                    B_FEATURES_CORE,
+                    draws=draws if not fast_mode else max(200, draws),
+                    tune=tune if not fast_mode else max(200, tune),
+                    trees= max(50, trees // (2 if not fast_mode else 3)),
+                    chains=chains,
+                    seed=seed+1
                 )
 
+                # Save + small cache key to avoid accidental retrain
                 st.session_state["A_bundle"] = A_bundle
                 st.session_state["B_bundle"] = B_bundle
-                st.success("BART models trained & stored for this session.")
+                st.session_state["data_hash"] = _hash_df_for_cache(df_all)
+                st.success(f"Trained (rows A: {len(dfA)}, rows B: {len(dfB_cap)}).")
 
 # ---------- UI: Add / Ranking ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
