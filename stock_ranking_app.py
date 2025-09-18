@@ -298,7 +298,8 @@ def _sample(draws, tune, chains, seed):
     )
 
 # ---------- BART training ----------
-def train_model_A(df_feats: pd.DataFrame, predictors: list[str], draws=800, tune=800, trees=200, seed=42, chains=1):
+def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
+                  draws=800, tune=800, trees=200, seed=42, chains=1):
     dfA = df_feats.dropna(subset=["ln_DVol"] + predictors).copy()
     if len(dfA) < 30:
         raise RuntimeError("Not enough rows to train Model A (need ≥30).")
@@ -314,7 +315,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str], draws=800, tune
         trace = pm.sample(
             draws=draws,
             tune=tune,
-            chains=chains,         # <-- use UI control
+            chains=chains,
             cores=1,
             step=pmb.PGBART(vars=[f]),  # <-- IMPORTANT
             target_accept=0.9,
@@ -354,15 +355,6 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         raise ValueError(f"predict_model_A length mismatch: {ln_mean.shape[0]} vs {X.shape[0]}")
 
     return np.exp(ln_mean)
-
-# --- FAST + ROBUST: Model B via scikit-learn ---
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.utils.class_weight import compute_class_weight
-import numpy as np
-import pandas as pd
-
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.utils.class_weight import compute_class_weight
 
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
