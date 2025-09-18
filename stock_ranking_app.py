@@ -4,14 +4,18 @@ import pandas as pd
 import numpy as np
 import math
 
-# -------- R (rpy2) bridge --------
-import rpy2.robjects as ro
-from rpy2.robjects import pandas2ri
-from rpy2.robjects.conversion import localconverter
-
-r = ro.r
-readRDS   = r['readRDS']
-r_predict = r['predict']
+# ===========================
+# R bridge (rpy2) – safe import
+# ===========================
+try:
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+    from rpy2.robjects.packages import importr
+    R_OK = True
+except Exception as e:
+    R_OK = False
+    R_ERR = str(e)
 
 def _pd_to_r(obj):
     with localconverter(ro.default_converter + pandas2ri.converter):
@@ -32,19 +36,40 @@ st.title("Premarket Stock Ranking")
 # =========================================================
 @st.cache_resource(show_spinner=False)
 def load_bart_models():
+    if not R_OK:
+        return dict(ok=False, err=f"rpy2/R not available: {R_ERR}")
     try:
+        # Import R packages and functions properly (avoid r['readRDS'])
+        base  = importr('base')
+        stats = importr('stats')  # predict() generic
+        readRDS = base.readRDS
+        r_predict = ro.r('predict')  # generic predict; S3 dispatch in R
+
+        # Load models + predictor name vectors
         modelA = readRDS("bart_model_A_predDVol_ln.rds")
         predsA = list(_r_to_pd(readRDS("bart_model_A_predictors.rds")))
         modelB = readRDS("bart_model_B_FT.rds")
         predsB = list(_r_to_pd(readRDS("bart_model_B_predictors.rds")))
-        return dict(A=modelA, A_preds=predsA, B=modelB, B_preds=predsB, ok=True, err=None)
+        return dict(
+            ok=True, err=None,
+            base=base, stats=stats,
+            readRDS=readRDS, r_predict=r_predict,
+            A=modelA, A_preds=predsA,
+            B=modelB, B_preds=predsB
+        )
     except Exception as e:
-        return dict(A=None, A_preds=None, B=None, B_preds=None, ok=False, err=str(e))
+        return dict(ok=False, err=str(e))
 
 MODELS = load_bart_models()
 if not MODELS["ok"]:
-    st.error("Could not load BART models (.rds). Make sure the four files are in the app folder.\n\n"
-             f"Details: {MODELS['err']}")
+    st.error(
+        "Could not load BART models (.rds). Make sure R + rpy2 are installed and the four files are in the app folder:\n\n"
+        "  • bart_model_A_predDVol_ln.rds\n"
+        "  • bart_model_A_predictors.rds\n"
+        "  • bart_model_B_FT.rds\n"
+        "  • bart_model_B_predictors.rds\n\n"
+        f"Details: {MODELS['err']}"
+    )
     st.stop()
 
 # =========================================================
@@ -145,7 +170,7 @@ dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.0
 st.sidebar.header("FT Threshold")
 ft_thresh = st.sidebar.slider("FT label threshold", 0.10, 0.90, 0.50, 0.01)
 
-# --- Confidence (log-space CI for display around PredVol) ---
+# --- PredVol CI (display only) ---
 st.sidebar.header("Prediction Uncertainty")
 sigma_ln = st.sidebar.slider("Log-space σ (residual std dev)", 0.10, 1.50, 0.60, 0.01,
                              help="For the CI on predicted volume. Does not affect BART prediction, display only.")
@@ -212,58 +237,46 @@ def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
 # =========================================================
 def make_features_df(rows: pd.DataFrame) -> pd.DataFrame:
     """
-    Expect columns in 'rows': PMVolM, PMDolM, FloatM, GapPct, ATR, MCapM, Catalyst (0/1)
-    Create the engineered predictors used in R, then we’ll subset to predsA/predsB.
+    Expect columns: PMVolM, PMDolM, FloatM, GapPct, ATR, MCapM, Catalyst (0/1)
     """
     eps = 1e-6
     df = rows.copy()
-
-    # Derived features (must exist regardless of selection)
-    df["FR"]     = df["PMVolM"] / np.maximum(df["FloatM"], eps)
-    df["ln_pm"]  = np.log(np.maximum(df["PMVolM"], eps))
+    df["FR"]      = df["PMVolM"] / np.maximum(df["FloatM"], eps)
+    df["ln_pm"]   = np.log(np.maximum(df["PMVolM"], eps))
     df["ln_pmdol"] = np.log(np.maximum(df.get("PMDolM", 0.0), eps))
-    df["ln_fr"]    = np.log(np.maximum(df["FR"], eps))
-    df["ln_gapf"]  = np.log(np.maximum(df["GapPct"], 0.0)/100.0 + eps)
-    df["ln_atr"]   = np.log(np.maximum(df["ATR"], eps))
-    df["ln_mcap"]  = np.log(np.maximum(df["MCapM"], eps))
-    # Optional (some fits used it):
-    if "PMDolM" in df.columns:
-        df["ln_pmdol_per_mcap"] = np.log(np.maximum(df["PMDolM"] / np.maximum(df["MCapM"], eps), eps))
-    else:
-        df["ln_pmdol_per_mcap"] = np.log(np.maximum(0.0, eps))
-
-    # Ensure Catalyst is numeric 0/1
+    df["ln_fr"]     = np.log(np.maximum(df["FR"], eps))
+    df["ln_gapf"]   = np.log(np.maximum(df["GapPct"], 0.0)/100.0 + eps)
+    df["ln_atr"]    = np.log(np.maximum(df["ATR"], eps))
+    df["ln_mcap"]   = np.log(np.maximum(df["MCapM"], eps))
+    df["ln_pmdol_per_mcap"] = np.log(np.maximum(df.get("PMDolM", 0.0) / np.maximum(df["MCapM"], eps), eps))
     df["Catalyst"] = (df["Catalyst"] != 0).astype(int)
-
     return df
 
 def predict_predVolM_from_features(feat_df: pd.DataFrame) -> np.ndarray:
-    """ BART Model A: returns predicted daily volume in millions (float array). """
+    """ BART Model A: returns predicted daily volume in millions. """
     predsA = MODELS["A_preds"]
     X = feat_df.loc[:, predsA].copy()
-    draws = r_predict(MODELS["A"], newdata=_pd_to_r(X))
+    draws = MODELS["r_predict"](MODELS["A"], newdata=_pd_to_r(X))
     draws_pd = _r_to_pd(draws)  # draws x n
     pred_ln = np.array(draws_pd).mean(axis=0)
     return np.exp(pred_ln)
 
 def predict_ft_prob_from_features(feat_df: pd.DataFrame) -> np.ndarray:
-    """
-    BART Model B: uses Model A’s PredVol_M inside its predictor set (PredVol_M must be present).
-    Returns probabilities in [0,1].
-    """
-    # 1) ensure PredVol_M via Model A with the exact same predictor set
+    """ BART Model B: returns probability in [0,1]. """
     predsA = MODELS["A_preds"]
     X_A = feat_df.loc[:, predsA].copy()
-    predA_draws = _r_to_pd(r_predict(MODELS["A"], newdata=_pd_to_r(X_A)))
-    predA_ln = np.array(predA_draws).mean(axis=0)
+    predA_draws = MODELS["r_predict"](MODELS["A"], newdata=_pd_to_r(X_A))
+    predA_pd = _r_to_pd(predA_draws)    # draws x n
+    predA_ln = np.array(predA_pd).mean(axis=0)
+
     feat_aug = feat_df.copy()
     feat_aug["PredVol_M"] = np.exp(predA_ln)
 
-    # 2) Subset to Model-B’s predictors, then predict prob
     predsB = MODELS["B_preds"]
     X_B = feat_aug.loc[:, predsB].copy()
-    p_obj = r_predict(MODELS["B"], newdata=_pd_to_r(X_B))
-    # prefer prob.test.mean; else average posterior p
+    p_obj = MODELS["r_predict"](MODELS["B"], newdata=_pd_to_r(X_B))
+
+    # Try prob.test.mean, else average posterior matrix
     phat = None
     try:
         phat = np.array(_r_to_pd(p_obj.rx2("prob.test.mean")))
@@ -335,7 +348,7 @@ with tab_add:
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
     if submitted and ticker:
-        # === BART Feature engineering ===
+        # === BART Features ===
         feat_input = pd.DataFrame([{
             "PMVolM": pm_vol_m,
             "PMDolM": pm_dol_m,
@@ -350,7 +363,7 @@ with tab_add:
         # === Model A: predicted daily volume (M) ===
         pred_vol_m = float(predict_predVolM_from_features(feat)[0])
 
-        # CI bands (display only, using sigma_ln)
+        # CI bands (display only)
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
         ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)
 
@@ -358,7 +371,7 @@ with tab_add:
         ft_prob = float(predict_ft_prob_from_features(feat)[0])
         ft_label = "FT" if ft_prob >= ft_thresh else "Fail"
 
-        # === Numeric points (your original scoring block) ===
+        # === Numeric points (your scoring block) ===
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
@@ -379,7 +392,7 @@ with tab_add:
         final_score = round(combo_pct + news_weight*news_points*10 + dilution_weight*dilution_points*10, 2)
         final_score = max(0.0, min(100.0, final_score))
 
-        # === Diagnostics to save (same as before, plus BART outputs) ===
+        # === Diagnostics to save ===
         pm_pct_of_pred   = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
         pm_float_rot_x   = pm_vol_m / float_m if float_m > 0 else 0.0
         pm_dollar_vs_mc  = 100.0 * (pm_dol_m) / mc_m if mc_m > 0 else 0.0
@@ -434,19 +447,15 @@ with tab_add:
         cD.metric("Final Score",   f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
 
         d1, d2, d3, d4 = st.columns(4)
-        # Keep Float Rotation in display
         d1.metric("PM Float Rotation", f"{l.get('PM_FloatRot_x',0):.3f}×")
         d1.caption("Premarket volume ÷ float.")
-
         d2.metric("PM $Vol / MC",      f"{l.get('PM$ / MC_%',0):.1f}%")
         d2.caption("PM dollar volume ÷ market cap × 100.")
-
         d3.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
         d3.caption(
             f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
             f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
         )
-
         ft_prob_pct = l.get("FT_Prob_%", 0.0)
         ft_lab = l.get("FT_Label","—")
         d4.metric("FT Probability", f"{ft_prob_pct:.1f}%")
@@ -459,7 +468,6 @@ with tab_rank:
         df = pd.DataFrame(st.session_state.rows)
         df = df.loc[:, ~df.columns.duplicated(keep="first")]
 
-        # Sort by FinalScore highest first (keep your behavior)
         if "FinalScore" in df.columns:
             df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
