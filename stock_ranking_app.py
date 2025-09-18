@@ -326,29 +326,29 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
         )
 
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
-
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["y_obs"],
+            var_names=["f"],          # <- latent, not y_obs
             return_inferencedata=False,
             progressbar=False
         )
-    arr = np.asarray(ppc["y_obs"])
+    arr = np.asarray(ppc["f"])
+    # shapes: (chains, draws, n) or (draws, n) or (n,)
     if arr.ndim == 3:
-        ln_mean = arr.mean(axis=(0, 1))
+        f_mean = arr.mean(axis=(0, 1))
     elif arr.ndim == 2:
-        ln_mean = arr.mean(axis=0)
+        f_mean = arr.mean(axis=0)
     elif arr.ndim == 1:
-        ln_mean = arr
+        f_mean = arr
     else:
-        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
-    if ln_mean.shape[0] != X.shape[0]:
-        raise ValueError(f"predict_model_A length mismatch: {ln_mean.shape[0]} vs {X.shape[0]}")
-    return np.exp(ln_mean)
+        raise ValueError(f"Unexpected PPC shape for f: {arr.shape}")
+    if f_mean.shape[0] != X.shape[0]:
+        raise ValueError(f"predict_model_A length mismatch: {f_mean.shape[0]} vs {X.shape[0]}")
+    return np.exp(f_mean)
 
 # --------- Model B: BART classification ----------
 def train_model_B(
@@ -411,22 +411,22 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["y_obs"],
+            var_names=["f"],          # <- latent log-odds
             return_inferencedata=False,
             progressbar=False
         )
-    arr = np.asarray(ppc["y_obs"])
+    arr = np.asarray(ppc["f"])
     if arr.ndim == 3:
-        probs = arr.mean(axis=(0, 1))
+        f_mean = arr.mean(axis=(0, 1))
     elif arr.ndim == 2:
-        probs = arr.mean(axis=0)
+        f_mean = arr.mean(axis=0)
     elif arr.ndim == 1:
-        probs = arr.astype(float)
+        f_mean = arr
     else:
-        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
-    if probs.shape[0] != X.shape[0]:
-        raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
-    return probs.astype(float)
+        raise ValueError(f"Unexpected PPC shape for f: {arr.shape}")
+    if f_mean.shape[0] != X.shape[0]:
+        raise ValueError(f"predict_model_B length mismatch: {f_mean.shape[0]} vs {X.shape[0]}")
+    return 1.0 / (1.0 + np.exp(-f_mean))  # sigmoid
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
     if n <= 0 or len(df) <= n:
