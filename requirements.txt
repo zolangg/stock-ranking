@@ -1,18 +1,9 @@
-streamlit==1.49.1
+numpy==1.26.4
 pandas==2.2.2
-numpy==1.24.4
-scipy==1.11.4
-openpyxl==3.1.2
-
-# PyMC + BART stack
 pymc==5.10.4
-pytensor==2.18.6
-pymc-bart==0.5.5
-
-# numba stack compatible with NumPy 1.24
-numba==0.58.1
-llvmlite==0.41.1
-
-# plotting + inference utils
-matplotlib==3.8.4
-arviz==0.15.1
+pymc-bart==0.5.4
+arviz==0.18.0
+pytensor==2.25.4
+scipy==1.13.1
+openpyxl==3.1.2
+streamlit==1.37.1
