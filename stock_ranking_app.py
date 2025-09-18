@@ -307,15 +307,14 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     X = dfA[predictors].to_numpy(dtype=float)
     y = dfA["ln_DVol"].to_numpy(dtype=float)
 
-    # Use a fixed observation noise (scale of log-volume). This avoids a second RV
-    # that would require a separate sampler and has caused step-assignment crashes.
+    # fixed observation noise in log-space (prevents sampler conflict)
     sigma_val = float(np.nanstd(y))
     if not np.isfinite(sigma_val) or sigma_val <= 0:
         sigma_val = 1.0
 
     with pm.Model() as mA:
         X_A = pm.MutableData("X_A", X)
-        f = pmb.BART("f", X_A, y, m=trees)           # latent mean in log-space
+        f = pmb.BART("f", X_A, y, m=trees)           # latent mean (log-volume)
         pm.Normal("y_obs", mu=f, sigma=sigma_val, observed=y)
 
         trace = pm.sample(
@@ -323,7 +322,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
             tune=tune,
             chains=chains,
             cores=1,
-            step=[pmb.PGBART(vars=[f])],             # <-- only BART stepper
+            step=[pmb.PGBART(vars=[f])],             # only BART stepper
             target_accept=0.9,
             random_seed=seed,
             progressbar=True,
@@ -333,7 +332,6 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
         )
 
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
-
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
     with bundle["model"]:
@@ -344,32 +342,21 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
             return_inferencedata=False,
             progressbar=False
         )
-
     arr = np.asarray(ppc["y_obs"])
-    # Expected shapes: (chains, draws, n) OR (draws, n) OR (n,)
     if arr.ndim == 3:
-        # chains × draws × n_obs  -> mean over chains & draws
         ln_mean = arr.mean(axis=(0, 1))
     elif arr.ndim == 2:
-        # draws × n_obs -> mean over draws
         ln_mean = arr.mean(axis=0)
     elif arr.ndim == 1:
-        # already n_obs
         ln_mean = arr
     else:
         raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
-
     if ln_mean.shape[0] != X.shape[0]:
         raise ValueError(f"predict_model_A length mismatch: {ln_mean.shape[0]} vs {X.shape[0]}")
-
     return np.exp(ln_mean)
 
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
-    """
-    Model B: BART classification. y ~ Bernoulli(logit_p = f), f ~ BART(X).
-    df_feats_with_predvol MUST already contain a finite 'PredVol_M' column.
-    """
     dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
     if len(dfB2) < 30 or dfB2["FT_fac"].nunique() < 2:
         raise RuntimeError("Not enough labeled rows or only one class for Model B.")
@@ -394,7 +381,7 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
             tune=tune,
             chains=chains,
             cores=1,
-            step=[pmb.PGBART(vars=[f])],             # <-- BART stepper
+            step=[pmb.PGBART(vars=[f])],             # BART stepper
             target_accept=0.9,
             random_seed=seed,
             progressbar=True,
@@ -406,19 +393,16 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    # Return P(FT) for each row using posterior predictive Bernoulli draws
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["y_obs"],               # Bernoulli draws 0/1
+            var_names=["y_obs"],
             return_inferencedata=False,
             progressbar=False
         )
-
     arr = np.asarray(ppc["y_obs"])
-    # shapes: (chains, draws, n) OR (draws, n) OR (n,)
     if arr.ndim == 3:
         probs = arr.mean(axis=(0, 1))
     elif arr.ndim == 2:
@@ -427,7 +411,6 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         probs = arr.astype(float)
     else:
         raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
-
     if probs.shape[0] != X.shape[0]:
         raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
     return probs.astype(float)
@@ -488,20 +471,21 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
 
                 # Train A
                 A_bundle = train_model_A(
-                dfA, A_FEATURES_DEFAULT,
-                draws=draws, tune=tune, trees=trees, seed=seed, chains=chains
+                    dfA, A_FEATURES_DEFAULT,
+                    draws=draws, tune=tune, trees=trees, seed=seed, chains=chains
                 )
-
-                # --- Use A to generate PredVol_M across eligible rows
+                
+                # --- Use A to generate PredVol_M across eligible rows (INDEX-ALIGNED) ---
                 pred_cols = A_bundle["predictors"]
                 
-                # Build X on the exact rows that have all predictors present
+                # Rows that have all predictors present for A
                 okA = df_all[pred_cols].dropna().index
                 if len(okA) == 0:
                     st.error("No rows pass Model A predictors; cannot proceed to Model B.")
                     st.stop()
                 
-                Xnew = df_all.loc[okA]  # rows ready for prediction
+                # Predict on those rows
+                Xnew = df_all.loc[okA]
                 preds = predict_model_A(A_bundle, Xnew)
                 
                 # Safety: ensure shape matches
@@ -510,23 +494,21 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                     st.error(f"Internal mismatch: got {preds.shape[0]} preds for {len(okA)} rows.")
                     st.stop()
                 
-                # Assign predictions back into df_all_with_pred
+                # Assign predictions back into a copy (index-aligned Series)
                 df_all_with_pred = df_all.copy()
                 df_all_with_pred.loc[okA, "PredVol_M"] = pd.Series(preds, index=okA, dtype="float64")
-
-                # Prep B data, cap with class balance
+                
+                # ---- Prepare B data and train B ----
                 dfB = df_all_with_pred.dropna(subset=["FT_fac", "PredVol_M"]).copy()
-                # Convert FT_fac → 1/0 once here for the cap helper
                 dfB["_y"] = (dfB["FT_fac"].astype(str) == "FT").astype(int)
                 dfB_cap = _row_cap(dfB, int(capB), y_col="_y") if capB else dfB
-
-                # Train B
+                
                 B_bundle = train_model_B(
                     dfB_cap.drop(columns=["_y"]),
                     B_FEATURES_CORE,
                     draws=draws if not fast_mode else max(200, draws),
                     tune=tune if not fast_mode else max(200, tune),
-                    trees= max(50, trees // (2 if not fast_mode else 3)),
+                    trees=max(50, trees // (2 if not fast_mode else 3)),
                     chains=chains,
                     seed=seed+1
                 )
