@@ -367,42 +367,69 @@ from sklearn.utils.class_weight import compute_class_weight
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
     """
-    Replacement: Train Model B (FT vs Fail) with HistGradientBoostingClassifier.
-    Uses the same predictors (including PredVol_M). Fast, deterministic, no MCMC.
+    Model B: BART classification. y ~ Bernoulli(logit_p = f),  f ~ BART(X).
+    df_feats_with_predvol MUST already contain a finite 'PredVol_M' column.
     """
-    dfB = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
-    if len(dfB) < 30 or dfB["FT_fac"].nunique() < 2:
+    dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
+    if len(dfB2) < 30 or dfB2["FT_fac"].nunique() < 2:
         raise RuntimeError("Not enough labeled rows or only one class for Model B.")
 
     preds_B = predictors_core.copy()
     if "PredVol_M" not in preds_B:
         preds_B = preds_B + ["PredVol_M"]
 
-    X = dfB[preds_B].to_numpy(dtype=float)
-    y = (dfB["FT_fac"].astype(str) == "FT").to_numpy(dtype=int)
+    X = dfB2[preds_B].to_numpy(dtype=float)
+    y = (dfB2["FT_fac"].astype(str) == "FT").to_numpy(dtype=int)
 
-    # Compute per-class weights, then map to per-sample weights
-    classes = np.array([0, 1])
-    cw = compute_class_weight(class_weight="balanced", classes=classes, y=y)
-    w0, w1 = float(cw[0]), float(cw[1])
-    sample_w = np.where(y == 1, w1, w0)
+    _assert_finite("X_B", X)
+    _assert_finite("y_B", y)
 
-    # Compact, strong defaults; deterministic with random_state
-    clf = HistGradientBoostingClassifier(
-        max_depth=3,
-        learning_rate=0.08,
-        max_iter=250,
-        l2_regularization=0.0,
-        random_state=seed,
-    )
-    clf.fit(X, y, sample_weight=sample_w)
+    with pm.Model() as mB:
+        X_B = pm.MutableData("X_B", X)
+        f = pmb.BART("f", X_B, y, m=trees)       # latent log-odds
+        pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
-    return {"model": clf, "predictors": preds_B}
+        trace = pm.sample(
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            cores=1,
+            step=pmb.PGBART(vars=[f]),           # <-- IMPORTANT
+            target_accept=0.9,
+            random_seed=seed,
+            progressbar=True,
+            discard_tuned_samples=True,
+            compute_convergence_checks=False,
+        )
+
+    return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
+    # Return P(FT) for each row using posterior predictive Bernoulli draws
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
-    proba = bundle["model"].predict_proba(X)[:, 1]  # P(FT)
-    return proba.astype(float)
+    with bundle["model"]:
+        pm.set_data({bundle["x_name"]: X})
+        ppc = pm.sample_posterior_predictive(
+            bundle["trace"],
+            var_names=["y_obs"],               # Bernoulli draws 0/1
+            return_inferencedata=False,
+            progressbar=False
+        )
+
+    arr = np.asarray(ppc["y_obs"])
+    # shapes: (chains, draws, n) OR (draws, n) OR (n,)
+    if arr.ndim == 3:
+        probs = arr.mean(axis=(0, 1))
+    elif arr.ndim == 2:
+        probs = arr.mean(axis=0)
+    elif arr.ndim == 1:
+        probs = arr.astype(float)
+    else:
+        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
+
+    if probs.shape[0] != X.shape[0]:
+        raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
+    return probs.astype(float)
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
     if n <= 0 or len(df) <= n: 
