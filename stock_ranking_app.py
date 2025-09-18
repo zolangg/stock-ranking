@@ -1,6 +1,7 @@
 import json, math, subprocess, shutil
 import streamlit as st
 import pandas as pd
+import os
 
 # ---------- Page + light CSS ----------
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -22,7 +23,24 @@ st.markdown(
 
 st.title("Premarket Stock Ranking")
 
-R_SCRIPT = "./predict_bart_cli.R"  # must exist next to this file
+# Resolve absolute paths so CWD changes don't break us
+APP_DIR   = os.path.dirname(os.path.abspath(__file__))
+R_SCRIPT  = os.path.join(APP_DIR, "predict_bart_cli.R")
+MODELS_DIR = os.path.join(APP_DIR, "models")
+
+def _find_rscript():
+    # Try PATH first
+    path = shutil.which("Rscript")
+    if path:
+        return path
+    # Try common locations
+    for candidate in ("/usr/bin/Rscript", "/usr/local/bin/Rscript", "/opt/homebrew/bin/Rscript", "/opt/R/bin/Rscript"):
+        if os.path.exists(candidate):
+            return candidate
+    raise RuntimeError(
+        "Rscript not found on PATH. Install system R (r-base). "
+        "On Streamlit Cloud add '.streamlit/packages.txt' with 'r-base' and redeploy."
+    )
 
 # ---------- helpers ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
@@ -137,72 +155,57 @@ sigma_ln = st.sidebar.slider(
 )
 
 # ---------- numeric scorers ----------
-def pts_rvol(x: float) -> int:
-    for th, p in [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]:
-        if x < th: return p
-    return 7
-
-def pts_atr(x: float) -> int:
-    for th, p in [(0.05,1),(0.10,2),(0.20,3),(0.35,4),(0.60,5),(1.00,6)]:
-        if x < th: return p
-    return 7
-
-def pts_si(x: float) -> int:
-    for th, p in [(2,1),(5,2),(10,3),(15,4),(20,5),(30,6)]:
-        if x < th: return p
-    return 7
-
-def pts_fr(pm_vol_m: float, float_m: float) -> int:
-    if float_m <= 0: return 1
-    rot = pm_vol_m / float_m
-    for th, p in [(0.01,1),(0.03,2),(0.10,3),(0.25,4),(0.50,5),(1.00,6)]:
-        if rot < th: return p
-    return 7
-
-def pts_float(float_m: float) -> int:
-    if float_m <= 3: return 7
-    for th, p in [(200,2),(100,3),(50,4),(35,5),(10,6)]:
-        if float_m > th: return p
-    return 7
-
-def odds_label(score: float) -> str:
-    if score >= 85: return "Very High Odds"
-    elif score >= 70: return "High Odds"
-    elif score >= 55: return "Moderate Odds"
-    elif score >= 40: return "Low Odds"
-    else: return "Very Low Odds"
-
-def grade(score_pct: float) -> str:
-    return ("A++" if score_pct >= 85 else
-            "A+"  if score_pct >= 80 else
-            "A"   if score_pct >= 70 else
-            "B"   if score_pct >= 60 else
-            "C"   if score_pct >= 45 else "D")
-
-# ---------- BART via R CLI ----------
 def call_bart_cli(rows: list[dict]) -> pd.DataFrame:
-    if not shutil.which("Rscript"):
-        raise RuntimeError("Rscript not found on PATH.")
+    rscript = _find_rscript()
+
+    # Sanity checks to give clear errors
+    if not os.path.exists(R_SCRIPT):
+        raise RuntimeError(f"R script not found: {R_SCRIPT}")
+    needed = [
+        "bart_model_A_predDVol_ln.rds",
+        "bart_model_A_predictors.rds",
+        "bart_model_B_FT.rds",
+        "bart_model_B_predictors.rds",
+    ]
+    for f in needed:
+        fp = os.path.join(MODELS_DIR, f)
+        if not os.path.exists(fp):
+            raise RuntimeError(f"Missing model file: {fp}")
+
     payload = []
     for r in rows:
         payload.append({
-            "PMVolM": float(r.get("PMVolM", 0) or 0),
-            "PMDolM": float(r.get("PMDolM", 0) or 0),  # computed from PMVolM * VWAP
-            "FloatM": float(r.get("FloatM", 0) or 0),
-            "GapPct": float(r.get("GapPct", 0) or 0),
-            "ATR":    float(r.get("ATR", 0) or 0),
-            "MCapM":  float(r.get("MCapM", 0) or 0),
+            "PMVolM":  float(r.get("PMVolM", 0) or 0),
+            "PMDolM":  float(r.get("PMDolM", 0) or 0),
+            "FloatM":  float(r.get("FloatM", 0) or 0),
+            "GapPct":  float(r.get("GapPct", 0) or 0),
+            "ATR":     float(r.get("ATR", 0) or 0),
+            "MCapM":   float(r.get("MCapM", 0) or 0),
             "Catalyst": float(r.get("Catalyst", 0) or 0),
         })
+
+    # Pass explicit models directory via arg (and env for good measure)
+    env = os.environ.copy()
+    env["MODELS_DIR"] = MODELS_DIR
+
     p = subprocess.run(
-        ["Rscript", R_SCRIPT, "--both"],
+        [rscript, R_SCRIPT, "--both", f"--models-dir={MODELS_DIR}"],
         input=json.dumps(payload).encode("utf-8"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        cwd=APP_DIR,          # run from app root
+        env=env,
         check=False,
     )
     if p.returncode != 0:
-        raise RuntimeError("R CLI failed.\nSTDERR:\n" + p.stderr.decode("utf-8", errors="ignore"))
+        raise RuntimeError(
+            "R CLI failed.\n"
+            f"CWD: {APP_DIR}\n"
+            f"Rscript: {rscript}\n"
+            f"R script: {R_SCRIPT}\n"
+            f"Models dir arg: {MODELS_DIR}\n"
+            "STDERR:\n" + p.stderr.decode("utf-8", errors="ignore")
+        )
     out = json.loads(p.stdout.decode("utf-8"))
     df = pd.DataFrame(out)
     if "PredVol_M" not in df.columns: df["PredVol_M"] = float("nan")
