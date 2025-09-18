@@ -1,5 +1,2 @@
 r-base
 r-base-dev
-jsonlite
-dbarts
-BART
