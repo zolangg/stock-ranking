@@ -1,10 +1,10 @@
-# Core (wheels exist for py3.10 on Streamlit Cloud)
+# Core (py3.10 wheels)
 numpy==1.24.4
 scipy==1.10.1
 pandas==2.0.3
 
-# PyMC stack (compatible set)
-pytensor==2.15.2
+# PyMC stack (compatible, wheels exist)
+pytensor==2.15.0
 arviz==0.16.1
 pymc==5.8.0
 pymc-bart==0.5.1
