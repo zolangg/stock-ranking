@@ -12,8 +12,34 @@ do_B    <- "--B" %in% args
 if (!do_A && !do_B) do_A <- do_B <- TRUE
 
 # --- locate models under ./models (next to this script)
-script_dir <- tryCatch(normalizePath(dirname(sys.frame(1)$ofile)), error=function(e) ".")
-models_dir <- file.path(script_dir, "models")
+args <- commandArgs(trailingOnly = TRUE)
+do_both <- "--both" %in% args || length(args) == 0
+do_A    <- "--A" %in% args
+do_B    <- "--B" %in% args
+if (!do_A && !do_B) do_A <- do_B <- TRUE
+
+# ----- resolve models directory -----
+# 1) --models-dir=/path
+models_arg <- grep("^--models-dir=", args, value = TRUE)
+models_dir <- NA_character_
+if (length(models_arg)) {
+  models_dir <- sub("^--models-dir=", "", models_arg[1])
+}
+
+# 2) env MODELS_DIR
+if (is.na(models_dir) || !nzchar(models_dir)) {
+  env_md <- Sys.getenv("MODELS_DIR", unset = "")
+  if (nzchar(env_md)) models_dir <- env_md
+}
+
+# 3) default: script_dir/models
+if (is.na(models_dir) || !nzchar(models_dir)) {
+  script_dir <- tryCatch(normalizePath(dirname(sys.frame(1)$ofile)),
+                         error = function(e) getwd())
+  models_dir <- file.path(script_dir, "models")
+}
+
+models_dir <- normalizePath(models_dir, mustWork = FALSE)
 
 rds_A  <- file.path(models_dir, "bart_model_A_predDVol_ln.rds")
 rds_Ap <- file.path(models_dir, "bart_model_A_predictors.rds")
@@ -22,15 +48,12 @@ rds_Bp <- file.path(models_dir, "bart_model_B_predictors.rds")
 
 if (!file.exists(rds_A) || !file.exists(rds_Ap) ||
     !file.exists(rds_B) || !file.exists(rds_Bp)) {
-  stop("Model files not found in ./models. Expected: ",
-       "bart_model_A_predDVol_ln.rds, bart_model_A_predictors.rds, ",
-       "bart_model_B_FT.rds, bart_model_B_predictors.rds")
+  stop(paste0(
+    "Model files not found in: ", models_dir, "\nExpected:\n  ",
+    basename(rds_A), "\n  ", basename(rds_Ap), "\n  ",
+    basename(rds_B), "\n  ", basename(rds_Bp), "\n"
+  ))
 }
-
-bartA     <- readRDS(rds_A)
-preds_A   <- readRDS(rds_Ap)
-bartB     <- readRDS(rds_B)
-preds_B   <- readRDS(rds_Bp)
 
 # ---- read JSON payload (array of rows)
 txt <- readLines(file("stdin"))
