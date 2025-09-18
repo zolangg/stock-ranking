@@ -298,7 +298,7 @@ def _sample(draws, tune, chains, seed):
     )
 
 # ---------- BART training ----------
-def train_model_A(df_feats: pd.DataFrame, predictors: list[str], draws=800, tune=800, trees=200, seed=42):
+def train_model_A(df_feats: pd.DataFrame, predictors: list[str], draws=800, tune=800, trees=200, seed=42, chains=1):
     dfA = df_feats.dropna(subset=["ln_DVol"] + predictors).copy()
     if len(dfA) < 30:
         raise RuntimeError("Not enough rows to train Model A (need ≥30).")
@@ -307,13 +307,22 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str], draws=800, tune
     y = dfA["ln_DVol"].to_numpy(dtype=float)
 
     with pm.Model() as mA:
-        X_A = pm.MutableData("X_A", X)             # <— key: data container
-        f = pmb.BART("f", X_A, y, m=trees)         # latent (log volume)
+        X_A = pm.MutableData("X_A", X)
+        f = pmb.BART("f", X_A, y, m=trees)     # latent (log-volume)
         sigma = pm.Exponential("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
-        trace = pm.sample(draws=draws, tune=tune, chains=2, cores=1,
-                          target_accept=0.9, random_seed=seed, progressbar=False)
-    # store the data name for later set_data()
+        trace = pm.sample(
+            draws=draws,
+            tune=tune,
+            chains=chains,         # <-- use UI control
+            cores=1,
+            step=pmb.PGBART(vars=[f]),  # <-- IMPORTANT
+            target_accept=0.9,
+            random_seed=seed,
+            progressbar=True,
+            discard_tuned_samples=True,
+            compute_convergence_checks=False,
+        )
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
@@ -451,8 +460,8 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
 
                 # Train A
                 A_bundle = train_model_A(
-                    dfA, A_FEATURES_DEFAULT,
-                    draws=draws, tune=tune, trees=trees, seed=seed
+                dfA, A_FEATURES_DEFAULT,
+                draws=draws, tune=tune, trees=trees, seed=seed, chains=chains
                 )
 
                 # --- Use A to generate PredVol_M across eligible rows
