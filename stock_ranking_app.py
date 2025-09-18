@@ -568,16 +568,53 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 dfB = df_all_with_pred.dropna(subset=["FT_fac", "PredVol_M"]).copy()
                 dfB["_y"] = (dfB["FT_fac"].astype(str) == "FT").astype(int)
                 dfB_cap = _row_cap(dfB, int(capB), y_col="_y") if capB else dfB
+
+                # ---- Preflight: make sure Model B has clean data
+                preds_B = list(B_FEATURES_CORE)
+                if "PredVol_M" not in preds_B:
+                    preds_B.append("PredVol_M")
                 
-                B_bundle = train_model_B(
-                    dfB_cap.drop(columns=["_y"]),
-                    B_FEATURES_CORE,
-                    draws=draws if not fast_mode else max(200, draws),
-                    tune=tune  if not fast_mode else max(200, tune),
-                    trees=max(50, trees // (2 if not fast_mode else 3)),
-                    chains=1,
-                    seed=seed+1
-                )
+                missing_cols = [c for c in preds_B + ["FT_fac"] if c not in df_all_with_pred.columns]
+                if missing_cols:
+                    st.error(f"Model B is missing columns: {missing_cols}")
+                    st.stop()
+                
+                dfB_dbg = df_all_with_pred.dropna(subset=preds_B + ["FT_fac"]).copy()
+                if dfB_dbg.empty:
+                    st.error("Model B has zero usable rows after dropping NA. Check PredVol_M and FT_fac availability.")
+                    st.stop()
+                
+                y_dbg = dfB_dbg["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"]).astype(int)
+                class_counts = y_dbg.value_counts(dropna=False).to_dict()
+                nan_counts = dfB_dbg[preds_B].isna().sum().sort_values(ascending=False)
+                inf_mask = ~np.isfinite(dfB_dbg[preds_B].to_numpy(dtype=float))
+                has_inf = bool(inf_mask.any())
+                
+                st.write("**Model B preflight**",
+                         {"rows": int(len(dfB_dbg)),
+                          "class_counts": class_counts,
+                          "n_missing_by_col_top5": nan_counts.head(5).to_dict(),
+                          "has_inf": has_inf})
+                
+                if len(class_counts) < 2:
+                    st.error("Model B only has one class present (all FT or all Fail). Add more labeled rows with both classes.")
+                    st.stop()
+                
+                try:
+                    B_bundle = train_model_B(
+                        df_all_with_pred,
+                        B_FEATURES_CORE,
+                        draws=draws if not fast_mode else max(200, draws),
+                        tune=tune if not fast_mode else max(200, tune),
+                        trees=max(50, trees // (2 if not fast_mode else 3)),
+                        seed=seed+1,
+                    )
+                except Exception as e:
+                    import traceback, textwrap
+                    tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+                    st.error(f"Model B failed: **{type(e).__name__}** — {e}")
+                    st.code(tb[-2000:], language="text")  # last ~2000 chars of traceback
+                    st.stop()
 
                 # Save + small cache key to avoid accidental retrain
                 st.session_state["A_bundle"] = A_bundle
