@@ -204,18 +204,49 @@ def grade(score_pct: float) -> str:
 # Feature engineering (exactly like your R pipeline)
 # ==============================================
 def featurize(df: pd.DataFrame) -> pd.DataFrame:
+    import numpy as np
+    import pandas as pd
+
     eps = 1e-6
     out = df.copy()
 
-    # ensure numeric columns exist
-    for c in ["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM"]:
-        if c not in out: out[c] = np.nan
+    # --- Ensure expected numeric columns exist & coerce numerically (handles "1,234" etc.)
+    for c in ["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM","DVolM"]:
+        if c not in out.columns:
+            out[c] = np.nan
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    # catalyst binary
-    out["Catalyst"] = (out.get("Catalyst", 0).fillna(0).astype(float) != 0).astype(int)
+    # --- Catalyst to binary: accepts numbers or strings like yes/y/true/ft/hot
+    if "Catalyst" not in out.columns:
+        out["Catalyst"] = 0
+    cat_raw = out["Catalyst"]
 
-    # engineered
+    # numeric interpretation (nonzero => True)
+    cat_num = pd.to_numeric(cat_raw, errors="coerce")
+    num_pos = (cat_num.fillna(0) != 0)
+
+    # text interpretation
+    cat_str = (
+        cat_raw.astype(str)
+        .str.strip()
+        .str.lower()
+        .replace({"": np.nan})
+    )
+    yes_words = {"yes","y","true","t","1","ft","hot","news","catalyst"}
+    str_pos = cat_str.isin(yes_words)
+
+    out["Catalyst"] = (num_pos | str_pos).astype(int)
+
+    # --- Optional targets if present
+    if "DVolM" in out.columns:
+        out["ln_DVol"] = np.log(np.maximum(out["DVolM"].astype(float), eps))
+    if "FT" in out.columns:
+        out["FT_fac"] = np.where(
+            out["FT"].astype(str).str.strip().str.lower().isin({"ft","1","true","yes","y"}),
+            1, 0
+        )
+
+    # --- Engineered features (match your R)
     out["FR"]       = out["PMVolM"] / np.maximum(out["FloatM"], eps)
     out["ln_pm"]    = np.log(np.maximum(out["PMVolM"], eps))
     out["ln_pmdol"] = np.log(np.maximum(out["PMDolM"], eps))
@@ -223,13 +254,10 @@ def featurize(df: pd.DataFrame) -> pd.DataFrame:
     out["ln_gapf"]  = np.log(np.maximum(out["GapPct"], 0)/100.0 + eps)
     out["ln_atr"]   = np.log(np.maximum(out["ATR"], eps))
     out["ln_mcap"]  = np.log(np.maximum(out["MCapM"], eps))
-    out["ln_pmdol_per_mcap"] = np.log(np.maximum(out["PMDolM"] / np.maximum(out["MCapM"], eps), eps))
+    out["ln_pmdol_per_mcap"] = np.log(
+        np.maximum(out["PMDolM"] / np.maximum(out["MCapM"], eps), eps)
+    )
 
-    # optional targets if present
-    if "DVolM" in out:
-        out["ln_DVol"] = np.log(np.maximum(pd.to_numeric(out["DVolM"], errors="coerce"), eps))
-    if "FT" in out:
-        out["FT_fac"] = np.where(out["FT"].astype(str).str.strip().str.lower().isin(["ft","1","true","yes","y"]), 1, 0)
     return out
 
 # ==============================================
