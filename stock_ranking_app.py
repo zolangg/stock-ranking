@@ -473,52 +473,196 @@ def train_model_A(df_all: pd.DataFrame, candidate_feats: list[str], use_xgb: boo
         "target": target,
     }
 
-def train_model_B(df_all: pd.DataFrame, feature_cols_core: List[str], modelA: Dict, use_xgb: bool=False):
-    df = df_all.copy()
-    A_feats = modelA["features"]
+def train_model_B(
+    df_all: pd.DataFrame,
+    core_feats: list[str],
+    A_bundle: dict,
+    use_xgb: bool = False,
+    min_rows: int = 12,
+    max_loss_frac: float = 0.25,
+):
+    """
+    Model B (FT classifier) trainer with robust missing-data handling.
 
-    # PredVol from Model A
-    rows = df.dropna(subset=A_feats).index
-    df.loc[rows, "PredVol_M"] = np.exp(modelA["model"].predict(df.loc[rows, A_feats].values))
+    - Ensures PredVol_M is computed from Model A on rows where A's features exist.
+    - Always includes PredVol_M and then greedily adds the largest usable subset of other features.
+    - If only one class remains after filtering, returns a constant-probability fallback.
+    """
+    import streamlit as st
+    import numpy as np
+    import pandas as pd
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import roc_auc_score
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
 
-    preds_B = feature_cols_core + ["PredVol_M"]
-    dfB = df.dropna(subset=preds_B + ["FT_fac"]).copy()
-    if len(dfB) < 30 or dfB["FT_fac"].nunique() < 2:
-        raise RuntimeError("Not enough labeled rows or only one class for Model B.")
-
-    X = dfB[preds_B].values
-    y = dfB["FT_fac"].astype(int).values
-
-    if use_xgb:
-        from xgboost import XGBClassifier
-        model = XGBClassifier(
-            n_estimators=700, max_depth=4, subsample=0.9, colsample_bytree=0.9,
-            learning_rate=0.05, reg_lambda=1.0, n_jobs=4, random_state=42,
-            eval_metric="logloss"
-        )
+    # ------------- 1) Validate label presence -------------
+    # Expect an FT label as either 'FT_fac' (factor-like) or numeric 0/1 in 'FT'
+    y_series = None
+    if "FT_fac" in df_all.columns:
+        # map 'FT' -> 1, otherwise 0
+        y_series = (df_all["FT_fac"].astype(str).str.upper() == "FT").astype(int)
+    elif "FT" in df_all.columns:
+        # try to coerce
+        if df_all["FT"].dtype.kind in ("i", "u", "f", "b"):
+            y_series = (pd.to_numeric(df_all["FT"], errors="coerce").fillna(0) != 0).astype(int)
+        else:
+            y_series = (df_all["FT"].astype(str).str.upper().isin(["FT", "YES", "Y", "TRUE", "1"])).astype(int)
     else:
-        model = RandomForestClassifier(
-            n_estimators=900, max_depth=None, min_samples_leaf=2,
-            random_state=42, n_jobs=4
-        )
+        raise RuntimeError("No FT label column found (expected 'FT_fac' or 'FT').")
 
-    k = 5 if len(dfB) >= 60 else 3
-    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
-    aucs = []
-    for tr, te in cv.split(X, y):
-        model.fit(X[tr], y[tr])
-        p = model.predict_proba(X[te])[:,1]
-        aucs.append(roc_auc_score(y[te], p))
-    model.fit(X, y)
-    auc_in = roc_auc_score(y, model.predict_proba(X)[:,1])
+    # basic label diagnostics (before any filtering)
+    n_labeled = int(y_series.notna().sum())
+    pos = int((y_series == 1).sum())
+    neg = int((y_series == 0).sum())
+    st.write("#### Model B — label availability")
+    st.write(f"Total labeled rows: **{n_labeled}**  |  FT=**{pos}**  Fail=**{neg}**")
+
+    if n_labeled < 5:
+        raise RuntimeError("Not enough raw labeled rows for Model B (need ≥5).")
+
+    # ------------- 2) Compute PredVol_M using Model A -------------
+    if A_bundle is None or "model" not in A_bundle or "features" not in A_bundle:
+        raise RuntimeError("Model A bundle missing. Train Model A before Model B.")
+
+    A_feats = [c for c in A_bundle["features"] if c in df_all.columns]
+    if not A_feats:
+        raise RuntimeError("Model A features missing in df_all; cannot compute PredVol_M.")
+
+    # rows where A can predict
+    mask_A = df_all[A_feats].notna().all(axis=1)
+    ln_pred = np.full(df_all.shape[0], np.nan, dtype=float)
+    if mask_A.any():
+        X_A = df_all.loc[mask_A, A_feats].values
+        ln_pred[mask_A] = A_bundle["model"].predict(X_A)
+    # PredVol_M (millions) on log scale target -> exp
+    df_all = df_all.copy()
+    df_all["PredVol_M"] = np.exp(ln_pred)
+
+    # ------------- 3) Choose features for B (always include PredVol_M) -------------
+    # start with PredVol_M + core feats
+    candidates = ["PredVol_M"] + [f for f in core_feats if f != "PredVol_M"]
+    # Show availability for each candidate with the label
+    st.write("#### Model B — data availability (with label)")
+    diag = []
+    for f in candidates:
+        n = count_complete_rows(df_all, [f]) if f in df_all.columns else 0
+        n_with_y = int(df_all[["PredVol_M", f]].join(y_series.rename("y")).dropna().shape[0]) if f in df_all.columns else 0
+        diag.append({"feature": f, "non-NA rows": n, "rows with label & PredVol": n_with_y})
+    st.dataframe(pd.DataFrame(diag), use_container_width=True, hide_index=True)
+
+    # Greedy subset: force PredVol_M in, then add others if they don't nuke too many rows
+    chosen = ["PredVol_M"]
+    base_rows = df_all[["PredVol_M"]].join(y_series.rename("y")).dropna().shape[0]
+    if base_rows < min_rows:
+        # Not enough rows even with PredVol_M alone -> fallback to prior-prob
+        prior = float((y_series == 1).mean())
+        st.error(f"Model B: only {base_rows} usable rows with PredVol_M. "
+                 f"Falling back to constant probability = {prior:.3f}")
+        return {
+            "type": "constant",
+            "prob": prior,
+            "features": ["(constant prior)"]
+        }
+
+    remaining = [f for f in candidates if f not in chosen]
+    current_n = base_rows
+    while remaining:
+        added = None
+        best_n = -1
+        for f in remaining:
+            cols = ["PredVol_M", f]
+            n = int(df_all[cols].join(y_series.rename("y")).dropna().shape[0])
+            # accept if loss ≤ max_loss_frac
+            if n >= current_n * (1 - max_loss_frac) and n >= min_rows and n > best_n:
+                best_n = n
+                added = f
+        if added is None:
+            break
+        chosen.append(added)
+        current_n = best_n
+        remaining = [x for x in remaining if x != added]
+
+    # ------------- 4) Build final training frame -------------
+    dfB = df_all[chosen].join(y_series.rename("y")).dropna().copy()
+    nB = dfB.shape[0]
+    cls_counts = dfB["y"].value_counts(dropna=False).to_dict()
+    st.info(f"Model B: chosen predictors = {chosen} · usable rows = {nB} · class counts = {cls_counts}")
+
+    # If only one class (e.g., all FT or all Fail), fallback to prior prob
+    if dfB["y"].nunique() < 2 or min(cls_counts.get(0, 0), cls_counts.get(1, 0)) < 2:
+        prior = float((y_series == 1).mean())
+        st.error(f"Model B: class imbalance after filtering (counts={cls_counts}). "
+                 f"Falling back to constant probability = {prior:.3f}")
+        return {
+            "type": "constant",
+            "prob": prior,
+            "features": ["(constant prior)"]
+        }
+
+    X = dfB[chosen].values
+    y = dfB["y"].values
+
+    # ------------- 5) Choose classifier -------------
+    clf = None
+    clf_name = None
+    if use_xgb:
+        try:
+            from xgboost import XGBClassifier
+            clf = XGBClassifier(
+                n_estimators=500,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_lambda=1.0,
+                eval_metric="logloss",
+                n_jobs=0,
+                scale_pos_weight=(cls_counts.get(0, 1) / max(1, cls_counts.get(1, 1)))
+            )
+            clf_name = "XGBClassifier"
+        except Exception:
+            st.warning("xgboost not available; using RandomForestClassifier.")
+    if clf is None:
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+            clf = RandomForestClassifier(
+                n_estimators=700, max_depth=None, min_samples_leaf=2, random_state=42,
+                class_weight="balanced_subsample"
+            )
+            clf_name = "RandomForestClassifier"
+        except Exception:
+            clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+            clf_name = "LogisticRegression"
+
+    clf.fit(X, y)
+
+    # ------------- 6) Stratified K-fold AUC (if enough rows) -------------
+    try:
+        k = 5 if nB >= 50 else (3 if nB >= 20 else nB)
+        if 2 <= k < nB:
+            skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=123)
+            oof = np.full(nB, np.nan, dtype=float)
+            for tr, te in skf.split(X, y):
+                m = clf.__class__(**getattr(clf, "get_params", lambda: {})())
+                m.fit(X[tr], y[tr])
+                if hasattr(m, "predict_proba"):
+                    oof[te] = m.predict_proba(X[te])[:, 1]
+                else:
+                    # logistic-like decision function fallback
+                    s = m.decision_function(X[te])
+                    oof[te] = 1 / (1 + np.exp(-s))
+            auc = roc_auc_score(y[~np.isnan(oof)], oof[~np.isnan(oof)])
+            st.success(f"Model B ({clf_name}) — CV AUC={auc:.3f} (n={nB})")
+        else:
+            st.warning(f"Model B ({clf_name}) — sample too small for CV; trained on n={nB}.")
+    except Exception as e:
+        st.warning(f"Model B: CV failed: {e}")
 
     return {
-        "model": model,
-        "features": preds_B,
-        "n": int(len(dfB)),
-        "auc_cv_mean": float(np.mean(aucs)),
-        "auc_cv_sd": float(np.std(aucs)),
-        "auc_in": float(auc_in),
+        "type": "sklearn",
+        "model": clf,
+        "features": chosen
     }
 
 # ==============================================
