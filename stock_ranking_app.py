@@ -263,6 +263,22 @@ def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     out["FT_fac"]   = out["FT_fac"].astype("category")
     return out
 
+# ---- Predictor sets (must be defined BEFORE training is called)
+A_FEATURES_DEFAULT = ["ln_pm", "ln_pmdol", "ln_fr", "ln_gapf", "ln_atr", "ln_mcap", "Catalyst"]
+B_FEATURES_CORE    = ["ln_pm", "ln_fr", "ln_gapf", "ln_atr", "ln_mcap", "Catalyst", "ln_pmdol", "PredVol_M"]
+
+# ---- Small helpers used by the cached trainers
+def _assert_finite(name, arr):
+    if not np.all(np.isfinite(arr)):
+        bad = np.where(~np.isfinite(arr))
+        raise ValueError(f"{name} contains non-finite values at indices {bad}.")
+
+def _sample(draws, tune, chains, seed):
+    return pm.sample(
+        draws=draws, tune=tune, chains=chains, cores=1,
+        target_accept=0.9, random_seed=seed, progressbar=False
+    )
+
 # Predictor sets (mirror your R run)
 A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
 B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","ln_pmdol","PredVol_M"]
