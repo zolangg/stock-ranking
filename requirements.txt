@@ -1,8 +1,10 @@
 streamlit==1.49.1
-pandas==2.3.2
-numpy==2.3.3
-openpyxl==3.1.5
-pymc==5.16.2
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.11.4
+openpyxl==3.1.2
+
+# PyMC BART stack (versions that have manylinux wheels for Py 3.11)
+pytensor==2.14.2
+pymc==5.10.4
 pymc-bart==0.5.5
-scikit-learn==1.5.2
-scipy==1.14.1
