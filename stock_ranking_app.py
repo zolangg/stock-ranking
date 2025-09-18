@@ -355,35 +355,43 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
 
 # --------- Model B: BART classification (canonical; no custom step) ----------
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
-                  draws=400, tune=300, trees=60, chains=1, seed=123):
-    dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
-    if len(dfB2) < 30 or dfB2["FT_fac"].nunique() < 2:
+                  draws=400, tune=300, trees=60, seed=123):
+    # rows with label + PredVol_M
+    dfB = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
+    if len(dfB) < 30 or dfB["FT_fac"].nunique() < 2:
         raise RuntimeError("Not enough labeled rows or only one class for Model B.")
 
-    preds_B = predictors_core.copy()
+    preds_B = list(predictors_core)
     if "PredVol_M" not in preds_B:
-        preds_B = preds_B + ["PredVol_M"]
+        preds_B.append("PredVol_M")
 
-    X = np.ascontiguousarray(dfB2[preds_B].to_numpy(dtype=np.float64))
-    y = (dfB2["FT_fac"].astype(str) == "FT").to_numpy(dtype=np.int8)
+    # float64 & contiguous avoids dtype/layout surprises
+    X = np.ascontiguousarray(dfB[preds_B].to_numpy(dtype=np.float64))
+    y = (dfB["FT_fac"].astype(str) == "FT").to_numpy(dtype=np.int8)  # {0,1}
 
     with pm.Model() as mB:
-        X_B = pm.MutableData("X_B", X)
-        f = pmb.BART("f", X_B, y, m=trees)      # latent log-odds
+        X_B = pm.Data("X_B", X)
+        f = pmb.BART("f", X_B, y, m=trees)          # <-- the ONLY free RV
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
+        # Force PGBART to be used; do NOT pass vars=[...]
         trace = pm.sample(
             draws=draws,
             tune=tune,
             chains=1,
             cores=1,
-            random_seed=seed,
+            step=[pmb.PGBART()],                     # <-- key line
             target_accept=0.9,
             init="adapt_diag",
             progressbar=True,
+            random_seed=seed,
             discard_tuned_samples=True,
             compute_convergence_checks=False,
         )
+
+        # sanity: ensure only one free RV (f)
+        assert len(mB.free_RVs) == 1 and mB.free_RVs[0].name == "f", \
+            f"Unexpected free RVs: {[rv.name for rv in mB.free_RVs]}"
 
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
