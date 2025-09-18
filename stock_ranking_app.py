@@ -450,45 +450,36 @@ with tab_add:
         st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
         do_rerun()
 
-    # ---------- Preview card ----------
+    # ---------- Preview card (with ALL numbers you like) ----------
     l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
     if l:
         st.markdown("---")
-        cA, cB, cC, cD = st.columns(4)
+        cA, cB, cC, cD, cE = st.columns(5)
+    
         cA.metric("Last Ticker", l.get("Ticker","—"))
         cB.metric("Numeric Block", f"{l.get('Numeric_%',0):.2f}%")
         cC.metric("Qual Block",    f"{l.get('Qual_%',0):.2f}%")
         cD.metric("Final Score",   f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
+        cE.metric("Odds", l.get("Odds","—"))
     
-        # Row 2 — Float Rotation removed; FT fused takes its place
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("FT", l.get("FT", "—"))                       # <— fused FT here
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("PM Float Rotation", f"{l.get('PM_FloatRot_x',0):.3f}×")
+        d1.caption("Premarket volume ÷ float.")
+    
         d2.metric("PM $Vol / MC", f"{l.get('PM$ / MC_%',0):.1f}%")
         d2.caption("PM dollar volume ÷ market cap × 100.")
+    
         d3.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
         d3.caption(
             f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
             f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
         )
+    
         d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
         d4.caption("PM volume ÷ predicted day volume × 100.")
-
-        st.markdown("---")
-        ft_prob = l.get("FT_Prob_%", None)
-        ft_label = l.get("FT_Label", "—")
-        
-        if ft_prob is not None:
-            st.markdown(
-                f"""
-                <div style="padding:1rem; border-radius:0.5rem; background-color:#f0f2f6;
-                            font-size:1.2rem; text-align:center;">
-                    <b>Follow-Through Probability:</b> {ft_prob:.1f}%  
-                    <br>
-                    <span style="font-size:1.4rem; color:#0072B5;"><b>{ft_label}</b></span>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+    
+        d5.metric("FT Probability", f"{l.get('FT_Prob_%',0):.1f}%")
+        d5.caption(f"FT Label: {l.get('FT_Label','—')}")
         
 
 # ---------- Ranking tab ----------
