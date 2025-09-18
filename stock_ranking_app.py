@@ -291,34 +291,51 @@ def predict_model_A(bundle, Xnew: pd.DataFrame) -> np.ndarray:
     # convert ln -> level (millions)
     return np.exp(f_new)
 
-@st.cache_resource(show_spinner=True)
-def train_model_B(df_feats: pd.DataFrame, predictors_core: list[str], A_bundle, draws=800, tune=800, trees=200, seed=123):
-    # Need PredVol_M from A for the same rows we use in B
-    # We'll use in-sample posterior mean from A to form PredVol_M (fast & simple).
-    dfB = df_feats.copy()
-    # build PredVol_M for all rows that have the A predictors
-    okA = dfB.dropna(subset=A_bundle["predictors"]).index
-    if len(okA) == 0:
-        raise RuntimeError("Could not compute PredVol_M for Model B (no rows pass A predictors).")
-    dfB_loc = dfB.loc[okA].copy()
-    predA_all = predict_model_A(A_bundle, dfB_loc)  # in-sample mean pred for rows passing A
-    dfB.loc[okA, "PredVol_M"] = predA_all
+# Train A
+A_bundle = train_model_A(df_all, A_FEATURES_DEFAULT, draws=draws, tune=tune, trees=trees, seed=seed)
 
-    preds_B = predictors_core.copy()
-    need = ["FT_fac","PredVol_M"] + [c for c in preds_B if c != "PredVol_M"]
-    dfB2 = dfB.dropna(subset=need).copy()
+# Make PredVol_M on all rows that can support A’s predictors
+okA_idx = df_all.dropna(subset=A_bundle["predictors"]).index
+df_all_with_pred = df_all.copy()
+if len(okA_idx) > 0:
+    df_all_with_pred.loc[okA_idx, "PredVol_M"] = predict_model_A(A_bundle, df_all.loc[okA_idx])
+else:
+    st.error("No rows pass Model A predictors; cannot proceed to Model B.")
+    st.stop()
+
+# Train B (now no unhashable args!)
+B_bundle = train_model_B(df_all_with_pred, B_FEATURES_CORE, draws=draws, tune=tune, trees=trees, seed=seed+1)
+
+# store both
+st.session_state["A_bundle"] = A_bundle
+st.session_state["B_bundle"] = B_bundle
+
+@st.cache_resource(show_spinner=True)
+@st.cache_resource(show_spinner=True)
+def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
+                  draws=400, tune=400, trees=75, chains=1, seed=123):
+    """df_feats_with_predvol MUST already contain a finite 'PredVol_M' column."""
+    dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac","PredVol_M"]).copy()
     if len(dfB2) < 30 or dfB2["FT_fac"].nunique() < 2:
         raise RuntimeError("Not enough labeled rows or only one class for Model B.")
+
+    preds_B = predictors_core.copy()
+    if "PredVol_M" not in preds_B:
+        preds_B = preds_B + ["PredVol_M"]
+
     X = dfB2[preds_B].to_numpy(dtype=float)
     y = (dfB2["FT_fac"].astype(str) == "FT").to_numpy(dtype=int)
+
+    _assert_finite("X_B", X)
+    _assert_finite("y_B", y)
 
     with pm.Model() as mB:
         f = pmb.BART("f", X, y, m=trees)
         p = pm.Deterministic("p", pm.math.sigmoid(f))
-        y_obs = pm.Bernoulli("y_obs", p=p, observed=y)
-        trace = pm.sample(draws=draws, tune=tune, chains=2, cores=1,
-                          target_accept=0.9, random_seed=seed, progressbar=False)
-    return {"model": mB, "trace": trace, "predictors": preds_B, "df_ref": dfB}
+        pm.Bernoulli("y_obs", p=p, observed=y)
+        trace = _sample(draws, tune, chains, seed)
+
+    return {"model": mB, "trace": trace, "predictors": preds_B}
 
 def predict_model_B(bundle, Xnew: pd.DataFrame) -> np.ndarray:
     X = Xnew[bundle["predictors"]].to_numpy(dtype=float)
@@ -419,6 +436,9 @@ with tab_add:
             "DVolM": np.nan, "FT_fac": "Fail",
         }])
         feats = featurize(row)
+
+        A_bundle = st.session_state["A_bundle"]
+        B_bundle = st.session_state["B_bundle"]
 
         # Model A prediction (millions)
         pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
