@@ -200,6 +200,14 @@ def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
     df = pd.read_excel(file, sheet_name=sheet, engine="openpyxl")
     nms = list(df.columns)
 
+    def _pick_col(nms, patterns):
+        lnms = [x.lower() for x in nms]
+        for pat in patterns:
+            for i, nm in enumerate(lnms):
+                if pd.Series(nm).str.contains(pat, regex=True).iloc[0]:
+                    return i
+        return None
+
     col_PMVolM   = _pick_col(nms, [r"^pm\s*\$?\s*vol.*\(m\)$", r"^pm\s*vol.*m", r"^pm\s*vol(ume)?$"])
     col_PMDolM   = _pick_col(nms, [r"^pm.*\$\s*vol.*\(m\)$", r"dollar.*pm.*\(m\)$", r"^pm\s*\$?\s*vol.*\(m\)$"])
     col_FloatM   = _pick_col(nms, [r"^float.*\(m\)$", r"^float.*m", r"^float$", r"public.*float"])
@@ -231,16 +239,20 @@ def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
         "FT_raw":   df.iloc[:, col_FT] if col_FT is not None else np.nan,
     })
 
-    # Catalyst to {0,1}
+    # Catalyst → {0,1}
     if not pd.api.types.is_numeric_dtype(out["Catalyst"]):
         c = out["Catalyst"].astype(str).str.lower().str.strip()
         out["Catalyst"] = np.where(c.isin(["yes","y","true","1","ft","hot"]), 1, 0).astype(int)
     else:
         out["Catalyst"] = (pd.to_numeric(out["Catalyst"], errors="coerce").fillna(0).astype(float) != 0).astype(int)
 
-    # FT factor label
-    f = out["FT_raw"].astype(str).str.lower().str.strip()
-    out["FT_fac"] = np.where(f.isin(["ft","1","yes","y","true"]), "FT", "Fail").astype("category")
+    # FT label → categorical; keep NaN if no label present
+    f_raw = out["FT_raw"]
+    fl = f_raw.astype(str).str.lower().str.strip()
+    is_ft = fl.isin(["ft","1","yes","y","true"])
+    # If FT_raw is NaN -> keep NaN; else label FT/Fail
+    ft_vals = np.where(f_raw.isna(), np.nan, np.where(is_ft, "FT", "Fail"))
+    out["FT_fac"] = pd.Series(ft_vals, index=out.index).astype("category")
 
     return out
 
