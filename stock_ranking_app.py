@@ -304,23 +304,25 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     if len(dfA) < 30:
         raise RuntimeError("Not enough rows to train Model A (need ≥30).")
 
-    X = dfA[predictors].to_numpy(dtype=float)
-    y = dfA["ln_DVol"].to_numpy(dtype=float)
+    # float64 & contiguous (PyMC/pymc-bart are picky)
+    X = np.ascontiguousarray(dfA[predictors].to_numpy(dtype=np.float64))
+    y = np.asarray(dfA["ln_DVol"].to_numpy(dtype=np.float64))
 
-    # Fix σ to avoid a second RV (most robust on Cloud)
+    # FIX σ so there's only one free RV (the BART latent)
     sigma_val = float(np.nanstd(y)) if np.isfinite(np.nanstd(y)) and np.nanstd(y) > 0 else 1.0
 
     with pm.Model() as mA:
         X_A = pm.MutableData("X_A", X)
-        f = pmb.BART("f", X_A, y, m=trees)      # latent log-volume
+        f = pmb.BART("f", X_A, y, m=trees)                 # the ONLY RV in this model
         pm.Normal("y_obs", mu=f, sigma=sigma_val, observed=y)
 
-        # Let PyMC choose steppers (works with the pinned versions)
+        # IMPORTANT: let PGBART auto-discover BART RVs — do NOT pass vars=[...]
         trace = pm.sample(
             draws=draws,
             tune=tune,
-            chains=1,           # 1 chain is plenty for BART on Cloud
+            chains=1,             # keep 1 for Cloud stability
             cores=1,
+            step=[pmb.PGBART()],  # <-- this is the fix
             random_seed=seed,
             target_accept=0.9,
             init="adapt_diag",
@@ -364,19 +366,21 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
     if "PredVol_M" not in preds_B:
         preds_B = preds_B + ["PredVol_M"]
 
-    X = dfB2[preds_B].to_numpy(dtype=float)
-    y = (dfB2["FT_fac"].astype(str) == "FT").to_numpy(dtype=int)
+    X = np.ascontiguousarray(dfB2[preds_B].to_numpy(dtype=np.float64))
+    y = (dfB2["FT_fac"].astype(str) == "FT").to_numpy(dtype=np.int8)  # {0,1}
 
     with pm.Model() as mB:
         X_B = pm.MutableData("X_B", X)
-        f = pmb.BART("f", X_B, y, m=trees)      # latent log-odds
+        f = pmb.BART("f", X_B, y, m=trees)                     # the ONLY RV
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
+        # Same: auto-detect the BART RV
         trace = pm.sample(
             draws=draws,
             tune=tune,
             chains=1,
             cores=1,
+            step=[pmb.PGBART()],   # <-- this is the fix
             random_seed=seed,
             target_accept=0.9,
             init="adapt_diag",
