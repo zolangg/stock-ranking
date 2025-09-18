@@ -302,26 +302,33 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str], draws=800, tune
     dfA = df_feats.dropna(subset=["ln_DVol"] + predictors).copy()
     if len(dfA) < 30:
         raise RuntimeError("Not enough rows to train Model A (need ≥30).")
+
     X = dfA[predictors].to_numpy(dtype=float)
     y = dfA["ln_DVol"].to_numpy(dtype=float)
 
     with pm.Model() as mA:
-        f = pmb.BART("f", X, y, m=trees)     # latent mean
+        X_A = pm.MutableData("X_A", X)             # <— key: data container
+        f = pmb.BART("f", X_A, y, m=trees)         # latent (log volume)
         sigma = pm.Exponential("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
         trace = pm.sample(draws=draws, tune=tune, chains=2, cores=1,
                           target_accept=0.9, random_seed=seed, progressbar=False)
-    return {"model": mA, "trace": trace, "predictors": predictors}
+    # store the data name for later set_data()
+    return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
-def predict_model_A(bundle, Xnew: pd.DataFrame) -> np.ndarray:
-    X = Xnew[bundle["predictors"]].to_numpy(dtype=float)
+def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
+    X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
     with bundle["model"]:
-        f_new = pmb.predict(bundle["trace"], X, kind="mean")
-    return np.exp(f_new)  # ln → level (millions)
+        pm.set_data({bundle["x_name"]: X})
+        ppc = pm.sample_posterior_predictive(bundle["trace"], var_names=["f"], progressbar=False)
+        f_mean = ppc["f"].mean(axis=0)             # mean over draws
+    return np.exp(f_mean)                          # ln → level (millions)
 
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
-    """df_feats_with_predvol MUST already contain a finite 'PredVol_M' column."""
+    """
+    df_feats_with_predvol MUST already contain a finite 'PredVol_M' column.
+    """
     dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac","PredVol_M"]).copy()
     if len(dfB2) < 30 or dfB2["FT_fac"].nunique() < 2:
         raise RuntimeError("Not enough labeled rows or only one class for Model B.")
@@ -337,12 +344,23 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
     _assert_finite("y_B", y)
 
     with pm.Model() as mB:
-        f = pmb.BART("f", X, y, m=trees)
+        X_B = pm.MutableData("X_B", X)            # <— data container
+        f = pmb.BART("f", X_B, y, m=trees)        # latent logit
         p = pm.Deterministic("p", pm.math.sigmoid(f))
         pm.Bernoulli("y_obs", p=p, observed=y)
         trace = _sample(draws, tune, chains, seed)
 
-    return {"model": mB, "trace": trace, "predictors": preds_B}
+    return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
+
+def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
+    X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
+    with bundle["model"]:
+        pm.set_data({bundle["x_name"]: X})
+        # posterior predictive draws of Bernoulli y_obs; take mean as P(FT)
+        ppc = pm.sample_posterior_predictive(bundle["trace"], var_names=["y_obs"], progressbar=False)
+        y_draws = ppc["y_obs"]                       # shape: draws × n_obs
+        probs = y_draws.mean(axis=0)                 # Monte Carlo prob
+    return probs.astype(float)
 
 def predict_model_B(bundle, Xnew: pd.DataFrame) -> np.ndarray:
     X = Xnew[bundle["predictors"]].to_numpy(dtype=float)
