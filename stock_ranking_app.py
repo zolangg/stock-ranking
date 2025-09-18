@@ -317,12 +317,21 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str], draws=800, tune
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
+    # Build new design matrix
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
+
+    # Swap data -> sample posterior predictive for the observed ln-volume ("y_obs")
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
-        ppc = pm.sample_posterior_predictive(bundle["trace"], var_names=["f"], progressbar=False)
-        f_mean = ppc["f"].mean(axis=0)             # mean over draws
-    return np.exp(f_mean)                          # ln → level (millions)
+        ppc = pm.sample_posterior_predictive(
+            bundle["trace"],
+            var_names=["y_obs"],           # <-- use observed var, not "f"
+            return_inferencedata=False,
+            progressbar=False
+        )
+    # y_obs are draws in ln-space; average over draws, then exp back to "millions"
+    ln_pred = np.asarray(ppc["y_obs"]).mean(axis=0)
+    return np.exp(ln_pred)
 
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
