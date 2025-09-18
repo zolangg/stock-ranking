@@ -1,9 +1,18 @@
-numpy==1.24.4
-scipy==1.10.1
-pandas==2.0.3
-arviz==0.16.1
-pytensor==2.16.3
-pymc==5.8.2
-pymc-bart==0.5.14
-openpyxl==3.1.2
-streamlit==1.27.2
+pip>=24
+setuptools>=68
+wheel
+
+# Core
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.2
+
+# PyMC stack (compatible on py3.11)
+pytensor==2.25.4
+arviz==0.18.0
+pymc==5.13.1
+pymc-bart==0.5.4
+
+# App
+openpyxl==3.1.5
+streamlit==1.37.1
