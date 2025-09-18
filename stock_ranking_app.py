@@ -309,21 +309,27 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
 
     with pm.Model() as mA:
         X_A = pm.MutableData("X_A", X)
-        f = pmb.BART("f", X_A, y, m=trees)     # latent (log-volume)
+        f = pmb.BART("f", X_A, y, m=trees)      # latent (log-volume)
         sigma = pm.Exponential("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
+
+        # Use BART stepper for f AND NUTS for sigma
+        steps = [pmb.PGBART(), pm.NUTS(vars=[sigma])]
+
         trace = pm.sample(
             draws=draws,
             tune=tune,
             chains=chains,
             cores=1,
-            step=pmb.PGBART(vars=[f]),  # <-- IMPORTANT
+            step=steps,                 # <-- list of steppers
             target_accept=0.9,
             random_seed=seed,
             progressbar=True,
+            init="adapt_diag",
             discard_tuned_samples=True,
             compute_convergence_checks=False,
         )
+
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
@@ -359,7 +365,7 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
 def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str],
                   draws=400, tune=400, trees=75, chains=1, seed=123):
     """
-    Model B: BART classification. y ~ Bernoulli(logit_p = f),  f ~ BART(X).
+    Model B: BART classification. y ~ Bernoulli(logit_p = f), f ~ BART(X).
     df_feats_with_predvol MUST already contain a finite 'PredVol_M' column.
     """
     dfB2 = df_feats_with_predvol.dropna(subset=["FT_fac", "PredVol_M"]).copy()
@@ -378,18 +384,22 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame, predictors_core: list[str
 
     with pm.Model() as mB:
         X_B = pm.MutableData("X_B", X)
-        f = pmb.BART("f", X_B, y, m=trees)       # latent log-odds
+        f = pmb.BART("f", X_B, y, m=trees)   # latent log-odds
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
+
+        # Robust across versions: pass a LIST and let it auto-detect bart vars
+        steps = [pmb.PGBART()]
 
         trace = pm.sample(
             draws=draws,
             tune=tune,
             chains=chains,
             cores=1,
-            step=pmb.PGBART(vars=[f]),           # <-- IMPORTANT
+            step=steps,                 # <-- list, auto-detect bart var(s)
             target_accept=0.9,
             random_seed=seed,
             progressbar=True,
+            init="adapt_diag",
             discard_tuned_samples=True,
             compute_convergence_checks=False,
         )
@@ -478,10 +488,8 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 dfA = _row_cap(dfA, int(capA)) if capA else dfA
 
                 # Train A
-                A_bundle = train_model_A(
-                dfA, A_FEATURES_DEFAULT,
-                draws=draws, tune=tune, trees=trees, seed=seed, chains=chains
-                )
+                A_bundle = train_model_A(dfA, A_FEATURES_DEFAULT,
+                         draws=draws, tune=tune, trees=trees, seed=seed, chains=chains)
 
                 # --- Use A to generate PredVol_M across eligible rows
                 pred_cols = A_bundle["predictors"]
