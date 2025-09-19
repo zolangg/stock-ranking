@@ -300,9 +300,10 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
         sigma = pm.HalfNormal("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
 
+        # IMPORTANT: do not pass NUTS-specific kwargs (e.g., target_accept) here
         trace = pm.sample(
             draws=draws, tune=tune, chains=1, cores=1,
-            random_seed=seed, target_accept=0.85,
+            random_seed=seed,
             init="adapt_diag",
             progressbar=True,
             discard_tuned_samples=True,
@@ -365,9 +366,10 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame,
         f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
+        # IMPORTANT: do not pass NUTS-specific kwargs (e.g., target_accept) here
         trace = pm.sample(
             draws=draws, tune=tune, chains=1, cores=1,
-            random_seed=seed, target_accept=0.85,
+            random_seed=seed,
             init="adapt_diag",
             progressbar=True,
             discard_tuned_samples=True,
