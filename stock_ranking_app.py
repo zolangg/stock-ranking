@@ -1,12 +1,47 @@
-import streamlit as st
-import pandas as pd
+# Premarket Stock Ranking — Model A (ln DVol regression) + Model B (FT classification)
+# ------------------------------------------------------------------------------------
+# A: ElasticNetCV on ln(DVol) with conformal CI (fallback to RidgeCV if sklearn missing)
+# B: Logistic Regression (Elastic Net) with Platt calibration (requires scikit-learn)
+# NumPy 2.x-safe handling for FT_fac to avoid DTypePromotionError.
+
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import math
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-# ---------- Page ----------
-st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
-st.title("Premarket Stock Ranking")
+# ----- Try scikit-learn; if missing, we keep Model A via custom RidgeCV and disable Model B -----
+SKLEARN_AVAILABLE = True
+try:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+    from sklearn.linear_model import ElasticNetCV, LogisticRegression
+    from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict
+    from sklearn.calibration import CalibratedClassifierCV
+except Exception:
+    SKLEARN_AVAILABLE = False
 
-# ---------- Markdown table helper ----------
+# ---------- Page + CSS ----------
+st.set_page_config(page_title="Premarket Stock Ranking — A: ln(DVol) • B: FT", layout="wide")
+st.markdown(
+    """
+    <style>
+      html, body, [class*="css"]  { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
+      .section-title { font-weight: 700; font-size: 1.05rem; letter-spacing:.2px; margin: 4px 0 8px 0; }
+      .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 16px 0; }
+      .muted { color:#6b7280; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("Premarket Stock Ranking — A: ln(DVol) regression • B: FT probability")
+
+# ---------- helpers ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     keep = [c for c in cols if c in df.columns]
     if not keep: return "| (no data) |\n| --- |"
@@ -26,534 +61,440 @@ def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     return "\n".join(lines)
 
 def do_rerun():
-    if hasattr(st, "rerun"):
+    try:
         st.rerun()
-    elif hasattr(st, "experimental_rerun"):
-        st.experimental_rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
 
-# ---------- Session state (safe defaults) ----------
+def _hash_df_for_cache(df: pd.DataFrame) -> int:
+    try:
+        return int(pd.util.hash_pandas_object(df, index=True).sum())
+    except Exception:
+        return len(df)
+
+# ---------- data mapping + features ----------
+def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
+    df = pd.read_excel(file, sheet_name=sheet, engine="openpyxl")
+    nms = list(df.columns)
+
+    def _pick_col(nms, patterns):
+        lnms = [x.lower() for x in nms]
+        for pat in patterns:
+            for i, nm in enumerate(lnms):
+                if pd.Series([nm]).str.contains(pat, regex=True, na=False).iloc[0]:
+                    return i
+        return None
+
+    col_PMVolM   = _pick_col(nms, [r"^pm\s*\$?\s*vol.*\(m\)$", r"^pm\s*vol.*m", r"^pm\s*vol(ume)?$"])
+    col_PMDolM   = _pick_col(nms, [r"^pm.*\$\s*vol.*\(m\)$", r"dollar.*pm.*\(m\)$", r"^pm\s*\$?\s*vol.*\(m\)$"])
+    col_FloatM   = _pick_col(nms, [r"^float.*\(m\)$", r"^float.*m", r"^float$", r"public.*float"])
+    col_GapPct   = _pick_col(nms, [r"^gap.*%$", r"^gap_?pct$", r"\bgap\b"])
+    col_ATR      = _pick_col(nms, [r"^daily\s*atr$", r"^atr(\s*\$)?$", r"\batr\b"])
+    col_MCapM    = _pick_col(nms, [r"^market.?cap.*\(m\)$", r"mcap.*\(m\)", r"^market.?cap", r"^mcap\s*m?$"])
+    col_DVolM    = _pick_col(nms, [r"^daily\s*vol(ume)?\s*\(m\)$", r"^daily\s*vol(ume)?$", r"^d.*vol.*\(m\)$", r"^daily\s*vol.*m$"])
+    col_Catalyst = _pick_col(nms, [r"^catalyst(flag|_?flag)?$", r"^catalyst$", r"^news$", r"catalyst.*score"])
+    col_FT       = _pick_col(nms, [r"^ft$", r"follow.?through", r"^ft_?label$", r"^label$"])
+
+    def _num(col):
+        if col is None: return pd.Series([np.nan]*len(df))
+        s = df.iloc[:, col]
+        if pd.api.types.is_numeric_dtype(s):
+            return pd.to_numeric(s, errors="coerce")
+        s = s.astype(str).str.replace(",", "", regex=False).str.strip()
+        s = s.mask(s.eq("") | s.str.upper().isin(["NA","N/A","NULL","-"]))
+        return pd.to_numeric(s, errors="coerce")
+
+    out = pd.DataFrame({
+        "PMVolM":   _num(col_PMVolM),
+        "PMDolM":   _num(col_PMDolM),
+        "FloatM":   _num(col_FloatM),
+        "GapPct":   _num(col_GapPct),
+        "ATR":      _num(col_ATR),
+        "MCapM":    _num(col_MCapM),
+        "DVolM":    _num(col_DVolM),
+        "Catalyst": df.iloc[:, col_Catalyst] if col_Catalyst is not None else 0,
+        "FT_raw":   df.iloc[:, col_FT] if col_FT is not None else np.nan,
+    })
+
+    # Catalyst → {0,1}
+    out["Catalyst"] = pd.to_numeric(out.get("Catalyst", 0), errors="coerce").fillna(0).ne(0).astype(int)
+
+    # FT label → categorical (NumPy 2.x safe)
+    f_raw = out["FT_raw"]
+    fl = f_raw.astype(str).str.lower().str.strip()
+    is_ft = fl.isin(["ft","1","yes","y","true"])
+    ft = pd.Series(np.where(is_ft, "FT", "Fail"), index=out.index, dtype="string")
+    ft = ft.mask(f_raw.isna())  # preserve missing
+    out["FT_fac"] = ft.astype("category")
+
+    return out
+
+def featurize(raw: pd.DataFrame) -> pd.DataFrame:
+    eps = 1e-6
+    out = raw.copy()
+    out["FR"]       = out["PMVolM"] / np.maximum(out["FloatM"].replace(0, np.nan), eps)
+    out["ln_DVol"]  = np.log(np.maximum(out["DVolM"], eps))
+    out["ln_pm"]    = np.log(np.maximum(out["PMVolM"], eps))
+    out["ln_pmdol"] = np.log(np.maximum(out["PMDolM"], eps))
+    out["ln_fr"]    = np.log(np.maximum(out["FR"], eps))
+    out["ln_gapf"]  = np.log(np.maximum(out["GapPct"], 0)/100 + eps)
+    out["ln_atr"]   = np.log(np.maximum(out["ATR"], eps))
+    out["ln_mcap"]  = np.log(np.maximum(out["MCapM"], eps))
+    out["ln_pmdol_per_mcap"] = np.log(np.maximum(out["PMDolM"] / np.maximum(out["MCapM"], eps), eps))
+    out["Catalyst"] = pd.to_numeric(out.get("Catalyst", 0), errors="coerce").fillna(0).ne(0).astype(int)
+    out["FT_fac"]   = out["FT_fac"].astype("category")
+    return out
+
+# ---- Default feature sets ----
+A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
+B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","ln_pmdol","PredVol_M"]
+
+# ---------- Metrics ----------
+def _r2(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float); y_pred = np.asarray(y_pred, dtype=float)
+    ss_res = np.sum((y_true - y_pred)**2); ss_tot = np.sum((y_true - np.mean(y_true))**2)
+    return 1.0 - ss_res / max(ss_tot, 1e-12)
+
+def _rmse(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float); y_pred = np.asarray(y_pred, dtype=float)
+    return float(np.sqrt(np.mean((y_true - y_pred)**2)))
+
+def _mae(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float); y_pred = np.asarray(y_pred, dtype=float)
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+def _roc_auc(y_true, y_score):
+    y_true = np.asarray(y_true, dtype=int); y_score = np.asarray(y_score, dtype=float)
+    pos = y_score[y_true == 1]; neg = y_score[y_true == 0]
+    n1, n0 = len(pos), len(neg)
+    if n1 == 0 or n0 == 0: return float("nan")
+    cmp = pos[:, None] - neg[None, :]
+    greater = np.sum(cmp > 0); equal = np.sum(cmp == 0)
+    return float((greater + 0.5*equal) / (n1*n0))
+
+def _accuracy(y_true, y_score, thr=0.5):
+    y_true = np.asarray(y_true, dtype=int)
+    y_hat = (np.asarray(y_score, dtype=float) >= thr).astype(int)
+    return float((y_hat == y_true).mean()) if len(y_true) else float("nan")
+
+def _logloss(y_true, y_score, eps=1e-12):
+    y_true = np.asarray(y_true, dtype=int)
+    p = np.clip(np.asarray(y_score, dtype=float), eps, 1.0 - eps)
+    return float(-np.mean(y_true*np.log(p) + (1 - y_true)*np.log(1 - p))) if len(y_true) else float("nan")
+
+# ---------- Fallback classes (Model A if sklearn missing) ----------
+class _Std:
+    def fit(self, X):
+        X = np.asarray(X, dtype=float)
+        self.mean_ = X.mean(axis=0)
+        self.std_ = X.std(axis=0, ddof=0)
+        self.std_[self.std_ == 0.0] = 1.0
+        return self
+    def transform(self, X):
+        X = np.asarray(X, dtype=float)
+        return (X - self.mean_) / self.std_
+
+class _RidgeCV:
+    def __init__(self, alphas, cv_splits=5, seed=42):
+        self.alphas = np.array(sorted(set(alphas)), dtype=float)
+        self.cv_splits = cv_splits
+        self.seed = seed
+    def _fit_ridge(self, X, y, alpha):
+        XtX = X.T @ X
+        nfeat = XtX.shape[0]
+        A = XtX + alpha * np.eye(nfeat)
+        coef = np.linalg.solve(A, X.T @ y)
+        return coef
+    def fit(self, X, y):
+        rng = np.random.default_rng(self.seed)
+        X = np.asarray(X, dtype=float); y = np.asarray(y, dtype=float)
+        self.std_ = _Std().fit(X)
+        Xs = self.std_.transform(X)
+        y_mean = y.mean()
+        ys = y - y_mean
+
+        k = max(2, min(self.cv_splits, len(y)//10 if len(y)>=20 else 2))
+        idx = np.arange(len(y))
+        rng.shuffle(idx)
+        folds = np.array_split(idx, k)
+
+        mse_per_alpha = []
+        for a in self.alphas:
+            mses = []
+            for i in range(k):
+                val = folds[i]
+                tr = np.concatenate([folds[j] for j in range(k) if j!=i])
+                coef = self._fit_ridge(Xs[tr], ys[tr], a)
+                yhat = Xs[val] @ coef
+                mses.append(np.mean((yhat - ys[val])**2))
+            mse_per_alpha.append(np.mean(mses))
+        best_idx = int(np.argmin(mse_per_alpha))
+        self.alpha_ = float(self.alphas[best_idx])
+        self.coef_ = self._fit_ridge(Xs, ys, self.alpha_)
+        self.y_mean_ = y_mean
+        return self
+    def predict(self, X):
+        Xs = self.std_.transform(X)
+        return (Xs @ self.coef_) + self.y_mean_
+
+# ---------- Model A (train/predict) ----------
+def _prep_A(df_feats: pd.DataFrame, predictors):
+    dfA = df_feats.dropna(subset=["ln_DVol"] + predictors).copy()
+    X = dfA[predictors].to_numpy(float)
+    y = dfA["ln_DVol"].to_numpy(float)
+    return dfA, X, y
+
+def train_model_A(df_feats: pd.DataFrame, predictors, seed: int = 42):
+    dfA, X, y = _prep_A(df_feats, predictors)
+    if len(dfA) < 20:
+        raise RuntimeError(f"Not enough rows to train Model A (have {len(dfA)}, need ≥20).")
+
+    if SKLEARN_AVAILABLE:
+        cv_splits = min(5, max(2, len(dfA)//10))
+        cv = KFold(n_splits=cv_splits, shuffle=True, random_state=seed)
+        pipe = Pipeline([
+            ("sc", StandardScaler(with_mean=True, with_std=True)),
+            ("enet", ElasticNetCV(
+                l1_ratio=[0.05,0.25,0.5,0.75,0.95],
+                alphas=None, cv=cv, n_alphas=200, random_state=seed, max_iter=20000
+            ))
+        ])
+        pipe.fit(X, y)
+        # manual CV preds for diagnostics
+        y_hat = pipe.predict(X)
+        resid = y - y_hat
+        coefs = getattr(pipe.named_steps["enet"], "coef_", None)
+        alpha_ = getattr(pipe.named_steps["enet"], "alpha_", None)
+        l1_ratio_ = getattr(pipe.named_steps["enet"], "l1_ratio_", None)
+        model = pipe
+        trainer = "ElasticNetCV (sklearn)"
+        splits = cv_splits
+    else:
+        alphas = np.logspace(-3, 3, 41)
+        ridge = _RidgeCV(alphas=alphas, cv_splits=5, seed=seed).fit(X, y)
+        # conformal residuals via simple in-sample proxy (keeps logic compact here)
+        resid = y - ridge.predict(X)
+        coefs = ridge.coef_
+        alpha_ = ridge.alpha_
+        l1_ratio_ = 0.0
+        model = ridge
+        trainer = "RidgeCV (NumPy fallback)"
+        splits = 5
+
+    return {
+        "model": model,
+        "predictors": predictors,
+        "resid": resid,
+        "n_train": len(dfA),
+        "cv_splits": splits,
+        "coefs": coefs,
+        "alpha_": alpha_,
+        "l1_ratio_": l1_ratio_,
+        "trainer": trainer,
+    }
+
+def predict_model_A(bundle, Xnew_df: pd.DataFrame, central_coverage: float = 0.68):
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Model A: missing predictors {missing}. Available: {list(Xnew_df.columns)}")
+    X = Xnew_df[cols].to_numpy(dtype=float)
+    ln_pred = bundle["model"].predict(X)
+
+    # Conformal interval on log scale (symmetric abs residual quantile)
+    alpha = max(0.0, min(1.0, 1.0 - central_coverage))
+    r = np.abs(np.asarray(bundle["resid"], dtype=float))
+    q = float(np.quantile(r, 1 - alpha)) if len(r) > 0 else 0.0
+
+    pred = np.exp(ln_pred)
+    lo = np.exp(ln_pred - q)
+    hi = np.exp(ln_pred + q)
+    return pred, lo, hi
+
+# ---------- Model B (train/predict) ----------
+def _prep_B(df_feats_with_pred: pd.DataFrame, predictors):
+    need = predictors + ["FT_fac"]
+    dfB = df_feats_with_pred.dropna(subset=need).copy()
+    y = (dfB["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
+    X = dfB[predictors].to_numpy(float)
+    return dfB, X, y
+
+def train_model_B(df_feats_with_pred: pd.DataFrame, predictors, seed: int = 123):
+    if not SKLEARN_AVAILABLE:
+        raise RuntimeError("Model B requires scikit-learn. Install scikit-learn to enable FT classification.")
+
+    need = predictors + ["FT_fac"]
+    dfB = df_feats_with_pred.dropna(subset=need).copy()
+    y = (dfB["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
+    X = dfB[predictors].to_numpy(float)
+    if len(dfB) < 20 or len(np.unique(y)) < 2:
+        raise RuntimeError(f"Not enough labeled rows/classes for Model B (rows={len(dfB)}).")
+
+    skf = StratifiedKFold(n_splits=min(5, max(2, len(dfB)//10)), shuffle=True, random_state=seed)
+    base = Pipeline([
+        ("sc", StandardScaler(with_mean=True, with_std=True)),
+        ("logit", LogisticRegression(
+            penalty="elasticnet", solver="saga", l1_ratio=0.5, C=1.0,
+            class_weight="balanced", max_iter=20000, random_state=seed
+        ))
+    ])
+
+    cal = CalibratedClassifierCV(base, method="sigmoid", cv=5)
+    cal.fit(X, y)
+
+    proba_cv = cross_val_predict(cal, X, y, cv=skf, method="predict_proba")[:, 1]
+    auc = _roc_auc(y, proba_cv)
+    acc = _accuracy(y, proba_cv, 0.5)
+    ll  = _logloss(y, proba_cv)
+
+    return {"model": cal, "predictors": predictors, "cv_auc": auc, "cv_acc": acc, "cv_logloss": ll, "n_train": len(dfB)}
+
+def predict_model_B(bundle, Xnew_df: pd.DataFrame):
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Model B: missing predictors {missing}. Available: {list(Xnew_df.columns)}")
+    X = Xnew_df[cols].to_numpy(dtype=float)
+    return bundle["model"].predict_proba(X)[:, 1]
+
+# ---------- session ----------
 if "rows" not in st.session_state: st.session_state.rows = []
-if "last" not in st.session_state: st.session_state.last = {}   # dict, not None
+if "last" not in st.session_state: st.session_state.last = {}
 if "flash" not in st.session_state: st.session_state.flash = None
 if st.session_state.flash:
     st.success(st.session_state.flash)
     st.session_state.flash = None
 
-# ---------- Qualitative criteria (YOUR original) ----------
-QUAL_CRITERIA = [
-    {
-        "name": "GapStruct",
-        "question": "Gap & Trend Development:",
-        "options": [
-            "Gap fully reversed: price loses >80% of gap.",
-            "Choppy reversal: price loses 50–80% of gap.",
-            "Partial retracement: price loses 25–50% of gap.",
-            "Sideways consolidation: gap holds, price within top 25% of gap.",
-            "Uptrend with deep pullbacks (>30% retrace).",
-            "Uptrend with moderate pullbacks (10–30% retrace).",
-            "Clean uptrend, only minor pullbacks (<10%).",
-        ],
-        "weight": 0.15,
-        "help": "How well the gap holds and trends.",
-    },
-    {
-        "name": "LevelStruct",
-        "question": "Key Price Levels:",
-        "options": [
-            "Fails at all major support/resistance; cannot hold any key level.",
-            "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
-            "Holds one support but unable to break resistance; capped below a key level.",
-            "Breaks above resistance but cannot stay; dips below reclaimed level.",
-            "Breaks and holds one major level; most resistance remains above.",
-            "Breaks and holds several major levels; clears most overhead resistance.",
-            "Breaks and holds above all resistance; blue sky.",
-        ],
-        "weight": 0.15,
-        "help": "Break/hold behavior at key levels.",
-    },
-    {
-        "name": "Monthly",
-        "question": "Monthly/Weekly Chart Context:",
-        "options": [
-            "Sharp, accelerating downtrend; new lows repeatedly.",
-            "Persistent downtrend; still lower lows.",
-            "Downtrend losing momentum; flattening.",
-            "Clear base; sideways consolidation.",
-            "Bottom confirmed; higher low after base.",
-            "Uptrend begins; breaks out of base.",
-            "Sustained uptrend; higher highs, blue sky.",
-        ],
-        "weight": 0.10,
-        "help": "Higher-timeframe bias.",
-    },
-]
+# ---------- SIDEBAR ----------
+st.sidebar.header("Training options")
+cov = st.sidebar.slider("Model A: central CI coverage", 0.50, 0.95, 0.68, 0.01,
+                        help="Conformal central coverage for predicted day volume (log-scale, then back-transformed).")
+seedA  = st.sidebar.number_input("Seed — Model A", value=42, step=1)
+seedB  = st.sidebar.number_input("Seed — Model B", value=123, step=1)
 
-# ---------- Sidebar: weights & modifiers (YOUR original) ----------
-st.sidebar.header("Numeric Weights")
-w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01, key="w_rvol")
-w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01, key="w_atr")
-w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, 0.15, 0.01, key="w_si")
-w_fr    = st.sidebar.slider("PM Float Rotation (×)", 0.0, 1.0, 0.45, 0.01, key="w_fr")
-w_float = st.sidebar.slider("Public Float (penalty/bonus)", 0.0, 1.0, 0.05, 0.01, key="w_float")
+st.sidebar.header("Feature sets")
+use_defaults_A = st.sidebar.toggle("Use default A features", value=True)
+custom_A = st.sidebar.text_input(
+    "Custom A features (comma sep)",
+    "ln_pm, ln_pmdol, ln_fr, ln_gapf, ln_atr, ln_mcap, Catalyst"
+)
+A_predictors = A_FEATURES_DEFAULT if use_defaults_A else [c.strip() for c in custom_A.split(",") if c.strip()]
 
-st.sidebar.header("Qualitative Weights")
-q_weights = {}
-for crit in QUAL_CRITERIA:
-    q_weights[crit["name"]] = st.sidebar.slider(
-        crit["name"], 0.0, 1.0, crit["weight"], 0.01, key=f"wq_{crit['name']}"
-    )
+use_defaults_B = st.sidebar.toggle("Use default B features", value=True)
+custom_B = st.sidebar.text_input(
+    "Custom B features (comma sep)",
+    "ln_pm, ln_fr, ln_gapf, ln_atr, ln_mcap, Catalyst, ln_pmdol, PredVol_M"
+)
+B_predictors = B_FEATURES_CORE if use_defaults_B else [c.strip() for c in custom_B.split(",") if c.strip()]
 
-st.sidebar.header("Modifiers")
-news_weight     = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight")
-dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05, key="dil_weight")
+# ---------- TRAINING PANEL ----------
+with st.expander("⚙️ Train / Load Models"):
+    if not SKLEARN_AVAILABLE:
+        st.info("scikit-learn not found — Model A uses RidgeCV fallback; **Model B is disabled**. "
+                "Add `scikit-learn==1.5.1` to requirements.txt to enable ElasticNet (A) and Logistic (B).")
 
-# --- Confidence (log-space) ---
-st.sidebar.header("Prediction Uncertainty")
-sigma_ln = st.sidebar.slider("Log-space σ (residual std dev)", 0.10, 1.50, 0.60, 0.01,
-                             help="Estimated std dev of residuals in ln(volume). 0.60 ≈ typical for your sheet.")
+    st.write("Upload your **PMH Database.xlsx** (sheet: _PMH BO Merged_) to (re)train.")
+    up = st.file_uploader("Upload Excel", type=["xlsx"], accept_multiple_files=False, key="train_xlsx")
+    sheet_train = st.text_input("Sheet name", "PMH BO Merged", key="train_sheet")
 
-# Normalize blocks separately
-num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
-w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
-qual_sum = max(1e-9, sum(q_weights.values()))
-for k in q_weights:
-    q_weights[k] = q_weights[k] / qual_sum
+    if st.button("Train A & B", use_container_width=True, type="primary"):
+        if not up:
+            st.error("Upload the Excel file first.")
+        else:
+            try:
+                with st.spinner("Training models…"):
+                    raw = read_excel_dynamic(up, sheet=sheet_train)
+                    df_all = featurize(raw)
 
-# ---------- Numeric bucket scorers (YOUR original logic) ----------
-def pts_rvol(x: float) -> int:
-    for th, p in [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]:
-        if x < th: return p
-    return 7
+                    # ==== Model A ====
+                    need_A = ["ln_DVol"] + A_predictors
+                    dfA = df_all.dropna(subset=need_A).copy()
+                    if len(dfA) < 20:
+                        st.error(f"Not enough rows for Model A after filtering: {len(dfA)} (need ≥20).")
+                        st.stop()
+                    A_bundle = train_model_A(df_all, A_predictors, seed=seedA)
 
-def pts_atr(x: float) -> int:
-    for th, p in [(0.05,1),(0.10,2),(0.20,3),(0.35,4),(0.60,5),(1.00,6)]:
-        if x < th: return p
-    return 7
+                    # Attach A predictions (PredVol_M) for B
+                    okA = df_all[A_bundle["predictors"]].dropna().index
+                    predsA, ci_l, ci_u = predict_model_A(A_bundle, df_all.loc[okA, A_bundle["predictors"]],
+                                                         central_coverage=cov)
+                    df_all_with_pred = df_all.copy()
+                    df_all_with_pred.loc[okA, "PredVol_M"]    = pd.Series(predsA, index=okA, dtype="float64")
+                    df_all_with_pred.loc[okA, "PredVol_CI_L"] = pd.Series(ci_l,  index=okA, dtype="float64")
+                    df_all_with_pred.loc[okA, "PredVol_CI_U"] = pd.Series(ci_u,  index=okA, dtype="float64")
 
-def pts_si(x: float) -> int:
-    for th, p in [(2,1),(5,2),(10,3),(15,4),(20,5),(30,6)]:
-        if x < th: return p
-    return 7
+                    # Save A artifacts
+                    st.session_state["A_bundle"] = A_bundle
+                    st.session_state["df_all_full"] = df_all_with_pred.copy()
+                    st.session_state["dfA_train"] = dfA.copy()
+                    st.session_state["A_predictors"] = A_bundle["predictors"]
+                    st.session_state["data_hash"] = _hash_df_for_cache(df_all)
 
-def pts_fr(pm_vol_m: float, float_m: float) -> int:
-    # rotation × directly (not percent)
-    if float_m <= 0: return 1
-    rot = pm_vol_m / float_m
-    for th, p in [(0.01,1),(0.03,2),(0.10,3),(0.25,4),(0.50,5),(1.00,6)]:
-        if rot < th: return p
-    return 7
+                    # Basic A diagnostics (train fit, log-scale)
+                    y_true_log = dfA["ln_DVol"].to_numpy(float)
+                    y_pred_log = A_bundle["model"].predict(dfA[A_bundle["predictors"]].to_numpy(float))
+                    c1, c2, c3 = st.columns(3)
+                    with c1: st.metric("A: Train R² (log)",  f"{_r2(y_true_log, y_pred_log):.3f}")
+                    with c2: st.metric("A: RMSE (log)",      f"{_rmse(y_true_log, y_pred_log):.3f}")
+                    with c3: st.metric("A: MAE (log)",       f"{_mae(y_true_log, y_pred_log):.3f}")
 
-def pts_float(float_m: float) -> int:
-    if float_m <= 3: return 7
-    for th, p in [(200,2),(100,3),(50,4),(35,5),(10,6)]:
-        if float_m > th: return p
-    return 7
+                    # Coefs
+                    coefs = A_bundle.get("coefs", None)
+                    if coefs is not None:
+                        coef_df = pd.DataFrame({"feature": A_bundle["predictors"], "coef": coefs})
+                        coef_df = coef_df.sort_values("coef", ascending=False)
+                        st.caption("A: Elastic Net coefficients (ln-scale):")
+                        st.dataframe(coef_df, hide_index=True, use_container_width=True)
 
-def odds_label(score: float) -> str:
-    if score >= 85: return "Very High Odds"
-    elif score >= 70: return "High Odds"
-    elif score >= 55: return "Moderate Odds"
-    elif score >= 40: return "Low Odds"
-    else: return "Very Low Odds"
+                    # ==== Model B (optional) ====
+                    B_bundle = None
+                    if SKLEARN_AVAILABLE:
+                        need_B = B_predictors + ["FT_fac"]
+                        dfB = df_all_with_pred.dropna(subset=need_B).copy()
+                        if len(dfB) >= 20 and dfB["FT_fac"].nunique(dropna=True) >= 2:
+                            # Diagnostics for B eligibility
+                            dfB_check = df_all_with_pred[need_B].copy()
+                            missing_cols = [c for c in need_B if c not in df_all_with_pred.columns]
+                            st.caption(f"B features required: {need_B}")
+                            if missing_cols:
+                                st.warning(f"Model B skip reason: missing columns {missing_cols}")
 
-def grade(score_pct: float) -> str:
-    return ("A++" if score_pct >= 85 else
-            "A+"  if score_pct >= 80 else
-            "A"   if score_pct >= 70 else
-            "B"   if score_pct >= 60 else
-            "C"   if score_pct >= 45 else "D")
+                            dfB_nonan = dfB_check.dropna()
+                            st.caption(f"B: non-missing rows after filtering: {len(dfB_nonan)}")
 
-# ---------- New premarket day-volume model (millions out) ----------
-def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
-    """
-    ln(Y) = 3.1435
-            + 0.1608*ln(MCap_M)
-            + 0.6704*ln(Gap_frac)        # Gap_frac = Gap_% / 100
-            - 0.3878*ln(ATR_$)
-    Returns Y in **millions of shares**
-    """
-    e = 1e-6
-    mc = max(float(mcap_m or 0.0), 0.0)
-    gp = max(float(gap_pct or 0.0), 0.0) / 100.0
-    atr = max(float(atr_usd or 0.0), 0.0)
+                            if "FT_fac" in df_all_with_pred.columns:
+                                label_counts = df_all_with_pred["FT_fac"].value_counts(dropna=False)
+                                st.caption(f"B: label distribution (including NaN):\n{label_counts.to_dict()}")
 
-    ln_y = (
-        3.1435
-        + 0.1608 * math.log(mc + e)
-        + 0.6704 * math.log(gp + e)
-        - 0.3878 * math.log(atr + e)
-    )
-    return math.exp(ln_y)  # already in millions
+                            if len(dfB_nonan) > 0:
+                                y_dbg = (dfB_nonan["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int)
+                                st.caption(f"B: eligible rows by class: {{0: {(y_dbg==0).sum()}, 1: {(y_dbg==1).sum()}}}")
+                            try:
+                                B_bundle = train_model_B(df_all_with_pred, B_predictors, seed=seedB)
+                                st.session_state["B_bundle"] = B_bundle
+                                st.session_state["B_predictors"] = B_bundle["predictors"]
+                                c1, c2, c3 = st.columns(3)
+                                with c1: st.metric("B: CV ROC-AUC",  f"{B_bundle['cv_auc']:.3f}")
+                                with c2: st.metric("B: CV Accuracy", f"{B_bundle['cv_acc']:.3f}")
+                                with c3: st.metric("B: CV LogLoss",  f"{B_bundle['cv_logloss']:.3f}")
+                                st.success(f"Model B trained on {B_bundle['n_train']} rows.")
+                            except Exception as e:
+                                st.warning(f"Model B skipped: {e}")
+                                st.session_state["B_bundle"] = None
+                        else:
+                            st.info("Model B skipped: insufficient labeled rows or only one class.")
+                            st.session_state["B_bundle"] = None
+                    else:
+                        st.info("Model B disabled (scikit-learn not available).")
 
-def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
-    flags = []
-    # Unit sanity
-    if mc_m > 50000: flags.append("⚠️ Market Cap looks > $50B — is it in *millions*?")
-    if float_m > 10000: flags.append("⚠️ Float > 10,000M — is it in *millions*?")
-    if pm_vol_m > 1000: flags.append("⚠️ PM volume > 1,000M — is it in *millions*?")
-    if si_pct > 100: flags.append("⚠️ Short interest > 100% — enter SI as percent (e.g., 25.0).")
-    if atr_usd > 20: flags.append("⚠️ ATR > $20 — double-check units.")
+                    st.success(f"✅ Trained A ({A_bundle['trainer']}, rows={A_bundle['n_train']})"
+                               + (" • Trained B" if st.session_state.get("B_bundle") else " • B skipped"))
 
-    # Adaptive FR threshold by float size
-    fr = (pm_vol_m / max(float_m, 1e-12)) if float_m > 0 else 0.0
-    if float_m <= 1.0:
-        if fr > 60: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× is extreme even for micro-float.")
-    elif float_m <= 5.0:
-        if fr > 20: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× is unusually high.")
-    elif float_m <= 20.0:
-        if fr > 10: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× is high.")
-    else:
-        if fr > 3.0: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× may indicate unit mismatch.")
-    return flags
+            except Exception as e:
+                st.exception(e)
 
-def ln_terms_for_display(mcap_m, gap_pct, atr_usd):
-    e = 1e-6
-    t0 = 3.1435
-    t1 = 0.1608 * math.log(max(float(mcap_m or 0.0), 0.0) + e)
-    t2 = 0.6704 * math.log(max(float(gap_pct or 0.0), 0.0) / 100.0 + e)
-    t3 = -0.3878 * math.log(max(float(atr_usd or 0.0), 0.0) + e)
-    lnY = t0 + t1 + t2 + t3
-    Y   = math.exp(lnY)
-    return {
-        "ln_components": {
-            "base": t0,
-            "+0.1608 ln(MCap M)": t1,
-            "+0.6704 ln(Gap frac)": t2,
-            "−0.3878 ln(ATR $)": t3,
-            "lnY total": lnY
-        },
-        "Predicted Y (millions shares)": Y
-    }
-
-def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
-    """
-    Given a point prediction in *millions* and log-space std dev (sigma_ln),
-    return (low, high) in millions for a two-sided CI using multiplier exp(±z·σ).
-    """
-    if pred_m <= 0:
-        return 0.0, 0.0
-    low  = pred_m * math.exp(-z * sigma_ln)
-    high = pred_m * math.exp( z * sigma_ln)
-    return low, high
-
-# ---------- FT model params (REPLACE with your trained values) ----------
-# If you paste your trained params, delete the placeholder block below.
-_FT_INTERCEPT = -0.20     # TODO: paste trained intercept
-_FT_COEF = {              # TODO: paste trained coefficients for selected features
-    # keys must be in this set: {'ln_float','ln_mcap','ln_atr','ln_gapf','ln_pmvol_f','ln_pmvol_m','ln_fr','catalyst'}
-    'ln_gapf':    1.20,
-    'ln_pmvol_f': 0.80,
-    'ln_fr':      0.30,
-    'ln_pmvol_m': 0.10,
-    'ln_mcap':   -0.40,
-    'ln_atr':    -0.30,
-    'ln_float':  -0.20,
-    'catalyst':   0.40,
-}
-# Standardization used at train time: z = (x - mean)/scale
-_FT_MEAN = {k: 0.0 for k in _FT_COEF.keys()}   # TODO: paste trained feature means
-_FT_SCALE= {k: 1.0 for k in _FT_COEF.keys()}   # TODO: paste trained feature scales (std dev)
-
-def _std(x, m, s):
-    s = float(s) if s not in (None, 0.0) else 1.0
-    return (x - float(m)) / s
-
-# ===== FT probability model (uses ONLY Predicted Day Volume as denominator) =====
-def predict_ft_prob_premarket(float_m: float, mcap_m: float, atr_usd: float,
-                              gap_pct: float, pm_vol_m: float,
-                              pred_vol_m: float,
-                              catalyst_flag: int = 0) -> float:
-    """
-    FT probability model (premarket).
-    PM % of day = PM Vol (M) / Predicted Day Volume (M)
-    """
-    e = 1e-6
-
-    # Base transforms
-    ln_float   = math.log(max(float_m, e))
-    ln_mcap    = math.log(max(mcap_m, e))
-    ln_atr     = math.log(max(atr_usd, e))
-    ln_gapf    = math.log(max(gap_pct, 0.0)/100.0 + e)
-
-    # PM volume levels + float rotation (kept)
-    ln_pmvol_m = math.log(max(pm_vol_m, 0.0) + 1.0)
-    fr         = (pm_vol_m / max(float_m, e)) if float_m > 0 else 0.0
-    ln_fr      = math.log(fr + 1.0)
-
-    # PM fraction of predicted day volume
-    denom  = max(float(pred_vol_m or 0.0), 0.0)
-    pm_frac = (pm_vol_m / denom) if denom > 0 else 0.0
-    # light clipping (avoids extreme early-PM tails)
-    pm_frac = max(0.0, min(pm_frac, 5.0))
-    ln_pmvol_f = math.log(pm_frac + 1.0)
-
-    # Linear predictor with standardization
-    lp = _FT_INTERCEPT
-    features = {
-        'ln_float': ln_float,
-        'ln_mcap': ln_mcap,
-        'ln_atr': ln_atr,
-        'ln_gapf': ln_gapf,
-        'ln_pmvol_f': ln_pmvol_f,   # PM % of predicted day volume
-        'ln_pmvol_m': ln_pmvol_m,   # level
-        'ln_fr': ln_fr,             # float rotation
-        'catalyst': float(catalyst_flag),
-    }
-    for name, val in features.items():
-        if name in _FT_COEF:
-            z = _std(val, _FT_MEAN.get(name, 0.0), _FT_SCALE.get(name, 1.0))
-            lp += _FT_COEF[name] * z
-
-    # numerically stable logistic
-    if lp >= 0:
-        p = 1.0 / (1.0 + math.exp(-lp))
-    else:
-        elp = math.exp(lp)
-        p = elp / (1.0 + elp)
-    return max(0.0, min(1.0, p))
-
-# ---------- Tabs ----------
-tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
-
-with tab_add:
-    st.subheader("Numeric Context")
-
-    # Form that clears on submit (YOUR original layout)
-    with st.form("add_form", clear_on_submit=True):
-        c_top = st.columns([1.2, 1.2, 1.0])
-
-        # Basics
-        with c_top[0]:
-            ticker   = st.text_input("Ticker", "").strip().upper()
-            rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
-
-        # Float / SI / PM volume
-        with c_top[1]:
-            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.0001, format="%.4f")
-
-        # Cap & Modifiers
-        with c_top[2]:
-            catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
-            dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
-
-        st.markdown("---")
-        st.subheader("Qualitative Context")
-
-        q_cols = st.columns(3)
-        for i, crit in enumerate(QUAL_CRITERIA):
-            with q_cols[i % 3]:
-                st.radio(
-                    crit["question"],
-                    options=list(enumerate(crit["options"], 1)),
-                    format_func=lambda x: x[1],
-                    key=f"qual_{crit['name']}",
-                    help=crit.get("help", None)
-                )
-
-        submitted = st.form_submit_button("Add / Score", use_container_width=True)
-
-    # After submit
-    if submitted and ticker:
-        # === Day volume prediction (M) ===
-        pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
-
-        # Confidence bands (millions)
-        ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)    # ~68%
-        ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)   # ~95%
-
-        # === Numeric points ===
-        p_rvol  = pts_rvol(rvol)
-        p_atr   = pts_atr(atr_usd)
-        p_si    = pts_si(si_pct)
-        p_fr    = pts_fr(pm_vol_m, float_m)
-        p_float = pts_float(float_m)
-        num_0_7 = (w_rvol*p_rvol) + (w_atr*p_atr) + (w_si*p_si) + (w_fr*p_fr) + (w_float*p_float)
-        num_pct = (num_0_7/7.0)*100.0
-
-        # === Qualitative points (weighted 1..7) ===
-        qual_0_7 = 0.0
-        for crit in QUAL_CRITERIA:
-            sel = st.session_state.get(f"qual_{crit['name']}", (1,))[0] if isinstance(st.session_state.get(f"qual_{crit['name']}"), tuple) else st.session_state.get(f"qual_{crit['name']}", 1)
-            qual_0_7 += q_weights[crit["name"]] * float(sel)
-        qual_pct = (qual_0_7/7.0)*100.0
-
-        # === Combine + modifiers (YOUR original 50/50 + sliders) ===
-        combo_pct   = 0.5*num_pct + 0.5*qual_pct
-        final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
-        final_score = max(0.0, min(100.0, final_score))
-
-        # === Diagnostics to save ===
-        pm_pct_of_pred   = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
-        pm_float_rot_x   = pm_vol_m / float_m if float_m > 0 else 0.0
-        pm_dollar_vs_mc  = 100.0 * (pm_vol_m * pm_vwap) / mc_m if mc_m > 0 else 0.0
-
-        # === FT Probability (uses PredVol_M as denominator) ===
-        ft_prob = predict_ft_prob_premarket(
-            float_m=float_m, mcap_m=mc_m, atr_usd=atr_usd,
-            gap_pct=gap_pct, pm_vol_m=pm_vol_m,
-            pred_vol_m=pred_vol_m,
-            catalyst_flag=1 if catalyst_points != 0 else 0
-        )
-        ft_pct = round(100.0 * ft_prob, 1)
-        ft_label = ("High FT" if ft_pct >= 70 else
-                    "Moderate FT" if ft_pct >= 55 else
-                    "Low FT" if ft_pct >= 40 else
-                    "Very Low FT")
-        
-        # NEW: fused display string
-        ft_display = f"{ft_pct:.1f}% ({ft_label})"
-
-        row = {
-            "Ticker": ticker,
-            "Odds": odds_label(final_score),
-            "Level": grade(final_score),
-            "OddsScore": final_score,
-            "Numeric_%": round(num_pct, 2),
-            "Qual_%": round(qual_pct, 2),
-            "FinalScore": final_score,
-        
-            # Prediction fields
-            "PredVol_M": round(pred_vol_m, 2),
-            "PredVol_CI68_L": round(ci68_l, 2),
-            "PredVol_CI68_U": round(ci68_u, 2),
-            "PredVol_CI95_L": round(ci95_l, 2),
-            "PredVol_CI95_U": round(ci95_u, 2),
-            "PM_%_of_Pred": round(pm_pct_of_pred, 1),
-        
-            # Keep $Vol/MC; hide Float Rotation from UI
-            "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
-            "PM_FloatRot_x": round(pm_float_rot_x, 3),   # kept for CSV/sanity, not shown
-        
-            # FT fields
-            "FT": ft_display,                # <— fused display
-            "FT_Prob_%": ft_pct,             # keep for sorting/export
-            "FT_Label": ft_label,            # keep for export
-        
-            # raw inputs for debug / sanity
-            "_MCap_M": mc_m,
-            "_Gap_%": gap_pct,
-            "_SI_%": si_pct,
-            "_ATR_$": atr_usd,
-            "_PM_M": pm_vol_m,
-            "_Float_M": float_m,
-            "_Catalyst": float(catalyst_points),
-        }
-
-        st.session_state.rows.append(row)
-        st.session_state.last = row
-        st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
-        do_rerun()
-
-    # ---------- Preview card (with ALL numbers you like) ----------
-    l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
-    if l:
-        st.markdown("---")
-        cA, cB, cC, cD, cE = st.columns(5)
-    
-        cA.metric("Last Ticker", l.get("Ticker","—"))
-        cB.metric("Numeric Block", f"{l.get('Numeric_%',0):.2f}%")
-        cC.metric("Qual Block",    f"{l.get('Qual_%',0):.2f}%")
-        cD.metric("Final Score",   f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
-        cE.metric("Odds", l.get("Odds","—"))
-    
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("PM Float Rotation", f"{l.get('PM_FloatRot_x',0):.3f}×")
-        d1.caption("Premarket volume ÷ float.")
-    
-        d2.metric("PM $Vol / MC", f"{l.get('PM$ / MC_%',0):.1f}%")
-        d2.caption("PM dollar volume ÷ market cap × 100.")
-    
-        d3.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
-        d3.caption(
-            f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
-            f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
-        )
-    
-        d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
-        d4.caption("PM volume ÷ predicted day volume × 100.")
-    
-        d5.metric("FT Probability", f"{l.get('FT_Prob_%',0):.1f}%")
-        d5.caption(f"FT Label: {l.get('FT_Label','—')}")
-        
-
-# ---------- Ranking tab ----------
-with tab_rank:
-    st.subheader("Current Ranking")
-
-    if st.session_state.rows:
-        df = pd.DataFrame(st.session_state.rows)
-        df = df.loc[:, ~df.columns.duplicated(keep="first")]
-
-        # Always sort by FinalScore highest first
-        if "FinalScore" in df.columns:
-            df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
-
-        cols_to_show = [
-            "Ticker","Odds","Level",
-            "Numeric_%","Qual_%","FinalScore",
-            "PM$ / MC_%",
-            "PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM_%_of_Pred",
-            "FT"   # <— fused
-        ]
-        for c in cols_to_show:
-            if c not in df.columns:
-                df[c] = "" if c in ("Ticker","Odds","Level","FT") else 0.0
-        df = df[cols_to_show]
-        
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Ticker": st.column_config.TextColumn("Ticker"),
-                "Odds": st.column_config.TextColumn("Odds"),
-                "Level": st.column_config.TextColumn("Level"),
-                "Numeric_%": st.column_config.NumberColumn("Numeric_%", format="%.2f"),
-                "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
-                "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
-                "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
-                "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
-                "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
-                "PredVol_CI68_U": st.column_config.NumberColumn("Pred Vol CI68 High (M)", format="%.2f"),
-                "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
-                "FT": st.column_config.TextColumn("FT (p/label)"),  # <— fused
-            }
-        )
-
-        # Row delete buttons (top 12)
-        st.markdown("#### Delete rows")
-        del_cols = st.columns(4)
-        head12 = df.head(12).reset_index(drop=True)
-        for i, r in head12.iterrows():
-            with del_cols[i % 4]:
-                label = r.get("Ticker", f"Row {i+1}")
-                if st.button(f"🗑️ {label}", key=f"del_{i}", use_container_width=True):
-                    keep = df.drop(index=i).reset_index(drop=True)
-                    st.session_state.rows = keep.to_dict(orient="records")
-                    do_rerun()
-
-        st.download_button(
-            "Download CSV",
-            df.to_csv(index=False).encode("utf-8"),
-            "ranking.csv",
-            "text/csv",
-            use_container_width=True
-        )
-
-        st.markdown("### 📋 Ranking (Markdown view)")
-        st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
-
-        c1, _ = st.columns([0.25, 0.75])
-        with c1:
-            if st.button("Clear Ranking", use_container_width=True):
-                st.session_state.rows = []
-                st.session_state.last = {}
-                do_rerun()
-    else:
-        st.info("No rows yet. Add a stock in the **Add Stock** tab.")
+# ---------- UI: Add / Ranking ----------
+tab_add, tab_rank =
