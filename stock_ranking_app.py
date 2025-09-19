@@ -422,14 +422,10 @@ def predict_model_A_insample(bundle) -> np.ndarray:
     return np.exp(ln_mean)
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """
-    Predict day volume (Millions) for NEW rows using latent 'f'.
-    """
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
         raise ValueError(f"Missing predictors for Model A: {missing}")
-
     X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_A")
     with bundle["model"]:
         try:
@@ -438,10 +434,15 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
                 bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
             )
         finally:
-            # restore training design so later in-sample PPCs don't break
+            # always go back to training X so any later code is safe
             pm.set_data({bundle["x_name"]: bundle["X_train"]})
-
-    f_draws = _ppc_to_2d(ppc["f"])      # (draws_total, n_rows)
+    f_draws = np.asarray(ppc["f"])
+    if f_draws.ndim == 3:
+        f_draws = f_draws.reshape(f_draws.shape[0]*f_draws.shape[1], f_draws.shape[2])
+    elif f_draws.ndim == 2:
+        pass
+    else:
+        f_draws = f_draws[:, None]
     ln_mean = f_draws.mean(axis=0)
     return np.exp(ln_mean).astype(float)
 
@@ -599,6 +600,40 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 # Save training frame now (needed for in-sample alignment)
                 st.session_state["dfA_train"] = dfA.copy()
 
+                # -- Cache stable in-sample predictions for diagnostics (no PPC later) --
+                try:
+                    with A_bundle["model"]:
+                        # hard reset to training X to avoid any shape drift
+                        pm.set_data({A_bundle["x_name"]: A_bundle["X_train"]})
+                        ppc_train = pm.sample_posterior_predictive(
+                            A_bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
+                        )
+                    f_draws = np.asarray(ppc_train["f"])
+                    if f_draws.ndim == 3:   # (chains, draws, n)
+                        f_draws = f_draws.reshape(f_draws.shape[0]*f_draws.shape[1], f_draws.shape[2])
+                    elif f_draws.ndim == 2: # (draws, n)
+                        pass
+                    else:
+                        f_draws = f_draws[:, None]  # degenerate
+                    ln_mean_train = f_draws.mean(axis=0)                  # (n_train,)
+                    y_pred_lvl_train = np.exp(ln_mean_train).astype(float)
+                
+                    if y_pred_lvl_train.shape[0] != len(dfA):
+                        st.warning(
+                            f"Train-pred size mismatch: {y_pred_lvl_train.shape[0]} vs {len(dfA)}; "
+                            "skipping cached diagnostics."
+                        )
+                        st.session_state["A_train_pred"] = None
+                    else:
+                        # keep alongside training frame for safe metrics
+                        dfA_diag = dfA.copy()
+                        dfA_diag["__PredA_lvl"] = y_pred_lvl_train
+                        st.session_state["dfA_train"] = dfA_diag         # overwrite with enriched frame
+                        st.session_state["A_train_pred"] = y_pred_lvl_train
+                except Exception as e:
+                    st.warning(f"Could not cache A in-sample preds: {type(e).__name__}: {e}")
+                    st.session_state["A_train_pred"] = None
+
                 # ---- PredVol_M (robust) ----
                 pred_cols = A_bundle["predictors"]
                 okA = df_all[pred_cols].dropna().index
@@ -723,29 +758,34 @@ with st.expander("🔎 Model diagnostics"):
     dfA_tr   = st.session_state.get("dfA_train")
     dfB_tr   = st.session_state.get("dfB_train")
 
-    # ---- Model A: R² / RMSE (log & level) ----
-    if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty:
-        try:
-            y_true_log = dfA_tr["ln_DVol"].to_numpy(float)
-            y_true_lvl = np.exp(y_true_log)
-            # In-sample predictions from latent f on training X
-            y_pred_lvl = predict_model_A_insample(A_bundle)
-            y_pred_log = np.log(np.maximum(y_pred_lvl, 1e-9))
-    
-            r2_log   = _r2(y_true_log, y_pred_log)
-            rmse_log = _rmse(y_true_log, y_pred_log)
-            r2_lvl   = _r2(y_true_lvl, y_pred_lvl)
-            rmse_lvl = _rmse(y_true_lvl, y_pred_lvl)
-    
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("A — R² (log)", _fmt(r2_log))
-            c2.metric("A — RMSE (log)", _fmt(rmse_log))
-            c3.metric("A — R² (level)", _fmt(r2_lvl))
-            c4.metric("A — RMSE (Millions)", _fmt(rmse_lvl))
-        except Exception as e:
-            st.warning(f"Model A metrics unavailable: {e}")
-    else:
-        st.info("Train Model A to see R²/RMSE.")
+# ---- Model A: R² / RMSE (log & level) ----
+if (st.session_state.get("A_bundle") is not None
+    and isinstance(st.session_state.get("dfA_train"), pd.DataFrame)
+    and not st.session_state["dfA_train"].empty
+    and st.session_state.get("A_train_pred") is not None):
+    try:
+        dfA_tr = st.session_state["dfA_train"]
+        # ground truth
+        y_true_log = dfA_tr["ln_DVol"].to_numpy(float)
+        y_true_lvl = np.exp(y_true_log)
+        # predictions cached at training time (level scale)
+        y_pred_lvl = dfA_tr["__PredA_lvl"].to_numpy(float)
+        y_pred_log = np.log(np.maximum(y_pred_lvl, 1e-9))
+
+        r2_log   = _r2(y_true_log, y_pred_log)
+        rmse_log = _rmse(y_true_log, y_pred_log)
+        r2_lvl   = _r2(y_true_lvl, y_pred_lvl)
+        rmse_lvl = _rmse(y_true_lvl, y_pred_lvl)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("A — R² (log)", _fmt(r2_log))
+        c2.metric("A — RMSE (log)", _fmt(rmse_log))
+        c3.metric("A — R² (level)", _fmt(r2_lvl))
+        c4.metric("A — RMSE (Millions)", _fmt(rmse_lvl))
+    except Exception as e:
+        st.warning(f"Model A metrics unavailable: {e}")
+else:
+    st.info("Train Model A to see R²/RMSE (no cached predictions found).")
 
     # ---- Model B: AUC / ACC / LogLoss / Brier ----
     if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty:
