@@ -328,26 +328,36 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
+    """
+    Predict day volume (Millions) for new rows using latent node 'f'.
+    """
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Model A: missing predictors {missing}. "
+                         f"Available: {list(Xnew_df.columns)}")
+    X = Xnew_df[cols].to_numpy(dtype=float)
+    if not np.all(np.isfinite(X)):
+        bad = [c for i, c in enumerate(cols) if not np.all(np.isfinite(X[:, i]))]
+        raise ValueError(f"Model A: non-finite values in {bad}")
+
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["y_obs"],
+            var_names=["f"],              # evaluate latent mean on new X
             return_inferencedata=False,
-            progressbar=False
+            progressbar=False,
         )
-    arr = np.asarray(ppc["y_obs"])
-    if arr.ndim == 3:
+    arr = np.asarray(ppc["f"])
+    if arr.ndim == 3:      # (chains, draws, n)
         ln_mean = arr.mean(axis=(0, 1))
-    elif arr.ndim == 2:
+    elif arr.ndim == 2:    # (draws, n)
         ln_mean = arr.mean(axis=0)
-    elif arr.ndim == 1:
-        ln_mean = arr
     else:
-        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
+        raise ValueError(f"Model A: unexpected PPC shape for 'f': {arr.shape}")
     if ln_mean.shape[0] != X.shape[0]:
-        raise ValueError(f"predict_model_A length mismatch: {ln_mean.shape[0]} vs {X.shape[0]}")
+        raise ValueError(f"Model A: length mismatch — PPC len {ln_mean.shape[0]} vs X rows {X.shape[0]}")
     return np.exp(ln_mean)
 
 # --------- Model B: BART classification ----------
@@ -373,7 +383,7 @@ def train_model_B(
         raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
     with pm.Model() as mB:
-        X_B = pm.Data("X_B", X)
+        X_B = pm.MutableData("X_B", X)  # MutableData so we can change shape later
         f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
@@ -406,27 +416,37 @@ def train_model_B(
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
+    """
+    Predict FT probability for new rows from latent logits 'f'.
+    """
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Model B: missing predictors {missing}. "
+                         f"Available: {list(Xnew_df.columns)}")
+    X = Xnew_df[cols].to_numpy(dtype=float)
+    if not np.all(np.isfinite(X)):
+        bad = [c for i, c in enumerate(cols) if not np.all(np.isfinite(X[:, i]))]
+        raise ValueError(f"Model B: non-finite values in {bad}")
+
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["y_obs"],
+            var_names=["f"],              # latent logits evaluated on new X
             return_inferencedata=False,
-            progressbar=False
+            progressbar=False,
         )
-    arr = np.asarray(ppc["y_obs"])
+    arr = np.asarray(ppc["f"])
     if arr.ndim == 3:
-        probs = arr.mean(axis=(0, 1))
+        logits_mean = arr.mean(axis=(0, 1))
     elif arr.ndim == 2:
-        probs = arr.mean(axis=0)
-    elif arr.ndim == 1:
-        probs = arr.astype(float)
+        logits_mean = arr.mean(axis=0)
     else:
-        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
-    if probs.shape[0] != X.shape[0]:
-        raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
-    return probs.astype(float)
+        raise ValueError(f"Model B: unexpected PPC shape for 'f': {arr.shape}")
+    if logits_mean.shape[0] != X.shape[0]:
+        raise ValueError(f"Model B: length mismatch — PPC len {logits_mean.shape[0]} vs X rows {X.shape[0]}")
+    return expit(logits_mean).astype(float)
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
     if n <= 0 or len(df) <= n:
@@ -572,8 +592,6 @@ def _roc_auc(y_true, y_score):
     n1, n0 = len(pos), len(neg)
     if n1 == 0 or n0 == 0:
         return float("nan")
-    # rank-based AUC: P(score_pos > score_neg) + 0.5*P(==)
-    # Use broadcasting; careful with memory if very large (your n is modest)
     cmp = pos[:, None] - neg[None, :]
     greater = np.sum(cmp > 0)
     equal = np.sum(cmp == 0)
@@ -675,7 +693,6 @@ with st.expander("🧠 Feature importance (permutation)"):
     dfA_tr   = st.session_state.get("dfA_train")
     dfB_tr   = st.session_state.get("dfB_train")
 
-    # Fall back to bundle predictors if session lists are missing/empty
     featsA = (st.session_state.get("A_predictors")
               or (A_bundle.get("predictors") if isinstance(A_bundle, dict) else [])
               or [])
@@ -778,17 +795,21 @@ with tab_add:
         }])
         feats = featurize(row)
 
+        # Predict volume (Millions)
         pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
 
+        # Predict FT probability (add PredVol_M as feature)
         featsB = feats.copy()
         featsB["PredVol_M"] = pred_vol_m
         ft_prob = float(predict_model_B(B_bundle, featsB)[0])
 
+        # Confidence bands in level space using user sigma_ln
         ci68_l = pred_vol_m * math.exp(-1.0 * sigma_ln)
         ci68_u = pred_vol_m * math.exp(+1.0 * sigma_ln)
         ci95_l = pred_vol_m * math.exp(-1.96 * sigma_ln)
         ci95_u = pred_vol_m * math.exp(+1.96 * sigma_ln)
 
+        # Scoring blocks
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
