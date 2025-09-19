@@ -268,8 +268,12 @@ def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     out["ln_mcap"]  = np.log(np.maximum(out["MCapM"], eps))
     out["ln_pmdol_per_mcap"] = np.log(np.maximum(out["PMDolM"] / np.maximum(out["MCapM"], eps), eps))
     out["Catalyst"] = (pd.to_numeric(out.get("Catalyst", 0), errors="coerce").fillna(0).astype(float) != 0).astype(int)
-    out["FT_fac"]   = out["FT_fac"].astype("category")
-    return out
+    if "FT_fac" in out.columns:
+        out["FT_fac"] = out["FT_fac"].astype("category")
+    else:
+        # create an all-NaN categorical so downstream code is happy
+        out["FT_fac"] = pd.Series([np.nan] * len(out), index=out.index, dtype="float").astype("category")
+        return out
 
 # ---- Predictor sets
 A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
@@ -525,7 +529,8 @@ def _bart_smoketest(A_bundle, B_bundle):
             "ATR": meds.get("ATR", 0.2),
             "MCapM": meds.get("MCapM", 200.0),
             "Catalyst": 1,
-            "DVolM": np.nan,   # <<< needed so featurize can compute ln_DVol safely
+            "DVolM": np.nan,
+            "FT_fac": "Fail",
         }
         df_probe = pd.DataFrame([base, base])
         feats_p = featurize(df_probe)
