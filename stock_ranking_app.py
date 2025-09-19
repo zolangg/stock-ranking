@@ -639,32 +639,32 @@ with st.expander("🔎 Model diagnostics"):
 
 # ---------- Feature Importance (Permutation) ----------
 @st.cache_data(show_spinner=False)
-def _perm_importance_A(bundle, df_eval, y_log, features, n_repeats=5, seed=42):
+def _perm_importance_A(_bundle, df_eval, y_log, features, n_repeats=5, seed=42):
     rng = np.random.default_rng(seed)
-    base = _r2(y_log, np.log(np.maximum(predict_model_A(bundle, df_eval), 1e-9)))
+    base = _r2(y_log, np.log(np.maximum(predict_model_A(_bundle, df_eval), 1e-9)))
     drops = []
     for ftr in features:
         scores = []
         for _ in range(n_repeats):
             df_s = df_eval.copy()
             df_s[ftr] = rng.permutation(df_s[ftr].values)
-            y_pred = np.log(np.maximum(predict_model_A(bundle, df_s), 1e-9))
+            y_pred = np.log(np.maximum(predict_model_A(_bundle, df_s), 1e-9))
             scores.append(_r2(y_log, y_pred))
         drops.append(base - np.mean(scores))
     out = pd.DataFrame({"feature": features, "R2_drop": drops})
     return out.sort_values("R2_drop", ascending=False, ignore_index=True)
 
 @st.cache_data(show_spinner=False)
-def _perm_importance_B(bundle, df_eval, y_true, features, n_repeats=5, seed=42):
+def _perm_importance_B(_bundle, df_eval, y_true, features, n_repeats=5, seed=42):
     rng = np.random.default_rng(seed)
-    base = _roc_auc(y_true, predict_model_B(bundle, df_eval))
+    base = _roc_auc(y_true, predict_model_B(_bundle, df_eval))
     drops = []
     for ftr in features:
         scores = []
         for _ in range(n_repeats):
             df_s = df_eval.copy()
             df_s[ftr] = rng.permutation(df_s[ftr].values)
-            scores.append(_roc_auc(y_true, predict_model_B(bundle, df_s)))
+            scores.append(_roc_auc(y_true, predict_model_B(_bundle, df_s)))
         drops.append(base - np.mean(scores))
     out = pd.DataFrame({"feature": features, "AUC_drop": drops})
     return out.sort_values("AUC_drop", ascending=False, ignore_index=True)
@@ -674,29 +674,46 @@ with st.expander("🧠 Feature importance (permutation)"):
     B_bundle = st.session_state.get("B_bundle")
     dfA_tr   = st.session_state.get("dfA_train")
     dfB_tr   = st.session_state.get("dfB_train")
-    featsA   = st.session_state.get("A_predictors") or []
-    featsB   = st.session_state.get("B_predictors") or []
 
-    if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty and featsA:
+    # Fall back to bundle predictors if session lists are missing/empty
+    featsA = (st.session_state.get("A_predictors")
+              or (A_bundle.get("predictors") if isinstance(A_bundle, dict) else [])
+              or [])
+    featsB = (st.session_state.get("B_predictors")
+              or (B_bundle.get("predictors") if isinstance(B_bundle, dict) else [])
+              or [])
+
+    # ---- Model A importance ----
+    if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty and len(featsA) > 0:
         try:
-            fiA = _perm_importance_A(A_bundle, dfA_tr[featsA], dfA_tr["ln_DVol"].to_numpy(float), featsA, n_repeats=5)
+            df_eval_A = dfA_tr[featsA]
+            y_log_A   = dfA_tr["ln_DVol"].to_numpy(float)
+            fiA = _perm_importance_A(A_bundle, df_eval_A, y_log_A, featsA, n_repeats=5)
             st.markdown("**Model A — R² drop when shuffling each feature**")
             st.dataframe(fiA, hide_index=True, use_container_width=True)
         except Exception as e:
             st.info(f"A importance not available: {e}")
     else:
         st.caption("Train Model A to see importance.")
+        st.caption(f"• Debug — A_bundle: {A_bundle is not None}, "
+                   f"dfA_tr rows: {0 if not isinstance(dfA_tr, pd.DataFrame) else len(dfA_tr)}, "
+                   f"featsA: {len(featsA)}")
 
-    if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty and featsB:
+    # ---- Model B importance ----
+    if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty and len(featsB) > 0:
         try:
-            y_true = (dfB_tr["FT_fac"].astype(str)=="FT").astype(int).to_numpy()
-            fiB = _perm_importance_B(B_bundle, dfB_tr[featsB], y_true, featsB, n_repeats=5)
+            y_true_B = (dfB_tr["FT_fac"].astype(str) == "FT").astype(int).to_numpy()
+            df_eval_B = dfB_tr[featsB]
+            fiB = _perm_importance_B(B_bundle, df_eval_B, y_true_B, featsB, n_repeats=5)
             st.markdown("**Model B — AUC drop when shuffling each feature**")
             st.dataframe(fiB, hide_index=True, use_container_width=True)
         except Exception as e:
             st.info(f"B importance not available: {e}")
     else:
         st.caption("Train Model B to see importance.")
+        st.caption(f"• Debug — B_bundle: {B_bundle is not None}, "
+                   f"dfB_tr rows: {0 if not isinstance(dfB_tr, pd.DataFrame) else len(dfB_tr)}, "
+                   f"featsB: {len(featsB)}")
 
 # ---------- UI: Add / Ranking ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
