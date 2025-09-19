@@ -6,6 +6,21 @@ import math
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
 
+# ---------- Global CSS ----------
+st.markdown(
+    """
+    <style>
+      html, body, [class*="css"]  { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
+      .section-title { font-weight: 700; font-size: 1.05rem; letter-spacing:.2px; margin: 4px 0 8px 0; }
+      .stMetric label { font-size: 0.85rem; font-weight: 600; color:#374151;}
+      .stMetric [data-testid="stMetricValue"] { font-size: 1.15rem; }
+      .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 16px 0; }
+      section[data-testid="stSidebar"] .stSlider { margin-bottom: 6px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # ---------- Markdown table helper ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     keep = [c for c in cols if c in df.columns]
@@ -282,11 +297,11 @@ def predict_ft_prob_premarket(float_m: float, mcap_m: float, atr_usd: float,
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 with tab_add:
-    st.subheader("Numeric Context")
+    st.markdown('<div class="section-title">Numeric Context</div>', unsafe_allow_html=True)
 
     # Form that clears on submit
     with st.form("add_form", clear_on_submit=True):
-        # === Your requested order ===
+        # === Requested order ===
         col1, col2 = st.columns([1.2, 1.2])
 
         # First column: Ticker, Market Cap, Float, SI %, Gap %
@@ -304,8 +319,8 @@ with tab_add:
             pm_vol_m = st.number_input("Premarket Volume (Millions shares)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             pm_dol_m = st.number_input("Premarket $Volume (Millions $)",     min_value=0.0, value=0.0, step=0.01, format="%.2f")
 
-        st.markdown("---")
-        st.subheader("Qualitative Context")
+        st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Qualitative Context</div>', unsafe_allow_html=True)
 
         q_cols = st.columns(3)
         for i, crit in enumerate(QUAL_CRITERIA):
@@ -318,7 +333,7 @@ with tab_add:
                     help=crit.get("help", None)
                 )
 
-        st.markdown("---")
+        st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
         c_mod1, c_mod2 = st.columns(2)
         with c_mod1:
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
@@ -360,7 +375,7 @@ with tab_add:
         # === Diagnostics to save ===
         pm_pct_of_pred   = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
         pm_float_rot_x   = pm_vol_m / float_m if float_m > 0 else 0.0
-        # NOTE: now uses input $Volume directly (in millions $)
+        # $Vol/MC uses provided $Volume (M$)
         pm_dollar_vs_mc  = 100.0 * pm_dol_m / mc_m if mc_m > 0 else 0.0
 
         # === FT Probability (uses PredVol_M as denominator) ===
@@ -409,7 +424,7 @@ with tab_add:
             "_SI_%": si_pct,
             "_ATR_$": atr_usd,
             "_PM_M": pm_vol_m,
-            "_PM$_M": pm_dol_m,   # <— NEW: store $Volume input
+            "_PM$_M": pm_dol_m,
             "_Float_M": float_m,
             "_Catalyst": float(catalyst_points),
         }
@@ -422,7 +437,7 @@ with tab_add:
     # ---------- Preview card ----------
     l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
     if l:
-        st.markdown("---")
+        st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
         cA, cB, cC, cD, cE = st.columns(5)
         cA.metric("Last Ticker", l.get("Ticker","—"))
         cB.metric("Numeric Block", f"{l.get('Numeric_%',0):.2f}%")
@@ -447,7 +462,7 @@ with tab_add:
 
 # ---------- Ranking tab ----------
 with tab_rank:
-    st.subheader("Current Ranking")
+    st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
 
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
@@ -489,7 +504,8 @@ with tab_rank:
             }
         )
 
-        st.markdown("#### Delete rows")
+        st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Delete rows</div>', unsafe_allow_html=True)
         del_cols = st.columns(4)
         head12 = df.head(12).reset_index(drop=True)
         for i, r in head12.iterrows():
@@ -508,7 +524,7 @@ with tab_rank:
             use_container_width=True
         )
 
-        st.markdown("### 📋 Ranking (Markdown view)")
+        st.markdown('<div class="section-title">📋 Ranking (Markdown view)</div>', unsafe_allow_html=True)
         st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
 
         c1, _ = st.columns([0.25, 0.75])
