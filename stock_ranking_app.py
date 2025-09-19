@@ -393,15 +393,18 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
         "x_name": "X_A",
         "n_train": X.shape[0],
         "trees": trees,
+        "X_train": X,
     }
 
 def predict_model_A_insample(bundle) -> np.ndarray:
     """
-    Robust in-sample prediction for Model A (training X only).
-    Uses PPC of y_obs (log scale) without set_data → shapes always match training n.
+    Robust in-sample prediction for Model A (TRAINING rows).
+    Resets X to training matrix before sampling PPC of y_obs.
     Returns level-scale predictions (Millions) of shape (n_train,).
     """
     with bundle["model"]:
+        # ensure shape matches training target
+        pm.set_data({bundle["x_name"]: bundle["X_train"]})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"], var_names=["y_obs"], return_inferencedata=False, progressbar=False
         )
@@ -416,7 +419,7 @@ def predict_model_A_insample(bundle) -> np.ndarray:
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     """
-    Predict day volume (Millions) for new rows using the latent BART mean 'f'.
+    Predict day volume (Millions) for NEW rows using latent 'f'.
     """
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
@@ -425,13 +428,17 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
 
     X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_A")
     with bundle["model"]:
-        pm.set_data({bundle["x_name"]: X})
-        ppc = pm.sample_posterior_predictive(
-            bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
-        )
+        try:
+            pm.set_data({bundle["x_name"]: X})
+            ppc = pm.sample_posterior_predictive(
+                bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
+            )
+        finally:
+            # restore training design so later in-sample PPCs don't break
+            pm.set_data({bundle["x_name"]: bundle["X_train"]})
 
-    f_draws = _ppc_to_2d(ppc["f"])      # (draws_total, n_rows) on log-scale
-    ln_mean = f_draws.mean(axis=0)      # (n_rows,)
+    f_draws = _ppc_to_2d(ppc["f"])      # (draws_total, n_rows)
+    ln_mean = f_draws.mean(axis=0)
     return np.exp(ln_mean).astype(float)
 
 def train_model_B(
