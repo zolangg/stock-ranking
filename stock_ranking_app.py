@@ -428,34 +428,39 @@ if enable_diagnostics:
         dfA_tr   = st.session_state.get("dfA_train")
         dfB_tr   = st.session_state.get("dfB_train")
 
-        # Model A diagnostics (log-space)
+        # ----- Model A: one row, 3 metrics
         if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty:
             try:
                 y_true_log = dfA_tr["ln_DVol"].to_numpy(float)
                 y_pred_lvl = predict_model_A(A_bundle, dfA_tr)
                 y_pred_log = np.log(np.maximum(y_pred_lvl, 1e-9))
-                st.metric("Model A — R² (log)",  f"{_r2(y_true_log, y_pred_log):.3f}")
-                st.metric("Model A — RMSE (log)", f"{_rmse(y_true_log, y_pred_log):.3f}")
-                st.metric("Model A — MAE (log)",  f"{_mae(y_true_log, y_pred_log):.3f}")
+                c1, c2, c3 = st.columns(3)
+                with c1: st.metric("Model A — R² (log)",  f"{_r2(y_true_log, y_pred_log):.3f}")
+                with c2: st.metric("Model A — RMSE (log)", f"{_rmse(y_true_log, y_pred_log):.3f}")
+                with c3: st.metric("Model A — MAE (log)",  f"{_mae(y_true_log, y_pred_log):.3f}")
             except Exception as e:
                 st.warning(f"Model A metrics unavailable: {e}")
         else:
             st.info("Train Model A to see diagnostics.")
 
-        # Model B diagnostics
+        # Spacer
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+
+        # ----- Model B: one row, 3 metrics
         if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty:
             try:
                 y_true = (dfB_tr["FT_fac"].astype(str).str.lower()
                           .isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
                 proba  = predict_model_B(B_bundle, dfB_tr)
-                st.metric("Model B — ROC AUC",          f"{_roc_auc(y_true, proba):.3f}")
-                st.metric("Model B — Accuracy (thr=0.5)", f"{_accuracy(y_true, proba, 0.5):.3f}")
-                st.metric("Model B — Log Loss",         f"{_logloss(y_true, proba):.3f}")
+                c1, c2, c3 = st.columns(3)
+                with c1: st.metric("Model B — ROC AUC",             f"{_roc_auc(y_true, proba):.3f}")
+                with c2: st.metric("Model B — Accuracy (thr=0.5)",  f"{_accuracy(y_true, proba, 0.5):.3f}")
+                with c3: st.metric("Model B — Log Loss",            f"{_logloss(y_true, proba):.3f}")
             except Exception as e:
                 st.warning(f"Model B metrics unavailable: {e}")
         elif st.session_state.get("B_bundle") is None:
             st.info("Model B skipped (insufficient rows).")
-# else: render nothing — no block divider, no expander
+# else: render nothing
 
 # ---------- Feature Importance (Permutation) — gated (slow) ----------
 @st.cache_data(show_spinner=False)
