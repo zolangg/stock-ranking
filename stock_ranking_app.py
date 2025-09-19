@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import math
+from typing import Optional
 
 # ---------- Page ----------
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -16,10 +17,52 @@ st.markdown(
       .stMetric [data-testid="stMetricValue"] { font-size: 1.15rem; }
       .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 16px 0; }
       section[data-testid="stSidebar"] .stSlider { margin-bottom: 6px; }
+      .hint { color:#6b7280; font-size:12px; margin-top:-6px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+# ---------- Comma-friendly numeric input ----------
+def _parse_local_float(s: str) -> Optional[float]:
+    if s is None: return None
+    s = str(s).strip()
+    if s == "": return None
+    # Remove spaces and apostrophes (1 234,56 or 1'234,56)
+    s = s.replace(" ", "").replace("’", "").replace("'", "")
+    # If there's a comma but no dot -> treat comma as decimal
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
+    else:
+        # Otherwise drop commas as thousands separators
+        s = s.replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
+                max_value: Optional[float] = None, decimals: int = 2,
+                key: Optional[str] = None, help: Optional[str] = None) -> float:
+    """Text input that accepts 5,05  / 1'234,5 / 1 234,5 / 5.05 and returns float."""
+    fmt = f"{{:.{decimals}f}}"
+    default_str = fmt.format(float(value))
+    s = st.text_input(label, default_str, key=key, help=help)
+    v = _parse_local_float(s)
+    if v is None:
+        st.caption('<span class="hint">Enter a number, e.g. 5,05</span>', unsafe_allow_html=True)
+        return float(value)
+    # Clamp to min/max
+    if v < min_value:
+        st.caption(f'<span class="hint">Clamped to minimum: {fmt.format(min_value)}</span>', unsafe_allow_html=True)
+        v = min_value
+    if max_value is not None and v > max_value:
+        st.caption(f'<span class="hint">Clamped to maximum: {fmt.format(max_value)}</span>', unsafe_allow_html=True)
+        v = max_value
+    # Show normalized preview if user typed a comma/formatting
+    if ("," in s) or (" " in s) or ("'" in s):
+        st.caption(f'<span class="hint">= {fmt.format(v)}</span>', unsafe_allow_html=True)
+    return float(v)
 
 # ---------- Markdown table helper ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
@@ -46,9 +89,9 @@ def do_rerun():
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
 
-# ---------- Session state (safe defaults) ----------
+# ---------- Session state ----------
 if "rows" not in st.session_state: st.session_state.rows = []
-if "last" not in st.session_state: st.session_state.last = {}   # dict, not None
+if "last" not in st.session_state: st.session_state.last = {}
 if "flash" not in st.session_state: st.session_state.flash = None
 if st.session_state.flash:
     st.success(st.session_state.flash)
@@ -103,20 +146,18 @@ QUAL_CRITERIA = [
     },
 ]
 
-# ---------- Sidebar: weights & modifiers ----------
+# ---------- Sidebar: weights & uncertainty ----------
 st.sidebar.header("Numeric Weights")
-w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01, key="w_rvol")
-w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01, key="w_atr")
-w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, 0.15, 0.01, key="w_si")
-w_fr    = st.sidebar.slider("PM Float Rotation (×)", 0.0, 1.0, 0.45, 0.01, key="w_fr")
-w_float = st.sidebar.slider("Public Float (penalty/bonus)", 0.0, 1.0, 0.05, 0.01, key="w_float")
+w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01)
+w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01)
+w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, 0.15, 0.01)
+w_fr    = st.sidebar.slider("PM Float Rotation (×)", 0.0, 1.0, 0.45, 0.01)
+w_float = st.sidebar.slider("Public Float (penalty/bonus)", 0.0, 1.0, 0.05, 0.01)
 
 st.sidebar.header("Qualitative Weights")
 q_weights = {}
 for crit in QUAL_CRITERIA:
-    q_weights[crit["name"]] = st.sidebar.slider(
-        crit["name"], 0.0, 1.0, crit["weight"], 0.01, key=f"wq_{crit['name']}"
-    )
+    q_weights[crit["name"]] = st.sidebar.slider(crit["name"], 0.0, 1.0, crit["weight"], 0.01)
 
 st.sidebar.header("Prediction Uncertainty")
 sigma_ln = st.sidebar.slider(
@@ -177,18 +218,14 @@ def grade(score_pct: float) -> str:
 # ---------- Day-volume model (millions out) ----------
 def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """
-    ln(Y) = 3.1435
-            + 0.1608*ln(MCap_M)
-            + 0.6704*ln(Gap_frac)        # Gap_frac = Gap_% / 100
-            - 0.3878*ln(ATR_$)
-    Returns Y in millions of shares
+    ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$)
+    Returns Y in **millions of shares**
     """
     e = 1e-6
-    mc = max(float(mcap_m or 0.0), 0.0)
-    gp = max(float(gap_pct or 0.0), 0.0) / 100.0
+    mc  = max(float(mcap_m or 0.0), 0.0)
+    gp  = max(float(gap_pct or 0.0), 0.0) / 100.0
     atr = max(float(atr_usd or 0.0), 0.0)
-
-    ln_y = 3.1435 + 0.1608 * math.log(mc + e) + 0.6704 * math.log(gp + e) - 0.3878 * math.log(atr + e)
+    ln_y = 3.1435 + 0.1608*math.log(mc + e) + 0.6704*math.log(gp + e) - 0.3878*math.log(atr + e)
     return math.exp(ln_y)
 
 def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
@@ -261,17 +298,17 @@ with tab_add:
         # First column: Ticker, Market Cap, Float, SI %, Gap %
         with col1:
             ticker   = st.text_input("Ticker", "").strip().upper()
-            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            float_m  = st.number_input("Public Float (Millions)",   min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            si_pct   = st.number_input("Short Interest (%)",        min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
+            mc_m     = input_float("Market Cap (Millions $)", 0.0, min_value=0.0, decimals=2)
+            float_m  = input_float("Public Float (Millions)",  0.0, min_value=0.0, decimals=2)
+            si_pct   = input_float("Short Interest (%)",       0.0, min_value=0.0, decimals=2)
+            gap_pct  = input_float("Gap % (Open vs prior close)", 0.0, min_value=0.0, decimals=1)
 
         # Second column: ATR, RVOL, Premarket Volume (shares), Premarket $ Volume
         with col2:
-            atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            rvol     = st.number_input("RVOL",    min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            pm_vol_m = st.number_input("Premarket Volume (Millions shares)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            pm_dol_m = st.number_input("Premarket Dollar Volume (Millions Dollars)",   min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            atr_usd  = input_float("ATR ($)", 0.0, min_value=0.0, decimals=2)
+            rvol     = input_float("RVOL",    0.0, min_value=0.0, decimals=2)
+            pm_vol_m = input_float("Premarket Volume (Millions shares)", 0.0, min_value=0.0, decimals=2)
+            pm_dol_m = input_float("Premarket Dollars Volume (Millions Dollars)",   0.0, min_value=0.0, decimals=2)
 
         # Third column: Modifiers right next to numbers
         with col3:
@@ -322,14 +359,13 @@ with tab_add:
 
         # === Combine + modifiers (50/50 + sliders) ===
         combo_pct   = 0.5*num_pct + 0.5*qual_pct
-        final_score = round(combo_pct + (catalyst_points*10) + (dilution_points*10), 2)  # direct add, as before
+        final_score = round(combo_pct + (catalyst_points*10) + (dilution_points*10), 2)
         final_score = max(0.0, min(100.0, final_score))
 
         # === Diagnostics to save ===
         pm_pct_of_pred   = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
         pm_float_rot_x   = pm_vol_m / float_m if float_m > 0 else 0.0
-        # uses input $ Volume directly (in M$)
-        pm_dollar_vs_mc  = 100.0 * pm_dol_m / mc_m if mc_m > 0 else 0.0
+        pm_dollar_vs_mc  = 100.0 * pm_dol_m / mc_m if mc_m > 0 else 0.0  # uses input $Volume (M$)
 
         # === FT Probability (uses PredVol_M as denominator) ===
         ft_prob = predict_ft_prob_premarket(
@@ -362,7 +398,7 @@ with tab_add:
             "PredVol_CI95_U": round(ci95_u, 2),
             "PM_%_of_Pred": round(pm_pct_of_pred, 1),
 
-            # $Vol/MC now from provided $ Volume (M$)
+            # Ratios
             "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
             "PM_FloatRot_x": round(pm_float_rot_x, 3),
 
@@ -371,7 +407,7 @@ with tab_add:
             "FT_Prob_%": ft_pct,
             "FT_Label": ft_label,
 
-            # raw inputs for debug / sanity
+            # raw inputs for debug / export
             "_MCap_M": mc_m,
             "_Gap_%": gap_pct,
             "_SI_%": si_pct,
@@ -422,7 +458,6 @@ with tab_rank:
         df = pd.DataFrame(st.session_state.rows)
         df = df.loc[:, ~df.columns.duplicated(keep="first")]
 
-        # Always sort by FinalScore highest first
         if "FinalScore" in df.columns:
             df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
