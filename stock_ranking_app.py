@@ -334,7 +334,8 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
-        raise ValueError(f"Model A: missing predictors {missing}. Available: {list(Xnew_df.columns)}")
+        raise ValueError(f"Model A: missing predictors {missing}. "
+                         f"Available: {list(Xnew_df.columns)}")
     X = Xnew_df[cols].to_numpy(dtype=float)
     if not np.all(np.isfinite(X)):
         bad = [c for i, c in enumerate(cols) if not np.all(np.isfinite(X[:, i]))]
@@ -374,7 +375,7 @@ def train_model_B(
 
     dfB = df_feats_with_predvol.dropna(subset=preds_B + ["FT_fac"]).copy()
     if len(dfB) < 30:
-        raise RuntimeError(f"Not enough rows for Model B (have {len[dfB]}, need ≥30).")
+        raise RuntimeError(f"Not enough rows for Model B (have {len(dfB)}, need ≥30).")
 
     X = np.ascontiguousarray(dfB[preds_B].to_numpy(dtype=np.float64))
     y = (dfB["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(np.int8).to_numpy()
@@ -382,8 +383,8 @@ def train_model_B(
         raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
     with pm.Model() as mB:
-        X_B = pm.MutableData("X_B", X)
-        f = pmb.BART("f", X_B, y, m=trees)   # latent logits
+        X_B = pm.MutableData("X_B", X)  # MutableData so we can change shape later
+        f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
         try:
@@ -421,7 +422,8 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
-        raise ValueError(f"Model B: missing predictors {missing}. Available: {list(Xnew_df.columns)}")
+        raise ValueError(f"Model B: missing predictors {missing}. "
+                         f"Available: {list(Xnew_df.columns)}")
     X = Xnew_df[cols].to_numpy(dtype=float)
     if not np.all(np.isfinite(X)):
         bad = [c for i, c in enumerate(cols) if not np.all(np.isfinite(X[:, i]))]
@@ -484,8 +486,6 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
     capA = st.number_input("Max rows for Model A", min_value=0, value=1200 if fast_mode else 0, help="0 = no cap")
     capB = st.number_input("Max rows for Model B (after PredVol_M)", min_value=0, value=600 if fast_mode else 0, help="0 = no cap")
 
-    show_b_debug = st.toggle("Show Model B data checks", value=False)
-
     if st.button("Train models", use_container_width=True, type="primary"):
         if not up:
             st.error("Upload the Excel file first.")
@@ -494,8 +494,21 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 raw = read_excel_dynamic(up)
                 df_all = featurize(raw)
 
+                # -------- Preflight A --------
+                need_A = ["ln_DVol"] + A_FEATURES_DEFAULT
+                missing_A_cols = [c for c in need_A if c not in df_all.columns]
+                if missing_A_cols:
+                    st.error(f"Model A cannot train. Missing columns: {missing_A_cols}")
+                    st.stop()
+                na_counts_A = df_all[need_A].isna().sum().sort_values(ascending=False)
+                n_pass_A = len(df_all.dropna(subset=need_A))
+                st.write("🧪 A preflight — rows passing dropna:", int(n_pass_A))
+                if (na_counts_A > 0).any():
+                    st.write("NaNs by column (top):")
+                    st.write(na_counts_A[na_counts_A > 0].head(10))
+
                 # A data
-                dfA = df_all.dropna(subset=["ln_DVol"] + A_FEATURES_DEFAULT).copy()
+                dfA = df_all.dropna(subset=need_A).copy()
                 dfA = _row_cap(dfA, int(capA)) if capA else dfA
 
                 # Train A
@@ -519,47 +532,41 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 df_all_with_pred = df_all.copy()
                 df_all_with_pred.loc[okA, "PredVol_M"] = pd.Series(preds, index=okA, dtype="float64")
 
-                # --- Conditional debug (no nested expander) ---
-                if show_b_debug:
-                    st.markdown("#### 🧪 Model B data checks")
-                    st.write(f"Rows in df_all: {len(df_all)}")
-                    st.write(f"Rows with A predictors (okA): {len(okA)}")
-                    st.write(f"Rows with PredVol_M set: {df_all_with_pred['PredVol_M'].notna().sum()}")
+                # -------- Preflight B --------
+                preds_B_needed = list(B_FEATURES_CORE)
+                if "PredVol_M" not in preds_B_needed:
+                    preds_B_needed.append("PredVol_M")
+                need_B = preds_B_needed + ["FT_fac"]
+                missing_B_cols = [c for c in need_B if c not in df_all_with_pred.columns]
+                st.write("🧪 B preflight — missing columns:", missing_B_cols)
+                rows_with_ft = df_all_with_pred["FT_fac"].notna().sum() if "FT_fac" in df_all_with_pred else 0
+                st.write("Rows with FT_fac present:", int(rows_with_ft))
 
-                    if "FT_raw" in raw.columns:
-                        st.write("FT_raw value counts:",
-                                 raw["FT_raw"].astype(str).str.lower().str.strip().value_counts())
+                dfB_probe = df_all_with_pred.dropna(subset=need_B).copy()
+                st.write("Rows eligible for B after dropna:", int(len(dfB_probe)))
+                if len(dfB_probe):
+                    y_probe = (dfB_probe["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int)
+                    st.write("Class counts (0=Fail, 1=FT):", dict(pd.Series(y_probe).value_counts()))
 
-                    if "FT_fac" in df_all_with_pred.columns:
-                        st.write("FT_fac counts:",
-                                 df_all_with_pred["FT_fac"].astype(str).value_counts(dropna=False))
+                # B data (use probe / or full with dropna)
+                dfB = dfB_probe
+                if len(dfB) < 30:
+                    st.warning(f"Model B skipped: only {len(dfB)} eligible rows (need ≥30).")
+                    st.session_state["A_bundle"] = A_bundle
+                    st.session_state["B_bundle"] = None
+                    st.session_state["data_hash"] = _hash_df_for_cache(df_all)
+                    st.session_state["dfA_train"] = dfA.copy()
+                    st.session_state["dfB_train"] = pd.DataFrame()
+                    st.session_state["A_predictors"] = A_bundle["predictors"]
+                    st.session_state["B_predictors"] = B_FEATURES_CORE
+                    st.success(f"Trained A (rows: {len(dfA)}); B not trained due to insufficient rows.")
+                    st.stop()
 
-                    preds_B = list(B_FEATURES_CORE)
-                    if "PredVol_M" not in preds_B:
-                        preds_B.append("PredVol_M")
-                    need_cols = preds_B + ["FT_fac"]
-                    missing_cols = [c for c in need_cols if c not in df_all_with_pred.columns]
-                    st.write("B required columns missing:", missing_cols)
-
-                    dfB_probe = df_all_with_pred.dropna(subset=need_cols).copy()
-                    st.write(f"Rows eligible for B after dropna(subset=B preds + FT_fac): {len(dfB_probe)}")
-                    if len(dfB_probe):
-                        y_probe = (dfB_probe["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int)
-                        st.write("Class counts (0=Fail, 1=FT):",
-                                 pd.Series(y_probe).value_counts().to_dict())
-
-                # B data (for diagnostics/importance table storage)
-                dfB = df_all_with_pred.dropna(subset=["FT_fac", "PredVol_M"]).copy()
                 dfB["_y"] = (dfB["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int)
                 dfB_cap = _row_cap(dfB, int(capB), y_col="_y") if capB else dfB
 
-                # Train B (guardrails)
-                B_bundle = None
+                # Train B
                 try:
-                    if len(dfB_cap) < 30:
-                        raise RuntimeError(f"Model B aborted: only {len(dfB_cap)} rows (need ≥30) after cleaning.")
-                    if dfB_cap["_y"].nunique() < 2:
-                        raise RuntimeError("Model B aborted: only one class present. Need both FT and Fail.")
                     B_bundle = train_model_B(
                         df_all_with_pred,
                         B_FEATURES_CORE,
@@ -569,28 +576,27 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                         seed=seed+1,
                     )
                 except Exception as e:
-                    st.warning(str(e))
-                    B_bundle = None
+                    import traceback
+                    tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+                    st.error(f"Model B failed: **{type(e).__name__}** — {e}")
+                    st.code(tb[-2000:], language="text")
+                    st.stop()
 
                 # Save bundles
                 st.session_state["A_bundle"] = A_bundle
                 st.session_state["B_bundle"] = B_bundle
                 st.session_state["data_hash"] = _hash_df_for_cache(df_all)
 
-                # Save training frames for diagnostics/importance
+                # Save training frames and predictor lists
                 st.session_state["dfA_train"] = dfA.copy()
                 st.session_state["dfB_train"] = dfB_cap.copy()
                 st.session_state["A_predictors"] = A_bundle["predictors"]
-                st.session_state["B_predictors"] = (B_bundle["predictors"] if B_bundle else [])
+                st.session_state["B_predictors"] = B_bundle["predictors"]
 
-                msg = f"Trained A (rows: {len(dfA)}). "
-                if B_bundle is None:
-                    msg += "B was skipped (see warning above)."
-                else:
-                    msg += f"B trained (rows: {len(dfB_cap)})."
-                st.success(msg)
+                st.success(f"Trained (rows A: {len(dfA)}, rows B: {len(dfB_cap)}).")
 
 # ---------- Metrics & Importance (GLOBAL; survives reruns) ----------
+# Basic metric helpers (no sklearn)
 def _r2(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -619,6 +625,7 @@ def _brier(y_true, y_prob):
     return float(np.mean((p - y_true)**2))
 
 def _roc_auc(y_true, y_score):
+    # Mann–Whitney U implementation (binary AUC)
     y_true = np.asarray(y_true, dtype=int)
     y_score = np.asarray(y_score, dtype=float)
     pos = y_score[y_true == 1]
@@ -734,6 +741,7 @@ with st.expander("🧠 Feature importance (permutation)"):
               or (B_bundle.get("predictors") if isinstance(B_bundle, dict) else [])
               or [])
 
+    # ---- Model A importance ----
     if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty and len(featsA) > 0:
         try:
             df_eval_A = dfA_tr[featsA]
@@ -749,6 +757,7 @@ with st.expander("🧠 Feature importance (permutation)"):
                    f"dfA_tr rows: {0 if not isinstance(dfA_tr, pd.DataFrame) else len(dfA_tr)}, "
                    f"featsA: {len(featsA)}")
 
+    # ---- Model B importance ----
     if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty and len(featsB) > 0:
         try:
             y_true_B = (dfB_tr["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
@@ -767,8 +776,8 @@ with st.expander("🧠 Feature importance (permutation)"):
 # ---------- UI: Add / Ranking ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
-def require_model_A():
-    if "A_bundle" not in st.session_state:
+def require_models():
+    if "A_bundle" not in st.session_state or st.session_state.get("A_bundle") is None:
         st.warning("Train Model A first (see expander above).")
         st.stop()
 
@@ -777,6 +786,7 @@ with tab_add:
     with st.form("add_form", clear_on_submit=True):
         c_top = st.columns([1.25, 1.25, 1.0])
 
+        # LEFT
         with c_top[0]:
             ticker   = st.text_input("Ticker", "").strip().upper()
             rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.01, format="%.2f")
@@ -784,12 +794,14 @@ with tab_add:
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
 
+        # MIDDLE
         with c_top[1]:
             mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.0001, format="%.4f")
 
+        # RIGHT
         with c_top[2]:
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
             dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
@@ -811,7 +823,8 @@ with tab_add:
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
     if submitted and ticker:
-        require_model_A()
+        # Need Model A always; Model B optional
+        require_models()
         A_bundle = st.session_state["A_bundle"]
         B_bundle = st.session_state.get("B_bundle")
 
@@ -824,29 +837,24 @@ with tab_add:
         }])
         feats = featurize(row)
 
+        # Predict volume (Millions) with A
         pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
 
+        # Predict FT probability with B if available
         if B_bundle is not None:
             featsB = feats.copy()
             featsB["PredVol_M"] = pred_vol_m
-            try:
-                ft_prob = float(predict_model_B(B_bundle, featsB)[0])
-                ft_label = ("FT likely" if ft_prob >= 0.60 else
-                            "Toss-up"   if ft_prob >= 0.40 else
-                            "FT unlikely")
-            except Exception as e:
-                st.warning(f"Model B prediction unavailable: {e}")
-                ft_prob = float("nan")
-                ft_label = "—"
+            ft_prob = float(predict_model_B(B_bundle, featsB)[0])
         else:
             ft_prob = float("nan")
-            ft_label = "—"
 
+        # Confidence bands in level space using user sigma_ln
         ci68_l = pred_vol_m * math.exp(-1.0 * sigma_ln)
         ci68_u = pred_vol_m * math.exp(+1.0 * sigma_ln)
         ci95_l = pred_vol_m * math.exp(-1.96 * sigma_ln)
         ci95_u = pred_vol_m * math.exp(+1.96 * sigma_ln)
 
+        # Scoring blocks
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
@@ -872,6 +880,10 @@ with tab_add:
         pm_pct_of_pred  = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
         pm_dollar_vs_mc = 100.0 * (pm_dol_m) / mc_m if mc_m > 0 else 0.0
 
+        ft_label = ("FT likely" if (not np.isnan(ft_prob) and ft_prob >= 0.60) else
+                    "Toss-up"   if (not np.isnan(ft_prob) and ft_prob >= 0.40) else
+                    ("FT unlikely" if not np.isnan(ft_prob) else "B model not trained"))
+
         row_out = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
@@ -886,7 +898,7 @@ with tab_add:
             "PredVol_CI95_L": round(ci95_l, 2),
             "PredVol_CI95_U": round(ci95_u, 2),
 
-            "FT_Prob": (None if np.isnan(ft_prob) else round(ft_prob, 3)),
+            "FT_Prob": (round(ft_prob, 3) if not np.isnan(ft_prob) else ""),
             "FT_Label": ft_label,
 
             "PM_%_of_Pred": round(pm_pct_of_pred, 1),
@@ -900,41 +912,13 @@ with tab_add:
         st.session_state.rows.append(row_out)
         st.session_state.last = row_out
         st.session_state.flash = (
-            f"Saved {ticker}"
-            + (f" — {ft_label} ({ft_prob*100:.1f}%)" if not np.isnan(ft_prob) else " — FT model not available")
+            f"Saved {ticker} — {ft_label}"
+            + (f" ({ft_prob*100:.1f}%)" if not np.isnan(ft_prob) else "")
             + f" · Odds {row_out['Odds']} (Score {row_out['FinalScore']})"
         )
         do_rerun()
 
-    # ---------- Preview card ----------
-    l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
-    if l:
-        st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
-        cA, cB, cC, cD = st.columns(4)
-        cA.metric("Last Ticker", l.get("Ticker","—"))
-        cB.metric("Final Score", f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
-        cC.metric("Pred Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
-        cC.caption(
-            f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
-            f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
-        )
-        if l.get("FT_Prob") is not None:
-            cD.metric("FT Probability", f"{l.get('FT_Prob',0)*100:.1f}%")
-            cD.caption(l.get("FT_Label","—"))
-        else:
-            cD.metric("FT Probability", "—")
-            cD.caption("Model B not trained")
-
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
-        d1.caption("Premarket volume ÷ predicted day volume × 100.")
-        d2.metric("PM $Vol / MC", f"{l.get('PM$ / MC_%',0):.1f}%")
-        d2.caption("PM dollar volume ÷ market cap × 100.")
-        d3.metric("Numeric Block", f"{l.get('Numeric_%',0):.1f}%")
-        d3.caption("Weighted buckets: RVOL / ATR / SI / FR / Float.")
-        d4.metric("Qual Block", f"{l.get('Qual_%',0):.1f}%")
-        d4.caption("Weighted radios: structure, levels, higher TF.")
-
+# ---------- Ranking tab ----------
 with tab_rank:
     st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
 
