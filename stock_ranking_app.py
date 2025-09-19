@@ -271,7 +271,7 @@ with tab_add:
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             rvol     = st.number_input("RVOL",    min_value=0.0, value=0.0, step=0.01, format="%.2f")
             pm_vol_m = st.number_input("Premarket Volume (Millions shares)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            pm_dol_m = st.number_input("Premarket $ Volume (Millions $)",   min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            pm_dol_m = st.number_input("Premarket Dollar Volume (Millions Dollars)",   min_value=0.0, value=0.0, step=0.01, format="%.2f")
 
         # Third column: Modifiers right next to numbers
         with col3:
