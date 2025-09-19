@@ -334,10 +334,16 @@ def _prep_B(df_feats_with_pred: pd.DataFrame, predictors):
 def train_model_B(df_feats_with_pred: pd.DataFrame, predictors, seed: int = 123):
     if not SKLEARN_AVAILABLE:
         raise RuntimeError("Model B requires scikit-learn. Install scikit-learn to enable FT classification.")
-    dfB, X, y = _prep_B(df_feats_with_pred, predictors)
+
+    # Prepare data
+    need = predictors + ["FT_fac"]
+    dfB = df_feats_with_pred.dropna(subset=need).copy()
+    y = (dfB["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
+    X = dfB[predictors].to_numpy(float)
     if len(dfB) < 20 or len(np.unique(y)) < 2:
         raise RuntimeError(f"Not enough labeled rows/classes for Model B (rows={len(dfB)}).")
 
+    # Base classifier inside a Pipeline (scaler + elastic-net logistic)
     skf = StratifiedKFold(n_splits=min(5, max(2, len(dfB)//10)), shuffle=True, random_state=seed)
     base = Pipeline([
         ("sc", StandardScaler(with_mean=True, with_std=True)),
@@ -346,18 +352,26 @@ def train_model_B(df_feats_with_pred: pd.DataFrame, predictors, seed: int = 123)
             class_weight="balanced", max_iter=20000, random_state=seed
         ))
     ])
-    # Split for calibration (hold-out)
-    X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.25, random_state=seed, stratify=y)
-    base.fit(X_tr, y_tr)
-    cal = CalibratedClassifierCV(base, method="sigmoid", cv="prefit")
-    cal.fit(X_val, y_val)
 
-    # quick CV metrics (on all data, just for display)
-    from sklearn.model_selection import cross_val_predict
+    # IMPORTANT: do NOT use cv="prefit" here.
+    # Let the calibrator handle its own internal CV calibration.
+    cal = CalibratedClassifierCV(base, method="sigmoid", cv=5)
+    cal.fit(X, y)
+
+    # Cross-validated metrics (this will refit cal in each fold — that's OK)
     proba_cv = cross_val_predict(cal, X, y, cv=skf, method="predict_proba")[:, 1]
-    auc = _roc_auc(y, proba_cv); acc = _accuracy(y, proba_cv, 0.5); ll = _logloss(y, proba_cv)
+    auc = _roc_auc(y, proba_cv)
+    acc = _accuracy(y, proba_cv, 0.5)
+    ll  = _logloss(y, proba_cv)
 
-    return {"model": cal, "predictors": predictors, "cv_auc": auc, "cv_acc": acc, "cv_logloss": ll, "n_train": len(dfB)}
+    return {
+        "model": cal,
+        "predictors": predictors,
+        "cv_auc": auc,
+        "cv_acc": acc,
+        "cv_logloss": ll,
+        "n_train": len(dfB)
+    }
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame):
     cols = bundle["predictors"]
