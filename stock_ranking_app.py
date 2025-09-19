@@ -213,7 +213,6 @@ def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
         lnms = [x.lower() for x in nms]
         for pat in patterns:
             for i, nm in enumerate(lnms):
-                # robust single-item Series to use str.contains
                 if pd.Series([nm]).str.contains(pat, regex=True, na=False).iloc[0]:
                     return i
         return None
@@ -301,10 +300,9 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
         sigma = pm.HalfNormal("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
 
-        # Explicit PGBART step (fast), 1 chain, no convergence checks
         trace = pm.sample(
             draws=draws, tune=tune, chains=1, cores=1,
-            step=[pmb.PGBART()],
+            step=pmb.PGBART(),              # <-- pass a single step, not a list
             random_seed=seed, target_accept=0.85,
             init="adapt_diag",
             progressbar=True,
@@ -373,7 +371,7 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame,
 
         trace = pm.sample(
             draws=draws, tune=tune, chains=1, cores=1,
-            step=[pmb.PGBART()],
+            step=pmb.PGBART(),              # <-- single step, not list
             random_seed=seed, target_accept=0.85,
             init="adapt_diag",
             progressbar=True,
