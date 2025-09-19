@@ -301,14 +301,14 @@ with tab_add:
             mc_m     = input_float("Market Cap (Millions $)", 0.0, min_value=0.0, decimals=2)
             float_m  = input_float("Public Float (Millions)",  0.0, min_value=0.0, decimals=2)
             si_pct   = input_float("Short Interest (%)",       0.0, min_value=0.0, decimals=2)
-            gap_pct  = input_float("Gap % (Open vs prior close)", 0.0, min_value=0.0, decimals=1)
+            gap_pct  = input_float("Gap %", 0.0, min_value=0.0, decimals=1)
 
         # Second column: ATR, RVOL, Premarket Volume (shares), Premarket $ Volume
         with col2:
             atr_usd  = input_float("ATR ($)", 0.0, min_value=0.0, decimals=2)
             rvol     = input_float("RVOL",    0.0, min_value=0.0, decimals=2)
-            pm_vol_m = input_float("Premarket Volume (Millions shares)", 0.0, min_value=0.0, decimals=2)
-            pm_dol_m = input_float("Premarket Dollars Volume (Millions Dollars)",   0.0, min_value=0.0, decimals=2)
+            pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
+            pm_dol_m = input_float("Premarket Dollar Volume (Millions $)",   0.0, min_value=0.0, decimals=2)
 
         # Third column: Modifiers right next to numbers
         with col3:
