@@ -1,19 +1,5 @@
-pip>=24
-setuptools>=68
-wheel
-
-# Core
-numpy==1.26.4
-scipy==1.13.1
-pandas==2.2.2
-
-# PyMC stack (compatible as a set)
-pytensor==2.20.0         # PyMC 5.13.1 requires >=2.20,<2.21
-arviz==0.18.0
-pymc==5.13.1
-pymc-bart==0.5.14        # <-- upgrade from 0.5.4 (fixes numpy<1.25 pin & registration bugs)
-numba==0.60.0            # works with numpy 1.26 on py3.11
-
-# App
-openpyxl==3.1.5
-streamlit==1.37.1
+streamlit
+pandas
+numpy
+openpyxl
+scikit-learn==1.5.1
