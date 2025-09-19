@@ -419,7 +419,10 @@ def _logloss(y_true, y_score, eps=1e-12):
     p = np.clip(np.asarray(y_score, dtype=float), eps, 1.0 - eps)
     return float(-np.mean(y_true*np.log(p) + (1 - y_true)*np.log(1 - p))) if len(y_true) else float("nan")
 
-# ---------- Quick diagnostics (only rendered when toggle is ON, manual + cached) ----------
+# In the sidebar (add this toggle just after compute_importance):
+enable_diagnostics = st.sidebar.toggle("Enable diagnostics", value=False)
+
+# ---------- Quick diagnostics (render only when toggle is ON) ----------
 if enable_diagnostics:
     st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
     with st.expander("🔎 Quick diagnostics", expanded=False):
@@ -428,69 +431,42 @@ if enable_diagnostics:
         dfA_tr   = st.session_state.get("dfA_train")
         dfB_tr   = st.session_state.get("dfB_train")
 
-        # A small, robust hash of the current training frames so cache invalidates only when data changes
-        def _df_hash(df):
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                return 0
-            try:
-                return int(pd.util.hash_pandas_object(df, index=True).sum())
-            except Exception:
-                return len(df)
-
-        data_sig = ( _df_hash(dfA_tr), _df_hash(dfB_tr),
-                     tuple(st.session_state.get("A_predictors", [])),
-                     tuple(st.session_state.get("B_predictors", [])) )
-
-        @st.cache_data(show_spinner=False)
-        def _compute_diags(_sig, _A_bundle, _dfA, _B_bundle, _dfB):
-            out = {}
-            # ----- Model A
-            if _A_bundle is not None and isinstance(_dfA, pd.DataFrame) and not _dfA.empty:
-                y_true_log = _dfA["ln_DVol"].to_numpy(float)
-                y_pred_lvl = predict_model_A(_A_bundle, _dfA)
-                y_pred_log = np.log(np.maximum(y_pred_lvl, 1e-9))
-                out["A_R2"]   = _r2(y_true_log, y_pred_log)
-                out["A_RMSE"] = _rmse(y_true_log, y_pred_log)
-                out["A_MAE"]  = _mae(y_true_log, y_pred_log)
-            # ----- Model B
-            if _B_bundle is not None and isinstance(_dfB, pd.DataFrame) and not _dfB.empty:
-                y_true = (_dfB["FT_fac"].astype(str).str.lower()
-                          .isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
-                proba  = predict_model_B(_B_bundle, _dfB)
-                out["B_AUC"]  = _roc_auc(y_true, proba)
-                out["B_ACC"]  = _accuracy(y_true, proba, 0.5)
-                out["B_LOG"]  = _logloss(y_true, proba)
-            return out
-
         run_now = st.button("Compute metrics now", use_container_width=True)
-        if not run_now:
-            st.caption("Click **Compute metrics now** to evaluate. Metrics are cached until training data changes.")
+        if run_now:
+            # Model A (three metrics in one row)
+            if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty:
+                try:
+                    y_true_log = dfA_tr["ln_DVol"].to_numpy(float)
+                    y_pred_lvl = predict_model_A(A_bundle, dfA_tr)
+                    y_pred_log = np.log(np.maximum(y_pred_lvl, 1e-9))
+                    c1,c2,c3 = st.columns(3)
+                    with c1: st.metric("Model A — R² (log)",  f"{_r2(y_true_log, y_pred_log):.3f}")
+                    with c2: st.metric("Model A — RMSE (log)", f"{_rmse(y_true_log, y_pred_log):.3f}")
+                    with c3: st.metric("Model A — MAE (log)",  f"{_mae(y_true_log, y_pred_log):.3f}")
+                except Exception as e:
+                    st.warning(f"Model A metrics unavailable: {e}")
+            else:
+                st.info("Train Model A to see diagnostics.")
+
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+
+            # Model B (three metrics in one row)
+            if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty:
+                try:
+                    y_true = (dfB_tr["FT_fac"].astype(str).str.lower()
+                              .isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
+                    proba  = predict_model_B(B_bundle, dfB_tr)
+                    c1,c2,c3 = st.columns(3)
+                    with c1: st.metric("Model B — ROC AUC",            f"{_roc_auc(y_true, proba):.3f}")
+                    with c2: st.metric("Model B — Accuracy (thr=0.5)", f"{_accuracy(y_true, proba, 0.5):.3f}")
+                    with c3: st.metric("Model B — Log Loss",           f"{_logloss(y_true, proba):.3f}")
+                except Exception as e:
+                    st.warning(f"Model B metrics unavailable: {e}")
+            elif st.session_state.get("B_bundle") is None:
+                st.info("Model B skipped (insufficient rows).")
         else:
-            try:
-                di = _compute_diags(data_sig, A_bundle, dfA_tr, B_bundle, dfB_tr)
-
-                # ----- Model A row (3 metrics)
-                if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty:
-                    c1, c2, c3 = st.columns(3)
-                    with c1: st.metric("Model A — R² (log)",  f"{di.get('A_R2', float('nan')):.3f}")
-                    with c2: st.metric("Model A — RMSE (log)", f"{di.get('A_RMSE', float('nan')):.3f}")
-                    with c3: st.metric("Model A — MAE (log)",  f"{di.get('A_MAE', float('nan')):.3f}")
-                else:
-                    st.info("Train Model A to see diagnostics.")
-
-                st.markdown("&nbsp;", unsafe_allow_html=True)
-
-                # ----- Model B row (3 metrics)
-                if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty:
-                    c1, c2, c3 = st.columns(3)
-                    with c1: st.metric("Model B — ROC AUC",            f"{di.get('B_AUC', float('nan')):.3f}")
-                    with c2: st.metric("Model B — Accuracy (thr=0.5)", f"{di.get('B_ACC', float('nan')):.3f}")
-                    with c3: st.metric("Model B — Log Loss",           f"{di.get('B_LOG', float('nan')):.3f}")
-                elif st.session_state.get("B_bundle") is None:
-                    st.info("Model B skipped (insufficient rows).")
-
-            except Exception as e:
-                st.warning(f"Diagnostics unavailable: {e}")
+            st.caption("Click **Compute metrics now** to evaluate.")
+# else: render nothing — no expander, no work
 
 # ---------- Feature Importance (Permutation) — gated (slow) ----------
 @st.cache_data(show_spinner=False)
@@ -663,7 +639,6 @@ with tab_add:
             f"Saved {ticker} — {ft_label}"
             + (f" ({ft_prob*100:.1f}%)" if not np.isnan(ft_prob) else "")
         )
-        do_rerun()
 
 # ---------- Ranking tab ----------
 with tab_rank:
