@@ -160,7 +160,7 @@ sigma_ln = st.sidebar.slider(
 # Optional (slow)
 compute_importance = st.sidebar.toggle("Compute permutation importance (slow)", value=False)
 
-# ---------- numeric scorers ----------
+# ---------- scorers ----------
 def pts_rvol(x: float) -> int:
     for th, p in [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]:
         if x < th: return p
@@ -294,7 +294,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     y = np.ascontiguousarray(dfA["ln_DVol"].to_numpy(dtype=np.float64))
 
     with pm.Model() as mA:
-        X_A = pm.Data("X_A", X)  # <-- pm.Data (binds to set_data)
+        X_A = pm.MutableData("X_A", X)  # <-- use MutableData (update shape safely)
         f = pmb.BART("f", X_A, y, m=trees)    # latent log-mean
         sigma = pm.HalfNormal("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
@@ -343,7 +343,7 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         raise ValueError(
             f"Model A: length mismatch — PPC len {ln_mean.shape[0]} vs X rows {X.shape[0]} "
             f"(train_n={bundle.get('n_train','?')}). "
-            "This usually means X was not updated inside the model. Ensure pm.Data is used for X and set_data() is called."
+            "This means the design matrix inside the model did not update."
         )
     return np.exp(ln_mean)
 
@@ -367,7 +367,7 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame,
         raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
     with pm.Model() as mB:
-        X_B = pm.Data("X_B", X)   # <-- pm.Data (binds to set_data)
+        X_B = pm.MutableData("X_B", X)   # <-- MutableData here, too
         f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
@@ -679,14 +679,22 @@ with tab_add:
         }])
         feats = featurize(row)
 
-        # Predict volume (Millions) via latent f
-        pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
+        # Predicts with clean error message if something is off
+        try:
+            pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
+        except Exception as e:
+            st.error(f"Model A prediction failed: {e}")
+            st.stop()
 
         # Predict FT probability if Model B trained
         if B_bundle is not None:
-            featsB = feats.copy()
-            featsB["PredVol_M"] = pred_vol_m
-            ft_prob = float(predict_model_B(B_bundle, featsB)[0])
+            try:
+                featsB = feats.copy()
+                featsB["PredVol_M"] = pred_vol_m
+                ft_prob = float(predict_model_B(B_bundle, featsB)[0])
+            except Exception as e:
+                st.warning(f"Model B prediction failed: {e}")
+                ft_prob = float("nan")
         else:
             ft_prob = float("nan")
 
