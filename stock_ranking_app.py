@@ -525,6 +525,7 @@ def _bart_smoketest(A_bundle, B_bundle):
             "ATR": meds.get("ATR", 0.2),
             "MCapM": meds.get("MCapM", 200.0),
             "Catalyst": 1,
+            "DVolM": np.nan,   # <<< needed so featurize can compute ln_DVol safely
         }
         df_probe = pd.DataFrame([base, base])
         feats_p = featurize(df_probe)
@@ -640,7 +641,7 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 # Smoketest predictions on tiny synthetic rows
                 _bart_smoketest(A_bundle, B_bundle)
 
-                st.success(f"Trained (rows A: {len(dfA)}, rows B: {len[dfB_cap]}).")
+                st.success(f"Trained (rows A: {len(dfA)}, rows B: {len(dfB_cap)}).")
 
 # ---------- Metrics & Importance (GLOBAL; survives reruns) ----------
 def _r2(y_true, y_pred):
@@ -949,7 +950,7 @@ with tab_rank:
 
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
-        df = df.loc[:, ~df.columns.uplicated(keep="first")] if hasattr(df.columns, "uplicated") else df.loc[:, ~df.columns.duplicated(keep="first")]
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
         if "FinalScore" in df.columns:
             df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
