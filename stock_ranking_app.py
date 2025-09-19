@@ -316,6 +316,57 @@ def _check_and_get_X(bundle, Xnew_df: pd.DataFrame, name: str):
 
     return X
 
+def _bart_predict_latent(trace, X: np.ndarray) -> np.ndarray:
+    """
+    Evaluate fitted BART trees for new X.
+    Returns an array of shape (draws, n_rows) with latent values
+    (log-volume for regression, logits for classification).
+    Tries several known entry points for pymc-bart 0.5.x.
+    """
+    X = np.asarray(X, dtype=float)
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2D, got shape {X.shape}")
+    n = X.shape[0]
+
+    def _norm(arr):
+        arr = np.asarray(arr)
+        # expected (draws, n) or (chains, draws, n)
+        if arr.ndim == 3:
+            arr = arr.mean(axis=0)  # -> (draws, n)
+        if arr.ndim != 2 or arr.shape[1] != n:
+            raise RuntimeError(f"BART predict returned unexpected shape {arr.shape} for n_rows={n}")
+        return arr
+
+    # 1) pymc_bart.pgbart.predict
+    try:
+        import pymc_bart.pgbart as pgbart
+        if hasattr(pgbart, "predict"):
+            return _norm(pgbart.predict(trace, X))
+    except Exception:
+        pass
+
+    # 2) pymc_bart.utils.predict
+    try:
+        import pymc_bart.utils as bart_utils
+        if hasattr(bart_utils, "predict"):
+            return _norm(bart_utils.predict(trace, X))
+    except Exception:
+        pass
+
+    # 3) top-level predict (some builds expose it)
+    try:
+        import pymc_bart as pmb
+        if hasattr(pmb, "predict"):
+            return _norm(pmb.predict(trace, X))
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not access a BART predictor function. "
+        "On some builds it is at pymc_bart.pgbart.predict(idata, X). "
+        "Verify pymc-bart==0.5.14 is installed and importable."
+    )
+
 # ---------- BART training ----------
 # --------- Model A: BART regression ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
@@ -349,27 +400,20 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    X = _check_and_get_X(bundle, Xnew_df, name="Model A")
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Model A: missing predictors {missing}. "
+                         f"Available: {list(Xnew_df.columns)}")
 
-    with bundle["model"]:
-        pm.set_data({bundle["x_name"]: X})
-        ppc = pm.sample_posterior_predictive(
-            bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
-        )
+    X = Xnew_df[cols].to_numpy(dtype=float)
+    if not np.all(np.isfinite(X)):
+        bad = [c for i, c in enumerate(cols) if not np.all(np.isfinite(X[:, i]))]
+        raise ValueError(f"Model A: non-finite values in {bad}")
 
-    arr = np.asarray(ppc["f"])
-    # Expected shapes: (chains, draws, n) or (draws, n) or (n,)
-    if arr.ndim == 3:
-        ln_mean = arr.mean(axis=(0, 1))
-    elif arr.ndim == 2:
-        ln_mean = arr.mean(axis=0)
-    elif arr.ndim == 1:
-        ln_mean = arr
-    else:
-        raise ValueError(f"Model A: unexpected PPC shape for 'f': {arr.shape}")
-
-    if ln_mean.shape[0] != X.shape[0]:
-        raise ValueError(f"Model A: length mismatch — PPC len {ln_mean.shape[0]} vs X rows {X.shape[0]}")
+    # Evaluate trees out-of-model so shape follows new X
+    draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows)
+    ln_mean = draws.mean(axis=0)                      # (n_rows,)
     return np.exp(ln_mean)
 
 # --------- Model B: BART classification ----------
@@ -428,27 +472,20 @@ def train_model_B(
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    X = _check_and_get_X(bundle, Xnew_df, name="Model B")
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Model B: missing predictors {missing}. "
+                         f"Available: {list(Xnew_df.columns)}")
 
-    with bundle["model"]:
-        pm.set_data({bundle["x_name"]: X})
-        ppc = pm.sample_posterior_predictive(
-            bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
-        )
+    X = Xnew_df[cols].to_numpy(dtype=float)
+    if not np.all(np.isfinite(X)):
+        bad = [c for i, c in enumerate(cols) if not np.all(np.isfinite(X[:, i]))]
+        raise ValueError(f"Model B: non-finite values in {bad}")
 
-    arr = np.asarray(ppc["f"])
-    if arr.ndim == 3:
-        logits = arr.mean(axis=(0, 1))
-    elif arr.ndim == 2:
-        logits = arr.mean(axis=0)
-    elif arr.ndim == 1:
-        logits = arr
-    else:
-        raise ValueError(f"Model B: unexpected PPC shape for 'f': {arr.shape}")
-
-    if logits.shape[0] != X.shape[0]:
-        raise ValueError(f"Model B: length mismatch — PPC len {logits.shape[0]} vs X rows {X.shape[0]}")
-    return expit(logits).astype(float)
+    draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows) logits
+    from scipy.special import expit
+    return expit(draws).mean(axis=0).astype(float)    # probs (n_rows,)
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
     if n <= 0 or len(df) <= n:
