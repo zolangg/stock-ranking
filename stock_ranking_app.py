@@ -158,7 +158,7 @@ sigma_ln = st.sidebar.slider(
     help="Used for CI bands around predicted day volume."
 )
 
-# (Optional) compute permutation importance — off by default (it’s slow)
+# (Optional) compute permutation importance — off by default (slow)
 compute_importance = st.sidebar.toggle("Compute permutation importance (slow)", value=False)
 
 # ---------- numeric scorers ----------
@@ -302,7 +302,6 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
 
         trace = pm.sample(
             draws=draws, tune=tune, chains=1, cores=1,
-            step=pmb.PGBART(),              # <-- pass a single step, not a list
             random_seed=seed, target_accept=0.85,
             init="adapt_diag",
             progressbar=True,
@@ -313,10 +312,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """
-    Predict day volume (Millions) for new rows using latent node 'f'.
-    Using 'f' avoids the length-mismatch problem with 'y_obs'.
-    """
+    """ Predict day volume (Millions) for new rows using latent node 'f'. """
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
@@ -371,7 +367,6 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame,
 
         trace = pm.sample(
             draws=draws, tune=tune, chains=1, cores=1,
-            step=pmb.PGBART(),              # <-- single step, not list
             random_seed=seed, target_accept=0.85,
             init="adapt_diag",
             progressbar=True,
@@ -382,9 +377,7 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame,
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """
-    Predict FT probability for new rows from latent logits 'f'.
-    """
+    """ Predict FT probability for new rows from latent logits 'f'. """
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
