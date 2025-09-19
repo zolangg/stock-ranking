@@ -188,14 +188,6 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # ---------- data mapping + features ----------
-def _pick_col(nms, patterns):
-    lnms = [x.lower() for x in nms]
-    for pat in patterns:
-        for i, nm in enumerate(lnms):
-            if pd.Series(nm).str.contains(pat, regex=True).iloc[0]:
-                return i
-    return None
-
 def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
     df = pd.read_excel(file, sheet_name=sheet, engine="openpyxl")
     nms = list(df.columns)
@@ -258,10 +250,11 @@ def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
 def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     eps = 1e-6
     out = raw.copy()
+
     # ensure base columns exist even if read_excel_dynamic didn’t find them
     for col in ["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM","DVolM","Catalyst","FT_fac"]:
         if col not in out.columns:
-            out[col] = np.nan if col != "Catalyst" else 0
+            out[col] = (0 if col == "Catalyst" else np.nan)
 
     out["FR"]       = out["PMVolM"] / np.maximum(out["FloatM"].replace(0, np.nan), eps)
     out["ln_DVol"]  = np.log(np.maximum(out["DVolM"], eps))
@@ -272,15 +265,16 @@ def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     out["ln_atr"]   = np.log(np.maximum(out["ATR"], eps))
     out["ln_mcap"]  = np.log(np.maximum(out["MCapM"], eps))
     out["ln_pmdol_per_mcap"] = np.log(np.maximum(out["PMDolM"] / np.maximum(out["MCapM"], eps), eps))
+
     # robust Catalyst + FT_fac handling
     out["Catalyst"] = (
-        pd.to_numeric(out["Catalyst"], errors="coerce")
-        .fillna(0).astype(float).ne(0).astype(int)
+        pd.to_numeric(out.get("Catalyst", 0), errors="coerce").fillna(0).astype(float).ne(0).astype(int)
     )
     if "FT_fac" in out.columns:
         out["FT_fac"] = out["FT_fac"].astype("category")
     else:
         out["FT_fac"] = pd.Series([np.nan]*len(out), index=out.index, dtype="float").astype("category")
+
     return out
 
 # ---- Predictor sets
@@ -298,53 +292,18 @@ def _ensure_clean_matrix(X: np.ndarray, name: str = "X") -> np.ndarray:
         )
     return np.ascontiguousarray(X, dtype=float)
 
-def _bart_predict_latent(trace, X: np.ndarray) -> np.ndarray:
-    """
-    Evaluate fitted BART trees for new X.
-    Returns (draws, n_rows) latent values (log-scale for reg, logits for cls).
-    Tries several known entry points for pymc-bart 0.5.x.
-    """
-    X = np.asarray(X, dtype=float)
-    if X.ndim != 2:
-        raise ValueError(f"X must be 2D, got shape {X.shape}")
-    n = X.shape[0]
-
-    def _norm(arr):
-        arr = np.asarray(arr)
-        if arr.ndim == 1:
-            return arr[:, None]
-        if arr.ndim != 2:
-            raise RuntimeError(f"BART predict returned unexpected shape {arr.shape}")
-        if arr.shape[1] != n:
-            raise RuntimeError(f"BART predict shape {arr.shape} does not match n_rows={n}")
+def _ppc_to_2d(arr: np.ndarray) -> np.ndarray:
+    """Normalize PPC array for 'f' to shape (draws_total, n_rows)."""
+    arr = np.asarray(arr)
+    if arr.ndim == 3:  # (chains, draws, n)
+        c, d, n = arr.shape
+        return arr.reshape(c * d, n)
+    elif arr.ndim == 2:  # (draws, n)
         return arr
-
-    try:
-        import pymc_bart.pgbart as pgbart
-        if hasattr(pgbart, "predict"):
-            return _norm(pgbart.predict(trace, X))
-    except Exception:
-        pass
-
-    try:
-        import pymc_bart.utils as bart_utils
-        if hasattr(bart_utils, "predict"):
-            return _norm(bart_utils.predict(trace, X))
-    except Exception:
-        pass
-
-    try:
-        import pymc_bart as pmb_mod
-        if hasattr(pmb_mod, "predict"):
-            return _norm(pmb_mod.predict(trace, X))
-    except Exception:
-        pass
-
-    raise RuntimeError(
-        "Could not access a BART predictor function. "
-        "On some builds it is at pymc_bart.pgbart.predict(idata, X). "
-        "Verify pymc-bart==0.5.14 is installed and importable."
-    )
+    elif arr.ndim == 1:  # (draws,) -> single row
+        return arr[:, None]
+    else:
+        raise ValueError(f"Unexpected PPC shape for 'f': {arr.shape}")
 
 def _hash_df_for_cache(df: pd.DataFrame) -> str:
     from hashlib import blake2b
@@ -359,6 +318,44 @@ def _hash_df_for_cache(df: pd.DataFrame) -> str:
     d = d.sort_index(axis=0).sort_index(axis=1)
     payload = d.to_json(orient="split", index=True, date_unit="ns", default_handler=str)
     return blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+# ---------- Row cap helper ----------
+def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return df
+    try:
+        n = int(n)
+    except Exception:
+        n = 0
+    if n <= 0: return df.copy()
+    m = len(df)
+    if m <= n: return df.copy()
+    if y_col is None or y_col not in df.columns:
+        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
+    pos = df[df[y_col] == 1]
+    neg = df[df[y_col] == 0]
+    if len(pos) == 0 or len(neg) == 0:
+        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
+    n_pos = int(round(n * len(pos) / m))
+    n_pos = max(1, min(n_pos, len(pos)))
+    n_neg = n - n_pos
+    n_neg = max(1, min(n_neg, len(neg)))
+    taken = n_pos + n_neg
+    if taken < n:
+        extra = min(n - taken, len(pos) - n_pos + len(neg) - n_neg)
+        if len(pos) - n_pos >= len(neg) - n_neg:
+            add_pos = min(extra, len(pos) - n_pos); n_pos += add_pos; extra -= add_pos
+            n_neg += min(extra, len(neg) - n_neg)
+        else:
+            add_neg = min(extra, len(neg) - n_neg); n_neg += add_neg; extra -= add_neg
+            n_pos += min(extra, len(pos) - n_pos)
+    parts = []
+    if n_pos > 0: parts.append(pos.sample(n=n_pos, random_state=42))
+    if n_neg > 0: parts.append(neg.sample(n=n_neg, random_state=42))
+    if not parts:
+        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
+    out = pd.concat(parts, axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
+    return out
 
 # ---------- BART training ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
@@ -418,14 +415,24 @@ def predict_model_A_insample(bundle) -> np.ndarray:
     return np.exp(ln_mean)
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
+    """
+    Predict day volume (Millions) for new rows using the latent BART mean 'f'.
+    """
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
         raise ValueError(f"Missing predictors for Model A: {missing}")
+
     X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_A")
-    draws = _bart_predict_latent(bundle["trace"], X)   # (draws, n_rows), latent log-volume
-    ln_mean = draws.mean(axis=0)                       # (n_rows,)
-    return np.exp(ln_mean)                             # level (Millions)
+    with bundle["model"]:
+        pm.set_data({bundle["x_name"]: X})
+        ppc = pm.sample_posterior_predictive(
+            bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
+        )
+
+    f_draws = _ppc_to_2d(ppc["f"])      # (draws_total, n_rows) on log-scale
+    ln_mean = f_draws.mean(axis=0)      # (n_rows,)
+    return np.exp(ln_mean).astype(float)
 
 def train_model_B(
     df_feats_with_predvol: pd.DataFrame,
@@ -476,51 +483,24 @@ def train_model_B(
     }
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
+    """
+    Predict FT probability for new rows by evaluating latent logits 'f' and applying expit.
+    """
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
         raise ValueError(f"Missing predictors for Model B: {missing}")
-    X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_B")
-    draws = _bart_predict_latent(bundle["trace"], X)   # (draws, n_rows), latent logits
-    return expit(draws).mean(axis=0).astype(float)     # probs (n_rows,)
 
-# ---------- Row cap helper ----------
-def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None) -> pd.DataFrame:
-    if not isinstance(df, pd.DataFrame):
-        return df
-    try:
-        n = int(n)
-    except Exception:
-        n = 0
-    if n <= 0: return df.copy()
-    m = len(df)
-    if m <= n: return df.copy()
-    if y_col is None or y_col not in df.columns:
-        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
-    pos = df[df[y_col] == 1]
-    neg = df[df[y_col] == 0]
-    if len(pos) == 0 or len(neg) == 0:
-        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
-    n_pos = int(round(n * len(pos) / m))
-    n_pos = max(1, min(n_pos, len(pos)))
-    n_neg = n - n_pos
-    n_neg = max(1, min(n_neg, len(neg)))
-    taken = n_pos + n_neg
-    if taken < n:
-        extra = min(n - taken, len(pos) - n_pos + len(neg) - n_neg)
-        if len(pos) - n_pos >= len(neg) - n_neg:
-            add_pos = min(extra, len(pos) - n_pos); n_pos += add_pos; extra -= add_pos
-            n_neg += min(extra, len(neg) - n_neg)
-        else:
-            add_neg = min(extra, len(neg) - n_neg); n_neg += add_neg; extra -= add_neg
-            n_pos += min(extra, len(pos) - n_pos)
-    parts = []
-    if n_pos > 0: parts.append(pos.sample(n=n_pos, random_state=42))
-    if n_neg > 0: parts.append(neg.sample(n=n_neg, random_state=42))
-    if not parts:
-        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
-    out = pd.concat(parts, axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
-    return out
+    X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_B")
+    with bundle["model"]:
+        pm.set_data({bundle["x_name"]: X})
+        ppc = pm.sample_posterior_predictive(
+            bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
+        )
+
+    f_draws = _ppc_to_2d(ppc["f"])      # logits (draws_total, n_rows)
+    probs   = expit(f_draws).mean(axis=0)
+    return probs.astype(float)
 
 # ---------- Smoketest ----------
 def _bart_smoketest(A_bundle, B_bundle):
@@ -537,8 +517,8 @@ def _bart_smoketest(A_bundle, B_bundle):
             "ATR": meds.get("ATR", 0.2),
             "MCapM": meds.get("MCapM", 200.0),
             "Catalyst": 1,
-            "DVolM": np.nan,
-            "FT_fac": "Fail",
+            "DVolM": np.nan,   # so featurize can compute ln_DVol safely
+            "FT_fac": "Fail",  # keep downstream happy
         }
         df_probe = pd.DataFrame([base, base])
         feats_p = featurize(df_probe)
@@ -581,21 +561,23 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 df_all = featurize(raw)
 
                 # --- sanity check: ensure all required columns exist before dropna
-                req_A = ["ln_DVol"] + A_FEATURES_DEFAULT  # ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
+                req_A = ["ln_DVol"] + A_FEATURES_DEFAULT
                 missing_A = [c for c in req_A if c not in df_all.columns]
                 if missing_A:
                     st.error(
                         "Training features missing from featurized frame:\n"
                         f"- Missing: {missing_A}\n"
                         f"- Available columns: {list(df_all.columns)}\n\n"
-                        "Check your Excel column mapping in read_excel_dynamic() and that featurize() always creates "
-                        "these ln_* columns even when raw inputs are NaN."
+                        "Check your Excel column mapping in read_excel_dynamic() and featurize()."
                     )
                     st.stop()
-                
+
                 # A data
-                dfA = df_all.dropna(subset=["ln_DVol"] + A_FEATURES_DEFAULT)
+                dfA = df_all.dropna(subset=req_A)
                 dfA = _row_cap(dfA, int(capA)) if capA else dfA
+                if len(dfA) < 30:
+                    st.error(f"After filtering, Model A has only {len(dfA)} rows (need ≥30).")
+                    st.stop()
 
                 # Train A
                 A_bundle = train_model_A(
@@ -635,8 +617,17 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                         pass  # still fine; Model B will train on rows with PredVol_M
 
                 # B data
-                dfB = df_all_with_pred.dropna(subset=["FT_fac", "PredVol_M"]).copy()
+                req_B = ["FT_fac", "PredVol_M"]
+                missing_B = [c for c in req_B if c not in df_all_with_pred.columns]
+                if missing_B:
+                    st.error(f"Missing columns for Model B: {missing_B}")
+                    st.stop()
+
+                dfB = df_all_with_pred.dropna(subset=req_B).copy()
                 dfB["_y"] = (dfB["FT_fac"].astype(str) == "FT").astype(int)
+                if dfB["_y"].nunique() < 2:
+                    st.error("Model B target has only one class after filtering; need both FT and Fail.")
+                    st.stop()
                 dfB_cap = _row_cap(dfB, int(capB), y_col="_y") if capB else dfB
 
                 # Train B
