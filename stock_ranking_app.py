@@ -398,23 +398,27 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
 
 def predict_model_A_insample(bundle) -> np.ndarray:
     """
-    Robust in-sample prediction for Model A (TRAINING rows).
-    Resets X to training matrix before sampling PPC of y_obs.
+    In-sample predictions for Model A using latent f, evaluated on training X.
     Returns level-scale predictions (Millions) of shape (n_train,).
     """
     with bundle["model"]:
-        # ensure shape matches training target
+        # ensure we're on the training design matrix
         pm.set_data({bundle["x_name"]: bundle["X_train"]})
         ppc = pm.sample_posterior_predictive(
-            bundle["trace"], var_names=["y_obs"], return_inferencedata=False, progressbar=False
+            bundle["trace"],
+            var_names=["f"],            # <-- use latent f, NOT y_obs
+            return_inferencedata=False,
+            progressbar=False,
         )
-    arr = np.asarray(ppc["y_obs"])
-    if arr.ndim == 3:
-        ln_mean = arr.mean(axis=(0, 1))
-    elif arr.ndim == 2:
-        ln_mean = arr.mean(axis=0)
-    else:
-        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
+    f_draws = np.asarray(ppc["f"])
+    # normalize to 2D: (draws_total, n_train)
+    if f_draws.ndim == 3:   # (chains, draws, n)
+        f_draws = f_draws.reshape(f_draws.shape[0]*f_draws.shape[1], f_draws.shape[2])
+    elif f_draws.ndim == 2: # (draws, n)
+        pass
+    elif f_draws.ndim == 1: # shouldn't happen for n_train>1, but guard anyway
+        f_draws = f_draws[:, None]
+    ln_mean = f_draws.mean(axis=0)
     return np.exp(ln_mean)
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
@@ -724,15 +728,15 @@ with st.expander("🔎 Model diagnostics"):
         try:
             y_true_log = dfA_tr["ln_DVol"].to_numpy(float)
             y_true_lvl = np.exp(y_true_log)
-            # Use in-sample predictor for stability
+            # In-sample predictions from latent f on training X
             y_pred_lvl = predict_model_A_insample(A_bundle)
             y_pred_log = np.log(np.maximum(y_pred_lvl, 1e-9))
-
+    
             r2_log   = _r2(y_true_log, y_pred_log)
             rmse_log = _rmse(y_true_log, y_pred_log)
             r2_lvl   = _r2(y_true_lvl, y_pred_lvl)
             rmse_lvl = _rmse(y_true_lvl, y_pred_lvl)
-
+    
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("A — R² (log)", _fmt(r2_log))
             c2.metric("A — RMSE (log)", _fmt(rmse_log))
