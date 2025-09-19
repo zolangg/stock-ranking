@@ -374,7 +374,7 @@ def train_model_B(
 
     dfB = df_feats_with_predvol.dropna(subset=preds_B + ["FT_fac"]).copy()
     if len(dfB) < 30:
-        raise RuntimeError(f"Not enough rows for Model B (have {len(dfB)}, need ≥30).")
+        raise RuntimeError(f"Not enough rows for Model B (have {len[dfB]}, need ≥30).")
 
     X = np.ascontiguousarray(dfB[preds_B].to_numpy(dtype=np.float64))
     y = (dfB["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(np.int8).to_numpy()
@@ -484,6 +484,8 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
     capA = st.number_input("Max rows for Model A", min_value=0, value=1200 if fast_mode else 0, help="0 = no cap")
     capB = st.number_input("Max rows for Model B (after PredVol_M)", min_value=0, value=600 if fast_mode else 0, help="0 = no cap")
 
+    show_b_debug = st.toggle("Show Model B data checks", value=False)
+
     if st.button("Train models", use_container_width=True, type="primary"):
         if not up:
             st.error("Upload the Excel file first.")
@@ -517,8 +519,9 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 df_all_with_pred = df_all.copy()
                 df_all_with_pred.loc[okA, "PredVol_M"] = pd.Series(preds, index=okA, dtype="float64")
 
-                # --- Debug: show why B may have 0 rows ---
-                with st.expander("🧪 Debug: Model B data checks", expanded=False):
+                # --- Conditional debug (no nested expander) ---
+                if show_b_debug:
+                    st.markdown("#### 🧪 Model B data checks")
                     st.write(f"Rows in df_all: {len(df_all)}")
                     st.write(f"Rows with A predictors (okA): {len(okA)}")
                     st.write(f"Rows with PredVol_M set: {df_all_with_pred['PredVol_M'].notna().sum()}")
@@ -553,7 +556,6 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 # Train B (guardrails)
                 B_bundle = None
                 try:
-                    # Quick preflight
                     if len(dfB_cap) < 30:
                         raise RuntimeError(f"Model B aborted: only {len(dfB_cap)} rows (need ≥30) after cleaning.")
                     if dfB_cap["_y"].nunique() < 2:
@@ -568,7 +570,7 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                     )
                 except Exception as e:
                     st.warning(str(e))
-                    B_bundle = None  # explicit
+                    B_bundle = None
 
                 # Save bundles
                 st.session_state["A_bundle"] = A_bundle
@@ -589,7 +591,6 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 st.success(msg)
 
 # ---------- Metrics & Importance (GLOBAL; survives reruns) ----------
-# Basic metric helpers (no sklearn)
 def _r2(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -733,7 +734,6 @@ with st.expander("🧠 Feature importance (permutation)"):
               or (B_bundle.get("predictors") if isinstance(B_bundle, dict) else [])
               or [])
 
-    # ---- Model A importance ----
     if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty and len(featsA) > 0:
         try:
             df_eval_A = dfA_tr[featsA]
@@ -749,7 +749,6 @@ with st.expander("🧠 Feature importance (permutation)"):
                    f"dfA_tr rows: {0 if not isinstance(dfA_tr, pd.DataFrame) else len(dfA_tr)}, "
                    f"featsA: {len(featsA)}")
 
-    # ---- Model B importance ----
     if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty and len(featsB) > 0:
         try:
             y_true_B = (dfB_tr["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
@@ -778,7 +777,6 @@ with tab_add:
     with st.form("add_form", clear_on_submit=True):
         c_top = st.columns([1.25, 1.25, 1.0])
 
-        # LEFT
         with c_top[0]:
             ticker   = st.text_input("Ticker", "").strip().upper()
             rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.01, format="%.2f")
@@ -786,14 +784,12 @@ with tab_add:
             float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
 
-        # MIDDLE
         with c_top[1]:
             mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.0001, format="%.4f")
 
-        # RIGHT
         with c_top[2]:
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
             dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
@@ -828,10 +824,8 @@ with tab_add:
         }])
         feats = featurize(row)
 
-        # Predict volume (Millions)
         pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
 
-        # Predict FT probability (if B is available)
         if B_bundle is not None:
             featsB = feats.copy()
             featsB["PredVol_M"] = pred_vol_m
@@ -848,13 +842,11 @@ with tab_add:
             ft_prob = float("nan")
             ft_label = "—"
 
-        # Confidence bands in level space using user sigma_ln
         ci68_l = pred_vol_m * math.exp(-1.0 * sigma_ln)
         ci68_u = pred_vol_m * math.exp(+1.0 * sigma_ln)
         ci95_l = pred_vol_m * math.exp(-1.96 * sigma_ln)
         ci95_u = pred_vol_m * math.exp(+1.96 * sigma_ln)
 
-        # Scoring blocks
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
