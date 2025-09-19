@@ -327,27 +327,65 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
 
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
+def _ppc_mean_1d(ppc_arr) -> np.ndarray:
+    """Mean across chains/draws → (n_rows,)"""
+    arr = np.asarray(ppc_arr)
+    if arr.ndim == 3:   # (chains, draws, n)
+        return arr.mean(axis=(0, 1))
+    if arr.ndim == 2:   # (draws, n)
+        return arr.mean(axis=0)
+    raise ValueError(f"Unexpected PPC array shape: {arr.shape}")
+
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """Predict day volume (Millions) for new rows using BART latent f, not y_obs."""
+    """
+    Predict day volume (Millions) robustly:
+      1) try latent 'f'
+      2) fallback to 'mu'
+      3) fallback to pymc_bart.utils.predict if present
+    """
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
+    n = X.shape[0]
+
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
-        ppc = pm.sample_posterior_predictive(
-            bundle["trace"],
-            var_names=["f"],         # <- key change: draw latent f at new X
-            return_inferencedata=False,
-            progressbar=False,
-        )
-    arr = np.asarray(ppc["f"])      # shapes commonly (draws, n_new) or (chains, draws, n_new)
-    if arr.ndim == 3:
-        ln_mean = arr.mean(axis=(0, 1))
-    elif arr.ndim == 2:
-        ln_mean = arr.mean(axis=0)
-    else:
-        raise ValueError(f"Unexpected PPC shape for f: {arr.shape}")
-    if ln_mean.shape[0] != X.shape[0]:
-        raise ValueError(f"predict_model_A length mismatch: {ln_mean.shape[0]} vs {X.shape[0]}")
-    return np.exp(ln_mean)          # back to level (Millions)
+
+        # 1) Try 'f'
+        try:
+            ppc = pm.sample_posterior_predictive(
+                bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
+            )
+            ln_mean = _ppc_mean_1d(ppc["f"])
+            if ln_mean.shape[0] == n:
+                return np.exp(ln_mean)
+        except Exception:
+            pass
+
+        # 2) Try 'mu'
+        try:
+            ppc = pm.sample_posterior_predictive(
+                bundle["trace"], var_names=["mu"], return_inferencedata=False, progressbar=False
+            )
+            ln_mean = _ppc_mean_1d(ppc["mu"])
+            if ln_mean.shape[0] == n:
+                return np.exp(ln_mean)
+        except Exception:
+            pass
+
+    # 3) Fallback to library helper if available
+    try:
+        import pymc_bart.utils as bart_utils
+        # returns draws x n; average on axis=0
+        draws = bart_utils.predict(bundle["trace"], X).astype(float)
+        if draws.ndim == 2 and draws.shape[1] == n:
+            return np.exp(draws.mean(axis=0))
+    except Exception:
+        pass
+
+    raise ValueError(
+        "BART PPC returned a different length than X rows. "
+        "Ensure the BART node is evaluated at the updated data. "
+        f"(wanted {n} rows for new X; got a different size from backend)"
+    )
 
 # --------- Model B: BART classification ----------
 def train_model_B(
@@ -405,26 +443,53 @@ def train_model_B(
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """Predict FT probability for new rows via logistic(f) from BART, not y_obs."""
+    """
+    Predict FT probability robustly:
+      1) try latent 'f' → expit
+      2) fallback to 'mu' → expit
+      3) fallback to pymc_bart.utils.predict (which emits latent f)
+    """
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
+    n = X.shape[0]
+
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
-        ppc = pm.sample_posterior_predictive(
-            bundle["trace"],
-            var_names=["f"],         # <- draw latent log-odds at new X
-            return_inferencedata=False,
-            progressbar=False,
-        )
-    arr = np.asarray(ppc["f"])      # (draws, n_new) or (chains, draws, n_new)
-    if arr.ndim == 3:
-        probs = expit(arr).mean(axis=(0, 1))
-    elif arr.ndim == 2:
-        probs = expit(arr).mean(axis=0)
-    else:
-        raise ValueError(f"Unexpected PPC shape for f: {arr.shape}")
-    if probs.shape[0] != X.shape[0]:
-        raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
-    return probs.astype(float)
+
+        # 1) 'f' as log-odds
+        try:
+            ppc = pm.sample_posterior_predictive(
+                bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
+            )
+            logits = _ppc_mean_1d(ppc["f"])
+            if logits.shape[0] == n:
+                return expit(logits).astype(float)
+        except Exception:
+            pass
+
+        # 2) 'mu' as log-odds
+        try:
+            ppc = pm.sample_posterior_predictive(
+                bundle["trace"], var_names=["mu"], return_inferencedata=False, progressbar=False
+            )
+            logits = _ppc_mean_1d(ppc["mu"])
+            if logits.shape[0] == n:
+                return expit(logits).astype(float)
+        except Exception:
+            pass
+
+    # 3) utils.predict fallback
+    try:
+        import pymc_bart.utils as bart_utils
+        draws = bart_utils.predict(bundle["trace"], X).astype(float)  # draws x n (log-odds)
+        if draws.ndim == 2 and draws.shape[1] == n:
+            return expit(draws).mean(axis=0).astype(float)
+    except Exception:
+        pass
+
+    raise ValueError(
+        "BART PPC returned a different length than X rows (classification). "
+        f"(wanted {n} rows for new X; got a different size from backend)"
+    )
 
 def _hash_df_for_cache(df: pd.DataFrame) -> str:
     """
