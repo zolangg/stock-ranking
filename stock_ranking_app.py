@@ -279,7 +279,7 @@ def featurize(raw: pd.DataFrame) -> pd.DataFrame:
 A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
 B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","ln_pmdol","PredVol_M"]
 
-# ---- Small helpers
+# ---- Utility helpers (NO PPC anywhere) ----
 def _ensure_clean_matrix(X: np.ndarray, name: str = "X") -> np.ndarray:
     if not np.all(np.isfinite(X)):
         bad = np.argwhere(~np.isfinite(X))
@@ -292,12 +292,12 @@ def _ensure_clean_matrix(X: np.ndarray, name: str = "X") -> np.ndarray:
 
 def _ppc_to_2d(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr)
-    if arr.ndim == 3:  # (chains, draws, n)
+    if arr.ndim == 3:
         c, d, n = arr.shape
         return arr.reshape(c*d, n)
-    elif arr.ndim == 2:  # (draws, n)
+    elif arr.ndim == 2:
         return arr
-    elif arr.ndim == 1:  # (draws,) -> single row
+    elif arr.ndim == 1:
         return arr[:, None]
     else:
         raise ValueError(f"Unexpected PPC shape: {arr.shape}")
@@ -317,12 +317,9 @@ def _hash_df_for_cache(df: pd.DataFrame) -> str:
     return blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None) -> pd.DataFrame:
-    if not isinstance(df, pd.DataFrame):
-        return df
-    try:
-        n = int(n)
-    except Exception:
-        n = 0
+    if not isinstance(df, pd.DataFrame): return df
+    try: n = int(n)
+    except Exception: n = 0
     if n <= 0: return df.copy()
     m = len(df)
     if m <= n: return df.copy()
@@ -351,6 +348,36 @@ def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None) -> pd.DataFrame
         return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
     out = pd.concat(parts, axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
     return out
+
+# ---------- BART latent predictor (no PPC, no y_obs) ----------
+def _bart_predict_latent(idata, X_new: np.ndarray) -> np.ndarray:
+    """
+    Return latent f draws with shape (draws_total, n_rows) using pymc_bart's pure-Python predictor.
+    Requires pymc-bart>=0.5.x where pgbart.predict is available.
+    """
+    X_new = np.asarray(X_new, dtype=float)
+    if X_new.ndim != 2:
+        raise ValueError(f"X_new must be 2D, got shape {X_new.shape}")
+
+    # Try the canonical location first
+    try:
+        from pymc_bart.pgbart import predict as bart_predict
+        draws = bart_predict(idata, X_new)  # shape (draws, n_rows)
+        return _ppc_to_2d(draws)
+    except Exception as e1:
+        # Try utils fallback (older refactor)
+        try:
+            from pymc_bart.utils import predict as bart_predict2
+            draws = bart_predict2(idata, X_new)
+            return _ppc_to_2d(draws)
+        except Exception as e2:
+            st.error(
+                "BART predictor function not found. "
+                "Please ensure `pymc-bart==0.5.14` is installed. "
+                f"\nImport errors:\n- pgbart.predict: {type(e1).__name__}: {e1}\n"
+                f"- utils.predict: {type(e2).__name__}: {e2}"
+            )
+            raise
 
 # ---------- BART training ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
@@ -388,29 +415,20 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
         "x_name": "X_A",
         "n_train": X.shape[0],
         "trees": trees,
-        "X_train": X,       # store training design for later resets
+        "X_train": X,
     }
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     """
-    Predict day volume (Millions) for NEW rows using latent f.
-    Always restores training X to avoid poisoning other code.
+    Predict day volume (Millions) for NEW rows using latent f (no PPC).
     """
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
         raise ValueError(f"Missing predictors for Model A: {missing}")
-
     X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_A")
-    with bundle["model"]:
-        try:
-            pm.set_data({bundle["x_name"]: X})
-            ppc = pm.sample_posterior_predictive(
-                bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
-            )
-        finally:
-            pm.set_data({bundle["x_name"]: bundle["X_train"]})
-    f_draws = _ppc_to_2d(ppc["f"])   # (draws_total, n_rows)
+    # get latent draws directly from BART trees
+    f_draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows)
     ln_mean = f_draws.mean(axis=0)
     return np.exp(ln_mean).astype(float)
 
@@ -467,41 +485,25 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
         raise ValueError(f"Missing predictors for Model B: {missing}")
-
     X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_B")
-    with bundle["model"]:
-        ppc = pm.sample_posterior_predictive(
-            bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False,
-            # NOTE: Model B need not reset X because diagnostics don't PPC it.
-        )
-    f_draws = _ppc_to_2d(ppc["f"])
+    # latent logits from BART; then logistic
+    f_draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows)
     probs   = expit(f_draws).mean(axis=0)
     return probs.astype(float)
 
 # ---------- Cache A in-sample preds (for diagnostics) ----------
 def _cache_A_train_preds(A_bundle, dfA):
-    """Compute in-sample preds from latent f on TRAIN X once; cache into session_state."""
+    """Compute in-sample preds from latent f on TRAIN X once (no PPC)."""
     try:
-        with A_bundle["model"]:
-            pm.set_data({A_bundle["x_name"]: A_bundle["X_train"]})
-            ppc_train = pm.sample_posterior_predictive(
-                A_bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
-            )
-        f = np.asarray(ppc_train["f"])
-        if f.ndim == 3:
-            f = f.reshape(f.shape[0]*f.shape[1], f.shape[2])
-        elif f.ndim == 2:
-            pass
-        else:
-            f = f[:, None]
+        # IMPORTANT: use the exact training X
+        X = A_bundle["X_train"]
+        f = _bart_predict_latent(A_bundle["trace"], X)  # (draws, n_train)
         y_pred_lvl = np.exp(f.mean(axis=0)).astype(float)  # (n_train,)
-
         if y_pred_lvl.shape[0] != len(dfA):
             st.warning(f"Train-pred size mismatch: {y_pred_lvl.shape[0]} vs {len(dfA)}; skipping cached diagnostics.")
             st.session_state["A_train_pred"] = None
             st.session_state["dfA_train"] = dfA.copy()
             return
-
         dfA_diag = dfA.copy()
         dfA_diag["__PredA_lvl"] = y_pred_lvl
         st.session_state["A_train_pred"] = y_pred_lvl
@@ -596,7 +598,7 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 # Save training frame
                 st.session_state["dfA_train"] = dfA.copy()
 
-                # Cache in-sample predictions for diagnostics (no PPC later)
+                # Cache in-sample predictions for diagnostics (NO PPC)
                 _cache_A_train_preds(A_bundle, dfA)
 
                 # ---- PredVol_M population ----
@@ -719,7 +721,7 @@ with st.expander("🔎 Model diagnostics"):
     dfA_tr   = st.session_state.get("dfA_train")
     dfB_tr   = st.session_state.get("dfB_train")
 
-    # ---- Model A: R² / RMSE (log & level) — uses cached preds only ----
+    # ---- Model A: R² / RMSE (log & level) — uses cached preds only (no PyMC calls) ----
     dfA_tr_cached = st.session_state.get("dfA_train")
     A_train_pred  = st.session_state.get("A_train_pred")
     if (A_bundle is not None
