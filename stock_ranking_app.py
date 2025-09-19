@@ -294,15 +294,50 @@ def _sample(draws, tune, chains, seed):
         jitter_max_retries=0,
         compute_convergence_checks=False,
     )
+    
 def _ensure_clean_matrix(X: np.ndarray, name: str = "X") -> np.ndarray:
     if not np.all(np.isfinite(X)):
         bad = np.argwhere(~np.isfinite(X))
-        sample = ", ".join([f"({i},{j})" for i, j in bad[:5]])
+        sample = ", ".join([f"({i},{j})" for i, j in bad[:6]])
         raise ValueError(
-            f"{name} contains non-finite values at {sample} (total {len(bad)}). "
-            "Check featurize() — e.g., ln(0) or division by 0."
+            f"{name} contains non-finite values at {sample} "
+            f"(total {len(bad)}). Check featurize() inputs."
         )
     return np.ascontiguousarray(X, dtype=float)
+
+def _bart_predict_latent(trace, X: np.ndarray) -> np.ndarray:
+    """
+    Returns latent draws with shape (draws, n_rows).
+    Tries multiple known entry points for pymc-bart 0.5.x.
+    """
+    # 1) pmb.utils.predict
+    try:
+        import pymc_bart.utils as bart_utils
+        draws = bart_utils.predict(trace, X)
+        draws = np.asarray(draws)
+        if draws.ndim == 1:  # single-row → (draws,)
+            draws = draws[:, None]
+        if draws.ndim == 2:
+            return draws
+    except Exception:
+        pass
+
+    # 2) pmb.predict (some builds expose it here)
+    try:
+        import pymc_bart as pmb
+        if hasattr(pmb, "predict"):
+            draws = pmb.predict(trace, X)
+            draws = np.asarray(draws)
+            if draws.ndim == 1:
+                draws = draws[:, None]
+            if draws.ndim == 2:
+                return draws
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not access pymc-bart predictor. Ensure pymc-bart==0.5.14 is installed."
+    )
 
 def _ppc_mean_match_rows(arr: np.ndarray, n_rows: int) -> np.ndarray:
     arr = np.asarray(arr)
@@ -379,47 +414,10 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     if missing:
         raise ValueError(f"Missing predictors for Model A: {missing}")
     X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_A")
-    n = X.shape[0]
 
-    with bundle["model"]:
-        pm.set_data({bundle["x_name"]: X})
-
-        # Try latent 'f'
-        try:
-            ppc = pm.sample_posterior_predictive(
-                bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
-            )
-            ln_mean = _ppc_mean_match_rows(ppc["f"], n)
-            return np.exp(ln_mean)
-        except Exception:
-            pass
-
-        # Fallback latent 'mu'
-        try:
-            ppc = pm.sample_posterior_predictive(
-                bundle["trace"], var_names=["mu"], return_inferencedata=False, progressbar=False
-            )
-            ln_mean = _ppc_mean_match_rows(ppc["mu"], n)
-            return np.exp(ln_mean)
-        except Exception:
-            pass
-
-    # Library fallback
-    try:
-        import pymc_bart.utils as bart_utils
-        draws = bart_utils.predict(bundle["trace"], X)  # (draws, n) or (draws,)
-        if draws.ndim == 1 and n == 1:
-            return np.exp(np.array([draws.mean()], dtype=float))
-        if draws.ndim == 2 and draws.shape[1] == n:
-            return np.exp(draws.mean(axis=0))
-    except Exception:
-        pass
-
-    raise ValueError(
-        f"Model A prediction failed. n_new={n}, n_train={bundle.get('n_train')}. "
-        "Most likely X_A is not pm.MutableData in the trained graph, "
-        "or pm.set_data did not actually bind to the node being used by BART."
-    )
+    draws = _bart_predict_latent(bundle["trace"], X)   # (draws, n_rows), latent log-volume
+    ln_mean = draws.mean(axis=0)                       # (n_rows,)
+    return np.exp(ln_mean)                             # level (Millions)
 
 # --------- Model B: BART classification ----------
 
@@ -491,45 +489,9 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     if missing:
         raise ValueError(f"Missing predictors for Model B: {missing}")
     X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_B")
-    n = X.shape[0]
 
-    with bundle["model"]:
-        pm.set_data({bundle["x_name"]: X})
-
-        # 'f' as logits
-        try:
-            ppc = pm.sample_posterior_predictive(
-                bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
-            )
-            logits = _ppc_mean_match_rows(ppc["f"], n)
-            return expit(logits).astype(float)
-        except Exception:
-            pass
-
-        # 'mu' as logits
-        try:
-            ppc = pm.sample_posterior_predictive(
-                bundle["trace"], var_names=["mu"], return_inferencedata=False, progressbar=False
-            )
-            logits = _ppc_mean_match_rows(ppc["mu"], n)
-            return expit(logits).astype(float)
-        except Exception:
-            pass
-
-    try:
-        import pymc_bart.utils as bart_utils
-        draws = bart_utils.predict(bundle["trace"], X)  # logits
-        if draws.ndim == 1 and n == 1:
-            return np.array([expit(draws).mean()], dtype=float)
-        if draws.ndim == 2 and draws.shape[1] == n:
-            return expit(draws).mean(axis=0).astype(float)
-    except Exception:
-        pass
-
-    raise ValueError(
-        f"Model B prediction failed. n_new={n}, n_train={bundle.get('n_train')}. "
-        "Confirm X_B is pm.MutableData and pm.set_data is used before PPC."
-    )
+    draws = _bart_predict_latent(bundle["trace"], X)   # (draws, n_rows), latent logits
+    return expit(draws).mean(axis=0).astype(float)     # probs (n_rows,)
 
 def _hash_df_for_cache(df: pd.DataFrame) -> str:
     """
