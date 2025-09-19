@@ -1,8 +1,8 @@
-# Premarket Stock Ranking — ln(DVol) regression (Elastic Net w/ fallback) + NumPy 2.x-safe FT label
-# -------------------------------------------------------------------------------------------------
-# - Primary model: ElasticNetCV on ln(DVol) with conformal CI (requires scikit-learn)
-# - Fallback model: custom RidgeCV (NumPy) with same UI/outputs if scikit-learn isn't installed
-# - Fixes DTypePromotionError by building FT_fac via pandas (no mixed float/string in np.where)
+# Premarket Stock Ranking — Model A (ln DVol regression) + Model B (FT classification)
+# ------------------------------------------------------------------------------------
+# A: ElasticNetCV on ln(DVol) with conformal CI (fallback to RidgeCV if sklearn missing)
+# B: Logistic Regression (Elastic Net) with Platt calibration (requires scikit-learn)
+# NumPy 2.x-safe handling for FT_fac to avoid DTypePromotionError.
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -14,25 +14,24 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ----- Try scikit-learn; if missing, we use NumPy fallback -----
+# ----- Try scikit-learn; if missing, we keep Model A via custom RidgeCV and disable Model B -----
 SKLEARN_AVAILABLE = True
 try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import Pipeline
-    from sklearn.linear_model import ElasticNetCV
-    from sklearn.model_selection import KFold, cross_val_predict
+    from sklearn.linear_model import ElasticNetCV, LogisticRegression
+    from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict, train_test_split
+    from sklearn.calibration import CalibratedClassifierCV
 except Exception:
     SKLEARN_AVAILABLE = False
 
-# ---------- Page + light CSS ----------
-st.set_page_config(page_title="Premarket Stock Ranking — ln(DVol) regression", layout="wide")
+# ---------- Page + CSS ----------
+st.set_page_config(page_title="Premarket Stock Ranking — A: ln(DVol) • B: FT", layout="wide")
 st.markdown(
     """
     <style>
       html, body, [class*="css"]  { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
       .section-title { font-weight: 700; font-size: 1.05rem; letter-spacing:.2px; margin: 4px 0 8px 0; }
-      .stMetric label { font-size: 0.85rem; font-weight: 600; color:#374151;}
-      .stMetric [data-testid="stMetricValue"] { font-size: 1.15rem; }
       .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 16px 0; }
       .muted { color:#6b7280; }
     </style>
@@ -40,7 +39,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Premarket Stock Ranking — ln(DVol) regression")
+st.title("Premarket Stock Ranking — A: ln(DVol) regression • B: FT probability")
 
 # ---------- helpers ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
@@ -120,16 +119,15 @@ def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
         "FT_raw":   df.iloc[:, col_FT] if col_FT is not None else np.nan,
     })
 
-    # Catalyst → {0,1} (robust to dtype quirks)
+    # Catalyst → {0,1}
     out["Catalyst"] = pd.to_numeric(out.get("Catalyst", 0), errors="coerce").fillna(0).ne(0).astype(int)
 
-    # FT label → categorical (NumPy 2.x safe; no mixing NaN + strings)
+    # FT label → categorical (NumPy 2.x safe)
     f_raw = out["FT_raw"]
     fl = f_raw.astype(str).str.lower().str.strip()
     is_ft = fl.isin(["ft","1","yes","y","true"])
-
     ft = pd.Series(np.where(is_ft, "FT", "Fail"), index=out.index, dtype="string")
-    ft = ft.mask(f_raw.isna())  # preserve original missingness
+    ft = ft.mask(f_raw.isna())  # preserve missing
     out["FT_fac"] = ft.astype("category")
 
     return out
@@ -150,9 +148,11 @@ def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     out["FT_fac"]   = out["FT_fac"].astype("category")
     return out
 
+# ---- Default feature sets ----
 A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
+B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","ln_pmdol","PredVol_M"]
 
-# ---------- Metrics helpers ----------
+# ---------- Metrics ----------
 def _r2(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=float); y_pred = np.asarray(y_pred, dtype=float)
     ss_res = np.sum((y_true - y_pred)**2); ss_tot = np.sum((y_true - np.mean(y_true))**2)
@@ -166,7 +166,26 @@ def _mae(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=float); y_pred = np.asarray(y_pred, dtype=float)
     return float(np.mean(np.abs(y_true - y_pred)))
 
-# ---------- Fallback: tiny Standardizer + RidgeCV (NumPy) ----------
+def _roc_auc(y_true, y_score):
+    y_true = np.asarray(y_true, dtype=int); y_score = np.asarray(y_score, dtype=float)
+    pos = y_score[y_true == 1]; neg = y_score[y_true == 0]
+    n1, n0 = len(pos), len(neg)
+    if n1 == 0 or n0 == 0: return float("nan")
+    cmp = pos[:, None] - neg[None, :]
+    greater = np.sum(cmp > 0); equal = np.sum(cmp == 0)
+    return float((greater + 0.5*equal) / (n1*n0))
+
+def _accuracy(y_true, y_score, thr=0.5):
+    y_true = np.asarray(y_true, dtype=int)
+    y_hat = (np.asarray(y_score, dtype=float) >= thr).astype(int)
+    return float((y_hat == y_true).mean()) if len(y_true) else float("nan")
+
+def _logloss(y_true, y_score, eps=1e-12):
+    y_true = np.asarray(y_true, dtype=int)
+    p = np.clip(np.asarray(y_score, dtype=float), eps, 1.0 - eps)
+    return float(-np.mean(y_true*np.log(p) + (1 - y_true)*np.log(1 - p))) if len(y_true) else float("nan")
+
+# ---------- Fallback classes (Model A if sklearn missing) ----------
 class _Std:
     def fit(self, X):
         X = np.asarray(X, dtype=float)
@@ -177,8 +196,6 @@ class _Std:
     def transform(self, X):
         X = np.asarray(X, dtype=float)
         return (X - self.mean_) / self.std_
-    def fit_transform(self, X):
-        return self.fit(X).transform(X)
 
 class _RidgeCV:
     def __init__(self, alphas, cv_splits=5, seed=42):
@@ -216,8 +233,6 @@ class _RidgeCV:
             mse_per_alpha.append(np.mean(mses))
         best_idx = int(np.argmin(mse_per_alpha))
         self.alpha_ = float(self.alphas[best_idx])
-
-        # Fit on full data
         self.coef_ = self._fit_ridge(Xs, ys, self.alpha_)
         self.y_mean_ = y_mean
         return self
@@ -225,7 +240,7 @@ class _RidgeCV:
         Xs = self.std_.transform(X)
         return (Xs @ self.coef_) + self.y_mean_
 
-# ---------- Model A trainers ----------
+# ---------- Model A (train/predict) ----------
 def _prep_A(df_feats: pd.DataFrame, predictors):
     dfA = df_feats.dropna(subset=["ln_DVol"] + predictors).copy()
     X = dfA[predictors].to_numpy(float)
@@ -235,7 +250,7 @@ def _prep_A(df_feats: pd.DataFrame, predictors):
 def train_model_A(df_feats: pd.DataFrame, predictors, seed: int = 42):
     dfA, X, y = _prep_A(df_feats, predictors)
     if len(dfA) < 20:
-        raise RuntimeError(f"Not enough rows to train model (have {len[dfA]}, need ≥20).")
+        raise RuntimeError(f"Not enough rows to train Model A (have {len(dfA)}, need ≥20).")
 
     if SKLEARN_AVAILABLE:
         cv_splits = min(5, max(2, len(dfA)//10))
@@ -254,12 +269,12 @@ def train_model_A(df_feats: pd.DataFrame, predictors, seed: int = 42):
         alpha_ = getattr(pipe.named_steps["enet"], "alpha_", None)
         l1_ratio_ = getattr(pipe.named_steps["enet"], "l1_ratio_", None)
         model = pipe
-        trainer = "ElasticNetCV (scikit-learn)"
+        trainer = "ElasticNetCV (sklearn)"
         splits = cv_splits
     else:
         alphas = np.logspace(-3, 3, 41)
         ridge = _RidgeCV(alphas=alphas, cv_splits=5, seed=seed).fit(X, y)
-        # manual CV predictions for conformal
+        # manual CV preds for conformal
         k = 5 if len(dfA) >= 25 else 2
         idx = np.arange(len(y))
         np.random.default_rng(seed).shuffle(idx)
@@ -268,8 +283,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors, seed: int = 42):
         for i in range(k):
             val = folds[i]
             tr = np.concatenate([folds[j] for j in range(k) if j!=i])
-            rcv = _RidgeCV(alphas=alphas, cv_splits=k, seed=seed)
-            rcv.fit(X[tr], y[tr])
+            rcv = _RidgeCV(alphas=alphas, cv_splits=k, seed=seed).fit(X[tr], y[tr])
             y_cv[val] = rcv.predict(X[val])
         resid = y - y_cv
         coefs = ridge.coef_
@@ -297,7 +311,6 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame, central_coverage: float = 0.6
     if missing:
         raise ValueError(f"Model A: missing predictors {missing}. Available: {list(Xnew_df.columns)}")
     X = Xnew_df[cols].to_numpy(dtype=float)
-
     ln_pred = bundle["model"].predict(X)
 
     # Conformal interval on log scale (symmetric abs residual quantile)
@@ -310,6 +323,50 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame, central_coverage: float = 0.6
     hi = np.exp(ln_pred + q)
     return pred, lo, hi
 
+# ---------- Model B (train/predict) ----------
+def _prep_B(df_feats_with_pred: pd.DataFrame, predictors):
+    need = predictors + ["FT_fac"]
+    dfB = df_feats_with_pred.dropna(subset=need).copy()
+    y = (dfB["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
+    X = dfB[predictors].to_numpy(float)
+    return dfB, X, y
+
+def train_model_B(df_feats_with_pred: pd.DataFrame, predictors, seed: int = 123):
+    if not SKLEARN_AVAILABLE:
+        raise RuntimeError("Model B requires scikit-learn. Install scikit-learn to enable FT classification.")
+    dfB, X, y = _prep_B(df_feats_with_pred, predictors)
+    if len(dfB) < 20 or len(np.unique(y)) < 2:
+        raise RuntimeError(f"Not enough labeled rows/classes for Model B (rows={len(dfB)}).")
+
+    skf = StratifiedKFold(n_splits=min(5, max(2, len(dfB)//10)), shuffle=True, random_state=seed)
+    base = Pipeline([
+        ("sc", StandardScaler(with_mean=True, with_std=True)),
+        ("logit", LogisticRegression(
+            penalty="elasticnet", solver="saga", l1_ratio=0.5, C=1.0,
+            class_weight="balanced", max_iter=20000, random_state=seed
+        ))
+    ])
+    # Split for calibration (hold-out)
+    X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.25, random_state=seed, stratify=y)
+    base.fit(X_tr, y_tr)
+    cal = CalibratedClassifierCV(base, method="sigmoid", cv="prefit")
+    cal.fit(X_val, y_val)
+
+    # quick CV metrics (on all data, just for display)
+    from sklearn.model_selection import cross_val_predict
+    proba_cv = cross_val_predict(cal, X, y, cv=skf, method="predict_proba")[:, 1]
+    auc = _roc_auc(y, proba_cv); acc = _accuracy(y, proba_cv, 0.5); ll = _logloss(y, proba_cv)
+
+    return {"model": cal, "predictors": predictors, "cv_auc": auc, "cv_acc": acc, "cv_logloss": ll, "n_train": len(dfB)}
+
+def predict_model_B(bundle, Xnew_df: pd.DataFrame):
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Model B: missing predictors {missing}. Available: {list(Xnew_df.columns)}")
+    X = Xnew_df[cols].to_numpy(dtype=float)
+    return bundle["model"].predict_proba(X)[:, 1]
+
 # ---------- session ----------
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
@@ -319,87 +376,112 @@ if st.session_state.flash:
     st.session_state.flash = None
 
 # ---------- SIDEBAR ----------
-st.sidebar.header("Training")
-cov = st.sidebar.slider("Central CI coverage", 0.50, 0.95, 0.68, 0.01,
+st.sidebar.header("Training options")
+cov = st.sidebar.slider("Model A: central CI coverage", 0.50, 0.95, 0.68, 0.01,
                         help="Conformal central coverage for predicted day volume (log-scale, then back-transformed).")
-seed  = st.sidebar.number_input("Random seed", value=42, step=1)
+seedA  = st.sidebar.number_input("Seed — Model A", value=42, step=1)
+seedB  = st.sidebar.number_input("Seed — Model B", value=123, step=1)
 
-st.sidebar.header("Feature set")
-use_defaults = st.sidebar.toggle("Use default features", value=True)
-custom_feats = st.sidebar.text_input(
-    "Custom features (comma sep)",
+st.sidebar.header("Feature sets")
+use_defaults_A = st.sidebar.toggle("Use default A features", value=True)
+custom_A = st.sidebar.text_input(
+    "Custom A features (comma sep)",
     "ln_pm, ln_pmdol, ln_fr, ln_gapf, ln_atr, ln_mcap, Catalyst"
 )
-if use_defaults:
-    A_predictors = A_FEATURES_DEFAULT
-else:
-    A_predictors = [c.strip() for c in custom_feats.split(",") if c.strip()]
+A_predictors = A_FEATURES_DEFAULT if use_defaults_A else [c.strip() for c in custom_A.split(",") if c.strip()]
+
+use_defaults_B = st.sidebar.toggle("Use default B features", value=True)
+custom_B = st.sidebar.text_input(
+    "Custom B features (comma sep)",
+    "ln_pm, ln_fr, ln_gapf, ln_atr, ln_mcap, Catalyst, ln_pmdol, PredVol_M"
+)
+B_predictors = B_FEATURES_CORE if use_defaults_B else [c.strip() for c in custom_B.split(",") if c.strip()]
 
 # ---------- TRAINING PANEL ----------
-with st.expander("⚙️ Train / Load ln(DVol) model"):
+with st.expander("⚙️ Train / Load Models"):
     if not SKLEARN_AVAILABLE:
-        st.info("scikit-learn not found — falling back to built-in RidgeCV (L2). "
-                "To enable ElasticNet, add `scikit-learn==1.5.1` to requirements.txt.")
+        st.info("scikit-learn not found — Model A uses RidgeCV fallback; **Model B is disabled**. "
+                "Add `scikit-learn==1.5.1` to requirements.txt to enable ElasticNet (A) and Logistic (B).")
 
-    st.write("Upload your **PMH Database.xlsx** (sheet: _PMH BO Merged_) to retrain.")
+    st.write("Upload your **PMH Database.xlsx** (sheet: _PMH BO Merged_) to (re)train.")
     up = st.file_uploader("Upload Excel", type=["xlsx"], accept_multiple_files=False, key="train_xlsx")
     sheet_train = st.text_input("Sheet name", "PMH BO Merged", key="train_sheet")
 
-    if st.button("Train model", use_container_width=True, type="primary"):
+    if st.button("Train A & B", use_container_width=True, type="primary"):
         if not up:
             st.error("Upload the Excel file first.")
         else:
             try:
-                with st.spinner("Training ln(DVol) model…"):
+                with st.spinner("Training models…"):
                     raw = read_excel_dynamic(up, sheet=sheet_train)
                     df_all = featurize(raw)
 
+                    # ==== Model A ====
                     need_A = ["ln_DVol"] + A_predictors
                     dfA = df_all.dropna(subset=need_A).copy()
                     if len(dfA) < 20:
-                        st.error(f"Not enough rows after filtering: {len(dfA)} (need ≥20).")
+                        st.error(f"Not enough rows for Model A after filtering: {len(dfA)} (need ≥20).")
                         st.stop()
+                    A_bundle = train_model_A(df_all, A_predictors, seed=seedA)
 
-                    A_bundle = train_model_A(df_all, A_predictors, seed=seed)
-
-                    # Predictions for PredVol_M (index-aligned)
+                    # Attach A predictions (PredVol_M) for B
                     okA = df_all[A_bundle["predictors"]].dropna().index
-                    if len(okA) == 0:
-                        st.error("No rows pass Model A predictors; cannot compute predictions.")
-                        st.stop()
-
-                    preds, ci_l, ci_u = predict_model_A(A_bundle, df_all.loc[okA, A_bundle["predictors"]],
-                                                        central_coverage=cov)
+                    predsA, ci_l, ci_u = predict_model_A(A_bundle, df_all.loc[okA, A_bundle["predictors"]],
+                                                         central_coverage=cov)
                     df_all_with_pred = df_all.copy()
-                    df_all_with_pred.loc[okA, "PredVol_M"]    = pd.Series(preds, index=okA, dtype="float64")
-                    df_all_with_pred.loc[okA, "PredVol_CI_L"] = pd.Series(ci_l,   index=okA, dtype="float64")
-                    df_all_with_pred.loc[okA, "PredVol_CI_U"] = pd.Series(ci_u,   index=okA, dtype="float64")
+                    df_all_with_pred.loc[okA, "PredVol_M"]    = pd.Series(predsA, index=okA, dtype="float64")
+                    df_all_with_pred.loc[okA, "PredVol_CI_L"] = pd.Series(ci_l,  index=okA, dtype="float64")
+                    df_all_with_pred.loc[okA, "PredVol_CI_U"] = pd.Series(ci_u,  index=okA, dtype="float64")
 
-                    # Save bundles + frames
-                    st.session_state["A_bundle"]   = A_bundle
-                    st.session_state["data_hash"]  = _hash_df_for_cache(df_all)
-                    st.session_state["dfA_train"]  = dfA.copy()
-                    st.session_state["df_all_full"]= df_all_with_pred.copy()
+                    # Save A artifacts
+                    st.session_state["A_bundle"] = A_bundle
+                    st.session_state["df_all_full"] = df_all_with_pred.copy()
+                    st.session_state["dfA_train"] = dfA.copy()
                     st.session_state["A_predictors"] = A_bundle["predictors"]
+                    st.session_state["data_hash"] = _hash_df_for_cache(df_all)
 
-                    # Basic diagnostics (train fit on log-scale)
+                    # Basic A diagnostics (train fit, log-scale)
                     y_true_log = dfA["ln_DVol"].to_numpy(float)
-                    X_train = dfA[A_bundle["predictors"]].to_numpy(float)
-                    y_pred_log = A_bundle["model"].predict(X_train)
-
-                    st.success(f"Trained ({A_bundle['trainer']}). Rows: {len(dfA)} • CV splits: {A_bundle['cv_splits']}")
+                    y_pred_log = A_bundle["model"].predict(dfA[A_bundle["predictors"]].to_numpy(float))
                     c1, c2, c3 = st.columns(3)
-                    with c1: st.metric("Train R² (log)",  f"{_r2(y_true_log, y_pred_log):.3f}")
-                    with c2: st.metric("Train RMSE (log)", f"{_rmse(y_true_log, y_pred_log):.3f}")
-                    with c3: st.metric("Train MAE (log)",  f"{_mae(y_true_log, y_pred_log):.3f}")
+                    with c1: st.metric("A: Train R² (log)",  f"{_r2(y_true_log, y_pred_log):.3f}")
+                    with c2: st.metric("A: RMSE (log)",      f"{_rmse(y_true_log, y_pred_log):.3f}")
+                    with c3: st.metric("A: MAE (log)",       f"{_mae(y_true_log, y_pred_log):.3f}")
 
-                    # Coeff summary
+                    # Coefs
                     coefs = A_bundle.get("coefs", None)
                     if coefs is not None:
                         coef_df = pd.DataFrame({"feature": A_bundle["predictors"], "coef": coefs})
                         coef_df = coef_df.sort_values("coef", ascending=False)
-                        st.caption("Model coefficients (ln-scale):")
+                        st.caption("A: Elastic Net coefficients (ln-scale):")
                         st.dataframe(coef_df, hide_index=True, use_container_width=True)
+
+                    # ==== Model B (optional) ====
+                    B_bundle = None
+                    if SKLEARN_AVAILABLE:
+                        need_B = B_predictors + ["FT_fac"]
+                        dfB = df_all_with_pred.dropna(subset=need_B).copy()
+                        if len(dfB) >= 20 and dfB["FT_fac"].nunique(dropna=True) >= 2:
+                            try:
+                                B_bundle = train_model_B(df_all_with_pred, B_predictors, seed=seedB)
+                                st.session_state["B_bundle"] = B_bundle
+                                st.session_state["B_predictors"] = B_bundle["predictors"]
+                                c1, c2, c3 = st.columns(3)
+                                with c1: st.metric("B: CV ROC-AUC",  f"{B_bundle['cv_auc']:.3f}")
+                                with c2: st.metric("B: CV Accuracy", f"{B_bundle['cv_acc']:.3f}")
+                                with c3: st.metric("B: CV LogLoss",  f"{B_bundle['cv_logloss']:.3f}")
+                                st.success(f"Model B trained on {B_bundle['n_train']} rows.")
+                            except Exception as e:
+                                st.warning(f"Model B skipped: {e}")
+                                st.session_state["B_bundle"] = None
+                        else:
+                            st.info("Model B skipped: insufficient labeled rows or only one class.")
+                            st.session_state["B_bundle"] = None
+                    else:
+                        st.info("Model B disabled (scikit-learn not available).")
+
+                    st.success(f"✅ Trained A ({A_bundle['trainer']}, rows={A_bundle['n_train']})"
+                               + (" • Trained B" if st.session_state.get("B_bundle") else " • B skipped"))
 
             except Exception as e:
                 st.exception(e)
@@ -409,7 +491,7 @@ tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 def require_A():
     if "A_bundle" not in st.session_state or st.session_state.get("A_bundle") is None:
-        st.warning("Train the model first (see expander above).")
+        st.warning("Train Model A first (see expander above).")
         st.stop()
 
 with tab_add:
@@ -438,6 +520,7 @@ with tab_add:
     if submitted and ticker:
         require_A()
         A_bundle = st.session_state["A_bundle"]
+        B_bundle = st.session_state.get("B_bundle")
 
         row = pd.DataFrame([{
             "PMVolM": pm_vol_m, "PMDolM": pm_dol_m, "FloatM": float_m, "GapPct": gap_pct,
@@ -446,15 +529,34 @@ with tab_add:
         }])
         feats = featurize(row)
 
+        # Model A prediction
         try:
             pred_vol_m, ci_l, ci_u = predict_model_A(
                 A_bundle, feats[A_bundle["predictors"]], central_coverage=cov
             )
             pred_vol_m = float(pred_vol_m[0]); ci_l = float(ci_l[0]); ci_u = float(ci_u[0])
         except Exception as e:
-            st.error(f"Prediction failed: {e}")
+            st.error(f"Model A prediction failed: {e}")
             st.stop()
 
+        # Model B prediction (if trained)
+        if B_bundle is not None:
+            try:
+                featsB = feats.copy()
+                featsB["PredVol_M"] = pred_vol_m
+                # Ensure all B predictors exist
+                for c in B_bundle["predictors"]:
+                    if c not in featsB.columns:
+                        featsB[c] = np.nan
+                ft_prob = float(predict_model_B(B_bundle, featsB)[0])
+                ft_label = ("FT likely" if ft_prob >= 0.60 else "Toss-up" if ft_prob >= 0.40 else "FT unlikely")
+            except Exception as e:
+                st.warning(f"Model B prediction failed: {e}")
+                ft_prob = float("nan"); ft_label = "B model error"
+        else:
+            ft_prob = float("nan"); ft_label = "B not trained"
+
+        # Diagnostics/ratios
         pm_float_rot_x  = (pm_vol_m / float_m) if float_m > 0 else 0.0
         pm_pct_of_pred  = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
         pm_dollar_vs_mc = 100.0 * (pm_dol_m) / mc_m if mc_m > 0 else 0.0
@@ -464,6 +566,8 @@ with tab_add:
             "PredVol_M": round(pred_vol_m, 2),
             "PredVol_CI_L": round(ci_l, 2),
             "PredVol_CI_U": round(ci_u, 2),
+            "FT_Prob": (round(ft_prob, 3) if not np.isnan(ft_prob) else ""),
+            "FT_Label": ft_label,
             "PM_%_of_Pred": round(pm_pct_of_pred, 1),
             "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
             "PM_FloatRot_x": round(pm_float_rot_x, 3),
@@ -473,25 +577,34 @@ with tab_add:
 
         st.session_state.rows.append(row_out)
         st.session_state.last = row_out
-        st.session_state.flash = f"Saved {ticker} — Predicted daily volume: {pred_vol_m:.2f}M (CI {ci_l:.2f}–{ci_u:.2f})"
+        st.session_state.flash = (
+            f"Saved {ticker} — PredVol {pred_vol_m:.2f}M (CI {ci_l:.2f}–{ci_u:.2f})"
+            + (f" • FT={ft_prob:.3f}" if isinstance(ft_prob, float) and not np.isnan(ft_prob) else "")
+        )
 
 with tab_rank:
     st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
+
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
         df = df.loc[:, ~df.columns.duplicated(keep="first")]
-        if "PredVol_M" in df.columns:
+
+        # Sort: prefer FT_Prob desc if present, else PredVol_M desc
+        if "FT_Prob" in df.columns and df["FT_Prob"].apply(lambda x: isinstance(x, (int, float))).any():
+            df["_sort_ft"] = pd.to_numeric(df["FT_Prob"], errors="coerce")
+            df = df.sort_values(["_sort_ft","PredVol_M"], ascending=[False, False]).drop(columns=["_sort_ft"])
+        elif "PredVol_M" in df.columns:
             df = df.sort_values("PredVol_M", ascending=False)
         df = df.reset_index(drop=True)
 
         cols_to_show = [
-            "Ticker",
+            "Ticker","FT_Label","FT_Prob",
             "PredVol_M","PredVol_CI_L","PredVol_CI_U",
             "PM_%_of_Pred","PM$ / MC_%","PM_FloatRot_x"
         ]
         for c in cols_to_show:
             if c not in df.columns:
-                df[c] = "" if c == "Ticker" else 0.0
+                df[c] = "" if c in ("Ticker","FT_Label") else 0.0
         df = df[cols_to_show]
 
         st.dataframe(
@@ -500,6 +613,8 @@ with tab_rank:
             hide_index=True,
             column_config={
                 "Ticker": st.column_config.TextColumn("Ticker"),
+                "FT_Label": st.column_config.TextColumn("FT Label"),
+                "FT_Prob": st.column_config.NumberColumn("FT Prob", format="%.3f"),
                 "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
                 "PredVol_CI_L": st.column_config.NumberColumn("Pred Vol CI Low (M)",  format="%.2f"),
                 "PredVol_CI_U": st.column_config.NumberColumn("Pred Vol CI High (M)", format="%.2f"),
