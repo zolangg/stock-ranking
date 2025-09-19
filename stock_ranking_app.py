@@ -13,43 +13,6 @@ import pymc as pm
 import pymc_bart as pmb
 from scipy.special import expit
 
-# ---------- Hard guard: ensure pymc-bart exposes a predictor ----------
-def _require_bart_predict():
-    ver = getattr(pmb, "__version__", "0.0.0")
-    try:
-        parts = tuple(int(x) for x in ver.split("."))
-    except Exception:
-        parts = (0, 0, 0)
-
-    has_predict = False
-    try:
-        import pymc_bart.pgbart as _pg
-        has_predict = has_predict or hasattr(_pg, "predict")
-    except Exception:
-        pass
-    try:
-        import pymc_bart.utils as _ut
-        has_predict = has_predict or hasattr(_ut, "predict")
-    except Exception:
-        pass
-    has_predict = has_predict or hasattr(pmb, "predict")
-
-    # Versions ≥0.5.12 generally have a predict entry point; you pin 0.5.14 in requirements.
-    if not has_predict or parts < (0, 5, 12):
-        st.error(
-            "pymc-bart predict() is not available in this runtime.\n\n"
-            f"Detected pymc-bart version: **{ver}**. "
-            "Please ensure **pymc-bart==0.5.14** is installed.\n\n"
-            "In your environment, run:\n"
-            "```bash\n"
-            "pip uninstall -y pymc-bart\n"
-            "pip install pymc-bart==0.5.14 --no-cache-dir\n"
-            "```\nThen restart the app."
-        )
-        st.stop()
-
-_require_bart_predict()
-
 # ---------- Page + light CSS ----------
 st.set_page_config(page_title="Premarket Stock Ranking (Python BART)", layout="wide")
 st.markdown(
