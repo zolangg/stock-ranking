@@ -328,27 +328,26 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
+    """Predict day volume (Millions) for new rows using BART latent f, not y_obs."""
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["y_obs"],
+            var_names=["f"],         # <- key change: draw latent f at new X
             return_inferencedata=False,
-            progressbar=False
+            progressbar=False,
         )
-    arr = np.asarray(ppc["y_obs"])
+    arr = np.asarray(ppc["f"])      # shapes commonly (draws, n_new) or (chains, draws, n_new)
     if arr.ndim == 3:
         ln_mean = arr.mean(axis=(0, 1))
     elif arr.ndim == 2:
         ln_mean = arr.mean(axis=0)
-    elif arr.ndim == 1:
-        ln_mean = arr
     else:
-        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
+        raise ValueError(f"Unexpected PPC shape for f: {arr.shape}")
     if ln_mean.shape[0] != X.shape[0]:
         raise ValueError(f"predict_model_A length mismatch: {ln_mean.shape[0]} vs {X.shape[0]}")
-    return np.exp(ln_mean)
+    return np.exp(ln_mean)          # back to level (Millions)
 
 # --------- Model B: BART classification ----------
 def train_model_B(
@@ -406,47 +405,26 @@ def train_model_B(
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
+    """Predict FT probability for new rows via logistic(f) from BART, not y_obs."""
     X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["y_obs"],
+            var_names=["f"],         # <- draw latent log-odds at new X
             return_inferencedata=False,
-            progressbar=False
+            progressbar=False,
         )
-    arr = np.asarray(ppc["y_obs"])
+    arr = np.asarray(ppc["f"])      # (draws, n_new) or (chains, draws, n_new)
     if arr.ndim == 3:
-        probs = arr.mean(axis=(0, 1))
+        probs = expit(arr).mean(axis=(0, 1))
     elif arr.ndim == 2:
-        probs = arr.mean(axis=0)
-    elif arr.ndim == 1:
-        probs = arr.astype(float)
+        probs = expit(arr).mean(axis=0)
     else:
-        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
+        raise ValueError(f"Unexpected PPC shape for f: {arr.shape}")
     if probs.shape[0] != X.shape[0]:
         raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
     return probs.astype(float)
-
-def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
-    if n <= 0 or len(df) <= n:
-        return df
-    if y_col is None or y_col not in df.columns:
-        return df.sample(n=n, random_state=42)
-    pos = df[df[y_col] == 1]
-    neg = df[df[y_col] == 0]
-    n_pos = max(1, int(n * len(pos) / max(1, len(df))))
-    n_neg = max(1, n - n_pos)
-    return pd.concat([
-        pos.sample(n=min(n_pos, len(pos)), random_state=42),
-        neg.sample(n=min(n_neg, len(neg)), random_state=42)
-    ], axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
-
-def _hash_df_for_cache(df: pd.DataFrame) -> int:
-    try:
-        return int(pd.util.hash_pandas_object(df, index=True).sum())
-    except Exception:
-        return len(df)
 
 # ---------- TRAINING PANEL ----------
 with st.expander("⚙️ Train / Load BART models (Python-only)"):
