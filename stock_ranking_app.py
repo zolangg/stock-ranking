@@ -294,7 +294,51 @@ def _sample(draws, tune, chains, seed):
         jitter_max_retries=0,
         compute_convergence_checks=False,
     )
+def _ensure_clean_matrix(X: np.ndarray, name: str = "X") -> np.ndarray:
+    if not np.all(np.isfinite(X)):
+        bad = np.argwhere(~np.isfinite(X))
+        # show a few offenders to debug feature creation
+        sample = ", ".join([f"({i},{j})" for i, j in bad[:5]])
+        raise ValueError(
+            f"{name} contains non-finite values at positions {sample} "
+            f"(total {len(bad)}). Check your featurize() inputs (zeros → ln(), etc.)."
+        )
+    return np.ascontiguousarray(X, dtype=float)
 
+def _ppc_mean_match_rows(arr: np.ndarray, n_rows: int) -> np.ndarray:
+    """
+    Return mean across draws/chains with shape (n_rows,).
+    Accepts shapes:
+      (chains, draws, n_rows)
+      (draws, n_rows)
+      (draws,)        # allowed only if n_rows==1
+      (n_rows,)       # already reduced
+    """
+    arr = np.asarray(arr)
+    if arr.ndim == 3:
+        # (chains, draws, n)
+        out = arr.mean(axis=(0, 1))
+    elif arr.ndim == 2:
+        # (draws, n)
+        out = arr.mean(axis=0)
+    elif arr.ndim == 1:
+        # single row predictions sometimes come back as (draws,)
+        if n_rows == 1:
+            out = np.array([arr.mean()], dtype=float)
+        else:
+            raise ValueError(f"Unexpected PPC shape {arr.shape} for n_rows={n_rows}.")
+    else:
+        raise ValueError(f"Unexpected PPC ndim={arr.ndim}, shape={arr.shape}.")
+
+    if out.shape[0] != n_rows:
+        # Some backends can return (n,) but with n==training_n; catch and explain
+        raise ValueError(
+            f"PPC result length {out.shape[0]} does not match requested rows {n_rows}. "
+            f"This usually means the latent node was evaluated on training X instead of new X. "
+            f"Ensure pm.MutableData is used and pm.set_data was called with the new matrix."
+        )
+    return out
+    
 # ---------- BART training ----------
 # --------- Model A: BART regression ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
@@ -337,54 +381,54 @@ def _ppc_mean_1d(ppc_arr) -> np.ndarray:
     raise ValueError(f"Unexpected PPC array shape: {arr.shape}")
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """
-    Predict day volume (Millions) robustly:
-      1) try latent 'f'
-      2) fallback to 'mu'
-      3) fallback to pymc_bart.utils.predict if present
-    """
-    X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
+    # Build X and validate
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Missing predictors for Model A: {missing}")
+    X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_A")
     n = X.shape[0]
 
+    # Try latent nodes first
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
 
-        # 1) Try 'f'
+        # 1) 'f' (most common)
         try:
             ppc = pm.sample_posterior_predictive(
                 bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
             )
-            ln_mean = _ppc_mean_1d(ppc["f"])
-            if ln_mean.shape[0] == n:
-                return np.exp(ln_mean)
+            ln_mean = _ppc_mean_match_rows(ppc["f"], n)
+            return np.exp(ln_mean)
         except Exception:
             pass
 
-        # 2) Try 'mu'
+        # 2) 'mu' (some builds name the latent mean this way)
         try:
             ppc = pm.sample_posterior_predictive(
                 bundle["trace"], var_names=["mu"], return_inferencedata=False, progressbar=False
             )
-            ln_mean = _ppc_mean_1d(ppc["mu"])
-            if ln_mean.shape[0] == n:
-                return np.exp(ln_mean)
+            ln_mean = _ppc_mean_match_rows(ppc["mu"], n)
+            return np.exp(ln_mean)
         except Exception:
             pass
 
-    # 3) Fallback to library helper if available
+    # 3) Library fallback
     try:
         import pymc_bart.utils as bart_utils
-        # returns draws x n; average on axis=0
-        draws = bart_utils.predict(bundle["trace"], X).astype(float)
+        draws = bart_utils.predict(bundle["trace"], X)  # shape (draws, n) or (draws,)
+        # handle single-row case too
+        if draws.ndim == 1 and n == 1:
+            return np.exp(np.array([draws.mean()], dtype=float))
         if draws.ndim == 2 and draws.shape[1] == n:
             return np.exp(draws.mean(axis=0))
     except Exception:
         pass
 
+    # Nothing worked
     raise ValueError(
-        "BART PPC returned a different length than X rows. "
-        "Ensure the BART node is evaluated at the updated data. "
-        f"(wanted {n} rows for new X; got a different size from backend)"
+        "Model A prediction failed: latent PPC did not match new X rows and utils fallback unavailable. "
+        "Double-check that Model A used pm.MutableData for X and that pm.set_data is called before sampling."
     )
 
 # --------- Model B: BART classification ----------
@@ -443,52 +487,50 @@ def train_model_B(
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """
-    Predict FT probability robustly:
-      1) try latent 'f' → expit
-      2) fallback to 'mu' → expit
-      3) fallback to pymc_bart.utils.predict (which emits latent f)
-    """
-    X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Missing predictors for Model B: {missing}")
+    X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_B")
     n = X.shape[0]
 
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
 
-        # 1) 'f' as log-odds
+        # 1) 'f' as logits
         try:
             ppc = pm.sample_posterior_predictive(
                 bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
             )
-            logits = _ppc_mean_1d(ppc["f"])
-            if logits.shape[0] == n:
-                return expit(logits).astype(float)
+            logits = _ppc_mean_match_rows(ppc["f"], n)
+            return expit(logits).astype(float)
         except Exception:
             pass
 
-        # 2) 'mu' as log-odds
+        # 2) 'mu' as logits
         try:
             ppc = pm.sample_posterior_predictive(
                 bundle["trace"], var_names=["mu"], return_inferencedata=False, progressbar=False
             )
-            logits = _ppc_mean_1d(ppc["mu"])
-            if logits.shape[0] == n:
-                return expit(logits).astype(float)
+            logits = _ppc_mean_match_rows(ppc["mu"], n)
+            return expit(logits).astype(float)
         except Exception:
             pass
 
-    # 3) utils.predict fallback
+    # 3) Library fallback (returns logits)
     try:
         import pymc_bart.utils as bart_utils
-        draws = bart_utils.predict(bundle["trace"], X).astype(float)  # draws x n (log-odds)
+        draws = bart_utils.predict(bundle["trace"], X)
+        if draws.ndim == 1 and n == 1:
+            return np.array([expit(draws).mean()], dtype=float)
         if draws.ndim == 2 and draws.shape[1] == n:
             return expit(draws).mean(axis=0).astype(float)
     except Exception:
         pass
 
     raise ValueError(
-        "BART PPC returned a different length than X rows (classification). "
-        f"(wanted {n} rows for new X; got a different size from backend)"
+        "Model B prediction failed: latent PPC did not match new X rows and utils fallback unavailable. "
+        "Ensure Model B also uses pm.MutableData and set_data is called."
     )
 
 def _hash_df_for_cache(df: pd.DataFrame) -> str:
@@ -906,6 +948,10 @@ with tab_add:
             "DVolM": np.nan, "FT_fac": "Fail",
         }])
         feats = featurize(row)
+        # Ensure no NaNs slipped in (e.g., FloatM=0 → ln_fr)
+        if not np.all(np.isfinite(feats[A_bundle["predictors"]].to_numpy(dtype=float))):
+            st.error("Non-finite values in features for prediction (check Float/PM/Gap/ATR/MCap).")
+            st.stop()
 
         pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
 
