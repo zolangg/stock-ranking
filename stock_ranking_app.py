@@ -719,33 +719,33 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 st.session_state["B_predictors"] = B_bundle["predictors"]
 
                 def _bart_smoketest(A_bundle, B_bundle):
-                # create two tiny rows near medians of the A training frame, then predict
-                try:
-                    dfA_tr = st.session_state.get("dfA_train")
-                    if dfA_tr is None or dfA_tr.empty:
-                        return
-                    meds = dfA_tr.median(numeric_only=True)
-                    rows = []
-                    for k in ["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM","Catalyst"]:
-                        v = meds.get(k, 1.0)
-                        rows.append(v)
-                    base = dict(zip(["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM","Catalyst"], rows))
-                    df_probe = pd.DataFrame([base, base])
-                    feats_p = featurize(df_probe)
-            
-                    # should return exactly length 2
-                    pv = predict_model_A(A_bundle, feats_p)
-                    if pv.shape[0] != 2:
-                        raise RuntimeError(f"Smoke A: got {pv.shape[0]} rows (want 2)")
-            
-                    feats_pB = feats_p.copy()
-                    feats_pB["PredVol_M"] = pv
-                    proba = predict_model_B(B_bundle, feats_pB)
-                    if proba.shape[0] != 2:
-                        raise RuntimeError(f"Smoke B: got {proba.shape[0]} rows (want 2)")
-                except Exception as e:
-                    st.error(f"⚠️ BART smoketest failed: {type(e).__name__}: {e}")
-                    st.stop()
+                    # create two tiny rows near medians of the A training frame, then predict
+                    try:
+                        dfA_tr = st.session_state.get("dfA_train")
+                        if dfA_tr is None or dfA_tr.empty:
+                            return
+                        meds = dfA_tr.median(numeric_only=True)
+                        rows = []
+                        for k in ["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM","Catalyst"]:
+                            v = meds.get(k, 1.0)
+                            rows.append(v)
+                        base = dict(zip(["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM","Catalyst"], rows))
+                        df_probe = pd.DataFrame([base, base])
+                        feats_p = featurize(df_probe)
+                
+                        # should return exactly length 2
+                        pv = predict_model_A(A_bundle, feats_p)
+                        if pv.shape[0] != 2:
+                            raise RuntimeError(f"Smoke A: got {pv.shape[0]} rows (want 2)")
+                
+                        feats_pB = feats_p.copy()
+                        feats_pB["PredVol_M"] = pv
+                        proba = predict_model_B(B_bundle, feats_pB)
+                        if proba.shape[0] != 2:
+                            raise RuntimeError(f"Smoke B: got {proba.shape[0]} rows (want 2)")
+                    except Exception as e:
+                        st.error(f"⚠️ BART smoketest failed: {type(e).__name__}: {e}")
+                        st.stop()
                 
                 st.success(f"Trained (rows A: {len(dfA)}, rows B: {len(dfB_cap)}).")
 
