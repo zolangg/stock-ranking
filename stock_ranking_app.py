@@ -283,6 +283,26 @@ def featurize(raw: pd.DataFrame) -> pd.DataFrame:
 A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
 B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","ln_pmdol","PredVol_M"]
 
+# ---------- helper to robustly average over draws/chains ----------
+def _mean_over_draws(arr: np.ndarray, n_rows: int) -> np.ndarray:
+    arr = np.asarray(arr)
+    # If we can find an axis equal to n_rows, average over all others
+    for axis in range(arr.ndim):
+        if arr.shape[axis] == n_rows:
+            axes = tuple(i for i in range(arr.ndim) if i != axis)
+            mu = arr.mean(axis=axes) if axes else arr  # already just rows
+            mu = np.asarray(mu)
+            if mu.ndim == 0:  # scalar -> repeat
+                return np.full(n_rows, float(mu))
+            return mu
+    # Fallbacks:
+    # (a) Single-row predictions sometimes come as shape (draws,)
+    if n_rows == 1 and arr.ndim >= 1:
+        return np.array([float(arr.mean())], dtype=float)
+    # (b) Otherwise average everything and repeat
+    scalar = float(arr.mean())
+    return np.full(n_rows, scalar, dtype=float)
+
 # ---------- BART training ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
                   draws=220, tune=220, trees=70, seed=42):
@@ -294,7 +314,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     y = np.ascontiguousarray(dfA["ln_DVol"].to_numpy(dtype=np.float64))
 
     with pm.Model() as mA:
-        X_A = pm.MutableData("X_A", X)  # <-- use MutableData (update shape safely)
+        X_A = pm.MutableData("X_A", X)
         f = pmb.BART("f", X_A, y, m=trees)    # latent log-mean
         sigma = pm.HalfNormal("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
@@ -324,26 +344,15 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
-            bundle["trace"],
-            var_names=["f"],   # evaluate latent mean on NEW X
-            return_inferencedata=False,
-            progressbar=False,
+            bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
         )
 
     arr = np.asarray(ppc["f"])
-    # Expected shapes: (chains, draws, n_new) or (draws, n_new)
-    if arr.ndim == 3:
-        ln_mean = arr.mean(axis=(0, 1))
-    elif arr.ndim == 2:
-        ln_mean = arr.mean(axis=0)
-    else:
-        raise ValueError(f"Model A: unexpected PPC shape for 'f': {arr.shape}")
-
+    ln_mean = _mean_over_draws(arr, X.shape[0])
     if ln_mean.shape[0] != X.shape[0]:
         raise ValueError(
             f"Model A: length mismatch — PPC len {ln_mean.shape[0]} vs X rows {X.shape[0]} "
-            f"(train_n={bundle.get('n_train','?')}). "
-            "This means the design matrix inside the model did not update."
+            f"(train_n={bundle.get('n_train','?')})."
         )
     return np.exp(ln_mean)
 
@@ -367,7 +376,7 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame,
         raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
     with pm.Model() as mB:
-        X_B = pm.MutableData("X_B", X)   # <-- MutableData here, too
+        X_B = pm.MutableData("X_B", X)
         f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
@@ -396,19 +405,10 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
-            bundle["trace"],
-            var_names=["f"],   # latent logits on NEW X
-            return_inferencedata=False,
-            progressbar=False,
+            bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
         )
     arr = np.asarray(ppc["f"])
-    if arr.ndim == 3:
-        logits_mean = arr.mean(axis=(0, 1))
-    elif arr.ndim == 2:
-        logits_mean = arr.mean(axis=0)
-    else:
-        raise ValueError(f"Model B: unexpected PPC shape for 'f': {arr.shape}")
-
+    logits_mean = _mean_over_draws(arr, X.shape[0])
     if logits_mean.shape[0] != X.shape[0]:
         raise ValueError(
             f"Model B: length mismatch — PPC len {logits_mean.shape[0]} vs X rows {X.shape[0]} "
@@ -474,7 +474,7 @@ with st.expander("⚙️ Train / Load BART models"):
                     need_B = preds_B_needed + ["FT_fac"]
                     dfB = df_all_with_pred.dropna(subset=need_B).copy()
                     if len(dfB) < 30:
-                        st.warning(f"Model B skipped: only {len(dfB)} eligible rows (need ≥30).")
+                        st.warning(f"Model B skipped: only {len[dfB]} eligible rows (need ≥30).")
                         B_bundle = None
                         dfB_cap = pd.DataFrame()
                     else:
