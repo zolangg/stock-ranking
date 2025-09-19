@@ -4,19 +4,6 @@ import math
 
 # ---------- Page ----------
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
-st.markdown(
-    """
-    <style>
-      html, body, [class*="css"]  { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
-      .section-title { font-weight: 700; font-size: 1.05rem; letter-spacing:.2px; margin: 4px 0 8px 0; }
-      .stMetric label { font-size: 0.85rem; font-weight: 600; color:#374151;}
-      .stMetric [data-testid="stMetricValue"] { font-size: 1.15rem; }
-      .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 16px 0; }
-      section[data-testid="stSidebar"] .stSlider { margin-bottom: 6px; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 st.title("Premarket Stock Ranking")
 
 # ---------- Markdown table helper ----------
