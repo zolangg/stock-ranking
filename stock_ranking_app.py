@@ -20,7 +20,7 @@ try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import Pipeline
     from sklearn.linear_model import ElasticNetCV, LogisticRegression
-    from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict
+    from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict, train_test_split
     from sklearn.calibration import CalibratedClassifierCV
 except Exception:
     SKLEARN_AVAILABLE = False
@@ -250,7 +250,7 @@ def _prep_A(df_feats: pd.DataFrame, predictors):
 def train_model_A(df_feats: pd.DataFrame, predictors, seed: int = 42):
     dfA, X, y = _prep_A(df_feats, predictors)
     if len(dfA) < 20:
-        raise RuntimeError(f"Not enough rows to train Model A (have {len(dfA)}, need ≥20).")
+        raise RuntimeError(f"Not enough rows to train Model A (have {len[dfA]}, need ≥20).")
 
     if SKLEARN_AVAILABLE:
         cv_splits = min(5, max(2, len(dfA)//10))
@@ -263,9 +263,8 @@ def train_model_A(df_feats: pd.DataFrame, predictors, seed: int = 42):
             ))
         ])
         pipe.fit(X, y)
-        # manual CV preds for diagnostics
-        y_hat = pipe.predict(X)
-        resid = y - y_hat
+        y_cv = cross_val_predict(pipe, X, y, cv=cv, method="predict")
+        resid = y - y_cv
         coefs = getattr(pipe.named_steps["enet"], "coef_", None)
         alpha_ = getattr(pipe.named_steps["enet"], "alpha_", None)
         l1_ratio_ = getattr(pipe.named_steps["enet"], "l1_ratio_", None)
@@ -275,14 +274,24 @@ def train_model_A(df_feats: pd.DataFrame, predictors, seed: int = 42):
     else:
         alphas = np.logspace(-3, 3, 41)
         ridge = _RidgeCV(alphas=alphas, cv_splits=5, seed=seed).fit(X, y)
-        # conformal residuals via simple in-sample proxy (keeps logic compact here)
-        resid = y - ridge.predict(X)
+        # manual CV preds for conformal
+        k = 5 if len(dfA) >= 25 else 2
+        idx = np.arange(len(y))
+        np.random.default_rng(seed).shuffle(idx)
+        folds = np.array_split(idx, k)
+        y_cv = np.zeros_like(y, dtype=float)
+        for i in range(k):
+            val = folds[i]
+            tr = np.concatenate([folds[j] for j in range(k) if j!=i])
+            rcv = _RidgeCV(alphas=alphas, cv_splits=k, seed=seed).fit(X[tr], y[tr])
+            y_cv[val] = rcv.predict(X[val])
+        resid = y - y_cv
         coefs = ridge.coef_
         alpha_ = ridge.alpha_
         l1_ratio_ = 0.0
         model = ridge
         trainer = "RidgeCV (NumPy fallback)"
-        splits = 5
+        splits = k
 
     return {
         "model": model,
@@ -326,6 +335,7 @@ def train_model_B(df_feats_with_pred: pd.DataFrame, predictors, seed: int = 123)
     if not SKLEARN_AVAILABLE:
         raise RuntimeError("Model B requires scikit-learn. Install scikit-learn to enable FT classification.")
 
+    # Prepare data
     need = predictors + ["FT_fac"]
     dfB = df_feats_with_pred.dropna(subset=need).copy()
     y = (dfB["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
@@ -333,6 +343,7 @@ def train_model_B(df_feats_with_pred: pd.DataFrame, predictors, seed: int = 123)
     if len(dfB) < 20 or len(np.unique(y)) < 2:
         raise RuntimeError(f"Not enough labeled rows/classes for Model B (rows={len(dfB)}).")
 
+    # Base classifier inside a Pipeline (scaler + elastic-net logistic)
     skf = StratifiedKFold(n_splits=min(5, max(2, len(dfB)//10)), shuffle=True, random_state=seed)
     base = Pipeline([
         ("sc", StandardScaler(with_mean=True, with_std=True)),
@@ -342,15 +353,25 @@ def train_model_B(df_feats_with_pred: pd.DataFrame, predictors, seed: int = 123)
         ))
     ])
 
+    # IMPORTANT: do NOT use cv="prefit" here.
+    # Let the calibrator handle its own internal CV calibration.
     cal = CalibratedClassifierCV(base, method="sigmoid", cv=5)
     cal.fit(X, y)
 
+    # Cross-validated metrics (this will refit cal in each fold — that's OK)
     proba_cv = cross_val_predict(cal, X, y, cv=skf, method="predict_proba")[:, 1]
     auc = _roc_auc(y, proba_cv)
     acc = _accuracy(y, proba_cv, 0.5)
     ll  = _logloss(y, proba_cv)
 
-    return {"model": cal, "predictors": predictors, "cv_auc": auc, "cv_acc": acc, "cv_logloss": ll, "n_train": len(dfB)}
+    return {
+        "model": cal,
+        "predictors": predictors,
+        "cv_auc": auc,
+        "cv_acc": acc,
+        "cv_logloss": ll,
+        "n_train": len(dfB)
+    }
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame):
     cols = bundle["predictors"]
@@ -456,19 +477,24 @@ with st.expander("⚙️ Train / Load Models"):
                         dfB = df_all_with_pred.dropna(subset=need_B).copy()
                         if len(dfB) >= 20 and dfB["FT_fac"].nunique(dropna=True) >= 2:
                             # Diagnostics for B eligibility
+                            need_B = B_predictors + ["FT_fac"]
                             dfB_check = df_all_with_pred[need_B].copy()
+                            
                             missing_cols = [c for c in need_B if c not in df_all_with_pred.columns]
                             st.caption(f"B features required: {need_B}")
                             if missing_cols:
                                 st.warning(f"Model B skip reason: missing columns {missing_cols}")
-
+                            
+                            # Count non-missing rows
                             dfB_nonan = dfB_check.dropna()
                             st.caption(f"B: non-missing rows after filtering: {len(dfB_nonan)}")
-
+                            
+                            # Label distribution (after mapping)
                             if "FT_fac" in df_all_with_pred.columns:
                                 label_counts = df_all_with_pred["FT_fac"].value_counts(dropna=False)
                                 st.caption(f"B: label distribution (including NaN):\n{label_counts.to_dict()}")
-
+                            
+                            # Check class presence on eligible rows
                             if len(dfB_nonan) > 0:
                                 y_dbg = (dfB_nonan["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int)
                                 st.caption(f"B: eligible rows by class: {{0: {(y_dbg==0).sum()}, 1: {(y_dbg==1).sum()}}}")
@@ -507,24 +533,23 @@ def require_A():
 with tab_add:
     st.markdown('<div class="section-title">Inputs</div>', unsafe_allow_html=True)
     with st.form("add_form", clear_on_submit=True):
-        # Column 1 (exact order): Ticker, Market Cap, Float, SI %, Gap %
-        # Column 2 (exact order): ATR, RVOL, Premarket Volume, $Volume
+        # EXACT ORDER as requested:
+        # Column 1: Ticker, Market Cap, Float, SI %, Gap %
+        # Column 2: ATR, RVOL, Premarket Volume, $Volume
         col1, col2 = st.columns(2)
 
         with col1:
             ticker = st.text_input("Ticker", "").strip().upper()
             catalyst_yes = st.toggle("Catalyst present?", value=False,
                                      help="News/pr catalyst flag used as binary feature.")
-            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            float_m  = st.number_input("Public Float (Millions)",   min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            si_pct   = st.number_input("SI %", min_value=0.0, value=0.0, step=0.1, format="%.1f",
-                                       help="Short interest as percent of float (optional).")
-            gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
+            mc_m    = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            float_m = st.number_input("Public Float (Millions)",  min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            si_pct  = st.number_input("SI %", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            gap_pct = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
 
         with col2:
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            rvol_x   = st.number_input("RVOL (×)", min_value=0.0, value=0.0, step=0.01, format="%.2f",
-                                       help="Relative Volume multiplier (optional).")
+            rvol_x   = st.number_input("RVOL (×)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             pm_vol_m = st.number_input("Premarket Volume (Millions shares)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             pm_dol_m = st.number_input("$Volume (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
 
@@ -557,6 +582,7 @@ with tab_add:
             try:
                 featsB = feats.copy()
                 featsB["PredVol_M"] = pred_vol_m
+                # Ensure all B predictors exist
                 for c in B_bundle["predictors"]:
                     if c not in featsB.columns:
                         featsB[c] = np.nan
@@ -585,7 +611,7 @@ with tab_add:
             "PM_FloatRot_x": round(pm_float_rot_x, 3),
             "_MCap_M": mc_m, "_ATR_$": atr_usd, "_PM_M": pm_vol_m, "_PM$_M": pm_dol_m,
             "_Float_M": float_m, "_Gap_%": gap_pct, "_Catalyst": 1 if catalyst_yes else 0,
-            "_SI_%": si_pct, "_RVOL_x": rvol_x,   # <- saved for export / later analysis
+            "_SI_%": si_pct, "_RVOL_x": rvol_x,   # saved for export / analysis; not used in models
         }
 
         st.session_state.rows.append(row_out)
