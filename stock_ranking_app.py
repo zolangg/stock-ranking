@@ -295,6 +295,27 @@ def _sample(draws, tune, chains, seed):
         compute_convergence_checks=False,
     )
 
+def _check_and_get_X(bundle, Xnew_df: pd.DataFrame, name: str):
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"{name}: missing predictors {missing}. "
+                         f"Available columns: {list(Xnew_df.columns)}")
+
+    X = Xnew_df[cols].to_numpy(dtype=float)
+
+    # Report which columns contain non-finite values
+    if not np.all(np.isfinite(X)):
+        bad_cols = []
+        for i, c in enumerate(cols):
+            colv = X[:, i]
+            if not np.all(np.isfinite(colv)):
+                bad_cols.append(c)
+        raise ValueError(f"{name}: non-finite values in columns {bad_cols}. "
+                         f"First row values: {X[0].tolist() if X.shape[0] else '[]'}")
+
+    return X
+
 # ---------- BART training ----------
 # --------- Model A: BART regression ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
@@ -328,16 +349,16 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
+    X = _check_and_get_X(bundle, Xnew_df, name="Model A")
+
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
-            bundle["trace"],
-            var_names=["y_obs"],
-            return_inferencedata=False,
-            progressbar=False
+            bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
         )
-    arr = np.asarray(ppc["y_obs"])
+
+    arr = np.asarray(ppc["f"])
+    # Expected shapes: (chains, draws, n) or (draws, n) or (n,)
     if arr.ndim == 3:
         ln_mean = arr.mean(axis=(0, 1))
     elif arr.ndim == 2:
@@ -345,9 +366,10 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     elif arr.ndim == 1:
         ln_mean = arr
     else:
-        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
+        raise ValueError(f"Model A: unexpected PPC shape for 'f': {arr.shape}")
+
     if ln_mean.shape[0] != X.shape[0]:
-        raise ValueError(f"predict_model_A length mismatch: {ln_mean.shape[0]} vs {X.shape[0]}")
+        raise ValueError(f"Model A: length mismatch — PPC len {ln_mean.shape[0]} vs X rows {X.shape[0]}")
     return np.exp(ln_mean)
 
 # --------- Model B: BART classification ----------
@@ -373,7 +395,7 @@ def train_model_B(
         raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
     with pm.Model() as mB:
-        X_B = pm.Data("X_B", X)
+        X_B = pm.MutableData("X_B", X)  # important so shape can change at predict time
         f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
@@ -406,27 +428,27 @@ def train_model_B(
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    X = Xnew_df[bundle["predictors"]].to_numpy(dtype=float)
+    X = _check_and_get_X(bundle, Xnew_df, name="Model B")
+
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
-            bundle["trace"],
-            var_names=["y_obs"],
-            return_inferencedata=False,
-            progressbar=False
+            bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
         )
-    arr = np.asarray(ppc["y_obs"])
+
+    arr = np.asarray(ppc["f"])
     if arr.ndim == 3:
-        probs = arr.mean(axis=(0, 1))
+        logits = arr.mean(axis=(0, 1))
     elif arr.ndim == 2:
-        probs = arr.mean(axis=0)
+        logits = arr.mean(axis=0)
     elif arr.ndim == 1:
-        probs = arr.astype(float)
+        logits = arr
     else:
-        raise ValueError(f"Unexpected PPC shape for y_obs: {arr.shape}")
-    if probs.shape[0] != X.shape[0]:
-        raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
-    return probs.astype(float)
+        raise ValueError(f"Model B: unexpected PPC shape for 'f': {arr.shape}")
+
+    if logits.shape[0] != X.shape[0]:
+        raise ValueError(f"Model B: length mismatch — PPC len {logits.shape[0]} vs X rows {X.shape[0]}")
+    return expit(logits).astype(float)
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
     if n <= 0 or len(df) <= n:
