@@ -307,8 +307,8 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     y = np.ascontiguousarray(dfA["ln_DVol"].to_numpy(dtype=np.float64))
 
     with pm.Model() as mA:
-        X_A = pm.MutableData("X_A", X)
-        f = pmb.BART("f", X_A, y, m=trees)      # latent mean (log-volume)
+        X_A = pm.MutableData("X_A", X)     # you already have this
+        f = pmb.BART("f", X_A, y, m=trees)
         sigma = pm.HalfNormal("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
 
@@ -410,7 +410,7 @@ def train_model_B(
         raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
     with pm.Model() as mB:
-        X_B = pm.Data("X_B", X)
+        X_B = pm.MutableData("X_B", X)     # make sure this is MutableData too
         f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
