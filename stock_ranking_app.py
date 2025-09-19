@@ -444,6 +444,73 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
     capA = st.number_input("Max rows for Model A", min_value=0, value=1200 if fast_mode else 0, help="0 = no cap")
     capB = st.number_input("Max rows for Model B (after PredVol_M)", min_value=0, value=600 if fast_mode else 0, help="0 = no cap")
 
+    def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None) -> pd.DataFrame:
+    """
+    Robust row cap:
+      • Safely handles n as float/NaN/np types
+      • Never requests more rows than available
+      • Class-balanced cap when y_col is provided, but falls back gracefully
+    """
+    if not isinstance(df, pd.DataFrame):
+        return df
+
+    try:
+        n = int(n)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return df.copy()
+
+    m = len(df)
+    if m <= n:
+        return df.copy()
+
+    # No class column → simple cap
+    if y_col is None or y_col not in df.columns:
+        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
+
+    # Class-balanced cap (binary 0/1 expected; tolerate missing buckets)
+    pos = df[df[y_col] == 1]
+    neg = df[df[y_col] == 0]
+
+    # If one bucket is empty, just simple-cap
+    if len(pos) == 0 or len(neg) == 0:
+        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
+
+    # Proportional allocation with hard bounds
+    n_pos = int(round(n * len(pos) / m))
+    n_pos = max(1, min(n_pos, len(pos)))
+    n_neg = n - n_pos
+    n_neg = max(1, min(n_neg, len(neg)))
+
+    # If rounding clipped us below n (common when buckets are tiny), top up from the larger bucket
+    taken = n_pos + n_neg
+    if taken < n:
+        extra = min(n - taken, len(pos) - n_pos + len(neg) - n_neg)
+        # Prefer the larger bucket for topping up
+        if len(pos) - n_pos >= len(neg) - n_neg:
+            add_pos = min(extra, len(pos) - n_pos)
+            n_pos += add_pos
+            extra -= add_pos
+            n_neg += min(extra, len(neg) - n_neg)
+        else:
+            add_neg = min(extra, len(neg) - n_neg)
+            n_neg += add_neg
+            extra -= add_neg
+            n_pos += min(extra, len(pos) - n_pos)
+
+    parts = []
+    if n_pos > 0:
+        parts.append(pos.sample(n=n_pos, random_state=42))
+    if n_neg > 0:
+        parts.append(neg.sample(n=n_neg, random_state=42))
+
+    if not parts:
+        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
+
+    out = pd.concat(parts, axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
+    return out
+    
     if st.button("Train models", use_container_width=True, type="primary"):
         if not up:
             st.error("Upload the Excel file first.")
