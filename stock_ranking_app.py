@@ -258,6 +258,11 @@ def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
 def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     eps = 1e-6
     out = raw.copy()
+    # ensure base columns exist even if read_excel_dynamic didn’t find them
+    for col in ["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM","DVolM","Catalyst","FT_fac"]:
+        if col not in out.columns:
+            out[col] = np.nan if col != "Catalyst" else 0
+
     out["FR"]       = out["PMVolM"] / np.maximum(out["FloatM"].replace(0, np.nan), eps)
     out["ln_DVol"]  = np.log(np.maximum(out["DVolM"], eps))
     out["ln_pm"]    = np.log(np.maximum(out["PMVolM"], eps))
@@ -267,13 +272,16 @@ def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     out["ln_atr"]   = np.log(np.maximum(out["ATR"], eps))
     out["ln_mcap"]  = np.log(np.maximum(out["MCapM"], eps))
     out["ln_pmdol_per_mcap"] = np.log(np.maximum(out["PMDolM"] / np.maximum(out["MCapM"], eps), eps))
-    out["Catalyst"] = (pd.to_numeric(out.get("Catalyst", 0), errors="coerce").fillna(0).astype(float) != 0).astype(int)
+    # robust Catalyst + FT_fac handling
+    out["Catalyst"] = (
+        pd.to_numeric(out["Catalyst"], errors="coerce")
+        .fillna(0).astype(float).ne(0).astype(int)
+    )
     if "FT_fac" in out.columns:
         out["FT_fac"] = out["FT_fac"].astype("category")
     else:
-        # create an all-NaN categorical so downstream code is happy
-        out["FT_fac"] = pd.Series([np.nan] * len(out), index=out.index, dtype="float").astype("category")
-        return out
+        out["FT_fac"] = pd.Series([np.nan]*len(out), index=out.index, dtype="float").astype("category")
+    return out
 
 # ---- Predictor sets
 A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
@@ -572,6 +580,19 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 raw = read_excel_dynamic(up)
                 df_all = featurize(raw)
 
+                # --- sanity check: ensure all required columns exist before dropna
+                req_A = ["ln_DVol"] + A_FEATURES_DEFAULT  # ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
+                missing_A = [c for c in req_A if c not in df_all.columns]
+                if missing_A:
+                    st.error(
+                        "Training features missing from featurized frame:\n"
+                        f"- Missing: {missing_A}\n"
+                        f"- Available columns: {list(df_all.columns)}\n\n"
+                        "Check your Excel column mapping in read_excel_dynamic() and that featurize() always creates "
+                        "these ln_* columns even when raw inputs are NaN."
+                    )
+                    st.stop()
+                
                 # A data
                 dfA = df_all.dropna(subset=["ln_DVol"] + A_FEATURES_DEFAULT)
                 dfA = _row_cap(dfA, int(capA)) if capA else dfA
