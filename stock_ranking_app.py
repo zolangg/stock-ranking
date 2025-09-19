@@ -462,6 +462,28 @@ with st.expander("⚙️ Train / Load Models"):
                         need_B = B_predictors + ["FT_fac"]
                         dfB = df_all_with_pred.dropna(subset=need_B).copy()
                         if len(dfB) >= 20 and dfB["FT_fac"].nunique(dropna=True) >= 2:
+                            # Diagnostics for B eligibility
+                            need_B = B_predictors + ["FT_fac"]
+                            dfB_check = df_all_with_pred[need_B].copy()
+                            
+                            missing_cols = [c for c in need_B if c not in df_all_with_pred.columns]
+                            st.caption(f"B features required: {need_B}")
+                            if missing_cols:
+                                st.warning(f"Model B skip reason: missing columns {missing_cols}")
+                            
+                            # Count non-missing rows
+                            dfB_nonan = dfB_check.dropna()
+                            st.caption(f"B: non-missing rows after filtering: {len(dfB_nonan)}")
+                            
+                            # Label distribution (after mapping)
+                            if "FT_fac" in df_all_with_pred.columns:
+                                label_counts = df_all_with_pred["FT_fac"].value_counts(dropna=False)
+                                st.caption(f"B: label distribution (including NaN):\n{label_counts.to_dict()}")
+                            
+                            # Check class presence on eligible rows
+                            if len(dfB_nonan) > 0:
+                                y_dbg = (dfB_nonan["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int)
+                                st.caption(f"B: eligible rows by class: {{0: {(y_dbg==0).sum()}, 1: {(y_dbg==1).sum()}}}")
                             try:
                                 B_bundle = train_model_B(df_all_with_pred, B_predictors, seed=seedB)
                                 st.session_state["B_bundle"] = B_bundle
