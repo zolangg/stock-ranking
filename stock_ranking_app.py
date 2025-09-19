@@ -639,32 +639,33 @@ with st.expander("🔎 Model diagnostics"):
 
 # ---------- Feature Importance (Permutation) ----------
 @st.cache_data(show_spinner=False)
-def _perm_importance_A(bundle, df_eval, y_log, features, n_repeats=5, seed=42):
+def _perm_importance_A(_bundle, df_eval, y_log, features, n_repeats=5, seed=42):
     rng = np.random.default_rng(seed)
-    base = _r2(y_log, np.log(np.maximum(predict_model_A(bundle, df_eval), 1e-9)))
+    base = _r2(y_log, np.log(np.maximum(predict_model_A(_bundle, df_eval), 1e-9)))
     drops = []
     for ftr in features:
         scores = []
         for _ in range(n_repeats):
             df_s = df_eval.copy()
             df_s[ftr] = rng.permutation(df_s[ftr].values)
-            y_pred = np.log(np.maximum(predict_model_A(bundle, df_s), 1e-9))
+            y_pred = np.log(np.maximum(predict_model_A(_bundle, df_s), 1e-9))
             scores.append(_r2(y_log, y_pred))
         drops.append(base - np.mean(scores))
     out = pd.DataFrame({"feature": features, "R2_drop": drops})
     return out.sort_values("R2_drop", ascending=False, ignore_index=True)
 
+
 @st.cache_data(show_spinner=False)
-def _perm_importance_B(bundle, df_eval, y_true, features, n_repeats=5, seed=42):
+def _perm_importance_B(_bundle, df_eval, y_true, features, n_repeats=5, seed=42):
     rng = np.random.default_rng(seed)
-    base = _roc_auc(y_true, predict_model_B(bundle, df_eval))
+    base = _roc_auc(y_true, predict_model_B(_bundle, df_eval))
     drops = []
     for ftr in features:
         scores = []
         for _ in range(n_repeats):
             df_s = df_eval.copy()
             df_s[ftr] = rng.permutation(df_s[ftr].values)
-            scores.append(_roc_auc(y_true, predict_model_B(bundle, df_s)))
+            scores.append(_roc_auc(y_true, predict_model_B(_bundle, df_s)))
         drops.append(base - np.mean(scores))
     out = pd.DataFrame({"feature": features, "AUC_drop": drops})
     return out.sort_values("AUC_drop", ascending=False, ignore_index=True)
