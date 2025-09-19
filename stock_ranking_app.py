@@ -419,25 +419,24 @@ def _logloss(y_true, y_score, eps=1e-12):
     p = np.clip(np.asarray(y_score, dtype=float), eps, 1.0 - eps)
     return float(-np.mean(y_true*np.log(p) + (1 - y_true)*np.log(1 - p))) if len(y_true) else float("nan")
 
-st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
-with st.expander("🔎 Quick diagnostics"):
-    A_bundle = st.session_state.get("A_bundle")
-    B_bundle = st.session_state.get("B_bundle")
-    dfA_tr   = st.session_state.get("dfA_train")
-    dfB_tr   = st.session_state.get("dfB_train")
+# ---------- Quick diagnostics (only rendered when toggle is ON) ----------
+if enable_diagnostics:
+    st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
+    with st.expander("🔎 Quick diagnostics", expanded=False):
+        A_bundle = st.session_state.get("A_bundle")
+        B_bundle = st.session_state.get("B_bundle")
+        dfA_tr   = st.session_state.get("dfA_train")
+        dfB_tr   = st.session_state.get("dfB_train")
 
-    if not enable_diagnostics:
-        st.caption("Diagnostics disabled in sidebar. Toggle **Enable diagnostics** to compute.")
-    else:
         # Model A diagnostics (log-space)
         if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty:
             try:
                 y_true_log = dfA_tr["ln_DVol"].to_numpy(float)
                 y_pred_lvl = predict_model_A(A_bundle, dfA_tr)
                 y_pred_log = np.log(np.maximum(y_pred_lvl, 1e-9))
-                st.metric("Model A — R² (log)", f"{_r2(y_true_log, y_pred_log):.3f}")
+                st.metric("Model A — R² (log)",  f"{_r2(y_true_log, y_pred_log):.3f}")
                 st.metric("Model A — RMSE (log)", f"{_rmse(y_true_log, y_pred_log):.3f}")
-                st.metric("Model A — MAE (log)", f"{_mae(y_true_log, y_pred_log):.3f}")
+                st.metric("Model A — MAE (log)",  f"{_mae(y_true_log, y_pred_log):.3f}")
             except Exception as e:
                 st.warning(f"Model A metrics unavailable: {e}")
         else:
@@ -446,15 +445,17 @@ with st.expander("🔎 Quick diagnostics"):
         # Model B diagnostics
         if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty:
             try:
-                y_true = (dfB_tr["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
+                y_true = (dfB_tr["FT_fac"].astype(str).str.lower()
+                          .isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
                 proba  = predict_model_B(B_bundle, dfB_tr)
-                st.metric("Model B — ROC AUC", f"{_roc_auc(y_true, proba):.3f}")
+                st.metric("Model B — ROC AUC",          f"{_roc_auc(y_true, proba):.3f}")
                 st.metric("Model B — Accuracy (thr=0.5)", f"{_accuracy(y_true, proba, 0.5):.3f}")
-                st.metric("Model B — Log Loss", f"{_logloss(y_true, proba):.3f}")
+                st.metric("Model B — Log Loss",         f"{_logloss(y_true, proba):.3f}")
             except Exception as e:
                 st.warning(f"Model B metrics unavailable: {e}")
         elif st.session_state.get("B_bundle") is None:
             st.info("Model B skipped (insufficient rows).")
+# else: render nothing — no block divider, no expander
 
 # ---------- Feature Importance (Permutation) — gated (slow) ----------
 @st.cache_data(show_spinner=False)
