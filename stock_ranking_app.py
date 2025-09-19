@@ -497,4 +497,162 @@ with st.expander("⚙️ Train / Load Models"):
                 st.exception(e)
 
 # ---------- UI: Add / Ranking ----------
-tab_add, tab_rank =
+tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
+
+def require_A():
+    if "A_bundle" not in st.session_state or st.session_state.get("A_bundle") is None:
+        st.warning("Train Model A first (see expander above).")
+        st.stop()
+
+with tab_add:
+    st.markdown('<div class="section-title">Inputs</div>', unsafe_allow_html=True)
+    with st.form("add_form", clear_on_submit=True):
+        # Column 1 (exact order): Ticker, Market Cap, Float, SI %, Gap %
+        # Column 2 (exact order): ATR, RVOL, Premarket Volume, $Volume
+        col1, col2 = st.columns(2)
+
+        with col1:
+            ticker = st.text_input("Ticker", "").strip().upper()
+            catalyst_yes = st.toggle("Catalyst present?", value=False,
+                                     help="News/pr catalyst flag used as binary feature.")
+            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            float_m  = st.number_input("Public Float (Millions)",   min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            si_pct   = st.number_input("SI %", min_value=0.0, value=0.0, step=0.1, format="%.1f",
+                                       help="Short interest as percent of float (optional).")
+            gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
+
+        with col2:
+            atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            rvol_x   = st.number_input("RVOL (×)", min_value=0.0, value=0.0, step=0.01, format="%.2f",
+                                       help="Relative Volume multiplier (optional).")
+            pm_vol_m = st.number_input("Premarket Volume (Millions shares)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            pm_dol_m = st.number_input("$Volume (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+
+        submitted = st.form_submit_button("Add / Predict", use_container_width=True)
+
+    if submitted and ticker:
+        require_A()
+        A_bundle = st.session_state["A_bundle"]
+        B_bundle = st.session_state.get("B_bundle")
+
+        row = pd.DataFrame([{
+            "PMVolM": pm_vol_m, "PMDolM": pm_dol_m, "FloatM": float_m, "GapPct": gap_pct,
+            "ATR": atr_usd, "MCapM": mc_m, "Catalyst": 1 if catalyst_yes else 0,
+            "DVolM": np.nan, "FT_fac": "Fail",
+        }])
+        feats = featurize(row)
+
+        # Model A prediction
+        try:
+            pred_vol_m, ci_l, ci_u = predict_model_A(
+                A_bundle, feats[A_bundle["predictors"]], central_coverage=cov
+            )
+            pred_vol_m = float(pred_vol_m[0]); ci_l = float(ci_l[0]); ci_u = float(ci_u[0])
+        except Exception as e:
+            st.error(f"Model A prediction failed: {e}")
+            st.stop()
+
+        # Model B prediction (if trained)
+        if B_bundle is not None:
+            try:
+                featsB = feats.copy()
+                featsB["PredVol_M"] = pred_vol_m
+                for c in B_bundle["predictors"]:
+                    if c not in featsB.columns:
+                        featsB[c] = np.nan
+                ft_prob = float(predict_model_B(B_bundle, featsB)[0])
+                ft_label = ("FT likely" if ft_prob >= 0.60 else "Toss-up" if ft_prob >= 0.40 else "FT unlikely")
+            except Exception as e:
+                st.warning(f"Model B prediction failed: {e}")
+                ft_prob = float("nan"); ft_label = "B model error"
+        else:
+            ft_prob = float("nan"); ft_label = "B not trained"
+
+        # Diagnostics/ratios
+        pm_float_rot_x  = (pm_vol_m / float_m) if float_m > 0 else 0.0
+        pm_pct_of_pred  = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
+        pm_dollar_vs_mc = 100.0 * (pm_dol_m) / mc_m if mc_m > 0 else 0.0
+
+        row_out = {
+            "Ticker": ticker,
+            "PredVol_M": round(pred_vol_m, 2),
+            "PredVol_CI_L": round(ci_l, 2),
+            "PredVol_CI_U": round(ci_u, 2),
+            "FT_Prob": (round(ft_prob, 3) if not np.isnan(ft_prob) else ""),
+            "FT_Label": ft_label,
+            "PM_%_of_Pred": round(pm_pct_of_pred, 1),
+            "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
+            "PM_FloatRot_x": round(pm_float_rot_x, 3),
+            "_MCap_M": mc_m, "_ATR_$": atr_usd, "_PM_M": pm_vol_m, "_PM$_M": pm_dol_m,
+            "_Float_M": float_m, "_Gap_%": gap_pct, "_Catalyst": 1 if catalyst_yes else 0,
+            "_SI_%": si_pct, "_RVOL_x": rvol_x,   # <- saved for export / later analysis
+        }
+
+        st.session_state.rows.append(row_out)
+        st.session_state.last = row_out
+        st.session_state.flash = (
+            f"Saved {ticker} — PredVol {pred_vol_m:.2f}M (CI {ci_l:.2f}–{ci_u:.2f})"
+            + (f" • FT={ft_prob:.3f}" if isinstance(ft_prob, float) and not np.isnan(ft_prob) else "")
+        )
+
+with tab_rank:
+    st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
+
+    if st.session_state.rows:
+        df = pd.DataFrame(st.session_state.rows)
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
+        # Sort: prefer FT_Prob desc if present, else PredVol_M desc
+        if "FT_Prob" in df.columns and df["FT_Prob"].apply(lambda x: isinstance(x, (int, float))).any():
+            df["_sort_ft"] = pd.to_numeric(df["FT_Prob"], errors="coerce")
+            df = df.sort_values(["_sort_ft","PredVol_M"], ascending=[False, False]).drop(columns=["_sort_ft"])
+        elif "PredVol_M" in df.columns:
+            df = df.sort_values("PredVol_M", ascending=False)
+        df = df.reset_index(drop=True)
+
+        cols_to_show = [
+            "Ticker","FT_Label","FT_Prob",
+            "PredVol_M","PredVol_CI_L","PredVol_CI_U",
+            "PM_%_of_Pred","PM$ / MC_%","PM_FloatRot_x"
+        ]
+        for c in cols_to_show:
+            if c not in df.columns:
+                df[c] = "" if c in ("Ticker","FT_Label") else 0.0
+        df = df[cols_to_show]
+
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "FT_Label": st.column_config.TextColumn("FT Label"),
+                "FT_Prob": st.column_config.NumberColumn("FT Prob", format="%.3f"),
+                "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
+                "PredVol_CI_L": st.column_config.NumberColumn("Pred Vol CI Low (M)",  format="%.2f"),
+                "PredVol_CI_U": st.column_config.NumberColumn("Pred Vol CI High (M)", format="%.2f"),
+                "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
+                "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
+                "PM_FloatRot_x": st.column_config.NumberColumn("PM Float Rotation ×", format="%.3f"),
+            }
+        )
+
+        st.markdown('<div class="section-title">📋 Ranking (Markdown view)</div>', unsafe_allow_html=True)
+        st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
+
+        c1, c2, _ = st.columns([0.25, 0.25, 0.5])
+        with c1:
+            st.download_button(
+                "Download CSV",
+                df.to_csv(index=False).encode("utf-8"),
+                "ranking.csv",
+                "text/csv",
+                use_container_width=True
+            )
+        with c2:
+            if st.button("Clear Ranking", use_container_width=True):
+                st.session_state.rows = []
+                st.session_state.last = {}
+                do_rerun()
+    else:
+        st.info("No rows yet. Add a stock in the **Add Stock** tab.")
