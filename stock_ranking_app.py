@@ -426,6 +426,42 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         raise ValueError(f"predict_model_B length mismatch: {probs.shape[0]} vs {X.shape[0]}")
     return probs.astype(float)
 
+def _hash_df_for_cache(df: pd.DataFrame) -> str:
+    """
+    Stable, dtype-agnostic hash for a DataFrame.
+    - Normalizes categorical/object to strings
+    - Sorts rows/columns
+    - Hashes a JSON representation
+    Returns a short hex string.
+    """
+    import pandas as pd
+    from hashlib import blake2b
+
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return "empty"
+
+    d = df.copy()
+
+    # Normalize dtypes to avoid hashing errors
+    for c in d.columns:
+        if pd.api.types.is_categorical_dtype(d[c]):
+            d[c] = d[c].astype("string")
+        elif d[c].dtype == object:
+            d[c] = d[c].astype("string")
+
+    # Deterministic ordering
+    d = d.sort_index(axis=0).sort_index(axis=1)
+
+    # Robust JSON encoding (works for numbers/strings/NaN)
+    payload = d.to_json(
+        orient="split",  # includes index/columns/data
+        index=True,
+        date_unit="ns",
+        default_handler=str
+    )
+
+    return blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+
 # ---------- TRAINING PANEL ----------
 with st.expander("⚙️ Train / Load BART models (Python-only)"):
     st.write("Upload your **PMH Database.xlsx** (sheet: _PMH BO Merged_) to retrain.")
