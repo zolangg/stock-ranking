@@ -307,36 +307,55 @@ def _ensure_clean_matrix(X: np.ndarray, name: str = "X") -> np.ndarray:
 
 def _bart_predict_latent(trace, X: np.ndarray) -> np.ndarray:
     """
-    Returns latent draws with shape (draws, n_rows).
-    Tries multiple known entry points for pymc-bart 0.5.x.
+    Evaluate fitted BART trees for new X.
+    Returns an array of shape (draws, n_rows) with latent values (log-scale for reg, logits for cls).
+    Tries several known entry points for pymc-bart 0.5.x.
     """
-    # 1) pmb.utils.predict
+    X = np.asarray(X, dtype=float)
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2D, got shape {X.shape}")
+    n = X.shape[0]
+
+    # Helper to normalize output to (draws, n_rows)
+    def _norm(arr):
+        arr = np.asarray(arr)
+        if arr.ndim == 1:
+            # single-row → (draws,)  → make (draws, 1)
+            return arr[:, None]
+        if arr.ndim != 2:
+            raise RuntimeError(f"BART predict returned unexpected shape {arr.shape}")
+        if arr.shape[1] != n:
+            raise RuntimeError(f"BART predict shape {arr.shape} does not match n_rows={n}")
+        return arr
+
+    # 1) pymc_bart.pgbart.predict
     try:
-        import pymc_bart.utils as bart_utils
-        draws = bart_utils.predict(trace, X)
-        draws = np.asarray(draws)
-        if draws.ndim == 1:  # single-row → (draws,)
-            draws = draws[:, None]
-        if draws.ndim == 2:
-            return draws
+        import pymc_bart.pgbart as pgbart
+        if hasattr(pgbart, "predict"):
+            return _norm(pgbart.predict(trace, X))
     except Exception:
         pass
 
-    # 2) pmb.predict (some builds expose it here)
+    # 2) pymc_bart.utils.predict
+    try:
+        import pymc_bart.utils as bart_utils
+        if hasattr(bart_utils, "predict"):
+            return _norm(bart_utils.predict(trace, X))
+    except Exception:
+        pass
+
+    # 3) pymc_bart.predict (sometimes exposed at top-level)
     try:
         import pymc_bart as pmb
         if hasattr(pmb, "predict"):
-            draws = pmb.predict(trace, X)
-            draws = np.asarray(draws)
-            if draws.ndim == 1:
-                draws = draws[:, None]
-            if draws.ndim == 2:
-                return draws
+            return _norm(pmb.predict(trace, X))
     except Exception:
         pass
 
     raise RuntimeError(
-        "Could not access pymc-bart predictor. Ensure pymc-bart==0.5.14 is installed."
+        "Could not access a BART predictor function. "
+        "On some builds it is at pymc_bart.pgbart.predict(idata, X). "
+        "Verify pymc-bart==0.5.14 is installed and importable."
     )
 
 def _ppc_mean_match_rows(arr: np.ndarray, n_rows: int) -> np.ndarray:
