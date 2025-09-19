@@ -365,9 +365,41 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    X = _check_and_get_X(bundle, Xnew_df, name="Model A")
-    draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows), latent log-volume
-    ln_mean = draws.mean(axis=0)                      # (n_rows,)
+    """
+    Predict day volume (Millions) for new rows.
+    Uses posterior predictive of latent node 'f' with new X.
+    """
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Model A: missing predictors {missing}. "
+                         f"Available columns: {list(Xnew_df.columns)}")
+
+    X = Xnew_df[cols].to_numpy(dtype=float)
+    if not np.all(np.isfinite(X)):
+        bad_cols = []
+        for i, c in enumerate(cols):
+            if not np.all(np.isfinite(X[:, i])):
+                bad_cols.append(c)
+        raise ValueError(f"Model A: non-finite values in columns {bad_cols}.")
+
+    with bundle["model"]:
+        pm.set_data({bundle["x_name"]: X})
+        ppc = pm.sample_posterior_predictive(
+            bundle["trace"],
+            var_names=["f"],              # <- latent mean, not y_obs
+            return_inferencedata=False,
+            progressbar=False,
+        )
+    arr = np.asarray(ppc["f"])  # shapes: (chains, draws, n) or (draws, n)
+    if arr.ndim == 3:
+        ln_mean = arr.mean(axis=(0, 1))  # -> (n,)
+    elif arr.ndim == 2:
+        ln_mean = arr.mean(axis=0)       # -> (n,)
+    else:
+        raise ValueError(f"Model A: unexpected PPC shape for 'f': {arr.shape}")
+    if ln_mean.shape[0] != X.shape[0]:
+        raise ValueError(f"Model A: length mismatch — PPC len {ln_mean.shape[0]} vs X rows {X.shape[0]}")
     return np.exp(ln_mean)                            # level (Millions)
 
 # --------- Model B: BART classification ----------
@@ -426,9 +458,42 @@ def train_model_B(
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    X = _check_and_get_X(bundle, Xnew_df, name="Model B")
-    draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows), logits
-    return expit(draws).mean(axis=0).astype(float)    # probs (n_rows,)
+    """
+    Predict FT probability for new rows.
+    Uses posterior predictive of latent node 'f' (logits) with new X.
+    """
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"Model B: missing predictors {missing}. "
+                         f"Available columns: {list(Xnew_df.columns)}")
+
+    X = Xnew_df[cols].to_numpy(dtype=float)
+    if not np.all(np.isfinite(X)):
+        bad_cols = []
+        for i, c in enumerate(cols):
+            if not np.all(np.isfinite(X[:, i])):
+                bad_cols.append(c)
+        raise ValueError(f"Model B: non-finite values in columns {bad_cols}.")
+
+    with bundle["model"]:
+        pm.set_data({bundle["x_name"]: X})
+        ppc = pm.sample_posterior_predictive(
+            bundle["trace"],
+            var_names=["f"],              # <- latent logits
+            return_inferencedata=False,
+            progressbar=False,
+        )
+    arr = np.asarray(ppc["f"])  # shapes: (chains, draws, n) or (draws, n)
+    if arr.ndim == 3:
+        logits_mean = arr.mean(axis=(0, 1))  # -> (n,)
+    elif arr.ndim == 2:
+        logits_mean = arr.mean(axis=0)       # -> (n,)
+    else:
+        raise ValueError(f"Model B: unexpected PPC shape for 'f': {arr.shape}")
+    if logits_mean.shape[0] != X.shape[0]:
+        raise ValueError(f"Model B: length mismatch — PPC len {logits_mean.shape[0]} vs X rows {X.shape[0]}")
+    return expit(logits_mean).astype(float)
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
     if not isinstance(df, pd.DataFrame):
