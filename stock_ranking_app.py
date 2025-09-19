@@ -295,50 +295,6 @@ def _sample(draws, tune, chains, seed):
         compute_convergence_checks=False,
     )
 
-def _bart_predict_latent(trace, X: np.ndarray) -> np.ndarray:
-    """
-    Evaluate fitted BART trees for new X.
-    Returns an array of shape (draws, n_rows) with latent values
-    (log-volume for regression, logits for classification).
-    Tries several known entry points for pymc-bart 0.5.x.
-    """
-    X = np.asarray(X, dtype=float)
-    if X.ndim != 2:
-        raise ValueError(f"X must be 2D, got shape {X.shape}")
-    n = X.shape[0]
-
-    def _norm(arr):
-        arr = np.asarray(arr)
-        if arr.ndim == 3:  # (chains, draws, n)
-            arr = arr.mean(axis=0)  # -> (draws, n)
-        if arr.ndim != 2 or arr.shape[1] != n:
-            raise RuntimeError(f"BART predict returned unexpected shape {arr.shape} for n_rows={n}")
-        return arr
-
-    # Try known entry points
-    try:
-        import pymc_bart.pgbart as pgbart
-        if hasattr(pgbart, "predict"):
-            return _norm(pgbart.predict(trace, X))
-    except Exception:
-        pass
-
-    try:
-        import pymc_bart.utils as bart_utils
-        if hasattr(bart_utils, "predict"):
-            return _norm(bart_utils.predict(trace, X))
-    except Exception:
-        pass
-
-    try:
-        import pymc_bart as _pmb
-        if hasattr(_pmb, "predict"):
-            return _norm(_pmb.predict(trace, X))
-    except Exception:
-        pass
-
-    raise RuntimeError("Could not access a BART predictor function.")
-
 def _check_and_get_X(bundle, Xnew_df: pd.DataFrame, name: str):
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
