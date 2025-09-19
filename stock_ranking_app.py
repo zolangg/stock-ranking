@@ -275,27 +275,7 @@ def featurize(raw: pd.DataFrame) -> pd.DataFrame:
 A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
 B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","ln_pmdol","PredVol_M"]
 
-# ---- Small helpers
-def _assert_finite(name, arr):
-    if not np.all(np.isfinite(arr)):
-        bad = np.where(~np.isfinite(arr))
-        raise ValueError(f"{name} contains non-finite values at indices {bad}.")
-
-def _sample(draws, tune, chains, seed):
-    return pm.sample(
-        draws=draws,
-        tune=tune,
-        chains=chains,
-        cores=1,
-        target_accept=0.85,
-        progressbar=True,
-        random_seed=seed,
-        discard_tuned_samples=True,
-        jitter_max_retries=0,
-        compute_convergence_checks=False,
-    )
-
-# ---------- BART training ----------
+# ---------- BART training / prediction ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
                   draws=600, tune=400, trees=150, seed=42, chains=1):
     dfA = df_feats.dropna(subset=["ln_DVol"] + predictors).copy()
@@ -446,7 +426,7 @@ def _hash_df_for_cache(df: pd.DataFrame) -> int:
         return len(df)
 
 # ---------- DATA INSPECTION (before training) ----------
-with st.expander("🧪 Data inspection (before training)"):
+with st.expander("📄 Data preview & mapping (preflight)", expanded=False):
     up_inspect = st.file_uploader("Upload Excel just to inspect", type=["xlsx"], key="inspect_xlsx")
     sheet_name = st.text_input("Sheet name", "PMH BO Merged")
     if up_inspect:
@@ -456,21 +436,25 @@ with st.expander("🧪 Data inspection (before training)"):
 
             st.write("Columns detected:", list(df_all_ins.columns))
             need_A = ["ln_DVol"] + A_FEATURES_DEFAULT
-            st.write("Required for A:", need_A)
-            st.write("Missing for A:", [c for c in need_A if c not in df_all_ins.columns])
-            st.write("Rows passing A dropna:", int(len(df_all_ins.dropna(subset=need_A))))
+            missing_A = [c for c in need_A if c not in df_all_ins.columns]
+            n_pass_A = df_all_ins.dropna(subset=need_A).shape[0] if not missing_A else 0
 
-            preds_B_needed = list(B_FEATURES_CORE)
-            if "PredVol_M" not in preds_B_needed:
-                preds_B_needed.append("PredVol_M")
-            need_B = preds_B_needed + ["FT_fac"]
-            st.write("Required for B:", need_B)
-            st.write("Missing for B:", [c for c in need_B if c not in df_all_ins.columns])
-            # note: PredVol_M will be created after A; here we just show FT presence
-            st.write("Non-null FT_fac rows:", int(df_all_ins["FT_fac"].notna().sum() if "FT_fac" in df_all_ins else 0))
+            st.write("Required for A:", need_A)
+            st.write("Missing for A:", missing_A)
+            st.write("Rows passing A dropna:", int(n_pass_A))
+
+            if "FT_fac" in df_all_ins.columns:
+                st.write("FT_fac counts:", df_all_ins["FT_fac"].astype(str).value_counts(dropna=False))
+
+            # B feasibility (after A would create PredVol_M)
+            if n_pass_A >= 30 and not missing_A:
+                rows_with_ft = df_all_ins["FT_fac"].notna().sum() if "FT_fac" in df_all_ins else 0
+                st.write("Rows with FT_fac present:", int(rows_with_ft))
+            else:
+                st.info("Fix A first (missing columns or not enough rows).")
 
             st.write("Top NaN counts:")
-            st.write(df_all_ins[set(df_all_ins.columns)].isna().sum().sort_values(ascending=False).head(20))
+            st.write(df_all_ins.isna().sum().sort_values(ascending=False).head(20))
             st.dataframe(df_all_ins.head(10), use_container_width=True)
         except Exception as e:
             st.exception(e)
@@ -515,6 +499,9 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                     if (na_counts_A > 0).any():
                         st.write("NaNs by column (top):")
                         st.write(na_counts_A[na_counts_A > 0].head(10))
+                    if n_pass_A < 30:
+                        st.error("Model A cannot train (need ≥30 rows passing).")
+                        st.stop()
 
                     # A data
                     dfA = df_all.dropna(subset=need_A).copy()
@@ -838,7 +825,7 @@ with tab_add:
             featsB["PredVol_M"] = pred_vol_m
             ft_prob = float(predict_model_B(B_bundle, featsB)[0])
         else:
-            ft_prob = float("nan")
+            ft_prob = np.nan
 
         ci68_l = pred_vol_m * math.exp(-1.0 * sigma_ln)
         ci68_u = pred_vol_m * math.exp(+1.0 * sigma_ln)
@@ -855,8 +842,8 @@ with tab_add:
 
         qual_0_7 = 0.0
         for crit in QUAL_CRITERIA:
-            raw = st.session_state.get(f"qual_{crit['name']}", (1,))
-            sel = raw[0] if isinstance(raw, tuple) else raw
+            raw_choice = st.session_state.get(f"qual_{crit['name']}", (1,))
+            sel = raw_choice[0] if isinstance(raw_choice, tuple) else raw_choice
             qual_0_7 += q_weights[crit["name"]] * float(sel)
         qual_pct = (qual_0_7/7.0)*100.0
 
@@ -888,7 +875,7 @@ with tab_add:
             "PredVol_CI95_L": round(ci95_l, 2),
             "PredVol_CI95_U": round(ci95_u, 2),
 
-            "FT_Prob": (round(ft_prob, 3) if not np.isnan(ft_prob) else ""),
+            "FT_Prob": (float(f"{ft_prob:.3f}") if not np.isnan(ft_prob) else np.nan),
             "FT_Label": ft_label,
 
             "PM_%_of_Pred": round(pm_pct_of_pred, 1),
@@ -926,7 +913,7 @@ with tab_rank:
         ]
         for c in cols_to_show:
             if c not in df.columns:
-                df[c] = "" if c in ("Ticker","FT_Label","Level") else 0.0
+                df[c] = "" if c in ("Ticker","FT_Label","Level") else np.nan
         df = df[cols_to_show]
 
         st.dataframe(
