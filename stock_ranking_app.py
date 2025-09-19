@@ -13,6 +13,43 @@ import pymc as pm
 import pymc_bart as pmb
 from scipy.special import expit
 
+# ---------- Hard guard: ensure pymc-bart exposes a predictor ----------
+def _require_bart_predict():
+    ver = getattr(pmb, "__version__", "0.0.0")
+    try:
+        parts = tuple(int(x) for x in ver.split("."))
+    except Exception:
+        parts = (0, 0, 0)
+
+    has_predict = False
+    try:
+        import pymc_bart.pgbart as _pg
+        has_predict = has_predict or hasattr(_pg, "predict")
+    except Exception:
+        pass
+    try:
+        import pymc_bart.utils as _ut
+        has_predict = has_predict or hasattr(_ut, "predict")
+    except Exception:
+        pass
+    has_predict = has_predict or hasattr(pmb, "predict")
+
+    # Versions ≥0.5.12 generally have a predict entry point; you pin 0.5.14 in requirements.
+    if not has_predict or parts < (0, 5, 12):
+        st.error(
+            "pymc-bart predict() is not available in this runtime.\n\n"
+            f"Detected pymc-bart version: **{ver}**. "
+            "Please ensure **pymc-bart==0.5.14** is installed.\n\n"
+            "In your environment, run:\n"
+            "```bash\n"
+            "pip uninstall -y pymc-bart\n"
+            "pip install pymc-bart==0.5.14 --no-cache-dir\n"
+            "```\nThen restart the app."
+        )
+        st.stop()
+
+_require_bart_predict()
+
 # ---------- Page + light CSS ----------
 st.set_page_config(page_title="Premarket Stock Ranking (Python BART)", layout="wide")
 st.markdown(
@@ -295,27 +332,6 @@ def _sample(draws, tune, chains, seed):
         compute_convergence_checks=False,
     )
 
-def _check_and_get_X(bundle, Xnew_df: pd.DataFrame, name: str):
-    cols = bundle["predictors"]
-    missing = [c for c in cols if c not in Xnew_df.columns]
-    if missing:
-        raise ValueError(f"{name}: missing predictors {missing}. "
-                         f"Available columns: {list(Xnew_df.columns)}")
-
-    X = Xnew_df[cols].to_numpy(dtype=float)
-
-    # Report which columns contain non-finite values
-    if not np.all(np.isfinite(X)):
-        bad_cols = []
-        for i, c in enumerate(cols):
-            colv = X[:, i]
-            if not np.all(np.isfinite(colv)):
-                bad_cols.append(c)
-        raise ValueError(f"{name}: non-finite values in columns {bad_cols}. "
-                         f"First row values: {X[0].tolist() if X.shape[0] else '[]'}")
-
-    return X
-
 def _bart_predict_latent(trace, X: np.ndarray) -> np.ndarray:
     """
     Evaluate fitted BART trees for new X.
@@ -330,14 +346,13 @@ def _bart_predict_latent(trace, X: np.ndarray) -> np.ndarray:
 
     def _norm(arr):
         arr = np.asarray(arr)
-        # expected (draws, n) or (chains, draws, n)
-        if arr.ndim == 3:
+        if arr.ndim == 3:  # (chains, draws, n)
             arr = arr.mean(axis=0)  # -> (draws, n)
         if arr.ndim != 2 or arr.shape[1] != n:
             raise RuntimeError(f"BART predict returned unexpected shape {arr.shape} for n_rows={n}")
         return arr
 
-    # 1) pymc_bart.pgbart.predict
+    # Try known entry points
     try:
         import pymc_bart.pgbart as pgbart
         if hasattr(pgbart, "predict"):
@@ -345,7 +360,6 @@ def _bart_predict_latent(trace, X: np.ndarray) -> np.ndarray:
     except Exception:
         pass
 
-    # 2) pymc_bart.utils.predict
     try:
         import pymc_bart.utils as bart_utils
         if hasattr(bart_utils, "predict"):
@@ -353,19 +367,51 @@ def _bart_predict_latent(trace, X: np.ndarray) -> np.ndarray:
     except Exception:
         pass
 
-    # 3) top-level predict (some builds expose it)
     try:
-        import pymc_bart as pmb
-        if hasattr(pmb, "predict"):
-            return _norm(pmb.predict(trace, X))
+        import pymc_bart as _pmb
+        if hasattr(_pmb, "predict"):
+            return _norm(_pmb.predict(trace, X))
     except Exception:
         pass
 
-    raise RuntimeError(
-        "Could not access a BART predictor function. "
-        "On some builds it is at pymc_bart.pgbart.predict(idata, X). "
-        "Verify pymc-bart==0.5.14 is installed and importable."
-    )
+    raise RuntimeError("Could not access a BART predictor function.")
+
+def _check_and_get_X(bundle, Xnew_df: pd.DataFrame, name: str):
+    cols = bundle["predictors"]
+    missing = [c for c in cols if c not in Xnew_df.columns]
+    if missing:
+        raise ValueError(f"{name}: missing predictors {missing}. "
+                         f"Available columns: {list(Xnew_df.columns)}")
+
+    X = Xnew_df[cols].to_numpy(dtype=float)
+    if not np.all(np.isfinite(X)):
+        bad_cols = []
+        for i, c in enumerate(cols):
+            if not np.all(np.isfinite(X[:, i])):
+                bad_cols.append(c)
+        raise ValueError(f"{name}: non-finite values in columns {bad_cols}.")
+    return X
+
+def _hash_df_for_cache(df: pd.DataFrame) -> str:
+    """
+    Stable, dtype-agnostic hash for a DataFrame.
+    - Normalizes categorical/object to strings
+    - Sorts rows/columns
+    - Hashes a JSON representation
+    Returns a short hex string.
+    """
+    from hashlib import blake2b
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return "empty"
+    d = df.copy()
+    for c in d.columns:
+        if pd.api.types.is_categorical_dtype(d[c]):
+            d[c] = d[c].astype("string")
+        elif d[c].dtype == object:
+            d[c] = d[c].astype("string")
+    d = d.sort_index(axis=0).sort_index(axis=1)
+    payload = d.to_json(orient="split", index=True, date_unit="ns", default_handler=str)
+    return blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
 # ---------- BART training ----------
 # --------- Model A: BART regression ----------
@@ -379,7 +425,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     y = np.ascontiguousarray(dfA["ln_DVol"].to_numpy(dtype=np.float64))
 
     with pm.Model() as mA:
-        X_A = pm.MutableData("X_A", X)
+        X_A = pm.MutableData("X_A", X)  # MutableData is fine for training; we won't use ppc
         f = pmb.BART("f", X_A, y, m=trees)      # latent mean (log-volume)
         sigma = pm.HalfNormal("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
@@ -400,21 +446,10 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    cols = bundle["predictors"]
-    missing = [c for c in cols if c not in Xnew_df.columns]
-    if missing:
-        raise ValueError(f"Model A: missing predictors {missing}. "
-                         f"Available: {list(Xnew_df.columns)}")
-
-    X = Xnew_df[cols].to_numpy(dtype=float)
-    if not np.all(np.isfinite(X)):
-        bad = [c for i, c in enumerate(cols) if not np.all(np.isfinite(X[:, i]))]
-        raise ValueError(f"Model A: non-finite values in {bad}")
-
-    # Evaluate trees out-of-model so shape follows new X
-    draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows)
+    X = _check_and_get_X(bundle, Xnew_df, name="Model A")
+    draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows), latent log-volume
     ln_mean = draws.mean(axis=0)                      # (n_rows,)
-    return np.exp(ln_mean)
+    return np.exp(ln_mean)                            # level (Millions)
 
 # --------- Model B: BART classification ----------
 def train_model_B(
@@ -439,7 +474,7 @@ def train_model_B(
         raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
     with pm.Model() as mB:
-        X_B = pm.MutableData("X_B", X)  # important so shape can change at predict time
+        X_B = pm.MutableData("X_B", X)  # IMPORTANT: MutableData so we can change shape later
         f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
@@ -472,40 +507,50 @@ def train_model_B(
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    cols = bundle["predictors"]
-    missing = [c for c in cols if c not in Xnew_df.columns]
-    if missing:
-        raise ValueError(f"Model B: missing predictors {missing}. "
-                         f"Available: {list(Xnew_df.columns)}")
-
-    X = Xnew_df[cols].to_numpy(dtype=float)
-    if not np.all(np.isfinite(X)):
-        bad = [c for i, c in enumerate(cols) if not np.all(np.isfinite(X[:, i]))]
-        raise ValueError(f"Model B: non-finite values in {bad}")
-
-    draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows) logits
-    from scipy.special import expit
+    X = _check_and_get_X(bundle, Xnew_df, name="Model B")
+    draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows), logits
     return expit(draws).mean(axis=0).astype(float)    # probs (n_rows,)
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
-    if n <= 0 or len(df) <= n:
+    if not isinstance(df, pd.DataFrame):
         return df
+    try:
+        n = int(n)
+    except Exception:
+        n = 0
+    if n <= 0 or len(df) <= n:
+        return df.copy()
     if y_col is None or y_col not in df.columns:
-        return df.sample(n=n, random_state=42)
+        return df.sample(n=min(n, len(df)), random_state=42).reset_index(drop=True)
     pos = df[df[y_col] == 1]
     neg = df[df[y_col] == 0]
-    n_pos = max(1, int(n * len(pos) / max(1, len(df))))
-    n_neg = max(1, n - n_pos)
-    return pd.concat([
-        pos.sample(n=min(n_pos, len(pos)), random_state=42),
-        neg.sample(n=min(n_neg, len(neg)), random_state=42)
-    ], axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
-
-def _hash_df_for_cache(df: pd.DataFrame) -> int:
-    try:
-        return int(pd.util.hash_pandas_object(df, index=True).sum())
-    except Exception:
-        return len(df)
+    if len(pos) == 0 or len(neg) == 0:
+        return df.sample(n=min(n, len(df)), random_state=42).reset_index(drop=True)
+    m = len(df)
+    n_pos = int(round(n * len(pos) / m))
+    n_pos = max(1, min(n_pos, len(pos)))
+    n_neg = n - n_pos
+    n_neg = max(1, min(n_neg, len(neg)))
+    taken = n_pos + n_neg
+    if taken < n:
+        extra = min(n - taken, len(pos) - n_pos + len(neg) - n_neg)
+        if len(pos) - n_pos >= len(neg) - n_neg:
+            add_pos = min(extra, len(pos) - n_pos)
+            n_pos += add_pos
+            extra -= add_pos
+            n_neg += min(extra, len(neg) - n_neg)
+        else:
+            add_neg = min(extra, len(neg) - n_neg)
+            n_neg += add_neg
+            extra -= add_neg
+            n_pos += min(extra, len(pos) - n_pos)
+    parts = []
+    if n_pos > 0: parts.append(pos.sample(n=n_pos, random_state=42))
+    if n_neg > 0: parts.append(neg.sample(n=n_neg, random_state=42))
+    if not parts:
+        return df.sample(n=min(n, len(df)), random_state=42).reset_index(drop=True)
+    out = pd.concat(parts, axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
+    return out
 
 # ---------- TRAINING PANEL ----------
 with st.expander("⚙️ Train / Load BART models (Python-only)"):
@@ -549,6 +594,7 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 if len(okA) == 0:
                     st.error("No rows pass Model A predictors; cannot proceed to Model B.")
                     st.stop()
+
                 preds = predict_model_A(A_bundle, df_all.loc[okA])
                 preds = np.asarray(preds).reshape(-1)
                 if preds.shape[0] != len(okA):
@@ -585,9 +631,9 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 st.session_state["B_bundle"] = B_bundle
                 st.session_state["data_hash"] = _hash_df_for_cache(df_all)
 
-                # >>> Save training frames for diagnostics/importance <<<
+                # Save training frames for diagnostics/importance
                 st.session_state["dfA_train"] = dfA.copy()
-                st.session_state["dfB_train"] = dfB_cap.copy()   # or dfB if uncapped
+                st.session_state["dfB_train"] = dfB_cap.copy()
                 st.session_state["A_predictors"] = A_bundle["predictors"]
                 st.session_state["B_predictors"] = B_bundle["predictors"]
 
@@ -631,8 +677,6 @@ def _roc_auc(y_true, y_score):
     n1, n0 = len(pos), len(neg)
     if n1 == 0 or n0 == 0:
         return float("nan")
-    # rank-based AUC: P(score_pos > score_neg) + 0.5*P(==)
-    # Use broadcasting; careful with memory if very large (your n is modest)
     cmp = pos[:, None] - neg[None, :]
     greater = np.sum(cmp > 0)
     equal = np.sum(cmp == 0)
@@ -697,7 +741,6 @@ with st.expander("🔎 Model diagnostics"):
         st.info("Train Model B to see classification metrics.")
 
 # ---------- Feature Importance (Permutation) ----------
-# ---------- Feature Importance (Permutation) ----------
 @st.cache_data(show_spinner=False)
 def _perm_importance_A(_bundle, df_eval, y_log, features, n_repeats=5, seed=42):
     rng = np.random.default_rng(seed)
@@ -734,46 +777,29 @@ with st.expander("🧠 Feature importance (permutation)"):
     B_bundle = st.session_state.get("B_bundle")
     dfA_tr   = st.session_state.get("dfA_train")
     dfB_tr   = st.session_state.get("dfB_train")
+    featsA   = st.session_state.get("A_predictors") or []
+    featsB   = st.session_state.get("B_predictors") or []
 
-    # Fall back to bundle predictors if session lists are missing/empty
-    featsA = (st.session_state.get("A_predictors")
-              or (A_bundle.get("predictors") if isinstance(A_bundle, dict) else [])
-              or [])
-    featsB = (st.session_state.get("B_predictors")
-              or (B_bundle.get("predictors") if isinstance(B_bundle, dict) else [])
-              or [])
-
-    # ---- Model A importance ----
-    if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty and len(featsA) > 0:
+    if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty and featsA:
         try:
-            df_eval_A = dfA_tr[featsA]
-            y_log_A   = dfA_tr["ln_DVol"].to_numpy(float)
-            fiA = _perm_importance_A(A_bundle, df_eval_A, y_log_A, featsA, n_repeats=5)
+            fiA = _perm_importance_A(A_bundle, dfA_tr[featsA], dfA_tr["ln_DVol"].to_numpy(float), featsA, n_repeats=5)
             st.markdown("**Model A — R² drop when shuffling each feature**")
             st.dataframe(fiA, hide_index=True, use_container_width=True)
         except Exception as e:
             st.info(f"A importance not available: {e}")
     else:
         st.caption("Train Model A to see importance.")
-        st.caption(f"• Debug — A_bundle: {A_bundle is not None}, "
-                   f"dfA_tr rows: {0 if not isinstance(dfA_tr, pd.DataFrame) else len(dfA_tr)}, "
-                   f"featsA: {len(featsA)}")
 
-    # ---- Model B importance ----
-    if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty and len(featsB) > 0:
+    if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty and featsB:
         try:
-            y_true_B = (dfB_tr["FT_fac"].astype(str) == "FT").astype(int).to_numpy()
-            df_eval_B = dfB_tr[featsB]
-            fiB = _perm_importance_B(B_bundle, df_eval_B, y_true_B, featsB, n_repeats=5)
+            y_true = (dfB_tr["FT_fac"].astype(str)=="FT").astype(int).to_numpy()
+            fiB = _perm_importance_B(B_bundle, dfB_tr[featsB], y_true, featsB, n_repeats=5)
             st.markdown("**Model B — AUC drop when shuffling each feature**")
             st.dataframe(fiB, hide_index=True, use_container_width=True)
         except Exception as e:
             st.info(f"B importance not available: {e}")
     else:
         st.caption("Train Model B to see importance.")
-        st.caption(f"• Debug — B_bundle: {B_bundle is not None}, "
-                   f"dfB_tr rows: {0 if not isinstance(dfB_tr, pd.DataFrame) else len(dfB_tr)}, "
-                   f"featsB: {len(featsB)}")
 
 # ---------- UI: Add / Ranking ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -837,6 +863,13 @@ with tab_add:
             "DVolM": np.nan, "FT_fac": "Fail",
         }])
         feats = featurize(row)
+
+        # Safety: ensure predictors exist & are finite
+        need = st.session_state["A_bundle"]["predictors"]
+        Xcheck = feats[need].to_numpy(dtype=float)
+        if not np.all(np.isfinite(Xcheck)):
+            st.error("Non-finite values in features for prediction (check Float/PM/Gap/ATR/MCap).")
+            st.stop()
 
         pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
 
