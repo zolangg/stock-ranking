@@ -14,7 +14,7 @@ import pymc_bart as pmb
 from scipy.special import expit
 
 # ---------- Page + light CSS ----------
-st.set_page_config(page_title="Premarket Stock Ranking — BART (Fast)", layout="wide")
+st.set_page_config(page_title="Premarket Stock Ranking — BART (fast)", layout="wide")
 st.markdown(
     """
     <style>
@@ -22,7 +22,6 @@ st.markdown(
       .section-title { font-weight: 700; font-size: 1.05rem; letter-spacing:.2px; margin: 4px 0 8px 0; }
       .stMetric label { font-size: 0.85rem; font-weight: 600; color:#374151;}
       .stMetric [data-testid="stMetricValue"] { font-size: 1.15rem; }
-      div[role="radiogroup"] label p { font-size: 0.88rem; line-height:1.25rem; }
       .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 16px 0; }
       section[data-testid="stSidebar"] .stSlider { margin-bottom: 6px; }
     </style>
@@ -30,7 +29,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Premarket Stock Ranking — PyMC BART (fast profile)")
+st.title("Premarket Stock Ranking — PyMC BART (fast)")
 
 # ---------- helpers ----------
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
@@ -158,7 +157,7 @@ sigma_ln = st.sidebar.slider(
     help="Used for CI bands around predicted day volume."
 )
 
-# (Optional) compute permutation importance — off by default (slow)
+# Optional (slow)
 compute_importance = st.sidebar.toggle("Compute permutation importance (slow)", value=False)
 
 # ---------- numeric scorers ----------
@@ -295,12 +294,11 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     y = np.ascontiguousarray(dfA["ln_DVol"].to_numpy(dtype=np.float64))
 
     with pm.Model() as mA:
-        X_A = pm.MutableData("X_A", X)
+        X_A = pm.Data("X_A", X)  # <-- pm.Data (binds to set_data)
         f = pmb.BART("f", X_A, y, m=trees)    # latent log-mean
         sigma = pm.HalfNormal("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
 
-        # IMPORTANT: do not pass NUTS-specific kwargs (e.g., target_accept) here
         trace = pm.sample(
             draws=draws, tune=tune, chains=1, cores=1,
             random_seed=seed,
@@ -310,10 +308,10 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
             compute_convergence_checks=False,
         )
 
-    return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
+    return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A", "n_train": X.shape[0]}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """ Predict day volume (Millions) for new rows using latent node 'f'. """
+    """Predict day volume (Millions) for new rows using latent node 'f'."""
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
@@ -327,19 +325,26 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["f"],   # evaluate latent mean on new X
+            var_names=["f"],   # evaluate latent mean on NEW X
             return_inferencedata=False,
             progressbar=False,
         )
+
     arr = np.asarray(ppc["f"])
-    if arr.ndim == 3:      # (chains, draws, n)
+    # Expected shapes: (chains, draws, n_new) or (draws, n_new)
+    if arr.ndim == 3:
         ln_mean = arr.mean(axis=(0, 1))
-    elif arr.ndim == 2:    # (draws, n)
+    elif arr.ndim == 2:
         ln_mean = arr.mean(axis=0)
     else:
         raise ValueError(f"Model A: unexpected PPC shape for 'f': {arr.shape}")
+
     if ln_mean.shape[0] != X.shape[0]:
-        raise ValueError(f"Model A: length mismatch — PPC len {ln_mean.shape[0]} vs X rows {X.shape[0]}")
+        raise ValueError(
+            f"Model A: length mismatch — PPC len {ln_mean.shape[0]} vs X rows {X.shape[0]} "
+            f"(train_n={bundle.get('n_train','?')}). "
+            "This usually means X was not updated inside the model. Ensure pm.Data is used for X and set_data() is called."
+        )
     return np.exp(ln_mean)
 
 def train_model_B(df_feats_with_predvol: pd.DataFrame,
@@ -362,11 +367,10 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame,
         raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
     with pm.Model() as mB:
-        X_B = pm.MutableData("X_B", X)
+        X_B = pm.Data("X_B", X)   # <-- pm.Data (binds to set_data)
         f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
-        # IMPORTANT: do not pass NUTS-specific kwargs (e.g., target_accept) here
         trace = pm.sample(
             draws=draws, tune=tune, chains=1, cores=1,
             random_seed=seed,
@@ -376,10 +380,10 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame,
             compute_convergence_checks=False,
         )
 
-    return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
+    return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B", "n_train": X.shape[0]}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """ Predict FT probability for new rows from latent logits 'f'. """
+    """Predict FT probability for new rows from latent logits 'f'."""
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
@@ -393,7 +397,7 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         pm.set_data({bundle["x_name"]: X})
         ppc = pm.sample_posterior_predictive(
             bundle["trace"],
-            var_names=["f"],   # latent logits evaluated on new X
+            var_names=["f"],   # latent logits on NEW X
             return_inferencedata=False,
             progressbar=False,
         )
@@ -404,8 +408,12 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         logits_mean = arr.mean(axis=0)
     else:
         raise ValueError(f"Model B: unexpected PPC shape for 'f': {arr.shape}")
+
     if logits_mean.shape[0] != X.shape[0]:
-        raise ValueError(f"Model B: length mismatch — PPC len {logits_mean.shape[0]} vs X rows {X.shape[0]}")
+        raise ValueError(
+            f"Model B: length mismatch — PPC len {logits_mean.shape[0]} vs X rows {X.shape[0]} "
+            f"(train_n={bundle.get('n_train','?')})."
+        )
     return expit(logits_mean).astype(float)
 
 def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
@@ -454,7 +462,7 @@ with st.expander("⚙️ Train / Load BART models"):
                     if len(okA) == 0:
                         st.error("No rows pass Model A predictors; cannot proceed to Model B.")
                         st.stop()
-                    preds = predict_model_A(A_bundle, df_all.loc[okA])
+                    preds = predict_model_A(A_bundle, df_all.loc[okA, pred_cols])
                     preds = np.asarray(preds).reshape(-1)
                     df_all_with_pred = df_all.copy()
                     df_all_with_pred.loc[okA, "PredVol_M"] = pd.Series(preds, index=okA, dtype="float64")
