@@ -188,14 +188,6 @@ def grade(score_pct: float) -> str:
             "C"   if score_pct >= 45 else "D")
 
 # ---------- data mapping + features ----------
-def _pick_col(nms, patterns):
-    lnms = [x.lower() for x in nms]
-    for pat in patterns:
-        for i, nm in enumerate(lnms):
-            if pd.Series(nm).str.contains(pat, regex=True).iloc[0]:
-                return i
-    return None
-
 def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
     df = pd.read_excel(file, sheet_name=sheet, engine="openpyxl")
     nms = list(df.columns)
@@ -258,6 +250,12 @@ def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
 def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     eps = 1e-6
     out = raw.copy()
+
+    # ensure base cols exist
+    for col in ["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM","DVolM","Catalyst","FT_fac"]:
+        if col not in out.columns:
+            out[col] = (0 if col == "Catalyst" else np.nan)
+
     out["FR"]       = out["PMVolM"] / np.maximum(out["FloatM"].replace(0, np.nan), eps)
     out["ln_DVol"]  = np.log(np.maximum(out["DVolM"], eps))
     out["ln_pm"]    = np.log(np.maximum(out["PMVolM"], eps))
@@ -267,58 +265,44 @@ def featurize(raw: pd.DataFrame) -> pd.DataFrame:
     out["ln_atr"]   = np.log(np.maximum(out["ATR"], eps))
     out["ln_mcap"]  = np.log(np.maximum(out["MCapM"], eps))
     out["ln_pmdol_per_mcap"] = np.log(np.maximum(out["PMDolM"] / np.maximum(out["MCapM"], eps), eps))
-    out["Catalyst"] = (pd.to_numeric(out.get("Catalyst", 0), errors="coerce").fillna(0).astype(float) != 0).astype(int)
-    out["FT_fac"]   = out["FT_fac"].astype("category")
+
+    out["Catalyst"] = (
+        pd.to_numeric(out.get("Catalyst", 0), errors="coerce").fillna(0).astype(float).ne(0).astype(int)
+    )
+    if "FT_fac" in out.columns:
+        out["FT_fac"] = out["FT_fac"].astype("category")
+    else:
+        out["FT_fac"] = pd.Series([np.nan]*len(out), index=out.index, dtype="float").astype("category")
     return out
 
 # ---- Predictor sets
 A_FEATURES_DEFAULT = ["ln_pm","ln_pmdol","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst"]
 B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","ln_pmdol","PredVol_M"]
 
-# ---- Small helpers
-def _assert_finite(name, arr):
-    if not np.all(np.isfinite(arr)):
-        bad = np.where(~np.isfinite(arr))
-        raise ValueError(f"{name} contains non-finite values at indices {bad}.")
-
-def _sample(draws, tune, chains, seed):
-    return pm.sample(
-        draws=draws,
-        tune=tune,
-        chains=chains,
-        cores=1,
-        target_accept=0.85,
-        progressbar=True,
-        random_seed=seed,
-        discard_tuned_samples=True,
-        jitter_max_retries=0,
-        compute_convergence_checks=False,
-    )
-
-def _check_and_get_X(bundle, Xnew_df: pd.DataFrame, name: str):
-    cols = bundle["predictors"]
-    missing = [c for c in cols if c not in Xnew_df.columns]
-    if missing:
-        raise ValueError(f"{name}: missing predictors {missing}. "
-                         f"Available columns: {list(Xnew_df.columns)}")
-
-    X = Xnew_df[cols].to_numpy(dtype=float)
+# ---- Utility helpers (NO PPC anywhere) ----
+def _ensure_clean_matrix(X: np.ndarray, name: str = "X") -> np.ndarray:
     if not np.all(np.isfinite(X)):
-        bad_cols = []
-        for i, c in enumerate(cols):
-            if not np.all(np.isfinite(X[:, i])):
-                bad_cols.append(c)
-        raise ValueError(f"{name}: non-finite values in columns {bad_cols}.")
-    return X
+        bad = np.argwhere(~np.isfinite(X))
+        sample = ", ".join([f"({i},{j})" for i, j in bad[:6]])
+        raise ValueError(
+            f"{name} contains non-finite values at {sample} "
+            f"(total {len(bad)}). Check featurize() inputs."
+        )
+    return np.ascontiguousarray(X, dtype=float)
+
+def _ppc_to_2d(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.ndim == 3:
+        c, d, n = arr.shape
+        return arr.reshape(c*d, n)
+    elif arr.ndim == 2:
+        return arr
+    elif arr.ndim == 1:
+        return arr[:, None]
+    else:
+        raise ValueError(f"Unexpected PPC shape: {arr.shape}")
 
 def _hash_df_for_cache(df: pd.DataFrame) -> str:
-    """
-    Stable, dtype-agnostic hash for a DataFrame.
-    - Normalizes categorical/object to strings
-    - Sorts rows/columns
-    - Hashes a JSON representation
-    Returns a short hex string.
-    """
     from hashlib import blake2b
     if not isinstance(df, pd.DataFrame) or df.empty:
         return "empty"
@@ -332,8 +316,70 @@ def _hash_df_for_cache(df: pd.DataFrame) -> str:
     payload = d.to_json(orient="split", index=True, date_unit="ns", default_handler=str)
     return blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
+def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame): return df
+    try: n = int(n)
+    except Exception: n = 0
+    if n <= 0: return df.copy()
+    m = len(df)
+    if m <= n: return df.copy()
+    if y_col is None or y_col not in df.columns:
+        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
+    pos = df[df[y_col] == 1]
+    neg = df[df[y_col] == 0]
+    if len(pos) == 0 or len(neg) == 0:
+        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
+    n_pos = int(round(n * len(pos) / m))
+    n_pos = max(1, min(n_pos, len(pos)))
+    n_neg = max(1, min(n - n_pos, len(neg)))
+    taken = n_pos + n_neg
+    if taken < n:
+        extra = min(n - taken, len(pos) - n_pos + len(neg) - n_neg)
+        if len(pos) - n_pos >= len(neg) - n_neg:
+            add_pos = min(extra, len(pos) - n_pos); n_pos += add_pos; extra -= add_pos
+            n_neg += min(extra, len(neg) - n_neg)
+        else:
+            add_neg = min(extra, len(neg) - n_neg); n_neg += add_neg; extra -= add_neg
+            n_pos += min(extra, len(pos) - n_pos)
+    parts = []
+    if n_pos > 0: parts.append(pos.sample(n=n_pos, random_state=42))
+    if n_neg > 0: parts.append(neg.sample(n=n_neg, random_state=42))
+    if not parts:
+        return df.sample(n=min(n, m), random_state=42).reset_index(drop=True)
+    out = pd.concat(parts, axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
+    return out
+
+# ---------- BART latent predictor (no PPC, no y_obs) ----------
+def _bart_predict_latent(idata, X_new: np.ndarray) -> np.ndarray:
+    """
+    Return latent f draws with shape (draws_total, n_rows) using pymc_bart's pure-Python predictor.
+    Requires pymc-bart>=0.5.x where pgbart.predict is available.
+    """
+    X_new = np.asarray(X_new, dtype=float)
+    if X_new.ndim != 2:
+        raise ValueError(f"X_new must be 2D, got shape {X_new.shape}")
+
+    # Try the canonical location first
+    try:
+        from pymc_bart.pgbart import predict as bart_predict
+        draws = bart_predict(idata, X_new)  # shape (draws, n_rows)
+        return _ppc_to_2d(draws)
+    except Exception as e1:
+        # Try utils fallback (older refactor)
+        try:
+            from pymc_bart.utils import predict as bart_predict2
+            draws = bart_predict2(idata, X_new)
+            return _ppc_to_2d(draws)
+        except Exception as e2:
+            st.error(
+                "BART predictor function not found. "
+                "Please ensure `pymc-bart==0.5.14` is installed. "
+                f"\nImport errors:\n- pgbart.predict: {type(e1).__name__}: {e1}\n"
+                f"- utils.predict: {type(e2).__name__}: {e2}"
+            )
+            raise
+
 # ---------- BART training ----------
-# --------- Model A: BART regression ----------
 def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
                   draws=600, tune=400, trees=150, seed=42, chains=1):
     dfA = df_feats.dropna(subset=["ln_DVol"] + predictors).copy()
@@ -344,7 +390,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     y = np.ascontiguousarray(dfA["ln_DVol"].to_numpy(dtype=np.float64))
 
     with pm.Model() as mA:
-        X_A = pm.MutableData("X_A", X)  # MutableData is fine for training; we won't use ppc
+        X_A = pm.MutableData("X_A", X)
         f = pmb.BART("f", X_A, y, m=trees)      # latent mean (log-volume)
         sigma = pm.HalfNormal("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
@@ -362,47 +408,30 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
             compute_convergence_checks=False,
         )
 
-    return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
+    return {
+        "model": mA,
+        "trace": trace,
+        "predictors": predictors,
+        "x_name": "X_A",
+        "n_train": X.shape[0],
+        "trees": trees,
+        "X_train": X,
+    }
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     """
-    Predict day volume (Millions) for new rows.
-    Uses posterior predictive of latent node 'f' with new X.
+    Predict day volume (Millions) for NEW rows using latent f (no PPC).
     """
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
-        raise ValueError(f"Model A: missing predictors {missing}. "
-                         f"Available columns: {list(Xnew_df.columns)}")
+        raise ValueError(f"Missing predictors for Model A: {missing}")
+    X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_A")
+    # get latent draws directly from BART trees
+    f_draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows)
+    ln_mean = f_draws.mean(axis=0)
+    return np.exp(ln_mean).astype(float)
 
-    X = Xnew_df[cols].to_numpy(dtype=float)
-    if not np.all(np.isfinite(X)):
-        bad_cols = []
-        for i, c in enumerate(cols):
-            if not np.all(np.isfinite(X[:, i])):
-                bad_cols.append(c)
-        raise ValueError(f"Model A: non-finite values in columns {bad_cols}.")
-
-    with bundle["model"]:
-        pm.set_data({bundle["x_name"]: X})
-        ppc = pm.sample_posterior_predictive(
-            bundle["trace"],
-            var_names=["f"],              # <- latent mean, not y_obs
-            return_inferencedata=False,
-            progressbar=False,
-        )
-    arr = np.asarray(ppc["f"])  # shapes: (chains, draws, n) or (draws, n)
-    if arr.ndim == 3:
-        ln_mean = arr.mean(axis=(0, 1))  # -> (n,)
-    elif arr.ndim == 2:
-        ln_mean = arr.mean(axis=0)       # -> (n,)
-    else:
-        raise ValueError(f"Model A: unexpected PPC shape for 'f': {arr.shape}")
-    if ln_mean.shape[0] != X.shape[0]:
-        raise ValueError(f"Model A: length mismatch — PPC len {ln_mean.shape[0]} vs X rows {X.shape[0]}")
-    return np.exp(ln_mean)                            # level (Millions)
-
-# --------- Model B: BART classification ----------
 def train_model_B(
     df_feats_with_predvol: pd.DataFrame,
     predictors_core: list[str],
@@ -425,116 +454,96 @@ def train_model_B(
         raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
     with pm.Model() as mB:
-        X_B = pm.MutableData("X_B", X)  # IMPORTANT: MutableData so we can change shape later
+        X_B = pm.MutableData("X_B", X)
         f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
         try:
             trace = pm.sample(
-                draws=draws,
-                tune=tune,
-                chains=1,
-                cores=1,
-                random_seed=seed,
-                init="adapt_diag",
-                progressbar=True,
-                discard_tuned_samples=True,
-                compute_convergence_checks=False,
+                draws=draws, tune=tune, chains=1, cores=1,
+                random_seed=seed, init="adapt_diag", progressbar=True,
+                discard_tuned_samples=True, compute_convergence_checks=False,
             )
         except Exception:
             trace = pm.sample(
-                draws=draws,
-                tune=tune,
-                chains=1,
-                cores=1,
-                step=[pmb.PGBART()],
-                random_seed=seed,
-                init="adapt_diag",
-                progressbar=True,
-                discard_tuned_samples=True,
-                compute_convergence_checks=False,
+                draws=draws, tune=tune, chains=1, cores=1, step=[pmb.PGBART()],
+                random_seed=seed, init="adapt_diag", progressbar=True,
+                discard_tuned_samples=True, compute_convergence_checks=False,
             )
 
-    return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
+    return {
+        "model": mB,
+        "trace": trace,
+        "predictors": preds_B,
+        "x_name": "X_B",
+        "n_train": X.shape[0],
+        "trees": trees,
+    }
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """
-    Predict FT probability for new rows.
-    Uses posterior predictive of latent node 'f' (logits) with new X.
-    """
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
-        raise ValueError(f"Model B: missing predictors {missing}. "
-                         f"Available columns: {list(Xnew_df.columns)}")
+        raise ValueError(f"Missing predictors for Model B: {missing}")
+    X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_B")
+    # latent logits from BART; then logistic
+    f_draws = _bart_predict_latent(bundle["trace"], X)  # (draws, n_rows)
+    probs   = expit(f_draws).mean(axis=0)
+    return probs.astype(float)
 
-    X = Xnew_df[cols].to_numpy(dtype=float)
-    if not np.all(np.isfinite(X)):
-        bad_cols = []
-        for i, c in enumerate(cols):
-            if not np.all(np.isfinite(X[:, i])):
-                bad_cols.append(c)
-        raise ValueError(f"Model B: non-finite values in columns {bad_cols}.")
-
-    with bundle["model"]:
-        pm.set_data({bundle["x_name"]: X})
-        ppc = pm.sample_posterior_predictive(
-            bundle["trace"],
-            var_names=["f"],              # <- latent logits
-            return_inferencedata=False,
-            progressbar=False,
-        )
-    arr = np.asarray(ppc["f"])  # shapes: (chains, draws, n) or (draws, n)
-    if arr.ndim == 3:
-        logits_mean = arr.mean(axis=(0, 1))  # -> (n,)
-    elif arr.ndim == 2:
-        logits_mean = arr.mean(axis=0)       # -> (n,)
-    else:
-        raise ValueError(f"Model B: unexpected PPC shape for 'f': {arr.shape}")
-    if logits_mean.shape[0] != X.shape[0]:
-        raise ValueError(f"Model B: length mismatch — PPC len {logits_mean.shape[0]} vs X rows {X.shape[0]}")
-    return expit(logits_mean).astype(float)
-
-def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
-    if not isinstance(df, pd.DataFrame):
-        return df
+# ---------- Cache A in-sample preds (for diagnostics) ----------
+def _cache_A_train_preds(A_bundle, dfA):
+    """Compute in-sample preds from latent f on TRAIN X once (no PPC)."""
     try:
-        n = int(n)
-    except Exception:
-        n = 0
-    if n <= 0 or len(df) <= n:
-        return df.copy()
-    if y_col is None or y_col not in df.columns:
-        return df.sample(n=min(n, len(df)), random_state=42).reset_index(drop=True)
-    pos = df[df[y_col] == 1]
-    neg = df[df[y_col] == 0]
-    if len(pos) == 0 or len(neg) == 0:
-        return df.sample(n=min(n, len(df)), random_state=42).reset_index(drop=True)
-    m = len(df)
-    n_pos = int(round(n * len(pos) / m))
-    n_pos = max(1, min(n_pos, len(pos)))
-    n_neg = n - n_pos
-    n_neg = max(1, min(n_neg, len(neg)))
-    taken = n_pos + n_neg
-    if taken < n:
-        extra = min(n - taken, len(pos) - n_pos + len(neg) - n_neg)
-        if len(pos) - n_pos >= len(neg) - n_neg:
-            add_pos = min(extra, len(pos) - n_pos)
-            n_pos += add_pos
-            extra -= add_pos
-            n_neg += min(extra, len(neg) - n_neg)
-        else:
-            add_neg = min(extra, len(neg) - n_neg)
-            n_neg += add_neg
-            extra -= add_neg
-            n_pos += min(extra, len(pos) - n_pos)
-    parts = []
-    if n_pos > 0: parts.append(pos.sample(n=n_pos, random_state=42))
-    if n_neg > 0: parts.append(neg.sample(n=n_neg, random_state=42))
-    if not parts:
-        return df.sample(n=min(n, len(df)), random_state=42).reset_index(drop=True)
-    out = pd.concat(parts, axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
-    return out
+        # IMPORTANT: use the exact training X
+        X = A_bundle["X_train"]
+        f = _bart_predict_latent(A_bundle["trace"], X)  # (draws, n_train)
+        y_pred_lvl = np.exp(f.mean(axis=0)).astype(float)  # (n_train,)
+        if y_pred_lvl.shape[0] != len(dfA):
+            st.warning(f"Train-pred size mismatch: {y_pred_lvl.shape[0]} vs {len(dfA)}; skipping cached diagnostics.")
+            st.session_state["A_train_pred"] = None
+            st.session_state["dfA_train"] = dfA.copy()
+            return
+        dfA_diag = dfA.copy()
+        dfA_diag["__PredA_lvl"] = y_pred_lvl
+        st.session_state["A_train_pred"] = y_pred_lvl
+        st.session_state["dfA_train"] = dfA_diag
+    except Exception as e:
+        st.warning(f"Could not cache A in-sample preds: {type(e).__name__}: {e}")
+        st.session_state["A_train_pred"] = None
+        st.session_state["dfA_train"] = dfA.copy()
+
+# ---------- Smoketest ----------
+def _bart_smoketest(A_bundle, B_bundle):
+    try:
+        dfA_tr = st.session_state.get("dfA_train")
+        if dfA_tr is None or dfA_tr.empty:
+            return
+        meds = dfA_tr.median(numeric_only=True)
+        base = {
+            "PMVolM": meds.get("PMVolM", 1.0),
+            "PMDolM": meds.get("PMDolM", 1.0),
+            "FloatM": meds.get("FloatM", 10.0),
+            "GapPct": meds.get("GapPct", 5.0),
+            "ATR": meds.get("ATR", 0.2),
+            "MCapM": meds.get("MCapM", 200.0),
+            "Catalyst": 1,
+            "DVolM": np.nan,
+            "FT_fac": "Fail",
+        }
+        df_probe = pd.DataFrame([base, base])
+        feats_p = featurize(df_probe)
+        pv = predict_model_A(A_bundle, feats_p)
+        if pv.shape[0] != 2:
+            raise RuntimeError(f"Smoke A: got {pv.shape[0]} rows (want 2)")
+        feats_pB = feats_p.copy()
+        feats_pB["PredVol_M"] = pv
+        proba = predict_model_B(B_bundle, feats_pB)
+        if proba.shape[0] != 2:
+            raise RuntimeError(f"Smoke B: got {proba.shape[0]} rows (want 2)")
+    except Exception as e:
+        st.error(f"⚠️ BART smoketest failed: {type(e).__name__}: {e}")
+        st.stop()
 
 # ---------- TRAINING PANEL ----------
 with st.expander("⚙️ Train / Load BART models (Python-only)"):
@@ -562,9 +571,23 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 raw = read_excel_dynamic(up)
                 df_all = featurize(raw)
 
+                # Ensure required columns exist
+                req_A = ["ln_DVol"] + A_FEATURES_DEFAULT
+                missing_A = [c for c in req_A if c not in df_all.columns]
+                if missing_A:
+                    st.error(
+                        "Training features missing from featurized frame:\n"
+                        f"- Missing: {missing_A}\n"
+                        f"- Available columns: {list(df_all.columns)}"
+                    )
+                    st.stop()
+
                 # A data
-                dfA = df_all.dropna(subset=["ln_DVol"] + A_FEATURES_DEFAULT)
+                dfA = df_all.dropna(subset=req_A)
                 dfA = _row_cap(dfA, int(capA)) if capA else dfA
+                if len(dfA) < 30:
+                    st.error(f"After filtering, Model A has only {len(dfA)} rows (need ≥30).")
+                    st.stop()
 
                 # Train A
                 A_bundle = train_model_A(
@@ -572,25 +595,48 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                     draws=draws, tune=tune, trees=trees, seed=seed, chains=1
                 )
 
-                # Predictions for PredVol_M (index-aligned)
+                # Save training frame
+                st.session_state["dfA_train"] = dfA.copy()
+
+                # Cache in-sample predictions for diagnostics (NO PPC)
+                _cache_A_train_preds(A_bundle, dfA)
+
+                # ---- PredVol_M population ----
                 pred_cols = A_bundle["predictors"]
                 okA = df_all[pred_cols].dropna().index
                 if len(okA) == 0:
                     st.error("No rows pass Model A predictors; cannot proceed to Model B.")
                     st.stop()
 
-                preds = predict_model_A(A_bundle, df_all.loc[okA])
-                preds = np.asarray(preds).reshape(-1)
-                if preds.shape[0] != len(okA):
-                    st.error(f"Internal mismatch: got {preds.shape[0]} preds for {len(okA)} rows.")
-                    st.stop()
-
                 df_all_with_pred = df_all.copy()
-                df_all_with_pred.loc[okA, "PredVol_M"] = pd.Series(preds, index=okA, dtype="float64")
+
+                # Fill training rows with cached preds (aligned)
+                dfA_diag = st.session_state["dfA_train"]
+                if "__PredA_lvl" in dfA_diag.columns and len(dfA_diag) == len(dfA):
+                    df_all_with_pred.loc[dfA_diag.index, "PredVol_M"] = dfA_diag["__PredA_lvl"].astype(float)
+
+                # Fill extra rows (non-training) via OOS predictor; ignore failures
+                extra_idx = okA.difference(dfA.index)
+                if len(extra_idx) > 0:
+                    try:
+                        oo_pred = predict_model_A(A_bundle, df_all.loc[extra_idx])
+                        if oo_pred.shape[0] == len(extra_idx):
+                            df_all_with_pred.loc[extra_idx, "PredVol_M"] = pd.Series(oo_pred, index=extra_idx, dtype="float64")
+                    except Exception:
+                        pass
 
                 # B data
-                dfB = df_all_with_pred.dropna(subset=["FT_fac", "PredVol_M"]).copy()
+                req_B = ["FT_fac", "PredVol_M"]
+                missing_B = [c for c in req_B if c not in df_all_with_pred.columns]
+                if missing_B:
+                    st.error(f"Missing columns for Model B: {missing_B}")
+                    st.stop()
+
+                dfB = df_all_with_pred.dropna(subset=req_B).copy()
                 dfB["_y"] = (dfB["FT_fac"].astype(str) == "FT").astype(int)
+                if dfB["_y"].nunique() < 2:
+                    st.error("Model B target has only one class after filtering; need both FT and Fail.")
+                    st.stop()
                 dfB_cap = _row_cap(dfB, int(capB), y_col="_y") if capB else dfB
 
                 # Train B
@@ -610,21 +656,20 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                     st.code(tb[-2000:], language="text")
                     st.stop()
 
-                # Save bundles
+                # Save bundles + diagnostics frames
                 st.session_state["A_bundle"] = A_bundle
                 st.session_state["B_bundle"] = B_bundle
                 st.session_state["data_hash"] = _hash_df_for_cache(df_all)
-
-                # Save training frames for diagnostics/importance
-                st.session_state["dfA_train"] = dfA.copy()
                 st.session_state["dfB_train"] = dfB_cap.copy()
                 st.session_state["A_predictors"] = A_bundle["predictors"]
                 st.session_state["B_predictors"] = B_bundle["predictors"]
 
+                # Smoketest
+                _bart_smoketest(A_bundle, B_bundle)
+
                 st.success(f"Trained (rows A: {len(dfA)}, rows B: {len(dfB_cap)}).")
 
 # ---------- Metrics & Importance (GLOBAL; survives reruns) ----------
-# Basic metric helpers (no sklearn)
 def _r2(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -653,7 +698,6 @@ def _brier(y_true, y_prob):
     return float(np.mean((p - y_true)**2))
 
 def _roc_auc(y_true, y_score):
-    # Mann–Whitney U implementation (binary AUC)
     y_true = np.asarray(y_true, dtype=int)
     y_score = np.asarray(y_score, dtype=float)
     pos = y_score[y_true == 1]
@@ -667,10 +711,8 @@ def _roc_auc(y_true, y_score):
     return float((greater + 0.5*equal) / (n1*n0))
 
 def _fmt(x, nd=3):
-    try:
-        return f"{x:.{nd}f}"
-    except Exception:
-        return "—"
+    try: return f"{x:.{nd}f}"
+    except Exception: return "—"
 
 st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
 with st.expander("🔎 Model diagnostics"):
@@ -679,12 +721,16 @@ with st.expander("🔎 Model diagnostics"):
     dfA_tr   = st.session_state.get("dfA_train")
     dfB_tr   = st.session_state.get("dfB_train")
 
-    # ---- Model A: R² / RMSE (log & level) ----
-    if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty:
+    # ---- Model A: R² / RMSE (log & level) — uses cached preds only (no PyMC calls) ----
+    dfA_tr_cached = st.session_state.get("dfA_train")
+    A_train_pred  = st.session_state.get("A_train_pred")
+    if (A_bundle is not None
+        and isinstance(dfA_tr_cached, pd.DataFrame) and not dfA_tr_cached.empty
+        and A_train_pred is not None and "__PredA_lvl" in dfA_tr_cached.columns):
         try:
-            y_true_log = dfA_tr["ln_DVol"].to_numpy(float)
+            y_true_log = dfA_tr_cached["ln_DVol"].to_numpy(float)
             y_true_lvl = np.exp(y_true_log)
-            y_pred_lvl = predict_model_A(A_bundle, dfA_tr)
+            y_pred_lvl = dfA_tr_cached["__PredA_lvl"].to_numpy(float)
             y_pred_log = np.log(np.maximum(y_pred_lvl, 1e-9))
 
             r2_log   = _r2(y_true_log, y_pred_log)
@@ -700,7 +746,7 @@ with st.expander("🔎 Model diagnostics"):
         except Exception as e:
             st.warning(f"Model A metrics unavailable: {e}")
     else:
-        st.info("Train Model A to see R²/RMSE.")
+        st.info("Train Model A to see R²/RMSE (cached predictions not found).")
 
     # ---- Model B: AUC / ACC / LogLoss / Brier ----
     if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty:
@@ -726,32 +772,32 @@ with st.expander("🔎 Model diagnostics"):
 
 # ---------- Feature Importance (Permutation) ----------
 @st.cache_data(show_spinner=False)
-def _perm_importance_A(_bundle, df_eval, y_log, features, n_repeats=5, seed=42):
+def _perm_importance_A(bundle, df_eval, y_log, features, n_repeats=5, seed=42):
     rng = np.random.default_rng(seed)
-    base = _r2(y_log, np.log(np.maximum(predict_model_A(_bundle, df_eval), 1e-9)))
+    base = _r2(y_log, np.log(np.maximum(predict_model_A(bundle, df_eval), 1e-9)))
     drops = []
     for ftr in features:
         scores = []
         for _ in range(n_repeats):
             df_s = df_eval.copy()
             df_s[ftr] = rng.permutation(df_s[ftr].values)
-            y_pred = np.log(np.maximum(predict_model_A(_bundle, df_s), 1e-9))
+            y_pred = np.log(np.maximum(predict_model_A(bundle, df_s), 1e-9))
             scores.append(_r2(y_log, y_pred))
         drops.append(base - np.mean(scores))
     out = pd.DataFrame({"feature": features, "R2_drop": drops})
     return out.sort_values("R2_drop", ascending=False, ignore_index=True)
 
 @st.cache_data(show_spinner=False)
-def _perm_importance_B(_bundle, df_eval, y_true, features, n_repeats=5, seed=42):
+def _perm_importance_B(bundle, df_eval, y_true, features, n_repeats=5, seed=42):
     rng = np.random.default_rng(seed)
-    base = _roc_auc(y_true, predict_model_B(_bundle, df_eval))
+    base = _roc_auc(y_true, predict_model_B(bundle, df_eval))
     drops = []
     for ftr in features:
         scores = []
         for _ in range(n_repeats):
             df_s = df_eval.copy()
             df_s[ftr] = rng.permutation(df_s[ftr].values)
-            scores.append(_roc_auc(y_true, predict_model_B(_bundle, df_s)))
+            scores.append(_roc_auc(y_true, predict_model_B(bundle, df_s)))
         drops.append(base - np.mean(scores))
     out = pd.DataFrame({"feature": features, "AUC_drop": drops})
     return out.sort_values("AUC_drop", ascending=False, ignore_index=True)
@@ -848,8 +894,7 @@ with tab_add:
         }])
         feats = featurize(row)
 
-        # Safety: ensure predictors exist & are finite
-        need = st.session_state["A_bundle"]["predictors"]
+        need = A_bundle["predictors"]
         Xcheck = feats[need].to_numpy(dtype=float)
         if not np.all(np.isfinite(Xcheck)):
             st.error("Non-finite values in features for prediction (check Float/PM/Gap/ATR/MCap).")
@@ -928,31 +973,7 @@ with tab_add:
         )
         do_rerun()
 
-    # ---------- Preview card ----------
-    l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
-    if l:
-        st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
-        cA, cB, cC, cD = st.columns(4)
-        cA.metric("Last Ticker", l.get("Ticker","—"))
-        cB.metric("Final Score", f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
-        cC.metric("Pred Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
-        cC.caption(
-            f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
-            f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
-        )
-        cD.metric("FT Probability", f"{l.get('FT_Prob',0)*100:.1f}%")
-        cD.caption(l.get("FT_Label","—"))
-
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
-        d1.caption("Premarket volume ÷ predicted day volume × 100.")
-        d2.metric("PM $Vol / MC", f"{l.get('PM$ / MC_%',0):.1f}%")
-        d2.caption("PM dollar volume ÷ market cap × 100.")
-        d3.metric("Numeric Block", f"{l.get('Numeric_%',0):.1f}%")
-        d3.caption("Weighted buckets: RVOL / ATR / SI / FR / Float.")
-        d4.metric("Qual Block", f"{l.get('Qual_%',0):.1f}%")
-        d4.caption("Weighted radios: structure, levels, higher TF.")
-
+# ---------- Ranking Tab ----------
 with tab_rank:
     st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
 
