@@ -153,16 +153,14 @@ B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","l
 # ---------- helper to robustly average over draws/chains ----------
 def _mean_over_draws(arr: np.ndarray, n_rows: int) -> np.ndarray:
     arr = np.asarray(arr)
-    # If we can find an axis equal to n_rows, average over all others
     for axis in range(arr.ndim):
         if arr.shape[axis] == n_rows:
             axes = tuple(i for i in range(arr.ndim) if i != axis)
-            mu = arr.mean(axis=axes) if axes else arr  # already just rows
+            mu = arr.mean(axis=axes) if axes else arr
             mu = np.asarray(mu)
-            if mu.ndim == 0:  # scalar -> repeat
+            if mu.ndim == 0:
                 return np.full(n_rows, float(mu))
             return mu
-    # Fallbacks:
     if n_rows == 1 and arr.ndim >= 1:
         return np.array([float(arr.mean())], dtype=float)
     scalar = float(arr.mean())
@@ -196,7 +194,6 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A", "n_train": X.shape[0]}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """Predict day volume (Millions) for new rows using latent node 'f'."""
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
@@ -257,7 +254,6 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame,
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B", "n_train": X.shape[0]}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    """Predict FT probability for new rows from latent logits 'f'."""
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
@@ -313,6 +309,8 @@ sigma_ln = st.sidebar.slider(
 
 # Optional (slow)
 compute_importance = st.sidebar.toggle("Compute permutation importance (slow)", value=False)
+# NEW: diagnostics control under feature importance
+enable_diagnostics = st.sidebar.toggle("Enable diagnostics", value=False, help="Compute metrics in the Quick diagnostics panel")
 
 # ---------- TRAINING PANEL ----------
 with st.expander("⚙️ Train / Load BART models"):
@@ -383,7 +381,7 @@ with st.expander("⚙️ Train / Load BART models"):
             except Exception as e:
                 st.exception(e)
 
-# ---------- Metrics (lightweight) ----------
+# ---------- Metrics helpers ----------
 def _r2(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -396,6 +394,11 @@ def _rmse(y_true, y_pred):
     y_pred = np.asarray(y_pred, dtype=float)
     return float(np.sqrt(np.mean((y_true - y_pred)**2)))
 
+def _mae(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return float(np.mean(np.abs(y_true - y_pred)))
+
 def _roc_auc(y_true, y_score):
     y_true = np.asarray(y_true, dtype=int)
     y_score = np.asarray(y_score, dtype=float)
@@ -406,18 +409,27 @@ def _roc_auc(y_true, y_score):
     greater = np.sum(cmp > 0); equal = np.sum(cmp == 0)
     return float((greater + 0.5*equal) / (n1*n0))
 
+def _accuracy(y_true, y_score, thr=0.5):
+    y_true = np.asarray(y_true, dtype=int)
+    y_hat = (np.asarray(y_score, dtype=float) >= thr).astype(int)
+    return float((y_hat == y_true).mean()) if len(y_true) else float("nan")
+
+def _logloss(y_true, y_score, eps=1e-12):
+    y_true = np.asarray(y_true, dtype=int)
+    p = np.clip(np.asarray(y_score, dtype=float), eps, 1.0 - eps)
+    return float(-np.mean(y_true*np.log(p) + (1 - y_true)*np.log(1 - p))) if len(y_true) else float("nan")
+
 st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
 with st.expander("🔎 Quick diagnostics"):
-    run_diag = st.checkbox("Run diagnostics now", value=False, help="Avoids heavy re-compute on every rerun.")
-
     A_bundle = st.session_state.get("A_bundle")
     B_bundle = st.session_state.get("B_bundle")
     dfA_tr   = st.session_state.get("dfA_train")
     dfB_tr   = st.session_state.get("dfB_train")
 
-    if not run_diag:
-        st.caption("Diagnostics are idle. Tick the box to compute.")
+    if not enable_diagnostics:
+        st.caption("Diagnostics disabled in sidebar. Toggle **Enable diagnostics** to compute.")
     else:
+        # Model A diagnostics (log-space)
         if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty:
             try:
                 y_true_log = dfA_tr["ln_DVol"].to_numpy(float)
@@ -425,16 +437,20 @@ with st.expander("🔎 Quick diagnostics"):
                 y_pred_log = np.log(np.maximum(y_pred_lvl, 1e-9))
                 st.metric("Model A — R² (log)", f"{_r2(y_true_log, y_pred_log):.3f}")
                 st.metric("Model A — RMSE (log)", f"{_rmse(y_true_log, y_pred_log):.3f}")
+                st.metric("Model A — MAE (log)", f"{_mae(y_true_log, y_pred_log):.3f}")
             except Exception as e:
                 st.warning(f"Model A metrics unavailable: {e}")
         else:
             st.info("Train Model A to see diagnostics.")
 
+        # Model B diagnostics
         if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty:
             try:
                 y_true = (dfB_tr["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
                 proba  = predict_model_B(B_bundle, dfB_tr)
                 st.metric("Model B — ROC AUC", f"{_roc_auc(y_true, proba):.3f}")
+                st.metric("Model B — Accuracy (thr=0.5)", f"{_accuracy(y_true, proba, 0.5):.3f}")
+                st.metric("Model B — Log Loss", f"{_logloss(y_true, proba):.3f}")
             except Exception as e:
                 st.warning(f"Model B metrics unavailable: {e}")
         elif st.session_state.get("B_bundle") is None:
@@ -519,21 +535,27 @@ def require_A():
 with tab_add:
     st.markdown('<div class="section-title">Inputs</div>', unsafe_allow_html=True)
     with st.form("add_form", clear_on_submit=True):
-        c_top = st.columns([1.25, 1.25, 1.0])
+        # Left column (Ticker + Catalyst only)
+        left, right = st.columns([1.0, 2.0])
 
-        with c_top[0]:
-            ticker   = st.text_input("Ticker", "").strip().upper()
-            atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
+        with left:
+            ticker = st.text_input("Ticker", "").strip().upper()
+            catalyst_yes = st.toggle("Catalyst present?", value=False,
+                                     help="News/pr catalyst flag used as binary feature.")
 
-        with c_top[1]:
-            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            pm_vol_m = st.number_input("Premarket Volume (Millions shares)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            pm_dol_m = st.number_input("Premarket Dollar Volume (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+        # Right area: two columns, 3 rows each
+        with right:
+            rcol1, rcol2 = st.columns(2)
 
-        with c_top[2]:
-            catalyst_yes = st.toggle("Catalyst present?", value=False, help="News/pr catalyst flag used as binary feature.")
+            with rcol1:
+                mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+                float_m  = st.number_input("Public Float (Millions)",   min_value=0.0, value=0.0, step=0.01, format="%.2f")
+                gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
+
+            with rcol2:
+                atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+                pm_vol_m = st.number_input("Premarket Volume (Millions shares)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+                pm_dol_m = st.number_input("Premarket Dollar Volume (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
 
         submitted = st.form_submit_button("Add / Predict", use_container_width=True)
 
@@ -549,14 +571,12 @@ with tab_add:
         }])
         feats = featurize(row)
 
-        # Predict with clean error message if something is off
         try:
             pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
         except Exception as e:
             st.error(f"Model A prediction failed: {e}")
             st.stop()
 
-        # Predict FT probability if Model B trained
         if B_bundle is not None:
             try:
                 featsB = feats.copy()
@@ -569,10 +589,13 @@ with tab_add:
             ft_prob = float("nan")
 
         # Confidence bands (user sigma)
-        ci68_l = pred_vol_m * math.exp(-1.0 * sigma_ln)
-        ci68_u = pred_vol_m * math.exp(+1.0 * sigma_ln)
-        ci95_l = pred_vol_m * math.exp(-1.96 * sigma_ln)
-        ci95_u = pred_vol_m * math.exp(+1.96 * sigma_ln)
+        sigma_ln = st.session_state.get("sigma_ln_override", None) or st.session_state.get("sigma_ln", None)
+        # ensure from sidebar
+        sigma_ln = st.session_state.get("sigma_ln", None) or st.session_state.get("sigma_ln_override", 0.60)
+        ci68_l = pred_vol_m * math.exp(-1.0 * float(sigma_ln))
+        ci68_u = pred_vol_m * math.exp(+1.0 * float(sigma_ln))
+        ci95_l = pred_vol_m * math.exp(-1.96 * float(sigma_ln))
+        ci95_u = pred_vol_m * math.exp(+1.96 * float(sigma_ln))
 
         pm_float_rot_x  = (pm_vol_m / float_m) if float_m > 0 else 0.0
         pm_pct_of_pred  = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
@@ -584,20 +607,16 @@ with tab_add:
 
         row_out = {
             "Ticker": ticker,
-
             "PredVol_M": round(pred_vol_m, 2),
             "PredVol_CI68_L": round(ci68_l, 2),
             "PredVol_CI68_U": round(ci68_u, 2),
             "PredVol_CI95_L": round(ci95_l, 2),
             "PredVol_CI95_U": round(ci95_u, 2),
-
             "FT_Prob": (round(ft_prob, 3) if not np.isnan(ft_prob) else ""),
             "FT_Label": ft_label,
-
             "PM_%_of_Pred": round(pm_pct_of_pred, 1),
             "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
             "PM_FloatRot_x": round(pm_float_rot_x, 3),
-
             "_MCap_M": mc_m, "_ATR_$": atr_usd, "_PM_M": pm_vol_m, "_PM$_M": pm_dol_m,
             "_Float_M": float_m, "_Gap_%": gap_pct, "_Catalyst": 1 if catalyst_yes else 0,
         }
