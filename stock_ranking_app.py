@@ -519,6 +519,38 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 df_all_with_pred = df_all.copy()
                 df_all_with_pred.loc[okA, "PredVol_M"] = pd.Series(preds, index=okA, dtype="float64")
 
+                # --- Debug: show why B has 0 rows ---
+                with st.expander("🧪 Debug: Model B data checks", expanded=False):
+                    st.write(f"Rows in df_all: {len(df_all)}")
+                    st.write(f"Rows with A predictors (okA): {len(okA)}")
+                    st.write(f"Rows with PredVol_M set: {df_all_with_pred['PredVol_M'].notna().sum()}")
+                
+                    # What does FT look like?
+                    ft_raw_counts = (
+                        raw.get("FT_raw")
+                        if "FT_raw" in raw.columns else pd.Series([], dtype=str)
+                    )
+                    if len(ft_raw_counts):
+                        st.write("FT_raw value counts:", ft_raw_counts.astype(str).str.lower().str.strip().value_counts())
+                
+                    if "FT_fac" in df_all_with_pred.columns:
+                        st.write("FT_fac counts:", df_all_with_pred["FT_fac"].astype(str).value_counts(dropna=False))
+                
+                    # Rows that would enter B
+                    preds_B = list(B_FEATURES_CORE)
+                    if "PredVol_M" not in preds_B:
+                        preds_B.append("PredVol_M")
+                    need_cols = preds_B + ["FT_fac"]
+                    missing_cols = [c for c in need_cols if c not in df_all_with_pred.columns]
+                    st.write("B required columns missing:", missing_cols)
+                
+                    dfB_probe = df_all_with_pred.dropna(subset=need_cols).copy()
+                    st.write(f"Rows eligible for B after dropna(subset=B preds + FT_fac): {len(dfB_probe)}")
+                
+                    if len(dfB_probe):
+                        y_probe = (dfB_probe["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int)
+                        st.write("Class counts (0=Fail, 1=FT):", pd.Series(y_probe).value_counts().to_dict())
+
                 # B data
                 dfB = df_all_with_pred.dropna(subset=["FT_fac", "PredVol_M"]).copy()
                 dfB["_y"] = (dfB["FT_fac"].astype(str) == "FT").astype(int)
