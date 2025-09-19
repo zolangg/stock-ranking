@@ -70,25 +70,6 @@ if st.session_state.flash:
     st.success(st.session_state.flash)
     st.session_state.flash = None
 
-# ---------- sidebar ----------
-st.sidebar.header("Training profile (BART)")
-fast_mode = st.sidebar.toggle("Fast profile", value=True, help="Reduces trees/draws and caps rows.")
-trees = st.sidebar.slider("BART trees", 25, 300, 70 if fast_mode else 160, 5)
-draws = st.sidebar.slider("MCMC draws", 100, 1500, 220 if fast_mode else 700, 20)
-tune  = st.sidebar.slider("MCMC tune",  100, 1500, 220 if fast_mode else 700, 20)
-seed  = st.sidebar.number_input("Random seed", value=42, step=1)
-capA  = st.sidebar.number_input("Max rows for Model A", min_value=0, value=(1200 if fast_mode else 0), help="0 = no cap")
-capB  = st.sidebar.number_input("Max rows for Model B", min_value=0, value=(700 if fast_mode else 0),   help="0 = no cap")
-
-st.sidebar.header("Prediction Uncertainty")
-sigma_ln = st.sidebar.slider(
-    "Log-space σ (residual std dev)", 0.10, 1.50, 0.60, 0.01,
-    help="Used for CI bands around predicted day volume."
-)
-
-# Optional (slow)
-compute_importance = st.sidebar.toggle("Compute permutation importance (slow)", value=False)
-
 # ---------- data mapping + features ----------
 def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
     df = pd.read_excel(file, sheet_name=sheet, engine="openpyxl")
@@ -172,14 +153,16 @@ B_FEATURES_CORE    = ["ln_pm","ln_fr","ln_gapf","ln_atr","ln_mcap","Catalyst","l
 # ---------- helper to robustly average over draws/chains ----------
 def _mean_over_draws(arr: np.ndarray, n_rows: int) -> np.ndarray:
     arr = np.asarray(arr)
+    # If we can find an axis equal to n_rows, average over all others
     for axis in range(arr.ndim):
         if arr.shape[axis] == n_rows:
             axes = tuple(i for i in range(arr.ndim) if i != axis)
-            mu = arr.mean(axis=axes) if axes else arr
+            mu = arr.mean(axis=axes) if axes else arr  # already just rows
             mu = np.asarray(mu)
-            if mu.ndim == 0:
+            if mu.ndim == 0:  # scalar -> repeat
                 return np.full(n_rows, float(mu))
             return mu
+    # Fallbacks:
     if n_rows == 1 and arr.ndim >= 1:
         return np.array([float(arr.mean())], dtype=float)
     scalar = float(arr.mean())
@@ -197,7 +180,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
 
     with pm.Model() as mA:
         X_A = pm.MutableData("X_A", X)
-        f = pmb.BART("f", X_A, y, m=trees)
+        f = pmb.BART("f", X_A, y, m=trees)    # latent log-mean
         sigma = pm.HalfNormal("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
 
@@ -213,6 +196,7 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A", "n_train": X.shape[0]}
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
+    """Predict day volume (Millions) for new rows using latent node 'f'."""
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
@@ -273,6 +257,7 @@ def train_model_B(df_feats_with_predvol: pd.DataFrame,
     return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B", "n_train": X.shape[0]}
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
+    """Predict FT probability for new rows from latent logits 'f'."""
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
@@ -309,6 +294,25 @@ def _row_cap(df: pd.DataFrame, n: int, y_col: str | None = None):
         pos.sample(n=min(n_pos, len(pos)), random_state=42),
         neg.sample(n=min(n_neg, len(neg)), random_state=42)
     ], axis=0).sample(frac=1.0, random_state=42).reset_index(drop=True)
+
+# ---------- SIDEBAR ----------
+st.sidebar.header("Training profile (BART)")
+fast_mode = st.sidebar.toggle("Fast profile", value=True, help="Reduces trees/draws and caps rows.")
+trees = st.sidebar.slider("BART trees", 25, 300, 70 if fast_mode else 160, 5)
+draws = st.sidebar.slider("MCMC draws", 100, 1500, 220 if fast_mode else 700, 20)
+tune  = st.sidebar.slider("MCMC tune",  100, 1500, 220 if fast_mode else 700, 20)
+seed  = st.sidebar.number_input("Random seed", value=42, step=1)
+capA  = st.sidebar.number_input("Max rows for Model A", min_value=0, value=(1200 if fast_mode else 0), help="0 = no cap")
+capB  = st.sidebar.number_input("Max rows for Model B", min_value=0, value=(700 if fast_mode else 0),   help="0 = no cap")
+
+st.sidebar.header("Prediction Uncertainty")
+sigma_ln = st.sidebar.slider(
+    "Log-space σ (residual std dev)", 0.10, 1.50, 0.60, 0.01,
+    help="Used for CI bands around predicted day volume."
+)
+
+# Optional (slow)
+compute_importance = st.sidebar.toggle("Compute permutation importance (slow)", value=False)
 
 # ---------- TRAINING PANEL ----------
 with st.expander("⚙️ Train / Load BART models"):
@@ -454,4 +458,217 @@ def _perm_importance_A(_bundle, df_eval, y_log, features, n_repeats=3, seed=42):
     return out.sort_values("R2_drop", ascending=False, ignore_index=True)
 
 @st.cache_data(show_spinner=False)
-def _perm_importance_B(_bundle, df_eval
+def _perm_importance_B(_bundle, df_eval, y_true, features, n_repeats=3, seed=42):
+    rng = np.random.default_rng(seed)
+    base = _roc_auc(y_true, predict_model_B(_bundle, df_eval))
+    drops = []
+    for ftr in features:
+        scores = []
+        for _ in range(n_repeats):
+            df_s = df_eval.copy()
+            df_s[ftr] = rng.permutation(df_s[ftr].values)
+            scores.append(_roc_auc(y_true, predict_model_B(_bundle, df_s)))
+        drops.append(base - np.mean(scores))
+    out = pd.DataFrame({"feature": features, "AUC_drop": drops})
+    return out.sort_values("AUC_drop", ascending=False, ignore_index=True)
+
+if compute_importance:
+    with st.expander("🧠 Feature importance (permutation)"):
+        A_bundle = st.session_state.get("A_bundle")
+        B_bundle = st.session_state.get("B_bundle")
+        dfA_tr   = st.session_state.get("dfA_train")
+        dfB_tr   = st.session_state.get("dfB_train")
+
+        featsA = (st.session_state.get("A_predictors")
+                  or (A_bundle.get("predictors") if isinstance(A_bundle, dict) else [])
+                  or [])
+        featsB = (st.session_state.get("B_predictors")
+                  or (B_bundle.get("predictors") if isinstance(B_bundle, dict) else [])
+                  or [])
+
+        if A_bundle is not None and isinstance(dfA_tr, pd.DataFrame) and not dfA_tr.empty and len(featsA) > 0:
+            try:
+                df_eval_A = dfA_tr[featsA]
+                y_log_A   = dfA_tr["ln_DVol"].to_numpy(float)
+                fiA = _perm_importance_A(A_bundle, df_eval_A, y_log_A, featsA, n_repeats=3)
+                st.markdown("**Model A — R² drop when shuffling each feature**")
+                st.dataframe(fiA, hide_index=True, use_container_width=True)
+            except Exception as e:
+                st.info(f"A importance not available: {e}")
+        else:
+            st.caption("Train Model A to see importance.")
+
+        if B_bundle is not None and isinstance(dfB_tr, pd.DataFrame) and not dfB_tr.empty and len(featsB) > 0:
+            try:
+                y_true_B = (dfB_tr["FT_fac"].astype(str).str.lower().isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
+                df_eval_B = dfB_tr[featsB]
+                fiB = _perm_importance_B(B_bundle, df_eval_B, y_true_B, featsB, n_repeats=3)
+                st.markdown("**Model B — AUC drop when shuffling each feature**")
+                st.dataframe(fiB, hide_index=True, use_container_width=True)
+            except Exception as e:
+                st.info(f"B importance not available: {e}")
+
+# ---------- UI: Add / Ranking ----------
+tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
+
+def require_A():
+    if "A_bundle" not in st.session_state or st.session_state.get("A_bundle") is None:
+        st.warning("Train Model A first (see expander above).")
+        st.stop()
+
+with tab_add:
+    st.markdown('<div class="section-title">Inputs</div>', unsafe_allow_html=True)
+    with st.form("add_form", clear_on_submit=True):
+        c_top = st.columns([1.25, 1.25, 1.0])
+
+        with c_top[0]:
+            ticker   = st.text_input("Ticker", "").strip().upper()
+            atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            float_m  = st.number_input("Public Float (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            gap_pct  = st.number_input("Gap % (Open vs prior close)", min_value=0.0, value=0.0, step=0.1, format="%.1f")
+
+        with c_top[1]:
+            mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            pm_vol_m = st.number_input("Premarket Volume (Millions shares)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+            pm_dol_m = st.number_input("Premarket Dollar Volume (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+
+        with c_top[2]:
+            catalyst_yes = st.toggle("Catalyst present?", value=False, help="News/pr catalyst flag used as binary feature.")
+
+        submitted = st.form_submit_button("Add / Predict", use_container_width=True)
+
+    if submitted and ticker:
+        require_A()
+        A_bundle = st.session_state["A_bundle"]
+        B_bundle = st.session_state.get("B_bundle")
+
+        row = pd.DataFrame([{
+            "PMVolM": pm_vol_m, "PMDolM": pm_dol_m, "FloatM": float_m, "GapPct": gap_pct,
+            "ATR": atr_usd, "MCapM": mc_m, "Catalyst": 1 if catalyst_yes else 0,
+            "DVolM": np.nan, "FT_fac": "Fail",
+        }])
+        feats = featurize(row)
+
+        # Predict with clean error message if something is off
+        try:
+            pred_vol_m = float(predict_model_A(A_bundle, feats)[0])
+        except Exception as e:
+            st.error(f"Model A prediction failed: {e}")
+            st.stop()
+
+        # Predict FT probability if Model B trained
+        if B_bundle is not None:
+            try:
+                featsB = feats.copy()
+                featsB["PredVol_M"] = pred_vol_m
+                ft_prob = float(predict_model_B(B_bundle, featsB)[0])
+            except Exception as e:
+                st.warning(f"Model B prediction failed: {e}")
+                ft_prob = float("nan")
+        else:
+            ft_prob = float("nan")
+
+        # Confidence bands (user sigma)
+        ci68_l = pred_vol_m * math.exp(-1.0 * sigma_ln)
+        ci68_u = pred_vol_m * math.exp(+1.0 * sigma_ln)
+        ci95_l = pred_vol_m * math.exp(-1.96 * sigma_ln)
+        ci95_u = pred_vol_m * math.exp(+1.96 * sigma_ln)
+
+        pm_float_rot_x  = (pm_vol_m / float_m) if float_m > 0 else 0.0
+        pm_pct_of_pred  = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
+        pm_dollar_vs_mc = 100.0 * (pm_dol_m) / mc_m if mc_m > 0 else 0.0
+
+        ft_label = ("FT likely" if (not np.isnan(ft_prob) and ft_prob >= 0.60) else
+                    "Toss-up"   if (not np.isnan(ft_prob) and ft_prob >= 0.40) else
+                    ("FT unlikely" if not np.isnan(ft_prob) else "B model not trained"))
+
+        row_out = {
+            "Ticker": ticker,
+
+            "PredVol_M": round(pred_vol_m, 2),
+            "PredVol_CI68_L": round(ci68_l, 2),
+            "PredVol_CI68_U": round(ci68_u, 2),
+            "PredVol_CI95_L": round(ci95_l, 2),
+            "PredVol_CI95_U": round(ci95_u, 2),
+
+            "FT_Prob": (round(ft_prob, 3) if not np.isnan(ft_prob) else ""),
+            "FT_Label": ft_label,
+
+            "PM_%_of_Pred": round(pm_pct_of_pred, 1),
+            "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
+            "PM_FloatRot_x": round(pm_float_rot_x, 3),
+
+            "_MCap_M": mc_m, "_ATR_$": atr_usd, "_PM_M": pm_vol_m, "_PM$_M": pm_dol_m,
+            "_Float_M": float_m, "_Gap_%": gap_pct, "_Catalyst": 1 if catalyst_yes else 0,
+        }
+
+        st.session_state.rows.append(row_out)
+        st.session_state.last = row_out
+        st.session_state.flash = (
+            f"Saved {ticker} — {ft_label}"
+            + (f" ({ft_prob*100:.1f}%)" if not np.isnan(ft_prob) else "")
+        )
+        do_rerun()
+
+# ---------- Ranking tab ----------
+with tab_rank:
+    st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
+
+    if st.session_state.rows:
+        df = pd.DataFrame(st.session_state.rows)
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
+        # Sort: prefer FT_Prob desc if present, else PredVol_M desc
+        if "FT_Prob" in df.columns and df["FT_Prob"].apply(lambda x: isinstance(x, (int, float))).any():
+            df["_sort_ft"] = pd.to_numeric(df["FT_Prob"], errors="coerce")
+            df = df.sort_values(["_sort_ft","PredVol_M"], ascending=[False, False]).drop(columns=["_sort_ft"])
+        elif "PredVol_M" in df.columns:
+            df = df.sort_values("PredVol_M", ascending=False)
+        df = df.reset_index(drop=True)
+
+        cols_to_show = [
+            "Ticker","FT_Label","FT_Prob",
+            "PredVol_M","PredVol_CI68_L","PredVol_CI68_U",
+            "PM_%_of_Pred","PM$ / MC_%","PM_FloatRot_x"
+        ]
+        for c in cols_to_show:
+            if c not in df.columns:
+                df[c] = "" if c in ("Ticker","FT_Label") else 0.0
+        df = df[cols_to_show]
+
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "FT_Label": st.column_config.TextColumn("FT Label"),
+                "FT_Prob": st.column_config.NumberColumn("FT Prob", format="%.3f"),
+                "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
+                "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
+                "PredVol_CI68_U": st.column_config.NumberColumn("Pred Vol CI68 High (M)", format="%.2f"),
+                "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
+                "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
+                "PM_FloatRot_x": st.column_config.NumberColumn("PM Float Rotation ×", format="%.3f"),
+            }
+        )
+
+        st.markdown('<div class="section-title">📋 Ranking (Markdown view)</div>', unsafe_allow_html=True)
+        st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
+
+        c1, c2, _ = st.columns([0.25, 0.25, 0.5])
+        with c1:
+            st.download_button(
+                "Download CSV",
+                df.to_csv(index=False).encode("utf-8"),
+                "ranking.csv",
+                "text/csv",
+                use_container_width=True
+            )
+        with c2:
+            if st.button("Clear Ranking", use_container_width=True):
+                st.session_state.rows = []
+                st.session_state.last = {}
+                do_rerun()
+    else:
+        st.info("No rows yet. Add a stock in the **Add Stock** tab.")
