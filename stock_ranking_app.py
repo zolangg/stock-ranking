@@ -297,45 +297,30 @@ def _sample(draws, tune, chains, seed):
 def _ensure_clean_matrix(X: np.ndarray, name: str = "X") -> np.ndarray:
     if not np.all(np.isfinite(X)):
         bad = np.argwhere(~np.isfinite(X))
-        # show a few offenders to debug feature creation
         sample = ", ".join([f"({i},{j})" for i, j in bad[:5]])
         raise ValueError(
-            f"{name} contains non-finite values at positions {sample} "
-            f"(total {len(bad)}). Check your featurize() inputs (zeros → ln(), etc.)."
+            f"{name} contains non-finite values at {sample} (total {len(bad)}). "
+            "Check featurize() — e.g., ln(0) or division by 0."
         )
     return np.ascontiguousarray(X, dtype=float)
 
 def _ppc_mean_match_rows(arr: np.ndarray, n_rows: int) -> np.ndarray:
-    """
-    Return mean across draws/chains with shape (n_rows,).
-    Accepts shapes:
-      (chains, draws, n_rows)
-      (draws, n_rows)
-      (draws,)        # allowed only if n_rows==1
-      (n_rows,)       # already reduced
-    """
     arr = np.asarray(arr)
-    if arr.ndim == 3:
-        # (chains, draws, n)
+    if arr.ndim == 3:   # (chains, draws, n)
         out = arr.mean(axis=(0, 1))
-    elif arr.ndim == 2:
-        # (draws, n)
+    elif arr.ndim == 2: # (draws, n)
         out = arr.mean(axis=0)
-    elif arr.ndim == 1:
-        # single row predictions sometimes come back as (draws,)
-        if n_rows == 1:
-            out = np.array([arr.mean()], dtype=float)
-        else:
+    elif arr.ndim == 1: # (draws,) valid only for n_rows==1
+        if n_rows != 1:
             raise ValueError(f"Unexpected PPC shape {arr.shape} for n_rows={n_rows}.")
+        out = np.array([arr.mean()], dtype=float)
     else:
         raise ValueError(f"Unexpected PPC ndim={arr.ndim}, shape={arr.shape}.")
-
     if out.shape[0] != n_rows:
-        # Some backends can return (n,) but with n==training_n; catch and explain
         raise ValueError(
-            f"PPC result length {out.shape[0]} does not match requested rows {n_rows}. "
-            f"This usually means the latent node was evaluated on training X instead of new X. "
-            f"Ensure pm.MutableData is used and pm.set_data was called with the new matrix."
+            f"PPC result length {out.shape[0]} != requested rows {n_rows}. "
+            "This means the latent node was evaluated on TRAINING X, not new X. "
+            "Ensure model used pm.MutableData and set_data was called."
         )
     return out
     
@@ -351,8 +336,9 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
     y = np.ascontiguousarray(dfA["ln_DVol"].to_numpy(dtype=np.float64))
 
     with pm.Model() as mA:
-        X_A = pm.MutableData("X_A", X)     # you already have this
-        f = pmb.BART("f", X_A, y, m=trees)
+        # MUST be MutableData so set_data can change BOTH values and SHAPE later
+        X_A = pm.MutableData("X_A", X)
+        f = pmb.BART("f", X_A, y, m=trees)      # latent mean (log-volume)
         sigma = pm.HalfNormal("sigma", 1.0)
         pm.Normal("y_obs", mu=f, sigma=sigma, observed=y)
 
@@ -369,7 +355,14 @@ def train_model_A(df_feats: pd.DataFrame, predictors: list[str],
             compute_convergence_checks=False,
         )
 
-    return {"model": mA, "trace": trace, "predictors": predictors, "x_name": "X_A"}
+    return {
+        "model": mA,
+        "trace": trace,
+        "predictors": predictors,
+        "x_name": "X_A",
+        "n_train": X.shape[0],       # for diagnostics
+        "trees": trees,
+    }
 
 def _ppc_mean_1d(ppc_arr) -> np.ndarray:
     """Mean across chains/draws → (n_rows,)"""
@@ -381,7 +374,6 @@ def _ppc_mean_1d(ppc_arr) -> np.ndarray:
     raise ValueError(f"Unexpected PPC array shape: {arr.shape}")
 
 def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
-    # Build X and validate
     cols = bundle["predictors"]
     missing = [c for c in cols if c not in Xnew_df.columns]
     if missing:
@@ -389,11 +381,10 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     X = _ensure_clean_matrix(Xnew_df[cols].to_numpy(dtype=float), name="X_A")
     n = X.shape[0]
 
-    # Try latent nodes first
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
 
-        # 1) 'f' (most common)
+        # Try latent 'f'
         try:
             ppc = pm.sample_posterior_predictive(
                 bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
@@ -403,7 +394,7 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         except Exception:
             pass
 
-        # 2) 'mu' (some builds name the latent mean this way)
+        # Fallback latent 'mu'
         try:
             ppc = pm.sample_posterior_predictive(
                 bundle["trace"], var_names=["mu"], return_inferencedata=False, progressbar=False
@@ -413,11 +404,10 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         except Exception:
             pass
 
-    # 3) Library fallback
+    # Library fallback
     try:
         import pymc_bart.utils as bart_utils
-        draws = bart_utils.predict(bundle["trace"], X)  # shape (draws, n) or (draws,)
-        # handle single-row case too
+        draws = bart_utils.predict(bundle["trace"], X)  # (draws, n) or (draws,)
         if draws.ndim == 1 and n == 1:
             return np.exp(np.array([draws.mean()], dtype=float))
         if draws.ndim == 2 and draws.shape[1] == n:
@@ -425,13 +415,14 @@ def predict_model_A(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     except Exception:
         pass
 
-    # Nothing worked
     raise ValueError(
-        "Model A prediction failed: latent PPC did not match new X rows and utils fallback unavailable. "
-        "Double-check that Model A used pm.MutableData for X and that pm.set_data is called before sampling."
+        f"Model A prediction failed. n_new={n}, n_train={bundle.get('n_train')}. "
+        "Most likely X_A is not pm.MutableData in the trained graph, "
+        "or pm.set_data did not actually bind to the node being used by BART."
     )
 
 # --------- Model B: BART classification ----------
+
 def train_model_B(
     df_feats_with_predvol: pd.DataFrame,
     predictors_core: list[str],
@@ -454,7 +445,8 @@ def train_model_B(
         raise RuntimeError("Model B only has one class present. Need both FT and Fail.")
 
     with pm.Model() as mB:
-        X_B = pm.MutableData("X_B", X)     # make sure this is MutableData too
+        # MUST be MutableData for shape changes
+        X_B = pm.MutableData("X_B", X)
         f = pmb.BART("f", X_B, y, m=trees)
         pm.Bernoulli("y_obs", logit_p=f, observed=y)
 
@@ -484,7 +476,14 @@ def train_model_B(
                 compute_convergence_checks=False,
             )
 
-    return {"model": mB, "trace": trace, "predictors": preds_B, "x_name": "X_B"}
+    return {
+        "model": mB,
+        "trace": trace,
+        "predictors": preds_B,
+        "x_name": "X_B",
+        "n_train": X.shape[0],
+        "trees": trees,
+    }
 
 def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     cols = bundle["predictors"]
@@ -497,7 +496,7 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
     with bundle["model"]:
         pm.set_data({bundle["x_name"]: X})
 
-        # 1) 'f' as logits
+        # 'f' as logits
         try:
             ppc = pm.sample_posterior_predictive(
                 bundle["trace"], var_names=["f"], return_inferencedata=False, progressbar=False
@@ -507,7 +506,7 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         except Exception:
             pass
 
-        # 2) 'mu' as logits
+        # 'mu' as logits
         try:
             ppc = pm.sample_posterior_predictive(
                 bundle["trace"], var_names=["mu"], return_inferencedata=False, progressbar=False
@@ -517,10 +516,9 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         except Exception:
             pass
 
-    # 3) Library fallback (returns logits)
     try:
         import pymc_bart.utils as bart_utils
-        draws = bart_utils.predict(bundle["trace"], X)
+        draws = bart_utils.predict(bundle["trace"], X)  # logits
         if draws.ndim == 1 and n == 1:
             return np.array([expit(draws).mean()], dtype=float)
         if draws.ndim == 2 and draws.shape[1] == n:
@@ -529,8 +527,8 @@ def predict_model_B(bundle, Xnew_df: pd.DataFrame) -> np.ndarray:
         pass
 
     raise ValueError(
-        "Model B prediction failed: latent PPC did not match new X rows and utils fallback unavailable. "
-        "Ensure Model B also uses pm.MutableData and set_data is called."
+        f"Model B prediction failed. n_new={n}, n_train={bundle.get('n_train')}. "
+        "Confirm X_B is pm.MutableData and pm.set_data is used before PPC."
     )
 
 def _hash_df_for_cache(df: pd.DataFrame) -> str:
@@ -720,6 +718,35 @@ with st.expander("⚙️ Train / Load BART models (Python-only)"):
                 st.session_state["A_predictors"] = A_bundle["predictors"]
                 st.session_state["B_predictors"] = B_bundle["predictors"]
 
+                def _bart_smoketest(A_bundle, B_bundle):
+                # create two tiny rows near medians of the A training frame, then predict
+                try:
+                    dfA_tr = st.session_state.get("dfA_train")
+                    if dfA_tr is None or dfA_tr.empty:
+                        return
+                    meds = dfA_tr.median(numeric_only=True)
+                    rows = []
+                    for k in ["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM","Catalyst"]:
+                        v = meds.get(k, 1.0)
+                        rows.append(v)
+                    base = dict(zip(["PMVolM","PMDolM","FloatM","GapPct","ATR","MCapM","Catalyst"], rows))
+                    df_probe = pd.DataFrame([base, base])
+                    feats_p = featurize(df_probe)
+            
+                    # should return exactly length 2
+                    pv = predict_model_A(A_bundle, feats_p)
+                    if pv.shape[0] != 2:
+                        raise RuntimeError(f"Smoke A: got {pv.shape[0]} rows (want 2)")
+            
+                    feats_pB = feats_p.copy()
+                    feats_pB["PredVol_M"] = pv
+                    proba = predict_model_B(B_bundle, feats_pB)
+                    if proba.shape[0] != 2:
+                        raise RuntimeError(f"Smoke B: got {proba.shape[0]} rows (want 2)")
+                except Exception as e:
+                    st.error(f"⚠️ BART smoketest failed: {type(e).__name__}: {e}")
+                    st.stop()
+                
                 st.success(f"Trained (rows A: {len(dfA)}, rows B: {len(dfB_cap)}).")
 
 # ---------- Metrics & Importance (GLOBAL; survives reruns) ----------
@@ -948,8 +975,9 @@ with tab_add:
             "DVolM": np.nan, "FT_fac": "Fail",
         }])
         feats = featurize(row)
-        # Ensure no NaNs slipped in (e.g., FloatM=0 → ln_fr)
-        if not np.all(np.isfinite(feats[A_bundle["predictors"]].to_numpy(dtype=float))):
+        need = st.session_state["A_bundle"]["predictors"]
+        Xcheck = feats[need].to_numpy(dtype=float)
+        if not np.all(np.isfinite(Xcheck)):
             st.error("Non-finite values in features for prediction (check Float/PM/Gap/ATR/MCap).")
             st.stop()
 
