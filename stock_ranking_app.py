@@ -198,7 +198,7 @@ def read_excel_dynamic(file, sheet="PMH BO Merged") -> pd.DataFrame:
         lnms = [x.lower() for x in nms]
         for pat in patterns:
             for i, nm in enumerate(lnms):
-                if pd.Series(nm).str_contains(pat, regex=True).iloc[0]:
+                if pd.Series(nm).str.contains(pat, regex=True).iloc[0]:
                     return i
         return None
 
