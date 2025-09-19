@@ -51,10 +51,13 @@ def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     return "\n".join(lines)
 
 def do_rerun():
-    try: st.rerun()
+    try:
+        st.rerun()
     except Exception:
-        try: st.experimental_rerun()
-        except Exception: pass
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
 
 def _hash_df_for_cache(df: pd.DataFrame) -> int:
     try:
@@ -309,7 +312,7 @@ sigma_ln = st.sidebar.slider(
 
 # Optional (slow)
 compute_importance = st.sidebar.toggle("Compute permutation importance (slow)", value=False)
-# NEW: diagnostics control under feature importance
+# Diagnostics control under feature importance
 enable_diagnostics = st.sidebar.toggle("Enable diagnostics", value=False, help="Compute metrics in the Quick diagnostics panel")
 
 # ---------- TRAINING PANEL ----------
@@ -419,9 +422,6 @@ def _logloss(y_true, y_score, eps=1e-12):
     p = np.clip(np.asarray(y_score, dtype=float), eps, 1.0 - eps)
     return float(-np.mean(y_true*np.log(p) + (1 - y_true)*np.log(1 - p))) if len(y_true) else float("nan")
 
-# In the sidebar (add this toggle just after compute_importance):
-enable_diagnostics = st.sidebar.toggle("Enable diagnostics", value=False)
-
 # ---------- Quick diagnostics (render only when toggle is ON) ----------
 if enable_diagnostics:
     st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
@@ -439,7 +439,7 @@ if enable_diagnostics:
                     y_true_log = dfA_tr["ln_DVol"].to_numpy(float)
                     y_pred_lvl = predict_model_A(A_bundle, dfA_tr)
                     y_pred_log = np.log(np.maximum(y_pred_lvl, 1e-9))
-                    c1,c2,c3 = st.columns(3)
+                    c1, c2, c3 = st.columns(3)
                     with c1: st.metric("Model A — R² (log)",  f"{_r2(y_true_log, y_pred_log):.3f}")
                     with c2: st.metric("Model A — RMSE (log)", f"{_rmse(y_true_log, y_pred_log):.3f}")
                     with c3: st.metric("Model A — MAE (log)",  f"{_mae(y_true_log, y_pred_log):.3f}")
@@ -456,7 +456,7 @@ if enable_diagnostics:
                     y_true = (dfB_tr["FT_fac"].astype(str).str.lower()
                               .isin(["ft","1","yes","y","true"])).astype(int).to_numpy()
                     proba  = predict_model_B(B_bundle, dfB_tr)
-                    c1,c2,c3 = st.columns(3)
+                    c1, c2, c3 = st.columns(3)
                     with c1: st.metric("Model B — ROC AUC",            f"{_roc_auc(y_true, proba):.3f}")
                     with c2: st.metric("Model B — Accuracy (thr=0.5)", f"{_accuracy(y_true, proba, 0.5):.3f}")
                     with c3: st.metric("Model B — Log Loss",           f"{_logloss(y_true, proba):.3f}")
@@ -600,10 +600,7 @@ with tab_add:
         else:
             ft_prob = float("nan")
 
-        # Confidence bands (user sigma)
-        sigma_ln = st.session_state.get("sigma_ln_override", None) or st.session_state.get("sigma_ln", None)
-        # ensure from sidebar
-        sigma_ln = st.session_state.get("sigma_ln", None) or st.session_state.get("sigma_ln_override", 0.60)
+        # Confidence bands (from sidebar slider sigma_ln)
         ci68_l = pred_vol_m * math.exp(-1.0 * float(sigma_ln))
         ci68_u = pred_vol_m * math.exp(+1.0 * float(sigma_ln))
         ci95_l = pred_vol_m * math.exp(-1.96 * float(sigma_ln))
