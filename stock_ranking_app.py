@@ -18,7 +18,6 @@ st.markdown(
       .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 16px 0; }
       section[data-testid="stSidebar"] .stSlider { margin-bottom: 6px; }
       .hint { color:#6b7280; font-size:12px; margin-top:-6px; }
-      .checklist pre { white-space: pre-wrap; font-size: 0.95rem; line-height: 1.25rem;}
       .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-weight:600; font-size:.75rem; }
       .pill-good { background:#e7f5e9; color:#166534; border:1px solid #bbf7d0;}
       .pill-warn { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa;}
@@ -35,13 +34,10 @@ def _parse_local_float(s: str) -> Optional[float]:
     if s is None: return None
     s = str(s).strip()
     if s == "": return None
-    # Remove spaces and apostrophes (1 234,56 or 1'234,56)
     s = s.replace(" ", "").replace("’", "").replace("'", "")
-    # If there's a comma but no dot -> treat comma as decimal
     if "," in s and "." not in s:
         s = s.replace(",", ".")
     else:
-        # Otherwise drop commas as thousands separators
         s = s.replace(",", "")
     try:
         return float(s)
@@ -51,7 +47,6 @@ def _parse_local_float(s: str) -> Optional[float]:
 def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
                 max_value: Optional[float] = None, decimals: int = 2,
                 key: Optional[str] = None, help: Optional[str] = None) -> float:
-    """Text input that accepts 5,05  / 1'234,5 / 1 234,5 / 5.05 and returns float."""
     fmt = f"{{:.{decimals}f}}"
     default_str = fmt.format(float(value))
     s = st.text_input(label, default_str, key=key, help=help)
@@ -59,14 +54,12 @@ def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
     if v is None:
         st.caption('<span class="hint">Enter a number, e.g. 5,05</span>', unsafe_allow_html=True)
         return float(value)
-    # Clamp to min/max
     if v < min_value:
         st.caption(f'<span class="hint">Clamped to minimum: {fmt.format(min_value)}</span>', unsafe_allow_html=True)
         v = min_value
     if max_value is not None and v > max_value:
         st.caption(f'<span class="hint">Clamped to maximum: {fmt.format(max_value)}</span>', unsafe_allow_html=True)
         v = max_value
-    # Show normalized preview if user typed a comma/formatting
     if ("," in s) or (" " in s) or ("'" in s):
         st.caption(f'<span class="hint">= {fmt.format(v)}</span>', unsafe_allow_html=True)
     return float(v)
@@ -104,7 +97,7 @@ if st.session_state.flash:
     st.success(st.session_state.flash)
     st.session_state.flash = None
 
-# ---------- Qualitative criteria ----------
+# ---------- Qualitative criteria (unchanged) ----------
 QUAL_CRITERIA = [
     {
         "name": "GapStruct",
@@ -125,13 +118,13 @@ QUAL_CRITERIA = [
         "name": "LevelStruct",
         "question": "Key Price Levels:",
         "options": [
-            "Fails at all major support/resistance; cannot hold any key level.",
-            "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
-            "Holds one support but unable to break resistance; capped below a key level.",
-            "Breaks above resistance but cannot stay; dips below reclaimed level.",
-            "Breaks and holds one major level; most resistance remains above.",
-            "Breaks and holds several major levels; clears most overhead resistance.",
-            "Breaks and holds above all resistance; blue sky.",
+                "Fails at all major support/resistance; cannot hold any key level.",
+                "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
+                "Holds one support but unable to break resistance; capped below a key level.",
+                "Breaks above resistance but cannot stay; dips below reclaimed level.",
+                "Breaks and holds one major level; most resistance remains above.",
+                "Breaks and holds several major levels; clears most overhead resistance.",
+                "Breaks and holds above all resistance; blue sky.",
         ],
         "weight": 0.15,
         "help": "Break/hold behavior at key levels.",
@@ -153,7 +146,7 @@ QUAL_CRITERIA = [
     },
 ]
 
-# ---------- Sidebar: weights & uncertainty (UNCHANGED) ----------
+# ---------- Sidebar: weights & uncertainty (kept) ----------
 st.sidebar.header("Numeric Weights")
 w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01)
 w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01)
@@ -172,17 +165,14 @@ sigma_ln = st.sidebar.slider(
     help="Estimated std dev of residuals in ln(volume). 0.60 ≈ typical for your sheet."
 )
 
-# ---------- Scoring mode (NEW) ----------
-mode = st.sidebar.radio("Scoring mode", ["Weights (original)", "PHB (data-based)", "Hybrid 50/50"], index=0)
-
-# Normalize blocks separately (UNCHANGED)
+# Normalize blocks separately (unchanged)
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
 qual_sum = max(1e-9, sum(q_weights.values()))
 for k in q_weights:
     q_weights[k] = q_weights[k] / qual_sum
 
-# ---------- Numeric bucket scorers (UNCHANGED) ----------
+# ---------- Numeric bucket scorers (kept for display; not used for final Numeric %) ----------
 def pts_rvol(x: float) -> int:
     for th, p in [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]:
         if x < th: return p
@@ -225,7 +215,7 @@ def grade(score_pct: float) -> str:
             "B"   if score_pct >= 60 else
             "C"   if score_pct >= 45 else "D")
 
-# ---------- Day-volume model (millions out) (for PM% calc) ----------
+# ---------- Day-volume model (millions out) ----------
 def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """
     ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$)
@@ -242,14 +232,14 @@ def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
     if pred_m <= 0: return 0.0, 0.0
     return pred_m * math.exp(-z * sigma_ln), pred_m * math.exp(z * sigma_ln)
 
-# ---------- PHB Premarket Checklist (structured, data-based) ----------
+# ---------- PHB Premarket Checklist (structured, no PM% of Pred) ----------
 PHB_RULES = {
     "FLOAT_MAX": 20.0, "FLOAT_SWEET_LO": 5.0, "FLOAT_SWEET_HI": 12.0,
     "MCAP_MAX": 150.0, "MCAP_HUGE": 500.0,
     "ATR_MIN": 0.15,
     "GAP_MIN": 70.0, "GAP_SWEET_HI": 180.0, "GAP_VIABLE_HI": 280.0, "GAP_OUTLIER": 300.0,
     "PM$_MIN": 7.0, "PM$_MAX": 30.0,
-    "PM_SHARE_MIN": 10.0, "PM_SHARE_MAX": 20.0, "PM_SHARE_FAIL_LOW": 5.0, "PM_SHARE_FAIL_HI": 35.0,
+    # removed PM_SHARE_* rules
     "RVOL_MIN": 100.0, "RVOL_MAX": 1500.0, "RVOL_WARN_MAX": 3000.0,
 }
 
@@ -265,13 +255,13 @@ def _fmt_val(v, suffix="", none_txt="—"):
 
 def make_premarket_checklist(*, float_m: float, mcap_m: float, atr_usd: float,
                              gap_pct: float, pm_vol_m: float, pm_dol_m: float,
-                             rvol: float, pm_pct_of_pred: float,
+                             rvol: float, pm_dollar_vs_mc: float,
                              catalyst_points: float, dilution_points: float) -> dict:
     R = PHB_RULES
     good, warn, risk = [], [], []
     greens = reds = 0
 
-    # Catalyst / Dilution
+    # Catalyst / Dilution (affect checklist but not final score directly)
     if catalyst_points >= 0.2:
         good.append("Catalyst: strong/real PR"); greens += 1
     elif catalyst_points <= -0.2:
@@ -347,20 +337,6 @@ def make_premarket_checklist(*, float_m: float, mcap_m: float, atr_usd: float,
     else:
         warn.append(f"PM $Vol marginal (you ${_fmt_val(pm_dol_m,'M')})")
 
-    # PM shares as % of predicted day
-    if pm_pct_of_pred is None or pm_pct_of_pred <= 0:
-        warn.append("PM % of predicted: missing")
-    elif R["PM_SHARE_MIN"] <= pm_pct_of_pred <= R["PM_SHARE_MAX"]:
-        good.append(f"PM shares sweet {int(R['PM_SHARE_MIN'])}–{int(R['PM_SHARE_MAX'])}% (you {_fmt_val(pm_pct_of_pred,'%')})"); greens += 1
-    elif 7 <= pm_pct_of_pred <= 25:
-        good.append(f"PM shares viable 7–25% (you {_fmt_val(pm_pct_of_pred,'%')})"); greens += 1
-    elif pm_pct_of_pred < R["PM_SHARE_FAIL_LOW"]:
-        risk.append(f"PM shares too thin (<{int(R['PM_SHARE_FAIL_LOW'])}% ; you {_fmt_val(pm_pct_of_pred,'%')})"); reds += 1
-    elif pm_pct_of_pred > R["PM_SHARE_FAIL_HI"]:
-        risk.append(f"PM shares front-loaded (>{int(R['PM_SHARE_FAIL_HI'])}% ; you {_fmt_val(pm_pct_of_pred,'%')})"); reds += 1
-    else:
-        warn.append(f"PM shares outside sweet band (you {_fmt_val(pm_pct_of_pred,'%')})")
-
     # RVOL
     if rvol is None or rvol <= 0:
         warn.append("RVOL: missing")
@@ -375,7 +351,11 @@ def make_premarket_checklist(*, float_m: float, mcap_m: float, atr_usd: float,
     if rvol and rvol > R["RVOL_WARN_MAX"]:
         warn.append(f"RVOL >{int(R['RVOL_WARN_MAX'])}× — blowout/exhaustion risk")
 
-    # Verdict & summary
+    # Neutral info (does not change greens/reds until threshold is backtested)
+    if pm_dollar_vs_mc is not None and pm_dollar_vs_mc == pm_dollar_vs_mc:
+        warn.append(f"Info: PM $Vol / MC = {_fmt_val(pm_dollar_vs_mc, '%')} (no threshold yet)")
+
+    # Verdict & numeric score (PHB-based)
     if reds >= 2:
         verdict = "Weak / Avoid"; pill = '<span class="pill pill-bad">Weak / Avoid</span>'
     elif greens >= 6:
@@ -383,24 +363,15 @@ def make_premarket_checklist(*, float_m: float, mcap_m: float, atr_usd: float,
     else:
         verdict = "Constructive"; pill = '<span class="pill pill-warn">Constructive</span>'
 
-    pos = [s.split(" (")[0] for s in good][:3]
-    neg = [s.split(" (")[0] for s in risk][:3]
-    summary_bits = []
-    if pos: summary_bits.append("Good: " + ", ".join(pos))
-    if neg: summary_bits.append("Risk: " + ", ".join(neg))
-    summary = " | ".join(summary_bits) if summary_bits else "—"
+    # PHB numeric % from checklist
+    phb_numeric = float(max(0, min(100, 50 + (10 * greens) - (15 * reds))))
 
     return {
         "greens": greens, "reds": reds,
         "good": good, "warn": warn, "risk": risk,
-        "verdict": verdict, "pill": pill, "summary": summary
+        "verdict": verdict, "pill": pill,
+        "phb_numeric": phb_numeric
     }
-
-# ---------- PHB score function (for mode switch) ----------
-def phb_score_from_checklist(greens: int, reds: int) -> float:
-    # 0–100 scale, rewarding greens and penalizing reds
-    base = 10 * greens - 15 * reds          # tweakable weights
-    return float(max(0, min(100, 50 + base)))
 
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -410,10 +381,8 @@ with tab_add:
 
     # Form that clears on submit
     with st.form("add_form", clear_on_submit=True):
-        # === Requested order ===
         col1, col2, col3 = st.columns([1.2, 1.2, 0.9])
 
-        # First column: Ticker, Market Cap, Float, SI %, Gap %
         with col1:
             ticker   = st.text_input("Ticker", "").strip().upper()
             mc_m     = input_float("Market Cap (Millions $)", 0.0, min_value=0.0, decimals=2)
@@ -421,14 +390,12 @@ with tab_add:
             si_pct   = input_float("Short Interest (%)",       0.0, min_value=0.0, decimals=2)
             gap_pct  = input_float("Gap %", 0.0, min_value=0.0, decimals=1)
 
-        # Second column: ATR, RVOL, Premarket Volume (shares), Premarket $ Volume
         with col2:
             atr_usd  = input_float("ATR ($)", 0.0, min_value=0.0, decimals=2)
             rvol     = input_float("RVOL",    0.0, min_value=0.0, decimals=2)
             pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
             pm_dol_m = input_float("Premarket Dollar Volume (Millions $)",   0.0, min_value=0.0, decimals=2)
 
-        # Third column: Modifiers right next to numbers
         with col3:
             st.markdown("**Modifiers**")
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
@@ -452,61 +419,46 @@ with tab_add:
 
     # After submit
     if submitted and ticker:
-        # === Day volume prediction (M) ===
+        # Predicted day volume (M) + CIs
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
+        ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
+        ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)
 
-        # Confidence bands (millions)
-        ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)    # ~68%
-        ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)   # ~95%
-
-        # === Numeric points (weights system) ===
+        # ORIGINAL numeric & qual blocks (kept to show but Numeric % replaced by PHB)
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
         p_fr    = pts_fr(pm_vol_m, float_m)
         p_float = pts_float(float_m)
         num_0_7 = (w_rvol*p_rvol) + (w_atr*p_atr) + (w_si*p_si) + (w_fr*p_fr) + (w_float*p_float)
-        num_pct = (num_0_7/7.0)*100.0
+        _orig_num_pct = (num_0_7/7.0)*100.0  # not used for final Numeric %
 
-        # === Qualitative points (weights system) ===
         qual_0_7 = 0.0
         for crit in QUAL_CRITERIA:
             sel = st.session_state.get(f"qual_{crit['name']}", (1,))[0] if isinstance(st.session_state.get(f"qual_{crit['name']}", 1), tuple) else st.session_state.get(f"qual_{crit['name']}", 1)
             qual_0_7 += q_weights[crit["name"]] * float(sel)
         qual_pct = (qual_0_7/7.0)*100.0
 
-        # === Combine weights (original) ===
-        final_score_weights = 0.5*num_pct + 0.5*qual_pct
-        final_score_weights = max(0.0, min(100.0, round(final_score_weights + (catalyst_points*10) + (dilution_points*10), 2)))
+        # PM $Vol / MC % (for metric + checklist neutral info)
+        pm_dollar_vs_mc = 100.0 * pm_dol_m / mc_m if mc_m > 0 else float("nan")
 
-        # === Diagnostics to save ===
-        pm_pct_of_pred   = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
-        pm_float_rot_x   = pm_vol_m / float_m if float_m > 0 else 0.0
-        pm_dollar_vs_mc  = 100.0 * pm_dol_m / mc_m if mc_m > 0 else 0.0  # uses input $Volume (M$)
-
-        # === Premarket Checklist (data-based) ===
+        # Checklist → PHB numeric %
         checklist = make_premarket_checklist(
             float_m=float_m, mcap_m=mc_m, atr_usd=atr_usd,
             gap_pct=gap_pct, pm_vol_m=pm_vol_m, pm_dol_m=pm_dol_m,
-            rvol=rvol, pm_pct_of_pred=pm_pct_of_pred,
+            rvol=rvol, pm_dollar_vs_mc=pm_dollar_vs_mc,
             catalyst_points=catalyst_points, dilution_points=dilution_points
         )
-        phb_pct = phb_score_from_checklist(checklist["greens"], checklist["reds"])
+        numeric_pct = checklist["phb_numeric"]
 
-        # === Scoring mode switch ===
-        if mode == "Weights (original)":
-            final_score = final_score_weights
-        elif mode == "PHB (data-based)":
-            final_score = phb_pct
-        else:  # Hybrid 50/50
-            final_score = 0.5 * final_score_weights + 0.5 * phb_pct
-        final_score = float(max(0.0, min(100.0, final_score)))
+        # Final Score = average of Numeric % (PHB) and Qualitative %
+        final_score = float(max(0.0, min(100.0, 0.5*numeric_pct + 0.5*qual_pct)))
 
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
             "Level": grade(final_score),
-            "Numeric_%": round(num_pct, 2),
+            "Numeric_%": round(numeric_pct, 2),  # PHB-based
             "Qual_%": round(qual_pct, 2),
             "FinalScore": round(final_score, 2),
 
@@ -516,24 +468,17 @@ with tab_add:
             "PredVol_CI68_U": round(ci68_u, 2),
             "PredVol_CI95_L": round(ci95_l, 2),
             "PredVol_CI95_U": round(ci95_u, 2),
-            "PM_%_of_Pred": round(pm_pct_of_pred, 1),
 
-            # Ratios
-            "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
-            "PM_FloatRot_x": round(pm_float_rot_x, 3),
+            # Ratios/diagnostics
+            "PM$ / MC_%": round(pm_dollar_vs_mc, 1) if pm_dollar_vs_mc == pm_dollar_vs_mc else "",  # show only if defined
+            "PM_FloatRot_x": round(pm_vol_m / float_m, 3) if float_m > 0 else 0.0,
 
-            # raw inputs for debug / export
-            "_MCap_M": mc_m,
-            "_Gap_%": gap_pct,
-            "_SI_%": si_pct,
-            "_ATR_$": atr_usd,
-            "_PM_M": pm_vol_m,
-            "_PM$_M": pm_dol_m,
-            "_Float_M": float_m,
-            "_Catalyst": float(catalyst_points),
-            "_Dilution": float(dilution_points),
+            # raw inputs
+            "_MCap_M": mc_m, "_Gap_%": gap_pct, "_SI_%": si_pct, "_ATR_$": atr_usd,
+            "_PM_M": pm_vol_m, "_PM$_M": pm_dol_m, "_Float_M": float_m,
+            "_Catalyst": float(catalyst_points), "_Dilution": float(dilution_points),
 
-            # checklist & summary (structured)
+            # checklist
             "PremarketVerdict": checklist["verdict"],
             "PremarketPill": checklist["pill"],
             "PremarketGreens": checklist["greens"],
@@ -541,10 +486,6 @@ with tab_add:
             "PremarketGood": checklist["good"],
             "PremarketWarn": checklist["warn"],
             "PremarketRisk": checklist["risk"],
-            "PremarketSummary": checklist["summary"],
-            "ScoreMode": mode,
-            "PHB_Score": round(phb_pct, 2),
-            "Weights_Score": round(final_score_weights, 2),
         }
 
         st.session_state.rows.append(row)
@@ -558,28 +499,27 @@ with tab_add:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
         cA, cB, cC, cD, cE = st.columns(5)
         cA.metric("Last Ticker", l.get("Ticker","—"))
-        cB.metric("Numeric Block", f"{l.get('Numeric_%',0):.2f}%")
-        cC.metric("Qual Block",    f"{l.get('Qual_%',0):.2f}%")
-        cD.metric("Final Score",   f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
+        cB.metric("Numeric % (PHB)", f"{l.get('Numeric_%',0):.2f}%")
+        cC.metric("Qualitative %",    f"{l.get('Qual_%',0):.2f}%")
+        cD.metric("Final Score",      f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
         cE.metric("Odds", l.get("Odds","—"))
 
-        d1, d2, d3, d4, d5 = st.columns(5)
+        d1, d2, d3, d4 = st.columns(4)
         d1.metric("PM Float Rotation", f"{l.get('PM_FloatRot_x',0):.3f}×")
         d1.caption("Premarket volume ÷ float.")
-        d2.metric("PM $Vol / MC", f"{l.get('PM$ / MC_%',0):.1f}%")
+        pm_mc = l.get("PM$ / MC_%","")
+        d2.metric("PM $Vol / MC", f"{pm_mc if pm_mc != '' else '—'}")
         d2.caption("Premarket dollar volume ÷ market cap × 100.")
         d3.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
         d3.caption(
             f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
             f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
         )
-        d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
-        d4.caption("PM volume ÷ predicted day volume × 100.")
-        d5.metric("Mode", l.get("ScoreMode","—"))
-        d5.caption(f"PHB {l.get('PHB_Score',0):.1f} · Weights {l.get('Weights_Score',0):.1f}")
+        d4.metric("Gap %", f"{l.get('_Gap_%',0):.1f}%")
+        d4.caption("Open gap vs prior close.")
 
         # ---------- Structured Premarket Checklist UI ----------
-        with st.expander("Premarket Checklist (data-based)", expanded=True):
+        with st.expander("Premarket Checklist (data-driven)", expanded=True):
             verdict = l.get("PremarketVerdict","—")
             greens = l.get("PremarketGreens",0)
             reds = l.get("PremarketReds",0)
@@ -606,8 +546,6 @@ with tab_add:
                 st.markdown("**Risk**")
                 st.markdown(_ul(l.get("PremarketRisk", [])), unsafe_allow_html=True)
 
-            st.caption(f"Summary: {l.get('PremarketSummary','—')}")
-
 # ---------- Ranking tab ----------
 with tab_rank:
     st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
@@ -619,17 +557,16 @@ with tab_rank:
         if "FinalScore" in df.columns:
             df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
+        # trimmed columns per your request (no mode, no FT, no PM% of Pred, no summary)
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
-            "ScoreMode","PHB_Score","Weights_Score",
             "PremarketVerdict","PremarketReds","PremarketGreens",
-            "PM$ / MC_%","PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM_%_of_Pred",
-            "PremarketSummary"
+            "PredVol_M","PredVol_CI68_L","PredVol_CI68_U",
         ]
         for c in cols_to_show:
             if c not in df.columns:
-                df[c] = "" if c in ("Ticker","Odds","Level","PremarketVerdict","PremarketSummary","ScoreMode") else 0.0
+                df[c] = "" if c in ("Ticker","Odds","Level","PremarketVerdict") else 0.0
         df = df[cols_to_show]
 
         st.dataframe(
@@ -640,21 +577,15 @@ with tab_rank:
                 "Ticker": st.column_config.TextColumn("Ticker"),
                 "Odds": st.column_config.TextColumn("Odds"),
                 "Level": st.column_config.TextColumn("Level"),
-                "Numeric_%": st.column_config.NumberColumn("Numeric_%", format="%.2f"),
+                "Numeric_%": st.column_config.NumberColumn("Numeric_% (PHB)", format="%.2f"),
                 "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
-                "ScoreMode": st.column_config.TextColumn("Mode"),
-                "PHB_Score": st.column_config.NumberColumn("PHB Score", format="%.2f"),
-                "Weights_Score": st.column_config.NumberColumn("Weights Score", format="%.2f"),
                 "PremarketVerdict": st.column_config.TextColumn("Premarket Verdict"),
                 "PremarketReds": st.column_config.NumberColumn("🚫 Reds"),
                 "PremarketGreens": st.column_config.NumberColumn("✅ Greens"),
-                "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
                 "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
                 "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
                 "PredVol_CI68_U": st.column_config.NumberColumn("Pred Vol CI68 High (M)", format="%.2f"),
-                "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
-                "PremarketSummary": st.column_config.TextColumn("Summary"),
             }
         )
 
