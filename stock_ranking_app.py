@@ -5,6 +5,14 @@ import math
 import re
 from typing import Optional, Dict, Any, List
 
+# ====== Optional: ensure Excel engine is available ======
+try:
+    import openpyxl  # noqa: F401
+    _EXCEL_ENGINE = "openpyxl"
+except Exception:
+    _EXCEL_ENGINE = None  # we'll let pandas pick; if missing, the app will error and tell user
+
+
 # =============== Page & Styles ===============
 st.set_page_config(page_title="Premarket Stock Ranking (Smooth Curves)", layout="wide")
 st.title("Premarket Stock Ranking")
@@ -28,6 +36,20 @@ st.markdown("""
   .debug-table th, .debug-table td { font-size:12px; }
 </style>
 """, unsafe_allow_html=True)
+
+# ======= Controls for calibrated stacking =======
+# Clip each variable's log-odds delta to ±PER_VAR_CLIP
+PER_VAR_CLIP = 0.9      # ~±0.9 ≈ about ±20 ppt near mid; tune 0.6–1.2
+# Global temperature (soften overall aggressiveness)
+TAU = 0.7               # 0.6–0.9 typical
+# Modifiers (Catalyst/Dilution) as log-odds shifts per +1.0 on the slider
+CATALYST_LOGODDS_COEF = 0.35
+DILUTION_LOGODDS_COEF = -0.35
+# Variables that are correlated; cap their combined reliability to avoid double-counting
+CORR_GROUPS = [
+    ["pm_vol_m", "fr_x", "pm_pct_pred", "pmmc_pct"],  # PM activity cluster
+]
+GROUP_MAX_WEIGHT = 1.2
 
 # =============== Helpers ===============
 def _parse_local_float(s: str) -> Optional[float]:
@@ -369,13 +391,70 @@ def fit_curve(series: pd.Series, labels: pd.Series):
         "q": {"p10": q10, "p25": q25, "p50": q50, "p75": q75, "p90": q90}
     }
 
+# ====== AUC & calibration utils (no sklearn needed) ======
+def _safe_auc(y_true: np.ndarray, score: np.ndarray) -> float:
+    """
+    Compute ROC-AUC via Mann–Whitney U (probability that a random positive ranks above a random negative).
+    Returns 0.5 if not computable.
+    """
+    y = np.asarray(y_true, dtype=float)
+    s = np.asarray(score, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(s)
+    y, s = y[mask], s[mask]
+    if y.size < 3 or len(np.unique(y)) < 2:
+        return 0.5
+    # Rank scores (average ranks for ties)
+    order = np.argsort(s)
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(1, len(s) + 1)
+    # tie adjust: average over equal scores
+    _, inv, counts = np.unique(s, return_inverse=True, return_counts=True)
+    avg_ranks = np.bincount(inv, weights=ranks) / np.bincount(inv)
+    ranks = avg_ranks[inv]
+    n1 = float((y == 1).sum())
+    n0 = float((y == 0).sum())
+    if n1 == 0 or n0 == 0:
+        return 0.5
+    rank_sum_pos = ranks[y == 1].sum()
+    u = rank_sum_pos - n1 * (n1 + 1) / 2.0
+    auc = u / (n0 * n1)
+    return float(np.clip(auc, 0.0, 1.0))
+
+def _prob_from_curve(model, xvals: np.ndarray) -> np.ndarray:
+    p = model["predict"](xvals)
+    p = np.asarray(p, dtype=float)
+    return np.clip(p, 1e-6, 1 - 1e-6)
+
+def _logit(p: np.ndarray) -> np.ndarray:
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return np.log(p / (1 - p))
+
+def _rebalance_group_weights(reliab: Dict[str, float]) -> Dict[str, float]:
+    r = dict(reliab)
+    for group in CORR_GROUPS:
+        s = sum(r.get(k, 0.0) for k in group)
+        if s > GROUP_MAX_WEIGHT and s > 0:
+            scale = GROUP_MAX_WEIGHT / s
+            for k in group:
+                r[k] = r.get(k, 0.0) * scale
+    return r
+
+# =============== Learn from Excel (with reliability & priors) ===============
 def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[str, Any]:
-    xls = pd.ExcelFile(file)
+    if _EXCEL_ENGINE is None:
+        try:
+            xls = pd.ExcelFile(file)
+        except Exception as e:
+            st.error("Reading .xlsx requires **openpyxl**. Install it (`pip install openpyxl`) and rerun.")
+            raise e
+    else:
+        xls = pd.ExcelFile(file, engine=_EXCEL_ENGINE)
+
     if ft_sheet not in xls.sheet_names or fail_sheet not in xls.sheet_names:
         raise ValueError(f"Sheets not found. Available: {xls.sheet_names}")
 
-    ft_raw   = pd.read_excel(xls, ft_sheet)
-    fail_raw = pd.read_excel(xls, fail_sheet)
+    ft_raw   = pd.read_excel(xls, ft_sheet, engine=_EXCEL_ENGINE) if _EXCEL_ENGINE else pd.read_excel(xls, ft_sheet)
+    fail_raw = pd.read_excel(xls, fail_sheet, engine=_EXCEL_ENGINE) if _EXCEL_ENGINE else pd.read_excel(xls, fail_sheet)
 
     ft_map = reveal_mapping(ft_raw)
     fail_map = reveal_mapping(fail_raw)
@@ -393,14 +472,13 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
         "fr_x","pmmc_pct","pm_pct_pred"
     ]
     curves = {}
-    learned = 0
     for v in var_list:
         if v in all_num.columns:
             model = fit_curve(all_num[v], all_num["_y"])
             if model:
                 curves[v] = model
-                learned += 1
 
+    # Training summary
     summary_rows = []
     for v in var_list:
         m = curves.get(v)
@@ -414,7 +492,46 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
             })
     summary_df = pd.DataFrame(summary_rows)
 
-    return {"curves": curves, "summary": summary_df, "ft_map": ft_map, "fail_map": fail_map, "learned_count": learned}
+    # === Base rate & variable reliabilities ===
+    y_all = all_num["_y"].to_numpy()
+    base_rate = float(np.mean(y_all)) if len(y_all) else 0.5
+    prior_logodds = math.log(max(base_rate,1e-6) / max(1 - base_rate, 1e-6))
+
+    reliab = {}       # key -> weight in [0,1]
+    ref_logit = {}    # key -> median logit(model(x)) on training x's
+    for v in var_list:
+        m = curves.get(v)
+        if (m is None) or (v not in all_num.columns):
+            reliab[v] = 0.0
+            ref_logit[v] = 0.0
+            continue
+        x = pd.to_numeric(all_num[v], errors="coerce").to_numpy()
+        mask = np.isfinite(x)
+        x = x[mask]
+        y = y_all[mask]
+        if len(x) < 10 or len(np.unique(y)) < 2:
+            reliab[v] = 0.0
+            ref_logit[v] = 0.0
+            continue
+        p_hat = _prob_from_curve(m, x)
+        auc  = _safe_auc(y, p_hat)
+        gamma = 0.8  # soft nonlinearity
+        w = (2.0 * abs(auc - 0.5)) ** gamma
+        reliab[v] = float(np.clip(w, 0.0, 1.0))
+        ref_logit[v] = float(np.median(_logit(p_hat)))
+
+    learned_meta = {
+        "curves": curves,
+        "summary": summary_df,
+        "ft_map": ft_map,
+        "fail_map": fail_map,
+        "learned_count": len(curves),
+        "base_rate": base_rate,
+        "prior_logodds": prior_logodds,
+        "reliability": reliab,
+        "ref_logit": ref_logit,
+    }
+    return learned_meta
 
 # =============== Qualitative % (unchanged) ===============
 def qualitative_percent(q_weights: Dict[str, float]) -> float:
@@ -425,21 +542,6 @@ def qualitative_percent(q_weights: Dict[str, float]) -> float:
         qual_0_7 += q_weights[crit["name"]] * float(sel)
     return (qual_0_7/7.0)*100.0
 
-# =============== Odds Stacking ===============
-def prob_from_logodds(z: float) -> float:
-    return 1.0 / (1.0 + math.exp(-z))
-
-def combine_probs_oddsstack(probs: List[float]) -> float:
-    z_sum = 0.0
-    for p in probs:
-        p = float(np.clip(p, 1e-6, 1 - 1e-6))
-        z_sum += math.log(p / (1 - p))
-    return prob_from_logodds(z_sum)
-
-# Sliders → log-odds shifts per +1.0
-CATALYST_LOGODDS_COEF = 0.5    # ~ +12 ppt around mid
-DILUTION_LOGODDS_COEF = -0.5   # ~ -12 ppt around mid
-
 # =============== Learn Button ===============
 if learn_btn:
     if not uploaded:
@@ -449,9 +551,9 @@ if learn_btn:
             learned = learn_all_curves_from_excel(uploaded, ft_sheet, fail_sheet)
             st.session_state.CURVES = learned
             if learned["learned_count"] == 0:
-                st.sidebar.warning("No curves learned. Check the mapping tables below and ensure ≥30 valid rows per variable across FT+Fail.")
+                st.sidebar.warning("No curves learned. Check mapping tables and ensure ≥30 valid rows per variable across FT+Fail.")
             else:
-                st.sidebar.success(f"Curves learned for {learned['learned_count']} variables.")
+                st.sidebar.success(f"Curves learned for {learned['learned_count']} variables. Base FT rate ≈ {learned['base_rate']*100:.1f}%.")
         except Exception as e:
             st.sidebar.error(f"Learning failed: {e}")
 
@@ -522,8 +624,15 @@ with tab_add:
         ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)
         pm_pct_pred = (100.0 * pm_vol_m / pred_vol_m) if pred_vol_m > 0 else float("nan")
 
-        # Curves
-        curves = (st.session_state.CURVES or {}).get("curves", {}) if isinstance(st.session_state.CURVES, dict) else {}
+        # Curves pack
+        curves_pack = st.session_state.CURVES if isinstance(st.session_state.CURVES, dict) else {}
+        curves = curves_pack.get("curves", {}) if isinstance(curves_pack.get("curves", {}), dict) else {}
+        prior_logodds = float(curves_pack.get("prior_logodds", 0.0))
+        reliab = curves_pack.get("reliability", {}) or {}
+        ref_logit = curves_pack.get("ref_logit", {}) or {}
+
+        # Rebalance reliabilities for correlated groups
+        reliab = _rebalance_group_weights(reliab)
 
         # Per-variable probabilities with diagnostics
         st.session_state["DEBUG_POF"] = {}
@@ -536,7 +645,7 @@ with tab_add:
             if x is None or not np.isfinite(x):
                 dbg[var_key] = "neutral: input missing/non-finite"
                 return 0.5
-            if m["use_log"] and x <= 0:
+            if m.get("use_log", False) and x <= 0:
                 dbg[var_key] = "neutral: input <=0 but curve is log-scale"
                 return 0.5
             try:
@@ -565,23 +674,36 @@ with tab_add:
             "pm_pct_pred": p_of("pm_pct_pred", pm_pct_pred),
         }
 
-        # Combine via odds stacking + modifiers
-        z_sum = 0.0
-        for p in probs.values():
-            p = float(np.clip(p, 1e-6, 1 - 1e-6))
-            z_sum += math.log(p / (1 - p))
+        # --- Calibrated odds stacking ---
+        z_sum = prior_logodds  # start at base-rate prior
+        for k, p in probs.items():
+            z_k = math.log(max(p,1e-6) / max(1 - p, 1e-6))
+            z0  = float(ref_logit.get(k, 0.0))
+            dz  = np.clip(z_k - z0, -PER_VAR_CLIP, PER_VAR_CLIP)
+            w   = float(np.clip(reliab.get(k, 0.0), 0.0, 1.0))
+            z_sum += w * dz
+
+        # Modifiers
         z_sum += CATALYST_LOGODDS_COEF * float(catalyst_points)
         z_sum += DILUTION_LOGODDS_COEF * float(dilution_points)
-        numeric_prob = prob_from_logodds(z_sum)
-        numeric_pct = 100.0 * numeric_prob
+
+        # Temperature
+        z_sum *= TAU
+
+        numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
+        numeric_pct  = 100.0 * numeric_prob
+
+        # Optional: keep numeric % within 5..95 (soft extreme cap)
+        # numeric_prob = 0.05 + 0.90 * numeric_prob
+        # numeric_pct  = 100.0 * numeric_prob
 
         # Qualitative %
         qual_pct = qualitative_percent(q_weights)
 
-        # Final score
+        # Final score (50/50)
         final_score = float(max(0.0, min(100.0, 0.5*numeric_pct + 0.5*qual_pct)))
 
-        # Verdict pill
+        # Verdict pill (based on numeric %)
         if numeric_pct >= 75.0:
             verdict = "Strong Setup"; pill = '<span class="pill pill-good">Strong Setup</span>'
         elif numeric_pct >= 55.0:
@@ -589,23 +711,29 @@ with tab_add:
         else:
             verdict = "Weak / Avoid"; pill = '<span class="pill pill-bad">Weak / Avoid</span>'
 
-        # Checklist buckets by per-variable probability
-        def bucket(name, p):
-            if p >= 0.60: return ("good", f"{name}: supports FT ({p*100:.0f}%)")
-            if p >= 0.45: return ("warn", f"{name}: neutral ({p*100:.0f}%)")
-            return ("risk", f"{name}: headwind ({p*100:.0f}%)")
-
+        # Checklist based on calibrated effective contribution
         names_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
             "pm_vol_m":"PM Volume (M)","pm_dol_m":"PM $Vol (M)","float_m":"Float (M)","mcap_m":"MarketCap (M)",
             "fr_x":"PM Float Rotation ×","pmmc_pct":"PM $Vol / MC %","pm_pct_pred":"PM Vol % of Pred"
         }
+        def contribution_label(var_key: str, p: float) -> str:
+            z_k = math.log(max(p,1e-6) / max(1 - p, 1e-6))
+            z0  = float(ref_logit.get(var_key, 0.0))
+            dz  = float(np.clip(z_k - z0, -PER_VAR_CLIP, PER_VAR_CLIP))
+            w   = float(np.clip(reliab.get(var_key, 0.0), 0.0, 1.0))
+            eff = TAU * w * dz
+            if eff >= 0.25:        return "good"
+            elif eff <= -0.25:     return "risk"
+            else:                  return "warn"
+
         good, warn, risk = [], [], []
-        for k,v in probs.items():
-            cat, txt = bucket(names_map.get(k,k), v)
-            if cat=="good": good.append(txt)
-            elif cat=="warn": warn.append(txt)
-            else: risk.append(txt)
+        for k, p in probs.items():
+            label = contribution_label(k, p)
+            txt = f"{names_map.get(k,k)}: {'supports' if label=='good' else 'headwind' if label=='risk' else 'neutral'} (p≈{p*100:.0f}%)"
+            if label == "good":   good.append(txt)
+            elif label == "risk": risk.append(txt)
+            else:                 warn.append(txt)
 
         row = {
             "Ticker": ticker,
