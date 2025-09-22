@@ -13,7 +13,7 @@ except Exception:
     _EXCEL_ENGINE = None  # pandas will try; if missing, we'll warn
 
 # =============== Page & Styles ===============
-st.set_page_config(page_title="Premarket Stock Ranking (Smooth Curves + Tail Risk)", layout="wide")
+st.set_page_config(page_title="Premarket Stock Ranking (Smooth Curves + Soft Tail Risk)", layout="wide")
 st.title("Premarket Stock Ranking")
 
 st.markdown("""
@@ -38,11 +38,21 @@ st.markdown("""
 
 # ======= Calibrated stacking / correlation settings =======
 PER_VAR_CLIP = 0.9      # per-variable log-odds delta clip (±)
-TAU = 0.7               # global temperature (softens stack)
+TAU = 0.70              # global temperature for curve contributions
+
+# NEW: penalties have their own “temperature”
+PEN_TAU = 0.60          # penalties scaled by this (softer than TAU)
+
+# caps (log-odds)
+MAX_PER_VAR_PEN = 0.50  # max |Δlogodds| per variable from tail penalty
+MAX_TOTAL_PEN   = 1.20  # max |sum of penalties| in log-odds (~ -20–25 ppt)
+
 CATALYST_LOGODDS_COEF = 0.35
 DILUTION_LOGODDS_COEF = -0.35
+
+# correlated PM activity cluster
 CORR_GROUPS = [
-    ["pm_vol_m", "fr_x", "pm_pct_pred", "pmmc_pct"],  # PM activity cluster
+    ["pm_vol_m", "fr_x", "pm_pct_pred", "pmmc_pct"],
 ]
 GROUP_MAX_WEIGHT = 1.2
 
@@ -248,7 +258,7 @@ def _numify(s: pd.Series) -> pd.Series:
 
 def _ensure_gap_pct(series: pd.Series) -> pd.Series:
     s = _numify(series)
-    if s.dropna().lt(5).mean() > 0.6:  # many values like 0.8 instead of 80
+    if s.dropna().lt(5).mean() > 0.6:  # values like 0.8 instead of 80
         s = s * 100.0
     return s
 
@@ -375,7 +385,7 @@ def fit_curve(series: pd.Series, labels: pd.Series):
         "q": {"p10": q10, "p25": q25, "p50": q50, "p75": q75, "p90": q90}
     }
 
-# ====== AUC & calibration utils (no sklearn needed) ======
+# ====== AUC & calibration utils ======
 def _safe_auc(y_true: np.ndarray, score: np.ndarray) -> float:
     y = np.asarray(y_true, dtype=float)
     s = np.asarray(score, dtype=float)
@@ -502,56 +512,64 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
         "prior_logodds": prior_logodds,
         "reliability": reliab,
         "ref_logit": ref_logit,
-        # keep training numeric table (to auto-derive guardrails)
         "train_num": all_num,
     }
     return learned_meta
 
-# =============== Tail-Risk Guardrails (all variables) ===============
+# =============== Tail-Risk Guardrails (soft for all variables) ===============
 
-# Default domain overrides (merged with data bands)
+# Domain overrides merged with data bands (soft)
 DOMAIN_OVERRIDES = {
-    # key: {"low": value or None, "high": value or None}
     "gap_pct":     {"low": 30.0,  "high": 300.0},  # <30 rarely runs; >300 exhaustion risk
     "rvol":        {"low": 3.0,   "high": 3000.0},
     "pm_dol_m":    {"low": 3.0,   "high": 40.0},   # $3–15M sweet; >40 bloated
-    "pm_vol_m":    {"low": None,  "high": None},   # data-driven; we’ll also handle via pm_pct_pred
+    "pm_vol_m":    {"low": None,  "high": None},   # data-driven
     "pm_pct_pred": {"low": 5.0,   "high": 35.0},   # <5% weak fuel; >35% front-loaded
     "pmmc_pct":    {"low": None,  "high": 35.0},   # >30–40% often bloaty
     "atr_usd":     {"low": 0.15,  "high": 1.50},   # typical 0.2–0.4
-    "float_m":     {"low": 2.0,   "high": 20.0},   # <2M halt/illiquid risk; >20M sluggish
-    "mcap_m":      {"low": None,  "high": 150.0},  # >150M sluggish for your setup
-    "si_pct":      {"low": 0.5,   "high": 35.0},   # tiny SI unhelpful; extreme SI unreliable
-    "fr_x":        {"low": 1e-3,  "high": 1.00},   # much above 1× in PM = front-loaded
+    "float_m":     {"low": 2.0,   "high": 20.0},   # <2M halt/illiquid; >20M sluggish
+    "mcap_m":      {"low": None,  "high": 150.0},  # >150M sluggish
+    "si_pct":      {"low": 0.5,   "high": 35.0},
+    "fr_x":        {"low": 1e-3,  "high": 1.00},   # >>1× PM rotation = front-loaded
 }
 
-# Base penalty strengths per variable (log-odds per log distance beyond band)
+# Softer base strengths (log-odds per log distance beyond band)
 BASE_PEN_STRENGTH = {
-    "gap_pct":     (0.50, 0.70),   # (low_pen, high_pen)
-    "rvol":        (0.40, 0.70),
-    "pm_dol_m":    (0.30, 0.60),
-    "pm_vol_m":    (0.20, 0.40),
-    "pm_pct_pred": (0.30, 0.70),
-    "pmmc_pct":    (0.20, 0.60),
-    "atr_usd":     (0.40, 0.40),
-    "float_m":     (0.30, 0.50),
-    "mcap_m":      (0.10, 0.40),
-    "si_pct":      (0.10, 0.30),
-    "fr_x":        (0.20, 0.60),
+    "gap_pct":     (0.35, 0.55),   # (low_pen, high_pen)
+    "rvol":        (0.30, 0.55),
+    "pm_dol_m":    (0.25, 0.45),
+    "pm_vol_m":    (0.15, 0.35),
+    "pm_pct_pred": (0.25, 0.55),
+    "pmmc_pct":    (0.15, 0.45),
+    "atr_usd":     (0.30, 0.35),
+    "float_m":     (0.25, 0.40),
+    "mcap_m":      (0.10, 0.30),
+    "si_pct":      (0.10, 0.25),
+    "fr_x":        (0.15, 0.45),
 }
 
-def _qr_band(s: pd.Series, p_lo=10, p_hi=90) -> tuple[float,float]:
+def _qr_band(s: pd.Series, p_lo=5, p_hi=95):
     z = pd.to_numeric(s, errors="coerce")
     z = z[np.isfinite(z)]
     if len(z) == 0:
         return (np.nan, np.nan)
     return (float(np.nanpercentile(z, p_lo)), float(np.nanpercentile(z, p_hi)))
 
+def _blend(a_low, a_high, b_low, b_high, w=0.35):
+    """Blend two bands (data & domain). w=0.35 -> lean to data."""
+    low  = None
+    high = None
+    if a_low is not None or b_low is not None:
+        aa = a_low if a_low is not None else b_low
+        bb = b_low if b_low is not None else a_low
+        low = (1-w)*aa + w*bb if (aa is not None and bb is not None) else (aa or bb)
+    if a_high is not None or b_high is not None:
+        aa = a_high if a_high is not None else b_high
+        bb = b_high if b_high is not None else a_high
+        high = (1-w)*aa + w*bb if (aa is not None and bb is not None) else (aa or bb)
+    return low, high
+
 def build_guardrails(curves_pack: Dict[str,Any]) -> Dict[str, Dict[str,float]]:
-    """
-    Combine data-driven bands (P10..P90 from training) with domain overrides.
-    For each var, guardrail = intersection of data-band and domain where provided.
-    """
     out = {}
     train = curves_pack.get("train_num", pd.DataFrame())
     vars_all = [
@@ -561,45 +579,48 @@ def build_guardrails(curves_pack: Dict[str,Any]) -> Dict[str, Dict[str,float]]:
     ]
     for v in vars_all:
         if v in train.columns:
-            lo, hi = _qr_band(train[v], 10, 90)
+            lo_d, hi_d = _qr_band(train[v], 5, 95)  # wider data band
         else:
-            lo, hi = (np.nan, np.nan)
+            lo_d, hi_d = (np.nan, np.nan)
         dom = DOMAIN_OVERRIDES.get(v, {})
         lo_dom = dom.get("low", None); hi_dom = dom.get("high", None)
-        lo_final = lo if np.isfinite(lo) else None
-        hi_final = hi if np.isfinite(hi) else None
-        if lo_dom is not None:
-            lo_final = max(lo_dom, lo_final) if lo_final is not None else lo_dom
-        if hi_dom is not None:
-            hi_final = min(hi_dom, hi_final) if hi_final is not None else hi_dom
+        lo_final, hi_final = _blend(
+            lo_d if np.isfinite(lo_d) else None,
+            hi_d if np.isfinite(hi_d) else None,
+            lo_dom, hi_dom,
+            w=0.35
+        )
         out[v] = {"low": lo_final, "high": hi_final}
     return out
 
-def tail_penalty_bidirectional(x: float, low: Optional[float], high: Optional[float],
-                               k_low: float, k_high: float, eps: float = 1e-9) -> float:
+def tail_penalty_bidirectional_soft(x: float, low: Optional[float], high: Optional[float],
+                                    k_low: float, k_high: float,
+                                    rel_w: float,
+                                    deadzone_frac: float = 0.05,
+                                    alpha: float = 0.60,
+                                    eps: float = 1e-9) -> float:
     """
-    Smooth negative log-odds penalty when x is outside [low, high].
-    Penalty grows ~ log(1 + distance / |band|).
+    Smooth negative log-odds penalty outside [low, high].
+    - deadzone_frac: no penalty until ~5% beyond the guardrail
+    - alpha < 1 => sub-linear growth (gentler tails)
+    - rel_w scales by variable reliability (evidence-weighted)
     """
     if not np.isfinite(x):
         return 0.0
     pen = 0.0
     if (low is not None) and (x < low):
-        dist = (low - x) / max(abs(low) + eps, 1.0)
-        pen -= float(k_low) * math.log1p(max(0.0, dist))
+        margin = max(0.0, (low - x) - deadzone_frac * max(abs(low), 1.0))
+        if margin > 0.0:
+            dist = margin / (max(abs(low), 1.0) + eps)
+            pen -= (k_low * (math.log1p(dist) ** alpha)) * rel_w
     if (high is not None) and (x > high):
-        dist = (x - high) / max(abs(high) + eps, 1.0)
-        pen -= float(k_high) * math.log1p(max(0.0, dist))
+        margin = max(0.0, (x - high) - deadzone_frac * max(abs(high), 1.0))
+        if margin > 0.0:
+            dist = margin / (max(abs(high), 1.0) + eps)
+            pen -= (k_high * (math.log1p(dist) ** alpha)) * rel_w
+    # cap per-var penalty
+    pen = float(np.clip(pen, -MAX_PER_VAR_PEN, MAX_PER_VAR_PEN))
     return pen
-
-# =============== Qualitative % (unchanged) ===============
-def qualitative_percent(q_weights: Dict[str, float]) -> float:
-    qual_0_7 = 0.0
-    for crit in QUAL_CRITERIA:
-        key = f"qual_{crit['name']}"
-        sel = st.session_state.get(key, (1,))[0] if isinstance(st.session_state.get(key, 1), tuple) else st.session_state.get(key, 1)
-        qual_0_7 += q_weights[crit["name"]] * float(sel)
-    return (qual_0_7/7.0)*100.0
 
 # =============== Sidebar: Tail-Risk Controls ===============
 st.sidebar.header("Tail-Risk (global)")
@@ -608,7 +629,6 @@ tail_scale = st.sidebar.slider("Global tail-risk strength", 0.25, 1.50, 1.00, 0.
 
 adv_tail = st.sidebar.checkbox("Advanced tail-risk tuning", value=False,
                                help="Show per-variable penalty multipliers.")
-
 per_var_mult = {}
 if adv_tail:
     st.sidebar.caption("Per-variable penalty multipliers (low/high):")
@@ -715,7 +735,7 @@ with tab_add:
         # Rebalance reliabilities for correlated groups
         reliab = _rebalance_group_weights(reliab)
 
-        # Guardrails (data + domain)
+        # Guardrails (data + domain, blended)
         guardrails = build_guardrails(curves_pack)
 
         # Per-variable probabilities with diagnostics
@@ -758,7 +778,7 @@ with tab_add:
             "pm_pct_pred": p_of("pm_pct_pred", pm_pct_pred),
         }
 
-        # --- Calibrated odds stacking ---
+        # --- Calibrated odds stacking (curves) ---
         z_sum = prior_logodds  # start at base-rate prior
         for k, p in probs.items():
             z_k = math.log(max(p,1e-6) / max(1 - p, 1e-6))
@@ -767,42 +787,48 @@ with tab_add:
             w   = float(np.clip(reliab.get(k, 0.0), 0.0, 1.0))
             z_sum += w * dz
 
-        # --- Tail-risk penalties for ALL variables (bidirectional, smooth) ---
+        # --- Soft tail-risk penalties for ALL variables ---
         penalty_debug = {}
         def apply_pen(var_key: str, value: float):
             band = guardrails.get(var_key, {})
             low, high = band.get("low", None), band.get("high", None)
-            base_low, base_high = BASE_PEN_STRENGTH.get(var_key, (0.3, 0.3))
+            base_low, base_high = BASE_PEN_STRENGTH.get(var_key, (0.25, 0.25))
             kL = tail_scale * base_low  * per_var_mult.get((var_key,"low"), 1.0)
             kH = tail_scale * base_high * per_var_mult.get((var_key,"high"),1.0)
-            pen = tail_penalty_bidirectional(value, low, high, kL, kH)
-            penalty_debug[var_key] = {"low":low,"high":high,"pen":pen}
+            rel_w = float(np.clip(reliab.get(var_key, 0.0), 0.0, 1.0))  # evidence-weighted
+            pen = tail_penalty_bidirectional_soft(value, low, high, kL, kH, rel_w,
+                                                  deadzone_frac=0.05, alpha=0.60)
+            penalty_debug[var_key] = {"low":low,"high":high,"pen_raw":pen}
             return pen
 
-        z_sum += apply_pen("gap_pct", gap_pct)
-        z_sum += apply_pen("rvol", rvol)
-        z_sum += apply_pen("pm_dol_m", pm_dol_m)
-        z_sum += apply_pen("pm_vol_m", pm_vol_m)
-        z_sum += apply_pen("pm_pct_pred", pm_pct_pred)
-        z_sum += apply_pen("pmmc_pct", pmmc_pct)
-        z_sum += apply_pen("atr_usd", atr_usd)
-        z_sum += apply_pen("float_m", float_m)
-        z_sum += apply_pen("mcap_m", mc_m)
-        z_sum += apply_pen("si_pct", si_pct)
-        z_sum += apply_pen("fr_x", fr_x)
+        pen_list = []
+        pen_list.append(apply_pen("gap_pct", gap_pct))
+        pen_list.append(apply_pen("rvol", rvol))
+        pen_list.append(apply_pen("pm_dol_m", pm_dol_m))
+        pen_list.append(apply_pen("pm_vol_m", pm_vol_m))
+        pen_list.append(apply_pen("pm_pct_pred", pm_pct_pred))
+        pen_list.append(apply_pen("pmmc_pct", pmmc_pct))
+        pen_list.append(apply_pen("atr_usd", atr_usd))
+        pen_list.append(apply_pen("float_m", float_m))
+        pen_list.append(apply_pen("mcap_m", mc_m))
+        pen_list.append(apply_pen("si_pct", si_pct))
+        pen_list.append(apply_pen("fr_x", fr_x))
+
+        pen_total = float(np.sum(pen_list))
+        pen_total = float(np.clip(pen_total, -MAX_TOTAL_PEN, MAX_TOTAL_PEN))
+        z_sum += PEN_TAU * pen_total
+        penalty_debug["_total_penalty"] = round(PEN_TAU * pen_total, 3)
 
         # Modifiers
         z_sum += CATALYST_LOGODDS_COEF * float(catalyst_points)
         z_sum += DILUTION_LOGODDS_COEF * float(dilution_points)
 
-        # Temperature
-        z_sum *= TAU
-
+        # Temperature for curve contributions already applied; penalties scaled by PEN_TAU above
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
         numeric_pct  = 100.0 * numeric_prob
 
         # Qualitative %
-        qual_pct = qualitative_percent(q_weights)
+        qual_pct =  qualitative_percent(q_weights)
 
         # Final score (50/50)
         final_score = float(max(0.0, min(100.0, 0.5*numeric_pct + 0.5*qual_pct)))
@@ -815,14 +841,13 @@ with tab_add:
         else:
             verdict = "Weak / Avoid"; pill = '<span class="pill pill-bad">Weak / Avoid</span>'
 
-        # Checklist based on calibrated effective contribution + tail flags
+        # Checklist based on effective contributions + tail flags
         names_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
             "pm_vol_m":"PM Volume (M)","pm_dol_m":"PM $Vol (M)","float_m":"Float (M)","mcap_m":"MarketCap (M)",
             "fr_x":"PM Float Rotation ×","pmmc_pct":"PM $Vol / MC %","pm_pct_pred":"PM Vol % of Pred"
         }
 
-        # contribution labeling (what moved the model)
         def contribution_label(var_key: str, p: float) -> str:
             z_k = math.log(max(p,1e-6) / max(1 - p, 1e-6))
             z0  = float(ref_logit.get(var_key, 0.0))
@@ -841,28 +866,23 @@ with tab_add:
             elif label == "risk": risk.append(txt)
             else:                 warn.append(txt)
 
-        # Explicit tail-risk flags for any band breaches
+        # Explicit tail-risk flags (band breaches)
         def add_tail_flag(var_key: str, value: float):
             band = guardrails.get(var_key, {})
             low, high = band.get("low", None), band.get("high", None)
             nm = names_map.get(var_key, var_key)
             if np.isfinite(value):
                 if (low is not None) and (value < low):
-                    risk.append(f"{nm}: below lower guardrail ({value:.3g} < {low:.3g})")
+                    risk.append(f"{nm}: below guardrail ({value:.3g} < {low:.3g})")
                 if (high is not None) and (value > high):
-                    risk.append(f"{nm}: above upper guardrail ({value:.3g} > {high:.3g})")
+                    risk.append(f"{nm}: above guardrail ({value:.3g} > {high:.3g})")
 
-        add_tail_flag("gap_pct", gap_pct)
-        add_tail_flag("rvol", rvol)
-        add_tail_flag("pm_dol_m", pm_dol_m)
-        add_tail_flag("pm_vol_m", pm_vol_m)
-        add_tail_flag("pm_pct_pred", pm_pct_pred)
-        add_tail_flag("pmmc_pct", pmmc_pct)
-        add_tail_flag("atr_usd", atr_usd)
-        add_tail_flag("float_m", float_m)
-        add_tail_flag("mcap_m", mc_m)
-        add_tail_flag("si_pct", si_pct)
-        add_tail_flag("fr_x", fr_x)
+        for _v in ["gap_pct","rvol","pm_dol_m","pm_vol_m","pm_pct_pred","pmmc_pct","atr_usd","float_m","mcap_m","si_pct","fr_x"]:
+            add_tail_flag(_v, {
+                "gap_pct":gap_pct,"rvol":rvol,"pm_dol_m":pm_dol_m,"pm_vol_m":pm_vol_m,
+                "pm_pct_pred":pm_pct_pred,"pmmc_pct":pmmc_pct,"atr_usd":atr_usd,"float_m":float_m,
+                "mcap_m":mc_m,"si_pct":si_pct,"fr_x":fr_x
+            }[_v])
 
         row = {
             "Ticker": ticker,
@@ -922,7 +942,7 @@ with tab_add:
         if pmpred != "":
             d2.metric("PM Vol / Predicted Day Vol", f"{pmpred}%")
 
-        with st.expander("Premarket Checklist (smooth, data-driven + tail risk)", expanded=True):
+        with st.expander("Premarket Checklist (smooth + soft tail risk)", expanded=True):
             verdict = l.get("PremarketVerdict","—")
             pill = l.get("PremarketPill","")
             st.markdown(f"**Verdict:** {pill if pill else verdict}", unsafe_allow_html=True)
@@ -943,7 +963,7 @@ with tab_add:
             with r_col:
                 st.markdown("**Risk**"); st.markdown(_ul(l.get("PremarketRisk", [])), unsafe_allow_html=True)
 
-        # Why-neutral / penalty diagnostics
+        # Diagnostics
         with st.expander("Diagnostics (curves & tail penalties)"):
             dbg = st.session_state.get("DEBUG_POF", {})
             if dbg:
@@ -956,7 +976,7 @@ with tab_add:
                     pen_rows.append({
                         "Variable": k, "Low": v.get("low", None),
                         "High": v.get("high", None),
-                        "Penalty (Δlogodds)": round(v.get("pen",0.0), 3)
+                        "Penalty (Δlogodds)": round(v.get("pen_raw",0.0), 3)
                     })
                 st.dataframe(pd.DataFrame(pen_rows), hide_index=True, use_container_width=True)
 
