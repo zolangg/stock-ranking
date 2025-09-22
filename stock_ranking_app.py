@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import math
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 # ====== Optional: ensure Excel engine is available ======
 try:
@@ -548,7 +548,7 @@ BASE_PEN_STRENGTH = {
     "fr_x":        (0.15, 0.45),
 }
 
-def _qr_band(s: pd.Series, p_lo=5, p_hi=95):
+def _qr_band(s: pd.Series, p_lo=5, p_hi=95) -> Tuple[float, float]:
     z = pd.to_numeric(s, errors="coerce")
     z = z[np.isfinite(z)]
     if len(z) == 0:
@@ -671,6 +671,18 @@ if st.session_state.CURVES:
 
     st.markdown('<div class="section-title">Learned curve training summary</div>', unsafe_allow_html=True)
     st.dataframe(st.session_state.CURVES.get("summary", pd.DataFrame()), use_container_width=True, hide_index=True)
+
+# =============== Qualitative % helper (FIX) ===============
+def qualitative_percent(q_weights: Dict[str, float]) -> float:
+    qual_0_7 = 0.0
+    for crit in [
+        {"name":"GapStruct"},{"name":"LevelStruct"},{"name":"Monthly"}
+    ]:
+        key = f"qual_{crit['name']}"
+        sel = st.session_state.get(key, (1,))[0] if isinstance(st.session_state.get(key, 1), tuple) else st.session_state.get(key, 1)
+        w   = float(q_weights.get(crit["name"], 0.0))
+        qual_0_7 += w * float(sel)
+    return (qual_0_7/7.0)*100.0
 
 # =============== Tabs ===============
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -828,7 +840,7 @@ with tab_add:
         numeric_pct  = 100.0 * numeric_prob
 
         # Qualitative %
-        qual_pct =  qualitative_percent(q_weights)
+        qual_pct = qualitative_percent(q_weights)
 
         # Final score (50/50)
         final_score = float(max(0.0, min(100.0, 0.5*numeric_pct + 0.5*qual_pct)))
