@@ -289,37 +289,82 @@ def _bandwidth(x_t: np.ndarray) -> float:
     return 0.6 * std * (n ** (-1/5)) if std > 0 else 0.3
 
 def fit_curve(series: pd.Series, labels: pd.Series):
-    x = pd.to_numeric(series, errors="coerce").to_numpy()
-    y = pd.to_numeric(labels, errors="coerce").to_numpy()
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]; y = y[mask]
-    if len(x) < 30:
+    """
+    Learn a smooth P(FT|x) with a Gaussian-kernel Nadaraya–Watson in transformed space.
+    Needs ~30 usable rows. Auto log-transform for skewed positive variables.
+    """
+    x_raw = pd.to_numeric(series, errors="coerce").to_numpy()
+    y_raw = pd.to_numeric(labels, errors="coerce").to_numpy()
+
+    # keep rows with both x and y finite
+    mask = np.isfinite(x_raw) & np.isfinite(y_raw)
+    x_raw = x_raw[mask]
+    y_raw = y_raw[mask]
+    if len(x_raw) < 30:
         return None
-    x_t, use_log = _auto_transform(x)
-    if len(x_t) < 30:
-        return None
-    # filter y accordingly
+
+    # auto-transform (log if positive & skewed)
+    use_log = False
+    if (x_raw > 0).all():
+        if abs(pd.Series(x_raw).skew()) > 0.75:
+            use_log = True
+
     if use_log:
-        # only keep positive for log
-        pos = pd.to_numeric(series, errors="coerce").to_numpy()[mask] > 0
-        y = y[pos]
-    # recompute x_t to align with y length
-    if len(x_t) != len(y):
-        # conservative guard
-        n = min(len(x_t), len(y))
-        x_t = x_t[:n]; y = y[:n]
-    h = _bandwidth(x_t)
-    grid = np.linspace(np.nanpercentile(x_t, 2), np.nanpercentile(x_t, 98), 161)
-    p_grid = _kernel_prob(x_t, y, grid, h)
+        # only keep strictly positive for log
+        pos = x_raw > 0
+        x_raw = x_raw[pos]
+        y_raw = y_raw[pos]
+        if len(x_raw) < 30:
+            return None
+        x_t = np.log(x_raw)
+    else:
+        x_t = x_raw.copy()
+
+    # bandwidth (Silverman-ish)
+    std = np.std(x_t)
+    n = len(x_t)
+    h = 0.6 * std * (n ** (-1/5)) if std > 0 else 0.3
+
+    # training grids in transformed space
+    lo = np.nanpercentile(x_t, 2)
+    hi = np.nanpercentile(x_t, 98)
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
+        return None
+    grid = np.linspace(lo, hi, 161)
+
+    def _kernel_prob(x_train, y_train, x_eval, bandwidth):
+        x_train = np.asarray(x_train, dtype=float)
+        y_train = np.asarray(y_train, dtype=float)
+        x_eval  = np.asarray(x_eval, dtype=float)
+        h = max(1e-6, float(bandwidth))
+        out = np.zeros_like(x_eval, dtype=float)
+        for i, xe in enumerate(x_eval):
+            w = np.exp(-0.5 * ((xe - x_train)/h)**2)
+            sw = w.sum()
+            out[i] = (w * y_train).sum() / sw if sw > 0 else np.nan
+        return out
+
+    p_grid = _kernel_prob(x_t, y_raw, grid, h)
 
     def predict(x_new):
         x_new = np.array(x_new, dtype=float)
-        z = np.log(x_new) if use_log else x_new
-        return _kernel_prob(x_t, y, z, h)
+        if use_log:
+            # guard: invalid (<=0) → neutral 0.5
+            bad = ~np.isfinite(x_new) | (x_new <= 0)
+            z = np.full_like(x_new, np.nan, dtype=float)
+            ok = ~bad
+            z[ok] = np.log(x_new[ok])
+        else:
+            z = x_new
 
-    # raw quantiles (original axis) for summary
-    s = pd.Series(x if not use_log else np.exp(x_t))
-    q10, q25, q50, q75, q90 = [float(s.quantile(p)) for p in [0.10,0.25,0.50,0.75,0.90]]
+        res = _kernel_prob(x_t, y_raw, z, h)
+        # neutralize NaNs to 0.5
+        res = np.where(np.isfinite(res), res, 0.5)
+        # clamp
+        return np.clip(res, 1e-3, 1-1e-3)
+
+    # raw quantiles on original axis for summary
+    q10, q25, q50, q75, q90 = [float(pd.Series(x_raw).quantile(p)) for p in [0.10,0.25,0.50,0.75,0.90]]
 
     return {
         "use_log": use_log,
@@ -331,37 +376,35 @@ def fit_curve(series: pd.Series, labels: pd.Series):
         "q": {"p10": q10, "p25": q25, "p50": q50, "p75": q75, "p90": q90}
     }
 
-def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[str, Any]:
+def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str):
     xls = pd.ExcelFile(file)
     if ft_sheet not in xls.sheet_names or fail_sheet not in xls.sheet_names:
-        # fallback try heuristic match
-        sheets = xls.sheet_names
-        raise ValueError(f"Sheets not found. Available: {sheets}")
+        raise ValueError(f"Sheets not found. Available: {xls.sheet_names}")
 
     ft_raw   = pd.read_excel(xls, ft_sheet)
     fail_raw = pd.read_excel(xls, fail_sheet)
+
     ft_num   = build_numeric_table(ft_raw)
     fail_num = build_numeric_table(fail_raw)
 
-    # Combined with labels (1=FT, 0=Fail)
     ft_num["_y"] = 1
     fail_num["_y"] = 0
     all_num = pd.concat([ft_num, fail_num], axis=0, ignore_index=True)
 
-    # Variables to learn curves for (ALL PM + your inputs)
     var_list = [
         "gap_pct","atr_usd","rvol","si_pct",
         "pm_vol_m","pm_dol_m","float_m","mcap_m",
         "fr_x","pmmc_pct","pm_pct_pred"
     ]
     curves = {}
+    learned = 0
     for v in var_list:
         if v in all_num.columns:
             model = fit_curve(all_num[v], all_num["_y"])
             if model:
                 curves[v] = model
+                learned += 1
 
-    # Training summary
     summary_rows = []
     for v in var_list:
         m = curves.get(v)
@@ -374,6 +417,11 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
                 "P10": round(q["p10"],3), "P50": round(q["p50"],3), "P90": round(q["p90"],3)
             })
     summary_df = pd.DataFrame(summary_rows)
+
+    # UI nudge if nothing learned
+    if learned == 0:
+        st.sidebar.warning("No curves learned. Check sheet names, column mapping, and that each variable has ≥30 valid rows.")
+
     return {"curves": curves, "summary": summary_df}
 
 # Handle Learn button
