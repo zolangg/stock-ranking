@@ -126,7 +126,7 @@ def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
 # =========================
 st.sidebar.header("Database (learn smooth curves)")
 uploaded = st.sidebar.file_uploader("Upload your Excel (.xlsx)", type=["xlsx"])
-ft_sheet   = st.sidebar.text_input("FT (winners) sheet name", "PMH BO FT")
+ft_sheet   = st.sidebar.text_input("FT (winners) sheet name", "PMH BO Merged")
 fail_sheet = st.sidebar.text_input("Fail sheet name", "PMH BO Fail")
 learn_btn  = st.sidebar.button("Learn curves from uploaded file", use_container_width=True)
 
