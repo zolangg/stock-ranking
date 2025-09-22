@@ -975,22 +975,33 @@ with tab_add:
             with r_col:
                 st.markdown("**Risk**"); st.markdown(_ul(l.get("PremarketRisk", [])), unsafe_allow_html=True)
 
-        # Diagnostics
-        with st.expander("Diagnostics (curves & tail penalties)"):
-            dbg = st.session_state.get("DEBUG_POF", {})
-            if dbg:
-                dd = pd.DataFrame([{"Variable": k, "Status": v} for k,v in dbg.items()])
-                st.dataframe(dd, hide_index=True, use_container_width=True)
-            pen_debug = l.get("_TailPenalties", {})
-            if pen_debug:
-                pen_rows = []
-                for k,v in pen_debug.items():
-                    pen_rows.append({
-                        "Variable": k, "Low": v.get("low", None),
-                        "High": v.get("high", None),
-                        "Penalty (Δlogodds)": round(v.get("pen_raw",0.0), 3)
-                    })
-                st.dataframe(pd.DataFrame(pen_rows), hide_index=True, use_container_width=True)
+  # Diagnostics
+with st.expander("Diagnostics (curves & tail penalties)"):
+    dbg = st.session_state.get("DEBUG_POF", {})
+    if dbg:
+        dd = pd.DataFrame([{"Variable": k, "Status": v} for k, v in dbg.items()])
+        st.dataframe(dd, hide_index=True, use_container_width=True)
+
+    pen_debug = l.get("_TailPenalties", {})
+    if pen_debug:
+        pen_rows = []
+        for k, v in pen_debug.items():
+            if isinstance(v, dict):
+                pen_rows.append({
+                    "Variable": k,
+                    "Low": v.get("low", None),
+                    "High": v.get("high", None),
+                    "Penalty (Δlogodds)": round(v.get("pen_raw", 0.0), 3)
+                })
+            else:
+                # e.g., the aggregated "_total_penalty" entry is a float
+                pen_rows.append({
+                    "Variable": k,
+                    "Low": "",
+                    "High": "",
+                    "Penalty (Δlogodds)": round(float(v), 3)
+                })
+        st.dataframe(pd.DataFrame(pen_rows), hide_index=True, use_container_width=True)
 
 # =============== Ranking Tab ===============
 with tab_rank:
