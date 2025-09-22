@@ -10,11 +10,10 @@ try:
     import openpyxl  # noqa: F401
     _EXCEL_ENGINE = "openpyxl"
 except Exception:
-    _EXCEL_ENGINE = None  # we'll let pandas pick; if missing, the app will error and tell user
-
+    _EXCEL_ENGINE = None  # pandas will try; if missing, we'll warn
 
 # =============== Page & Styles ===============
-st.set_page_config(page_title="Premarket Stock Ranking (Smooth Curves)", layout="wide")
+st.set_page_config(page_title="Premarket Stock Ranking (Smooth Curves + Tail Risk)", layout="wide")
 st.title("Premarket Stock Ranking")
 
 st.markdown("""
@@ -37,15 +36,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ======= Controls for calibrated stacking =======
-# Clip each variable's log-odds delta to ±PER_VAR_CLIP
-PER_VAR_CLIP = 0.9      # ~±0.9 ≈ about ±20 ppt near mid; tune 0.6–1.2
-# Global temperature (soften overall aggressiveness)
-TAU = 0.7               # 0.6–0.9 typical
-# Modifiers (Catalyst/Dilution) as log-odds shifts per +1.0 on the slider
+# ======= Calibrated stacking / correlation settings =======
+PER_VAR_CLIP = 0.9      # per-variable log-odds delta clip (±)
+TAU = 0.7               # global temperature (softens stack)
 CATALYST_LOGODDS_COEF = 0.35
 DILUTION_LOGODDS_COEF = -0.35
-# Variables that are correlated; cap their combined reliability to avoid double-counting
 CORR_GROUPS = [
     ["pm_vol_m", "fr_x", "pm_pct_pred", "pmmc_pct"],  # PM activity cluster
 ]
@@ -221,12 +216,10 @@ def _norm(s: str) -> str:
 def _pick(df: pd.DataFrame, logical_key: str, *prefer_exact: str) -> Optional[str]:
     cols = list(df.columns)
     norm_map = {c: _norm(c) for c in cols}
-    # prefer exact
     for n in prefer_exact:
         for c in cols:
             if norm_map[c] == _norm(n):
                 return c
-    # synonyms
     for cand in _SYNONYMS.get(logical_key, []):
         n_cand = _norm(cand)
         for c in cols:
@@ -235,7 +228,6 @@ def _pick(df: pd.DataFrame, logical_key: str, *prefer_exact: str) -> Optional[st
         for c in cols:
             if n_cand in norm_map[c]:
                 return c
-    # loose contains
     tokens = re.split(r"[^\w]+", logical_key)
     tokens = [t for t in tokens if t]
     for c in cols:
@@ -314,10 +306,6 @@ def reveal_mapping(df: pd.DataFrame) -> pd.DataFrame:
 MIN_ROWS = 30  # minimum usable rows for a curve (FT+Fail combined)
 
 def fit_curve(series: pd.Series, labels: pd.Series):
-    """
-    Learn smooth P(FT|x) via Gaussian-kernel Nadaraya–Watson in transformed space.
-    Auto log-transform for positive skewed vars. Needs ~MIN_ROWS usable rows.
-    """
     x_raw = pd.to_numeric(series, errors="coerce").to_numpy()
     y_raw = pd.to_numeric(labels, errors="coerce").to_numpy()
 
@@ -334,20 +322,17 @@ def fit_curve(series: pd.Series, labels: pd.Series):
 
     if use_log:
         pos = x_raw > 0
-        x_raw = x_raw[pos]
-        y_raw = y_raw[pos]
+        x_raw = x_raw[pos]; y_raw = y_raw[pos]
         if len(x_raw) < MIN_ROWS:
             return None
         x_t = np.log(x_raw)
     else:
         x_t = x_raw.copy()
 
-    std = np.std(x_t)
-    n = len(x_t)
+    std = np.std(x_t); n = len(x_t)
     h = 0.6 * std * (n ** (-1/5)) if std > 0 else 0.3
 
-    lo = np.nanpercentile(x_t, 2)
-    hi = np.nanpercentile(x_t, 98)
+    lo = np.nanpercentile(x_t, 2); hi = np.nanpercentile(x_t, 98)
     if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
         return None
     grid = np.linspace(lo, hi, 161)
@@ -371,8 +356,7 @@ def fit_curve(series: pd.Series, labels: pd.Series):
         if use_log:
             bad = ~np.isfinite(x_new) | (x_new <= 0)
             z = np.full_like(x_new, np.nan, dtype=float)
-            ok = ~bad
-            z[ok] = np.log(x_new[ok])
+            ok = ~bad; z[ok] = np.log(x_new[ok])
         else:
             z = x_new
         res = _kernel_prob(x_t, y_raw, z, h)
@@ -393,28 +377,20 @@ def fit_curve(series: pd.Series, labels: pd.Series):
 
 # ====== AUC & calibration utils (no sklearn needed) ======
 def _safe_auc(y_true: np.ndarray, score: np.ndarray) -> float:
-    """
-    Compute ROC-AUC via Mann–Whitney U (probability that a random positive ranks above a random negative).
-    Returns 0.5 if not computable.
-    """
     y = np.asarray(y_true, dtype=float)
     s = np.asarray(score, dtype=float)
     mask = np.isfinite(y) & np.isfinite(s)
     y, s = y[mask], s[mask]
     if y.size < 3 or len(np.unique(y)) < 2:
         return 0.5
-    # Rank scores (average ranks for ties)
     order = np.argsort(s)
     ranks = np.empty_like(order, dtype=float)
     ranks[order] = np.arange(1, len(s) + 1)
-    # tie adjust: average over equal scores
     _, inv, counts = np.unique(s, return_inverse=True, return_counts=True)
     avg_ranks = np.bincount(inv, weights=ranks) / np.bincount(inv)
     ranks = avg_ranks[inv]
-    n1 = float((y == 1).sum())
-    n0 = float((y == 0).sum())
-    if n1 == 0 or n0 == 0:
-        return 0.5
+    n1 = float((y == 1).sum()); n0 = float((y == 0).sum())
+    if n1 == 0 or n0 == 0: return 0.5
     rank_sum_pos = ranks[y == 1].sum()
     u = rank_sum_pos - n1 * (n1 + 1) / 2.0
     auc = u / (n0 * n1)
@@ -445,7 +421,7 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
         try:
             xls = pd.ExcelFile(file)
         except Exception as e:
-            st.error("Reading .xlsx requires **openpyxl**. Install it (`pip install openpyxl`) and rerun.")
+            st.error("Reading .xlsx requires **openpyxl**. Install it (`pip install openpyxl`).")
             raise e
     else:
         xls = pd.ExcelFile(file, engine=_EXCEL_ENGINE)
@@ -492,30 +468,26 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
             })
     summary_df = pd.DataFrame(summary_rows)
 
-    # === Base rate & variable reliabilities ===
+    # Base rate & variable reliabilities
     y_all = all_num["_y"].to_numpy()
     base_rate = float(np.mean(y_all)) if len(y_all) else 0.5
     prior_logodds = math.log(max(base_rate,1e-6) / max(1 - base_rate, 1e-6))
 
-    reliab = {}       # key -> weight in [0,1]
-    ref_logit = {}    # key -> median logit(model(x)) on training x's
+    reliab = {}; ref_logit = {}
     for v in var_list:
         m = curves.get(v)
         if (m is None) or (v not in all_num.columns):
-            reliab[v] = 0.0
-            ref_logit[v] = 0.0
+            reliab[v] = 0.0; ref_logit[v] = 0.0
             continue
         x = pd.to_numeric(all_num[v], errors="coerce").to_numpy()
         mask = np.isfinite(x)
-        x = x[mask]
-        y = y_all[mask]
+        x = x[mask]; y = y_all[mask]
         if len(x) < 10 or len(np.unique(y)) < 2:
-            reliab[v] = 0.0
-            ref_logit[v] = 0.0
+            reliab[v] = 0.0; ref_logit[v] = 0.0
             continue
         p_hat = _prob_from_curve(m, x)
         auc  = _safe_auc(y, p_hat)
-        gamma = 0.8  # soft nonlinearity
+        gamma = 0.8
         w = (2.0 * abs(auc - 0.5)) ** gamma
         reliab[v] = float(np.clip(w, 0.0, 1.0))
         ref_logit[v] = float(np.median(_logit(p_hat)))
@@ -530,8 +502,95 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
         "prior_logodds": prior_logodds,
         "reliability": reliab,
         "ref_logit": ref_logit,
+        # keep training numeric table (to auto-derive guardrails)
+        "train_num": all_num,
     }
     return learned_meta
+
+# =============== Tail-Risk Guardrails (all variables) ===============
+
+# Default domain overrides (merged with data bands)
+DOMAIN_OVERRIDES = {
+    # key: {"low": value or None, "high": value or None}
+    "gap_pct":     {"low": 30.0,  "high": 300.0},  # <30 rarely runs; >300 exhaustion risk
+    "rvol":        {"low": 3.0,   "high": 3000.0},
+    "pm_dol_m":    {"low": 3.0,   "high": 40.0},   # $3–15M sweet; >40 bloated
+    "pm_vol_m":    {"low": None,  "high": None},   # data-driven; we’ll also handle via pm_pct_pred
+    "pm_pct_pred": {"low": 5.0,   "high": 35.0},   # <5% weak fuel; >35% front-loaded
+    "pmmc_pct":    {"low": None,  "high": 35.0},   # >30–40% often bloaty
+    "atr_usd":     {"low": 0.15,  "high": 1.50},   # typical 0.2–0.4
+    "float_m":     {"low": 2.0,   "high": 20.0},   # <2M halt/illiquid risk; >20M sluggish
+    "mcap_m":      {"low": None,  "high": 150.0},  # >150M sluggish for your setup
+    "si_pct":      {"low": 0.5,   "high": 35.0},   # tiny SI unhelpful; extreme SI unreliable
+    "fr_x":        {"low": 1e-3,  "high": 1.00},   # much above 1× in PM = front-loaded
+}
+
+# Base penalty strengths per variable (log-odds per log distance beyond band)
+BASE_PEN_STRENGTH = {
+    "gap_pct":     (0.50, 0.70),   # (low_pen, high_pen)
+    "rvol":        (0.40, 0.70),
+    "pm_dol_m":    (0.30, 0.60),
+    "pm_vol_m":    (0.20, 0.40),
+    "pm_pct_pred": (0.30, 0.70),
+    "pmmc_pct":    (0.20, 0.60),
+    "atr_usd":     (0.40, 0.40),
+    "float_m":     (0.30, 0.50),
+    "mcap_m":      (0.10, 0.40),
+    "si_pct":      (0.10, 0.30),
+    "fr_x":        (0.20, 0.60),
+}
+
+def _qr_band(s: pd.Series, p_lo=10, p_hi=90) -> tuple[float,float]:
+    z = pd.to_numeric(s, errors="coerce")
+    z = z[np.isfinite(z)]
+    if len(z) == 0:
+        return (np.nan, np.nan)
+    return (float(np.nanpercentile(z, p_lo)), float(np.nanpercentile(z, p_hi)))
+
+def build_guardrails(curves_pack: Dict[str,Any]) -> Dict[str, Dict[str,float]]:
+    """
+    Combine data-driven bands (P10..P90 from training) with domain overrides.
+    For each var, guardrail = intersection of data-band and domain where provided.
+    """
+    out = {}
+    train = curves_pack.get("train_num", pd.DataFrame())
+    vars_all = [
+        "gap_pct","atr_usd","rvol","si_pct",
+        "pm_vol_m","pm_dol_m","float_m","mcap_m",
+        "fr_x","pmmc_pct","pm_pct_pred"
+    ]
+    for v in vars_all:
+        if v in train.columns:
+            lo, hi = _qr_band(train[v], 10, 90)
+        else:
+            lo, hi = (np.nan, np.nan)
+        dom = DOMAIN_OVERRIDES.get(v, {})
+        lo_dom = dom.get("low", None); hi_dom = dom.get("high", None)
+        lo_final = lo if np.isfinite(lo) else None
+        hi_final = hi if np.isfinite(hi) else None
+        if lo_dom is not None:
+            lo_final = max(lo_dom, lo_final) if lo_final is not None else lo_dom
+        if hi_dom is not None:
+            hi_final = min(hi_dom, hi_final) if hi_final is not None else hi_dom
+        out[v] = {"low": lo_final, "high": hi_final}
+    return out
+
+def tail_penalty_bidirectional(x: float, low: Optional[float], high: Optional[float],
+                               k_low: float, k_high: float, eps: float = 1e-9) -> float:
+    """
+    Smooth negative log-odds penalty when x is outside [low, high].
+    Penalty grows ~ log(1 + distance / |band|).
+    """
+    if not np.isfinite(x):
+        return 0.0
+    pen = 0.0
+    if (low is not None) and (x < low):
+        dist = (low - x) / max(abs(low) + eps, 1.0)
+        pen -= float(k_low) * math.log1p(max(0.0, dist))
+    if (high is not None) and (x > high):
+        dist = (x - high) / max(abs(high) + eps, 1.0)
+        pen -= float(k_high) * math.log1p(max(0.0, dist))
+    return pen
 
 # =============== Qualitative % (unchanged) ===============
 def qualitative_percent(q_weights: Dict[str, float]) -> float:
@@ -541,6 +600,28 @@ def qualitative_percent(q_weights: Dict[str, float]) -> float:
         sel = st.session_state.get(key, (1,))[0] if isinstance(st.session_state.get(key, 1), tuple) else st.session_state.get(key, 1)
         qual_0_7 += q_weights[crit["name"]] * float(sel)
     return (qual_0_7/7.0)*100.0
+
+# =============== Sidebar: Tail-Risk Controls ===============
+st.sidebar.header("Tail-Risk (global)")
+tail_scale = st.sidebar.slider("Global tail-risk strength", 0.25, 1.50, 1.00, 0.05,
+                               help="Multiplies all variable penalty strengths.")
+
+adv_tail = st.sidebar.checkbox("Advanced tail-risk tuning", value=False,
+                               help="Show per-variable penalty multipliers.")
+
+per_var_mult = {}
+if adv_tail:
+    st.sidebar.caption("Per-variable penalty multipliers (low/high):")
+    for v in BASE_PEN_STRENGTH.keys():
+        c1, c2 = st.sidebar.columns(2)
+        with c1:
+            per_var_mult[(v,"low")]  = st.slider(f"{v} low×", 0.25, 2.00, 1.00, 0.05, key=f"{v}_low_mult")
+        with c2:
+            per_var_mult[(v,"high")] = st.slider(f"{v} high×",0.25, 2.00, 1.00, 0.05, key=f"{v}_high_mult")
+else:
+    for v in BASE_PEN_STRENGTH.keys():
+        per_var_mult[(v,"low")]  = 1.00
+        per_var_mult[(v,"high")] = 1.00
 
 # =============== Learn Button ===============
 if learn_btn:
@@ -634,6 +715,9 @@ with tab_add:
         # Rebalance reliabilities for correlated groups
         reliab = _rebalance_group_weights(reliab)
 
+        # Guardrails (data + domain)
+        guardrails = build_guardrails(curves_pack)
+
         # Per-variable probabilities with diagnostics
         st.session_state["DEBUG_POF"] = {}
         def p_of(var_key, x) -> float:
@@ -659,7 +743,7 @@ with tab_add:
                 dbg[var_key] = f"neutral: error {e}"
                 return 0.5
 
-        # Evaluate all PM variables you use
+        # Evaluate all variables
         probs = {
             "gap_pct":     p_of("gap_pct", gap_pct),
             "atr_usd":     p_of("atr_usd", atr_usd),
@@ -683,6 +767,30 @@ with tab_add:
             w   = float(np.clip(reliab.get(k, 0.0), 0.0, 1.0))
             z_sum += w * dz
 
+        # --- Tail-risk penalties for ALL variables (bidirectional, smooth) ---
+        penalty_debug = {}
+        def apply_pen(var_key: str, value: float):
+            band = guardrails.get(var_key, {})
+            low, high = band.get("low", None), band.get("high", None)
+            base_low, base_high = BASE_PEN_STRENGTH.get(var_key, (0.3, 0.3))
+            kL = tail_scale * base_low  * per_var_mult.get((var_key,"low"), 1.0)
+            kH = tail_scale * base_high * per_var_mult.get((var_key,"high"),1.0)
+            pen = tail_penalty_bidirectional(value, low, high, kL, kH)
+            penalty_debug[var_key] = {"low":low,"high":high,"pen":pen}
+            return pen
+
+        z_sum += apply_pen("gap_pct", gap_pct)
+        z_sum += apply_pen("rvol", rvol)
+        z_sum += apply_pen("pm_dol_m", pm_dol_m)
+        z_sum += apply_pen("pm_vol_m", pm_vol_m)
+        z_sum += apply_pen("pm_pct_pred", pm_pct_pred)
+        z_sum += apply_pen("pmmc_pct", pmmc_pct)
+        z_sum += apply_pen("atr_usd", atr_usd)
+        z_sum += apply_pen("float_m", float_m)
+        z_sum += apply_pen("mcap_m", mc_m)
+        z_sum += apply_pen("si_pct", si_pct)
+        z_sum += apply_pen("fr_x", fr_x)
+
         # Modifiers
         z_sum += CATALYST_LOGODDS_COEF * float(catalyst_points)
         z_sum += DILUTION_LOGODDS_COEF * float(dilution_points)
@@ -692,10 +800,6 @@ with tab_add:
 
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
         numeric_pct  = 100.0 * numeric_prob
-
-        # Optional: keep numeric % within 5..95 (soft extreme cap)
-        # numeric_prob = 0.05 + 0.90 * numeric_prob
-        # numeric_pct  = 100.0 * numeric_prob
 
         # Qualitative %
         qual_pct = qualitative_percent(q_weights)
@@ -711,12 +815,14 @@ with tab_add:
         else:
             verdict = "Weak / Avoid"; pill = '<span class="pill pill-bad">Weak / Avoid</span>'
 
-        # Checklist based on calibrated effective contribution
+        # Checklist based on calibrated effective contribution + tail flags
         names_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
             "pm_vol_m":"PM Volume (M)","pm_dol_m":"PM $Vol (M)","float_m":"Float (M)","mcap_m":"MarketCap (M)",
             "fr_x":"PM Float Rotation ×","pmmc_pct":"PM $Vol / MC %","pm_pct_pred":"PM Vol % of Pred"
         }
+
+        # contribution labeling (what moved the model)
         def contribution_label(var_key: str, p: float) -> str:
             z_k = math.log(max(p,1e-6) / max(1 - p, 1e-6))
             z0  = float(ref_logit.get(var_key, 0.0))
@@ -735,6 +841,29 @@ with tab_add:
             elif label == "risk": risk.append(txt)
             else:                 warn.append(txt)
 
+        # Explicit tail-risk flags for any band breaches
+        def add_tail_flag(var_key: str, value: float):
+            band = guardrails.get(var_key, {})
+            low, high = band.get("low", None), band.get("high", None)
+            nm = names_map.get(var_key, var_key)
+            if np.isfinite(value):
+                if (low is not None) and (value < low):
+                    risk.append(f"{nm}: below lower guardrail ({value:.3g} < {low:.3g})")
+                if (high is not None) and (value > high):
+                    risk.append(f"{nm}: above upper guardrail ({value:.3g} > {high:.3g})")
+
+        add_tail_flag("gap_pct", gap_pct)
+        add_tail_flag("rvol", rvol)
+        add_tail_flag("pm_dol_m", pm_dol_m)
+        add_tail_flag("pm_vol_m", pm_vol_m)
+        add_tail_flag("pm_pct_pred", pm_pct_pred)
+        add_tail_flag("pmmc_pct", pmmc_pct)
+        add_tail_flag("atr_usd", atr_usd)
+        add_tail_flag("float_m", float_m)
+        add_tail_flag("mcap_m", mc_m)
+        add_tail_flag("si_pct", si_pct)
+        add_tail_flag("fr_x", fr_x)
+
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
@@ -743,7 +872,7 @@ with tab_add:
             "Qual_%": round(qual_pct, 2),
             "FinalScore": round(final_score, 2),
 
-            # Prediction fields (for info & PM% of Pred in checklist)
+            # Prediction fields
             "PredVol_M": round(pred_vol_m, 2),
             "PredVol_CI68_L": round(ci68_l, 2),
             "PredVol_CI68_U": round(ci68_u, 2),
@@ -762,6 +891,9 @@ with tab_add:
             "PremarketGood": good,
             "PremarketWarn": warn,
             "PremarketRisk": risk,
+
+            # Debug penalties
+            "_TailPenalties": penalty_debug,
         }
 
         st.session_state.rows.append(row)
@@ -790,7 +922,7 @@ with tab_add:
         if pmpred != "":
             d2.metric("PM Vol / Predicted Day Vol", f"{pmpred}%")
 
-        with st.expander("Premarket Checklist (smooth, data-driven)", expanded=True):
+        with st.expander("Premarket Checklist (smooth, data-driven + tail risk)", expanded=True):
             verdict = l.get("PremarketVerdict","—")
             pill = l.get("PremarketPill","")
             st.markdown(f"**Verdict:** {pill if pill else verdict}", unsafe_allow_html=True)
@@ -811,14 +943,22 @@ with tab_add:
             with r_col:
                 st.markdown("**Risk**"); st.markdown(_ul(l.get("PremarketRisk", [])), unsafe_allow_html=True)
 
-        # Why-neutral diagnostics
-        with st.expander("Why are some variables neutral?", expanded=False):
+        # Why-neutral / penalty diagnostics
+        with st.expander("Diagnostics (curves & tail penalties)"):
             dbg = st.session_state.get("DEBUG_POF", {})
             if dbg:
                 dd = pd.DataFrame([{"Variable": k, "Status": v} for k,v in dbg.items()])
                 st.dataframe(dd, hide_index=True, use_container_width=True)
-            else:
-                st.caption("No diagnostics yet. Add a stock after learning curves.")
+            pen_debug = l.get("_TailPenalties", {})
+            if pen_debug:
+                pen_rows = []
+                for k,v in pen_debug.items():
+                    pen_rows.append({
+                        "Variable": k, "Low": v.get("low", None),
+                        "High": v.get("high", None),
+                        "Penalty (Δlogodds)": round(v.get("pen",0.0), 3)
+                    })
+                st.dataframe(pd.DataFrame(pen_rows), hide_index=True, use_container_width=True)
 
 # =============== Ranking Tab ===============
 with tab_rank:
