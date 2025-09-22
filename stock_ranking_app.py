@@ -118,13 +118,13 @@ QUAL_CRITERIA = [
         "name": "LevelStruct",
         "question": "Key Price Levels:",
         "options": [
-                "Fails at all major support/resistance; cannot hold any key level.",
-                "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
-                "Holds one support but unable to break resistance; capped below a key level.",
-                "Breaks above resistance but cannot stay; dips below reclaimed level.",
-                "Breaks and holds one major level; most resistance remains above.",
-                "Breaks and holds several major levels; clears most overhead resistance.",
-                "Breaks and holds above all resistance; blue sky.",
+            "Fails at all major support/resistance; cannot hold any key level.",
+            "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
+            "Holds one support but unable to break resistance; capped below a key level.",
+            "Breaks above resistance but cannot stay; dips below reclaimed level.",
+            "Breaks and holds one major level; most resistance remains above.",
+            "Breaks and holds several major levels; clears most overhead resistance.",
+            "Breaks and holds above all resistance; blue sky.",
         ],
         "weight": 0.15,
         "help": "Break/hold behavior at key levels.",
@@ -146,8 +146,8 @@ QUAL_CRITERIA = [
     },
 ]
 
-# ---------- Sidebar: weights & uncertainty (kept) ----------
-st.sidebar.header("Numeric Weights")
+# ---------- Sidebar: weights & uncertainty (kept for Qual %) ----------
+st.sidebar.header("Numeric Weights (legacy display only)")
 w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, 0.20, 0.01)
 w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, 0.15, 0.01)
 w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, 0.15, 0.01)
@@ -165,41 +165,12 @@ sigma_ln = st.sidebar.slider(
     help="Estimated std dev of residuals in ln(volume). 0.60 ≈ typical for your sheet."
 )
 
-# Normalize blocks separately (unchanged)
+# Normalize qual block (numeric sliders kept but not used for Numeric %)
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
 qual_sum = max(1e-9, sum(q_weights.values()))
 for k in q_weights:
     q_weights[k] = q_weights[k] / qual_sum
-
-# ---------- Numeric bucket scorers (kept for display; not used for final Numeric %) ----------
-def pts_rvol(x: float) -> int:
-    for th, p in [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]:
-        if x < th: return p
-    return 7
-
-def pts_atr(x: float) -> int:
-    for th, p in [(0.05,1),(0.10,2),(0.20,3),(0.35,4),(0.60,5),(1.00,6)]:
-        if x < th: return p
-    return 7
-
-def pts_si(x: float) -> int:
-    for th, p in [(2,1),(5,2),(10,3),(15,4),(20,5),(30,6)]:
-        if x < th: return p
-    return 7
-
-def pts_fr(pm_vol_m: float, float_m: float) -> int:
-    if float_m <= 0: return 1
-    rot = pm_vol_m / float_m
-    for th, p in [(0.01,1),(0.03,2),(0.10,3),(0.25,4),(0.50,5),(1.00,6)]:
-        if rot < th: return p
-    return 7
-
-def pts_float(float_m: float) -> int:
-    if float_m <= 3: return 7
-    for th, p in [(200,2),(100,3),(50,4),(35,5),(10,6)]:
-        if float_m > th: return p
-    return 7
 
 def odds_label(score: float) -> str:
     if score >= 85: return "Very High Odds"
@@ -232,145 +203,201 @@ def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
     if pred_m <= 0: return 0.0, 0.0
     return pred_m * math.exp(-z * sigma_ln), pred_m * math.exp(z * sigma_ln)
 
-# ---------- PHB Premarket Checklist (structured, no PM% of Pred) ----------
-PHB_RULES = {
-    "FLOAT_MAX": 20.0, "FLOAT_SWEET_LO": 5.0, "FLOAT_SWEET_HI": 12.0,
-    "MCAP_MAX": 150.0, "MCAP_HUGE": 500.0,
-    "ATR_MIN": 0.15,
-    "GAP_MIN": 70.0, "GAP_SWEET_HI": 180.0, "GAP_VIABLE_HI": 280.0, "GAP_OUTLIER": 300.0,
-    "PM$_MIN": 7.0, "PM$_MAX": 30.0,
-    # removed PM_SHARE_* rules
-    "RVOL_MIN": 100.0, "RVOL_MAX": 1500.0, "RVOL_WARN_MAX": 3000.0,
+# ---------- IQR scoring helpers ----------
+def score_iqr(x, lo, q1, med, q3, hi):
+    """
+    0..1 score:
+    - x <= lo or x >= hi -> 0
+    - lo..q1: linear 0 -> 0.7
+    - q1..q3: peak at med; 0.7 at edges; 1.0 at med (triangular)
+    - q3..hi: linear 0.7 -> 0
+    """
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return 0.0
+    x = float(x)
+    if x <= lo or x >= hi:
+        return 0.0
+    if x < q1:
+        return 0.7 * (x - lo) / max(1e-9, (q1 - lo))
+    if x > q3:
+        return 0.7 * (hi - x) / max(1e-9, (hi - q3))
+    # inside IQR: triangular peak at median, 0.7 at q1/q3
+    half = max(1e-9, (q3 - q1)/2.0)
+    t = min(1.0, abs(x - med) / half)  # 0 at med, 1 at edges
+    return 1.0 - 0.3 * t
+
+def clamp01(v): return max(0.0, min(1.0, float(v)))
+
+# ---------- IQR parameterization (tweak from your dataset) ----------
+IQR = {
+    # value units noted
+    "float_m":   dict(lo=0.5,  q1=5.0,  med=8.5,  q3=12.0, hi=50.0),   # M shares
+    "mcap_m":    dict(lo=5.0,  q1=30.0, med=80.0, q3=150.0, hi=500.0), # $M
+    "atr_usd":   dict(lo=0.10, q1=0.20, med=0.30, q3=0.40, hi=1.00),   # $
+    "gap_pct":   dict(lo=30.0, q1=70.0, med=120.0,q3=180.0,hi=280.0),  # %
+    "pm_dol_m":  dict(lo=3.0,  q1=7.0,  med=11.0, q3=15.0, hi=40.0),   # $M
+    "rvol":      dict(lo=50.0, q1=100.0,med=680.0,q3=1500.0,hi=3000.0),# ×
+    # soft sliders:
+    "catalyst":  dict(lo=-1.0,q1=-0.2,med=0.2, q3=0.6,  hi=1.0),       # slider -1..+1
+    "dilution":  dict(lo=-1.0,q1=-0.2,med=0.0, q3=0.2,  hi=1.0),       # higher -> better
 }
 
-def _fmt_val(v, suffix="", none_txt="—"):
-    try:
-        if v is None: return none_txt
-        if isinstance(v, (int, float)):
-            if math.isnan(v): return none_txt
-            return f"{v:.2f}{suffix}"
-        return str(v)
-    except Exception:
-        return none_txt
+# feature weights (sum ≈ 1; renormalized)
+W = {
+    "float_m": 0.18,
+    "mcap_m":  0.15,
+    "atr_usd": 0.12,
+    "gap_pct": 0.18,
+    "pm_dol_m":0.15,
+    "rvol":    0.17,
+    "catalyst":0.03,
+    "dilution":0.02,
+}
+W_sum = sum(W.values()) or 1.0
+for k in W: W[k] = W[k] / W_sum
 
-def make_premarket_checklist(*, float_m: float, mcap_m: float, atr_usd: float,
-                             gap_pct: float, pm_vol_m: float, pm_dol_m: float,
-                             rvol: float, pm_dollar_vs_mc: float,
-                             catalyst_points: float, dilution_points: float) -> dict:
-    R = PHB_RULES
+# hard caps for tail risks
+HARD_CAPS = {
+    "gap_abs_hi": 500.0,   # %; cap Numeric if above
+    "rvol_blow":  6000.0,  # ×
+    "pm$_double": 80.0,    # $M: ~2× high fence for PM$
+    "cap_at_gap": 65.0,    # % max after extreme gap
+    "cap_at_rvol":65.0,    # % max after blowout rvol
+    "cap_at_pm$": 70.0,    # % max after very bloated PM$
+}
+
+def phb_checklist_iqr(float_m, mcap_m, atr_usd, gap_pct, pm_dol_m, rvol,
+                      catalyst_points, dilution_points, pm_dollar_vs_mc) -> dict:
     good, warn, risk = [], [], []
-    greens = reds = 0
 
-    # Catalyst / Dilution (affect checklist but not final score directly)
-    if catalyst_points >= 0.2:
-        good.append("Catalyst: strong/real PR"); greens += 1
-    elif catalyst_points <= -0.2:
-        warn.append("Catalyst: weak/low-quality")
-    else:
-        warn.append("Catalyst: neutral/unknown")
-
-    if dilution_points <= -0.2:
-        risk.append("Dilution/ATM/overhang"); reds += 1
-    elif dilution_points >= 0.2:
-        good.append("Clean cap table / low dilution"); greens += 1
-    else:
-        warn.append("Dilution: neutral/unknown")
-
-    # Float
+    s_float = score_iqr(float_m, **IQR["float_m"])
     if float_m is None or float_m <= 0:
         warn.append("Float: missing")
-    elif R["FLOAT_SWEET_LO"] <= float_m <= R["FLOAT_SWEET_HI"]:
-        good.append(f"Float sweet {R['FLOAT_SWEET_LO']:.0f}–{R['FLOAT_SWEET_HI']:.0f}M (you {_fmt_val(float_m,'M')})"); greens += 1
-    elif float_m < R["FLOAT_MAX"]:
-        good.append(f"Float <{R['FLOAT_MAX']:.0f}M (you {_fmt_val(float_m,'M')})"); greens += 1
-    elif float_m >= 50:
-        risk.append(f"Float very large (≥50M; you {_fmt_val(float_m,'M')})"); reds += 1
+    elif float_m < IQR["float_m"]["q1"] or float_m > IQR["float_m"]["q3"]:
+        warn.append(f"Float outside IQR (you {float_m:.2f}M)")
     else:
-        warn.append(f"Float elevated (≥{R['FLOAT_MAX']:.0f}M; you {_fmt_val(float_m,'M')})")
+        good.append(f"Float in IQR 5–12M (you {float_m:.2f}M)")
 
-    # Market Cap
+    s_mcap = score_iqr(mcap_m, **IQR["mcap_m"])
     if mcap_m is None or mcap_m <= 0:
         warn.append("MarketCap: missing")
-    elif mcap_m < R["MCAP_MAX"]:
-        good.append(f"MarketCap <{R['MCAP_MAX']:.0f}M (you {_fmt_val(mcap_m,'M')})"); greens += 1
-    elif mcap_m >= R["MCAP_HUGE"]:
-        risk.append(f"MarketCap huge (≥{R['MCAP_HUGE']:.0f}M; you {_fmt_val(mcap_m,'M')})"); reds += 1
+    elif mcap_m < IQR["mcap_m"]["q1"] or mcap_m > IQR["mcap_m"]["q3"]:
+        warn.append(f"MarketCap outside IQR (you {mcap_m:.0f}M)")
     else:
-        warn.append(f"MarketCap elevated (≥{R['MCAP_MAX']:.0f}M; you {_fmt_val(mcap_m,'M')})")
+        good.append(f"MarketCap in IQR 30–150M (you {mcap_m:.0f}M)")
 
-    # ATR
+    s_atr = score_iqr(atr_usd, **IQR["atr_usd"])
     if atr_usd is None or atr_usd <= 0:
         warn.append("ATR: missing")
-    elif atr_usd >= R["ATR_MIN"]:
-        if 0.20 <= atr_usd <= 0.40:
-            good.append(f"ATR in 0.20–0.40 band (you ${_fmt_val(atr_usd)})"); greens += 1
-        else:
-            good.append(f"ATR ≥{R['ATR_MIN']:.2f} (you ${_fmt_val(atr_usd)})"); greens += 1
+    elif 0.20 <= atr_usd <= 0.40:
+        good.append(f"ATR in IQR 0.20–0.40 (you ${atr_usd:.2f})")
+    elif atr_usd < 0.10:
+        risk.append(f"ATR very thin (<$0.10; you ${atr_usd:.2f})")
     else:
-        warn.append(f"ATR thin (<{R['ATR_MIN']:.2f}; you ${_fmt_val(atr_usd)})")
+        warn.append(f"ATR OK (you ${atr_usd:.2f})")
 
-    # Gap %
+    s_gap = score_iqr(gap_pct, **IQR["gap_pct"])
     if gap_pct is None or gap_pct <= 0:
         warn.append("Gap %: missing")
-    elif gap_pct < R["GAP_MIN"]:
-        risk.append(f"Gap small (<{R['GAP_MIN']:.0f}% ; you {_fmt_val(gap_pct,'%')})"); reds += 1
-    elif gap_pct <= R["GAP_SWEET_HI"]:
-        good.append(f"Gap sweet {R['GAP_MIN']:.0f}–{R['GAP_SWEET_HI']:.0f}% (you {_fmt_val(gap_pct,'%')})"); greens += 1
-    elif gap_pct <= R["GAP_VIABLE_HI"]:
-        good.append(f"Gap viable ≤{R['GAP_VIABLE_HI']:.0f}% (you {_fmt_val(gap_pct,'%')})"); greens += 1
+    elif IQR["gap_pct"]["q1"] <= gap_pct <= IQR["gap_pct"]["q3"]:
+        good.append(f"Gap in IQR 70–180% (you {gap_pct:.1f}%)")
+    elif gap_pct < IQR["gap_pct"]["lo"]:
+        risk.append(f"Gap weak (<{IQR['gap_pct']['lo']:.0f}% ; you {gap_pct:.1f}%)")
+    elif gap_pct > IQR["gap_pct"]["hi"]:
+        risk.append(f"Gap extreme (>{IQR['gap_pct']['hi']:.0f}% ; you {gap_pct:.1f}%)")
     else:
-        warn.append(f"Gap outlier >{R['GAP_VIABLE_HI']:.0f}% (you {_fmt_val(gap_pct,'%')})")
-        if gap_pct > R["GAP_OUTLIER"]:
-            warn.append(f">{R['GAP_OUTLIER']:.0f}% unproven tail (exhaustion risk)")
+        warn.append(f"Gap viable (you {gap_pct:.1f}%)")
 
-    # Premarket $Vol
+    s_pm = score_iqr(pm_dol_m, **IQR["pm_dol_m"])
     if pm_dol_m is None or pm_dol_m < 0:
         warn.append("PM $Vol: missing")
-    elif pm_dol_m < 3:
-        risk.append(f"PM $Vol very thin (<$3M; you ${_fmt_val(pm_dol_m,'M')})"); reds += 1
-    elif R["PM$_MIN"] <= pm_dol_m <= R["PM$_MAX"]:
-        good.append(f"PM $Vol sweet ${R['PM$_MIN']:.0f}–{R['PM$_MAX']:.0f}M (you ${_fmt_val(pm_dol_m,'M')})"); greens += 1
-    elif 5 <= pm_dol_m <= 22:
-        good.append(f"PM $Vol viable ~$5–22M (you ${_fmt_val(pm_dol_m,'M')})"); greens += 1
-    elif pm_dol_m > 40:
-        risk.append(f"PM $Vol bloated (>{40}M; you ${_fmt_val(pm_dol_m,'M')})"); reds += 1
+    elif IQR["pm_dol_m"]["q1"] <= pm_dol_m <= IQR["pm_dol_m"]["q3"]:
+        good.append(f"PM $Vol in IQR $7–15M (you ${pm_dol_m:.1f}M)")
+    elif pm_dol_m < IQR["pm_dol_m"]["lo"]:
+        risk.append(f"PM $Vol thin (<${IQR['pm_dol_m']['lo']:.0f}M; you ${pm_dol_m:.1f}M)")
+    elif pm_dol_m > IQR["pm_dol_m"]["hi"]:
+        risk.append(f"PM $Vol bloated (>${IQR['pm_dol_m']['hi']:.0f}M; you ${pm_dol_m:.1f}M)")
     else:
-        warn.append(f"PM $Vol marginal (you ${_fmt_val(pm_dol_m,'M')})")
+        warn.append(f"PM $Vol viable (you ${pm_dol_m:.1f}M)")
 
-    # RVOL
+    s_rvol = score_iqr(rvol, **IQR["rvol"])
     if rvol is None or rvol <= 0:
         warn.append("RVOL: missing")
-    elif R["RVOL_MIN"] <= rvol <= R["RVOL_MAX"]:
-        good.append(f"RVOL sweet {int(R['RVOL_MIN'])}–{int(R['RVOL_MAX'])}× (you {int(rvol)}×)"); greens += 1
-    elif 70 <= rvol <= 2000:
-        good.append(f"RVOL viable ~70–2000× (you {int(rvol)}×)"); greens += 1
-    elif rvol < 50:
-        risk.append(f"RVOL very low (<50× ; you {int(rvol)}×)"); reds += 1
+    elif IQR["rvol"]["q1"] <= rvol <= IQR["rvol"]["q3"]:
+        good.append(f"RVOL in IQR {int(IQR['rvol']['q1'])}–{int(IQR['rvol']['q3'])}× (you {int(rvol)}×)")
+    elif rvol < IQR["rvol"]["lo"]:
+        risk.append(f"RVOL too low (<{int(IQR['rvol']['lo'])}×; you {int(rvol)}×)")
+    elif rvol > IQR["rvol"]["hi"]:
+        risk.append(f"RVOL extreme (>{int(IQR['rvol']['hi'])}×; you {int(rvol)}×)")
     else:
-        warn.append(f"RVOL outside sweet band (you {int(rvol)}×)")
-    if rvol and rvol > R["RVOL_WARN_MAX"]:
-        warn.append(f"RVOL >{int(R['RVOL_WARN_MAX'])}× — blowout/exhaustion risk")
+        warn.append(f"RVOL viable (you {int(rvol)}×)")
 
-    # Neutral info (does not change greens/reds until threshold is backtested)
+    # Catalyst / Dilution as soft features scored by IQR too
+    s_cat = score_iqr(catalyst_points, **IQR["catalyst"])
+    s_dil = score_iqr(dilution_points, **IQR["dilution"])
+    if catalyst_points >= 0.2: good.append("Catalyst: strong/real PR")
+    elif catalyst_points <= -0.2: warn.append("Catalyst: weak/low-quality")
+    else: warn.append("Catalyst: neutral/unknown")
+
+    if dilution_points <= -0.2: risk.append("Dilution/ATM/overhang")
+    elif dilution_points >= 0.2: good.append("Clean cap table / low dilution")
+    else: warn.append("Dilution: neutral/unknown")
+
+    # Optional neutral info
     if pm_dollar_vs_mc is not None and pm_dollar_vs_mc == pm_dollar_vs_mc:
-        warn.append(f"Info: PM $Vol / MC = {_fmt_val(pm_dollar_vs_mc, '%')} (no threshold yet)")
+        warn.append(f"Info: PM $Vol / MC = {pm_dollar_vs_mc:.1f}% (threshold TBD)")
 
-    # Verdict & numeric score (PHB-based)
-    if reds >= 2:
-        verdict = "Weak / Avoid"; pill = '<span class="pill pill-bad">Weak / Avoid</span>'
-    elif greens >= 6:
+    # Weighted Numeric % from IQR scores
+    soft = (
+        W["float_m"]  * s_float +
+        W["mcap_m"]   * s_mcap  +
+        W["atr_usd"]  * s_atr   +
+        W["gap_pct"]  * s_gap   +
+        W["pm_dol_m"] * s_pm    +
+        W["rvol"]     * s_rvol  +
+        W["catalyst"] * clamp01((s_cat)) +
+        W["dilution"] * clamp01((s_dil))
+    )
+    numeric_pct = float(max(0.0, min(100.0, 100.0 * soft)))
+
+    # Hard caps for extreme tails
+    cap = 100.0
+    if gap_pct and gap_pct >= HARD_CAPS["gap_abs_hi"]:
+        cap = min(cap, HARD_CAPS["cap_at_gap"])
+    if rvol and rvol >= HARD_CAPS["rvol_blow"]:
+        cap = min(cap, HARD_CAPS["cap_at_rvol"])
+    if pm_dol_m and pm_dol_m >= HARD_CAPS["pm$_double"]:
+        cap = min(cap, HARD_CAPS["cap_at_pm$"])
+    numeric_pct = min(numeric_pct, cap)
+
+    # Verdict from numeric %
+    if numeric_pct >= 75.0:
         verdict = "Strong Setup"; pill = '<span class="pill pill-good">Strong Setup</span>'
-    else:
+    elif numeric_pct >= 55.0:
         verdict = "Constructive"; pill = '<span class="pill pill-warn">Constructive</span>'
+    else:
+        verdict = "Weak / Avoid"; pill = '<span class="pill pill-bad">Weak / Avoid</span>'
 
-    # PHB numeric % from checklist
-    phb_numeric = float(max(0, min(100, 50 + (10 * greens) - (15 * reds))))
+    # Greens/Reds for counters (IQR-based)
+    greens = 0
+    reds = 0
+    # inside IQR => green
+    for name, val in [("float_m", float_m), ("mcap_m", mcap_m), ("atr_usd", atr_usd),
+                      ("gap_pct", gap_pct), ("pm_dol_m", pm_dol_m), ("rvol", rvol)]:
+        if val is None: continue
+        p = IQR[name]
+        if p["q1"] <= val <= p["q3"]:
+            greens += 1
+        elif val <= p["lo"] or val >= p["hi"]:
+            reds += 1
+    if catalyst_points >= IQR["catalyst"]["med"]: greens += 1
+    if dilution_points <= IQR["dilution"]["q1"]:  reds += 1
 
     return {
         "greens": greens, "reds": reds,
         "good": good, "warn": warn, "risk": risk,
         "verdict": verdict, "pill": pill,
-        "phb_numeric": phb_numeric
+        "phb_numeric": numeric_pct
     }
 
 # ---------- Tabs ----------
@@ -379,7 +406,6 @@ tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 with tab_add:
     st.markdown('<div class="section-title">Numeric & Modifiers</div>', unsafe_allow_html=True)
 
-    # Form that clears on submit
     with st.form("add_form", clear_on_submit=True):
         col1, col2, col3 = st.columns([1.2, 1.2, 0.9])
 
@@ -417,48 +443,39 @@ with tab_add:
 
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
-    # After submit
     if submitted and ticker:
         # Predicted day volume (M) + CIs
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
         ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)
 
-        # ORIGINAL numeric & qual blocks (kept to show but Numeric % replaced by PHB)
-        p_rvol  = pts_rvol(rvol)
-        p_atr   = pts_atr(atr_usd)
-        p_si    = pts_si(si_pct)
-        p_fr    = pts_fr(pm_vol_m, float_m)
-        p_float = pts_float(float_m)
-        num_0_7 = (w_rvol*p_rvol) + (w_atr*p_atr) + (w_si*p_si) + (w_fr*p_fr) + (w_float*p_float)
-        _orig_num_pct = (num_0_7/7.0)*100.0  # not used for final Numeric %
-
+        # Qualitative %
         qual_0_7 = 0.0
         for crit in QUAL_CRITERIA:
             sel = st.session_state.get(f"qual_{crit['name']}", (1,))[0] if isinstance(st.session_state.get(f"qual_{crit['name']}", 1), tuple) else st.session_state.get(f"qual_{crit['name']}", 1)
             qual_0_7 += q_weights[crit["name"]] * float(sel)
         qual_pct = (qual_0_7/7.0)*100.0
 
-        # PM $Vol / MC % (for metric + checklist neutral info)
+        # PM $Vol / MC % (diagnostic)
         pm_dollar_vs_mc = 100.0 * pm_dol_m / mc_m if mc_m > 0 else float("nan")
 
-        # Checklist → PHB numeric %
-        checklist = make_premarket_checklist(
+        # IQR checklist + Numeric %
+        ck = phb_checklist_iqr(
             float_m=float_m, mcap_m=mc_m, atr_usd=atr_usd,
-            gap_pct=gap_pct, pm_vol_m=pm_vol_m, pm_dol_m=pm_dol_m,
-            rvol=rvol, pm_dollar_vs_mc=pm_dollar_vs_mc,
-            catalyst_points=catalyst_points, dilution_points=dilution_points
+            gap_pct=gap_pct, pm_dol_m=pm_dol_m, rvol=rvol,
+            catalyst_points=catalyst_points, dilution_points=dilution_points,
+            pm_dollar_vs_mc=pm_dollar_vs_mc
         )
-        numeric_pct = checklist["phb_numeric"]
+        numeric_pct = ck["phb_numeric"]
 
-        # Final Score = average of Numeric % (PHB) and Qualitative %
+        # Final Score = 50/50 Numeric (IQR) & Qualitative
         final_score = float(max(0.0, min(100.0, 0.5*numeric_pct + 0.5*qual_pct)))
 
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
             "Level": grade(final_score),
-            "Numeric_%": round(numeric_pct, 2),  # PHB-based
+            "Numeric_%": round(numeric_pct, 2),  # IQR-based
             "Qual_%": round(qual_pct, 2),
             "FinalScore": round(final_score, 2),
 
@@ -469,8 +486,8 @@ with tab_add:
             "PredVol_CI95_L": round(ci95_l, 2),
             "PredVol_CI95_U": round(ci95_u, 2),
 
-            # Ratios/diagnostics
-            "PM$ / MC_%": round(pm_dollar_vs_mc, 1) if pm_dollar_vs_mc == pm_dollar_vs_mc else "",  # show only if defined
+            # Diagnostics
+            "PM$ / MC_%": round(pm_dollar_vs_mc, 1) if pm_dollar_vs_mc == pm_dollar_vs_mc else "",
             "PM_FloatRot_x": round(pm_vol_m / float_m, 3) if float_m > 0 else 0.0,
 
             # raw inputs
@@ -479,13 +496,13 @@ with tab_add:
             "_Catalyst": float(catalyst_points), "_Dilution": float(dilution_points),
 
             # checklist
-            "PremarketVerdict": checklist["verdict"],
-            "PremarketPill": checklist["pill"],
-            "PremarketGreens": checklist["greens"],
-            "PremarketReds": checklist["reds"],
-            "PremarketGood": checklist["good"],
-            "PremarketWarn": checklist["warn"],
-            "PremarketRisk": checklist["risk"],
+            "PremarketVerdict": ck["verdict"],
+            "PremarketPill": ck["pill"],
+            "PremarketGreens": ck["greens"],
+            "PremarketReds": ck["reds"],
+            "PremarketGood": ck["good"],
+            "PremarketWarn": ck["warn"],
+            "PremarketRisk": ck["risk"],
         }
 
         st.session_state.rows.append(row)
@@ -499,7 +516,7 @@ with tab_add:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
         cA, cB, cC, cD, cE = st.columns(5)
         cA.metric("Last Ticker", l.get("Ticker","—"))
-        cB.metric("Numeric % (PHB)", f"{l.get('Numeric_%',0):.2f}%")
+        cB.metric("Numeric % (IQR)", f"{l.get('Numeric_%',0):.2f}%")
         cC.metric("Qualitative %",    f"{l.get('Qual_%',0):.2f}%")
         cD.metric("Final Score",      f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
         cE.metric("Odds", l.get("Odds","—"))
@@ -518,8 +535,7 @@ with tab_add:
         d4.metric("Gap %", f"{l.get('_Gap_%',0):.1f}%")
         d4.caption("Open gap vs prior close.")
 
-        # ---------- Structured Premarket Checklist UI ----------
-        with st.expander("Premarket Checklist (data-driven)", expanded=True):
+        with st.expander("Premarket Checklist (IQR-based)", expanded=True):
             verdict = l.get("PremarketVerdict","—")
             greens = l.get("PremarketGreens",0)
             reds = l.get("PremarketReds",0)
@@ -553,11 +569,9 @@ with tab_rank:
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows)
         df = df.loc[:, ~df.columns.duplicated(keep="first")]
-
         if "FinalScore" in df.columns:
             df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
-        # trimmed columns per your request (no mode, no FT, no PM% of Pred, no summary)
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
@@ -577,7 +591,7 @@ with tab_rank:
                 "Ticker": st.column_config.TextColumn("Ticker"),
                 "Odds": st.column_config.TextColumn("Odds"),
                 "Level": st.column_config.TextColumn("Level"),
-                "Numeric_%": st.column_config.NumberColumn("Numeric_% (PHB)", format="%.2f"),
+                "Numeric_%": st.column_config.NumberColumn("Numeric_% (IQR)", format="%.2f"),
                 "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
                 "PremarketVerdict": st.column_config.TextColumn("Premarket Verdict"),
