@@ -348,7 +348,7 @@ def make_premarket_checklist(
     s_mcap  = gauss_iqr_score(mcap_m,    **IQR["mcap_m"])
     s_atr   = gauss_iqr_score(atr_usd,   **IQR["atr_usd"])
     s_gap   = gauss_iqr_score(gap_pct,   **IQR["gap_pct"])
-    s_pm$   = gauss_iqr_score(pm_dol_m,  **IQR["pm_dol_m"])
+    s_pmdol   = gauss_iqr_score(pm_dol_m,  **IQR["pm_dol_m"])
     s_rvol  = gauss_iqr_score(rvol,      **IQR["rvol"])
     s_pmmc  = gauss_iqr_score(pm_mc_pct, **IQR["pm_mc_pct"]) if pm_mc_pct is not None else EPS_FLOOR
 
@@ -391,7 +391,7 @@ def make_premarket_checklist(
         W["mcap_m"]    * s_mcap  +
         W["atr_usd"]   * s_atr   +
         W["gap_pct"]   * s_gap   +
-        W["pm_dol_m"]  * s_pm$   +
+        W["pm_dol_m"]  * s_pmdol   +
         W["pm_mc_pct"] * s_pmmc  +
         W["rvol"]      * s_rvol  +
         W["catalyst"]  * s_cat   +
