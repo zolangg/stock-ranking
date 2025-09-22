@@ -230,7 +230,7 @@ def learn_iqr_from_excel(file, sheet_name: str) -> Dict[str, Dict[str, float]]:
     col_float = pick("float m shares","public float (m)","float (m)","float_m")
     col_mcap  = pick("marketcap m","market cap (m)","market cap m","mcap")
     col_gap   = pick("gap %","gap%","gap pct","premarket gap %")
-    col_pm$   = pick("pm $vol (m)","pm $ vol (m)","pm dollar vol (m)","premarket $vol (m)")
+    col_pmdol   = pick("pm $vol (m)","pm $ vol (m)","pm dollar vol (m)","premarket $vol (m)")
     col_rvol  = pick("rvol @ bo","rvol","relative volume","rv ol bo","rvol bo")
     col_atr   = pick("atr","atr $","atr (usd)","atr $/day")
 
@@ -242,7 +242,7 @@ def learn_iqr_from_excel(file, sheet_name: str) -> Dict[str, Dict[str, float]]:
         # if mostly ratio (e.g., 0.84), convert to %
         if gap.dropna().lt(5).mean() > 0.6: gap = gap * 100.0
         cols["gap_pct"] = gap
-    if col_pm$:    cols["pm_dol_m"] = _numify(df[col_pm$])
+    if col_pmdol:    cols["pm_dol_m"] = _numify(df[col_pmdol])
     if col_rvol:   cols["rvol"]     = _numify(df[col_rvol])
     if col_atr:    cols["atr_usd"]  = _numify(df[col_atr])
 
