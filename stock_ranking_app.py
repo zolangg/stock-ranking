@@ -23,6 +23,8 @@ st.markdown(
       .pill-good { background:#e7f5e9; color:#166534; border:1px solid #bbf7d0;}
       .pill-warn { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa;}
       .pill-bad  { background:#fef2f2; color:#991b1b; border:1px solid #fecaca;}
+      ul { margin-top: 4px; margin-bottom: 4px; padding-left: 18px; }
+      li { margin-bottom: 2px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -54,7 +56,9 @@ def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
     default_str = fmt.format(float(value))
     s = st.text_input(label, default_str, key=key, help=help)
     v = _parse_local_float(s)
-    return float(value)
+    if v is None:
+        st.caption('<span class="hint">Enter a number, e.g. 5,05</span>', unsafe_allow_html=True)
+        return float(value)
     # Clamp to min/max
     if v < min_value:
         st.caption(f'<span class="hint">Clamped to minimum: {fmt.format(min_value)}</span>', unsafe_allow_html=True)
@@ -287,162 +291,158 @@ def predict_ft_prob_premarket(float_m: float, mcap_m: float, atr_usd: float,
         p = elp / (1.0 + elp)
     return max(0.0, min(1.0, p))
 
-# ---------- PHB Premarket Checklist (NEW, uses numeric inputs only) ----------
+# ---------- PHB Premarket Checklist (structured, clean) ----------
 PHB_RULES = {
-    "FLOAT_MAX": 20.0,           # sweet 5–12M
-    "FLOAT_SWEET_LO": 5.0,
-    "FLOAT_SWEET_HI": 12.0,
-    "MCAP_MAX": 150.0,
-    "MCAP_HUGE": 500.0,
-    "ATR_MIN": 0.15,             # runners often 0.2–0.4
-    "GAP_MIN": 70.0,             # sweet ~100
-    "GAP_SWEET_HI": 180.0,
-    "GAP_VIABLE_HI": 280.0,      # tails thin above here
-    "GAP_OUTLIER": 300.0,        # unproven tail in your sample
-    "PM$_MIN": 7.0,
-    "PM$_MAX": 30.0,             # >30–40M often frontloads
-    "PM_SHARE_MIN": 10.0,        # % of predicted day
-    "PM_SHARE_MAX": 20.0,
-    "PM_SHARE_FAIL_LOW": 5.0,
-    "PM_SHARE_FAIL_HI": 35.0,
-    "RVOL_MIN": 100.0,
-    "RVOL_MAX": 1500.0,
-    "RVOL_WARN_MAX": 3000.0,
+    "FLOAT_MAX": 20.0, "FLOAT_SWEET_LO": 5.0, "FLOAT_SWEET_HI": 12.0,
+    "MCAP_MAX": 150.0, "MCAP_HUGE": 500.0,
+    "ATR_MIN": 0.15,
+    "GAP_MIN": 70.0, "GAP_SWEET_HI": 180.0, "GAP_VIABLE_HI": 280.0, "GAP_OUTLIER": 300.0,
+    "PM$_MIN": 7.0, "PM$_MAX": 30.0,
+    "PM_SHARE_MIN": 10.0, "PM_SHARE_MAX": 20.0, "PM_SHARE_FAIL_LOW": 5.0, "PM_SHARE_FAIL_HI": 35.0,
+    "RVOL_MIN": 100.0, "RVOL_MAX": 1500.0, "RVOL_WARN_MAX": 3000.0,
 }
+
+def _fmt_val(v, suffix="", none_txt="—"):
+    try:
+        if v is None: return none_txt
+        if isinstance(v, (int, float)):
+            if math.isnan(v): return none_txt
+            return f"{v:.2f}{suffix}"
+        return str(v)
+    except Exception:
+        return none_txt
 
 def make_premarket_checklist(*, float_m: float, mcap_m: float, atr_usd: float,
                              gap_pct: float, pm_vol_m: float, pm_dol_m: float,
                              rvol: float, pm_pct_of_pred: float,
                              catalyst_points: float, dilution_points: float) -> dict:
     R = PHB_RULES
-    lines = []
-    reds = 0
-    greens = 0
+    good, warn, risk = [], [], []
+    greens = reds = 0
 
-    # Catalyst (slider)
+    # Catalyst / Dilution
     if catalyst_points >= 0.2:
-        lines.append("✅ Catalyst: strong / real PR.")
-        greens += 1
+        good.append("Catalyst: strong/real PR"); greens += 1
     elif catalyst_points <= -0.2:
-        lines.append("🚫 Catalyst: weak / low-quality.")
-        reds += 1
+        warn.append("Catalyst: weak/low-quality")
     else:
-        lines.append("⚠️ Catalyst: neutral / unknown.")
+        warn.append("Catalyst: neutral/unknown")
 
-    # Dilution (slider)
-    if dilution_points >= 0.2:
-        lines.append("✅ Dilution risk low / clean cap table.")
-        greens += 1
-    elif dilution_points <= -0.2:
-        lines.append("🚫 Dilution / ATM / overhang risk.")
-        reds += 1
+    if dilution_points <= -0.2:
+        risk.append("Dilution/ATM/overhang"); reds += 1
+    elif dilution_points >= 0.2:
+        good.append("Clean cap table / low dilution"); greens += 1
     else:
-        lines.append("⚠️ Dilution: neutral / unknown.")
+        warn.append("Dilution: neutral/unknown")
 
     # Float
-    if float_m <= 0:
-        lines.append("⚠️ Float missing.")
+    if float_m is None or float_m <= 0:
+        warn.append("Float: missing")
     elif R["FLOAT_SWEET_LO"] <= float_m <= R["FLOAT_SWEET_HI"]:
-        lines.append(f"✅ Float sweet spot {R['FLOAT_SWEET_LO']:.0f}–{R['FLOAT_SWEET_HI']:.0f}M (you {float_m:.2f}M)."); greens += 1
+        good.append(f"Float sweet {R['FLOAT_SWEET_LO']:.0f}–{R['FLOAT_SWEET_HI']:.0f}M (you {_fmt_val(float_m,'M')})"); greens += 1
     elif float_m < R["FLOAT_MAX"]:
-        lines.append(f"✅ Float <{R['FLOAT_MAX']:.0f}M (you {float_m:.2f}M)."); greens += 1
+        good.append(f"Float <{R['FLOAT_MAX']:.0f}M (you {_fmt_val(float_m,'M')})"); greens += 1
     elif float_m >= 50:
-        lines.append(f"🚫 Float very large (≥50M; you {float_m:.2f}M)."); reds += 1
+        risk.append(f"Float very large (≥50M; you {_fmt_val(float_m,'M')})"); reds += 1
     else:
-        lines.append(f"⚠️ Float elevated (≥{R['FLOAT_MAX']:.0f}M; you {float_m:.2f}M).")
+        warn.append(f"Float elevated (≥{R['FLOAT_MAX']:.0f}M; you {_fmt_val(float_m,'M')})")
 
-    # Market cap
-    if mcap_m <= 0:
-        lines.append("⚠️ Market cap missing.")
+    # Market Cap
+    if mcap_m is None or mcap_m <= 0:
+        warn.append("MarketCap: missing")
     elif mcap_m < R["MCAP_MAX"]:
-        lines.append(f"✅ MarketCap <{R['MCAP_MAX']:.0f}M (you {mcap_m:.1f}M)."); greens += 1
+        good.append(f"MarketCap <{R['MCAP_MAX']:.0f}M (you {_fmt_val(mcap_m,'M')})"); greens += 1
     elif mcap_m >= R["MCAP_HUGE"]:
-        lines.append(f"🚫 MarketCap huge (≥{R['MCAP_HUGE']:.0f}M; you {mcap_m:.1f}M)."); reds += 1
+        risk.append(f"MarketCap huge (≥{R['MCAP_HUGE']:.0f}M; you {_fmt_val(mcap_m,'M')})"); reds += 1
     else:
-        lines.append(f"⚠️ MarketCap elevated (≥{R['MCAP_MAX']:.0f}M; you {mcap_m:.1f}M).")
+        warn.append(f"MarketCap elevated (≥{R['MCAP_MAX']:.0f}M; you {_fmt_val(mcap_m,'M')})")
 
     # ATR
-    if atr_usd >= R["ATR_MIN"]:
-        if 0.2 <= atr_usd <= 0.4:
-            lines.append(f"✅ ATR runner band 0.2–0.4 (you {atr_usd:.2f})."); greens += 1
+    if atr_usd is None or atr_usd <= 0:
+        warn.append("ATR: missing")
+    elif atr_usd >= R["ATR_MIN"]:
+        if 0.20 <= atr_usd <= 0.40:
+            good.append(f"ATR in 0.20–0.40 band (you ${_fmt_val(atr_usd)})"); greens += 1
         else:
-            lines.append(f"✅ ATR ≥{R['ATR_MIN']:.2f} (you {atr_usd:.2f})."); greens += 1
+            good.append(f"ATR ≥{R['ATR_MIN']:.2f} (you ${_fmt_val(atr_usd)})"); greens += 1
     else:
-        lines.append(f"⚠️ ATR thin (<{R['ATR_MIN']:.2f}; you {atr_usd:.2f}).")
+        warn.append(f"ATR thin (<{R['ATR_MIN']:.2f}; you ${_fmt_val(atr_usd)})")
 
     # Gap %
-    if gap_pct < R["GAP_MIN"]:
-        lines.append(f"🚫 Gap small (<{R['GAP_MIN']:.0f}%; you {gap_pct:.1f}%)."); reds += 1
+    if gap_pct is None or gap_pct <= 0:
+        warn.append("Gap %: missing")
+    elif gap_pct < R["GAP_MIN"]:
+        risk.append(f"Gap small (<{R['GAP_MIN']:.0f}% ; you {_fmt_val(gap_pct,'%')})"); reds += 1
     elif gap_pct <= R["GAP_SWEET_HI"]:
-        lines.append(f"✅ Gap sweet {R['GAP_MIN']:.0f}–{R['GAP_SWEET_HI']:.0f}% (you {gap_pct:.1f}%)."); greens += 1
+        good.append(f"Gap sweet {R['GAP_MIN']:.0f}–{R['GAP_SWEET_HI']:.0f}% (you {_fmt_val(gap_pct,'%')})"); greens += 1
     elif gap_pct <= R["GAP_VIABLE_HI"]:
-        lines.append(f"✅ Gap viable ≤{R['GAP_VIABLE_HI']:.0f}% (you {gap_pct:.1f}%)."); greens += 1
+        good.append(f"Gap viable ≤{R['GAP_VIABLE_HI']:.0f}% (you {_fmt_val(gap_pct,'%')})"); greens += 1
     else:
-        lines.append(f"⚠️ Gap outlier >{R['GAP_VIABLE_HI']:.0f}% (you {gap_pct:.1f}%).")
+        warn.append(f"Gap outlier >{R['GAP_VIABLE_HI']:.0f}% (you {_fmt_val(gap_pct,'%')})")
         if gap_pct > R["GAP_OUTLIER"]:
-            lines.append(f"⚠️ >{R['GAP_OUTLIER']:.0f}% is unproven tail in sample (exhaustion risk).")
+            warn.append(f">{R['GAP_OUTLIER']:.0f}% unproven tail (exhaustion risk)")
 
-    # Premarket $Volume
-    if pm_dol_m < 3:
-        lines.append(f"🚫 PM $Vol very thin (<$3M; you ${pm_dol_m:.1f}M)."); reds += 1
+    # Premarket $Vol
+    if pm_dol_m is None or pm_dol_m < 0:
+        warn.append("PM $Vol: missing")
+    elif pm_dol_m < 3:
+        risk.append(f"PM $Vol very thin (<$3M; you ${_fmt_val(pm_dol_m,'M')})"); reds += 1
     elif R["PM$_MIN"] <= pm_dol_m <= R["PM$_MAX"]:
-        lines.append(f"✅ PM $Vol sweet ${R['PM$_MIN']:.0f}–{R['PM$_MAX']:.0f}M (you ${pm_dol_m:.1f}M)."); greens += 1
+        good.append(f"PM $Vol sweet ${R['PM$_MIN']:.0f}–{R['PM$_MAX']:.0f}M (you ${_fmt_val(pm_dol_m,'M')})"); greens += 1
     elif 5 <= pm_dol_m <= 22:
-        lines.append(f"✅ PM $Vol viable ~$5–22M (you ${pm_dol_m:.1f}M)."); greens += 1
+        good.append(f"PM $Vol viable ~$5–22M (you ${_fmt_val(pm_dol_m,'M')})"); greens += 1
     elif pm_dol_m > 40:
-        lines.append(f"🚫 PM $Vol bloated (>{40}M; you ${pm_dol_m:.1f}M)."); reds += 1
+        risk.append(f"PM $Vol bloated (>{40}M; you ${_fmt_val(pm_dol_m,'M')})"); reds += 1
     else:
-        lines.append(f"⚠️ PM $Vol marginal (you ${pm_dol_m:.1f}M).")
+        warn.append(f"PM $Vol marginal (you ${_fmt_val(pm_dol_m,'M')})")
 
     # PM shares as % of predicted day
-    if pm_pct_of_pred <= 0:
-        lines.append("⚠️ PM % of Predicted: cannot compute.")
+    if pm_pct_of_pred is None or pm_pct_of_pred <= 0:
+        warn.append("PM % of predicted: missing")
     elif R["PM_SHARE_MIN"] <= pm_pct_of_pred <= R["PM_SHARE_MAX"]:
-        lines.append(f"✅ PM shares sweet {R['PM_SHARE_MIN']:.0f}–{R['PM_SHARE_MAX']:.0f}% (you {pm_pct_of_pred:.1f}%)."); greens += 1
+        good.append(f"PM shares sweet {int(R['PM_SHARE_MIN'])}–{int(R['PM_SHARE_MAX'])}% (you {_fmt_val(pm_pct_of_pred,'%')})"); greens += 1
     elif 7 <= pm_pct_of_pred <= 25:
-        lines.append(f"✅ PM shares viable 7–25% (you {pm_pct_of_pred:.1f}%)."); greens += 1
+        good.append(f"PM shares viable 7–25% (you {_fmt_val(pm_pct_of_pred,'%')})"); greens += 1
     elif pm_pct_of_pred < R["PM_SHARE_FAIL_LOW"]:
-        lines.append(f"🚫 PM shares too thin (<{R['PM_SHARE_FAIL_LOW']:.0f}%; you {pm_pct_of_pred:.1f}%)."); reds += 1
+        risk.append(f"PM shares too thin (<{int(R['PM_SHARE_FAIL_LOW'])}% ; you {_fmt_val(pm_pct_of_pred,'%')})"); reds += 1
     elif pm_pct_of_pred > R["PM_SHARE_FAIL_HI"]:
-        lines.append(f"🚫 PM shares front-loaded (>{R['PM_SHARE_FAIL_HI']:.0f}%; you {pm_pct_of_pred:.1f}%)."); reds += 1
+        risk.append(f"PM shares front-loaded (>{int(R['PM_SHARE_FAIL_HI'])}% ; you {_fmt_val(pm_pct_of_pred,'%')})"); reds += 1
     else:
-        lines.append(f"⚠️ PM shares outside sweet band (you {pm_pct_of_pred:.1f}%).")
+        warn.append(f"PM shares outside sweet band (you {_fmt_val(pm_pct_of_pred,'%')})")
 
     # RVOL
-    if rvol <= 0:
-        lines.append("⚠️ RVOL missing/zero.")
+    if rvol is None or rvol <= 0:
+        warn.append("RVOL: missing")
     elif R["RVOL_MIN"] <= rvol <= R["RVOL_MAX"]:
-        lines.append(f"✅ RVOL sweet {int(R['RVOL_MIN'])}–{int(R['RVOL_MAX'])}× (you {rvol:.0f}×)."); greens += 1
+        good.append(f"RVOL sweet {int(R['RVOL_MIN'])}–{int(R['RVOL_MAX'])}× (you {int(rvol)}×)"); greens += 1
     elif 70 <= rvol <= 2000:
-        lines.append(f"✅ RVOL viable ~70–2000× (you {rvol:.0f}×)."); greens += 1
+        good.append(f"RVOL viable ~70–2000× (you {int(rvol)}×)"); greens += 1
     elif rvol < 50:
-        lines.append(f"🚫 RVOL very low (<50×; you {rvol:.0f}×)."); reds += 1
+        risk.append(f"RVOL very low (<50× ; you {int(rvol)}×)"); reds += 1
     else:
-        lines.append(f"⚠️ RVOL outside sweet band (you {rvol:.0f}×).")
-    if rvol > R["RVOL_WARN_MAX"]:
-        lines.append(f"⚠️ RVOL >{int(R['RVOL_WARN_MAX'])}× — blowout/exhaustion risk.")
+        warn.append(f"RVOL outside sweet band (you {int(rvol)}×)")
+    if rvol and rvol > R["RVOL_WARN_MAX"]:
+        warn.append(f"RVOL >{int(R['RVOL_WARN_MAX'])}× — blowout/exhaustion risk")
 
-    # Verdict
+    # Verdict & summary
     if reds >= 2:
-        verdict = "Weak / Avoid"
-        pill = '<span class="pill pill-bad">Weak / Avoid</span>'
+        verdict = "Weak / Avoid"; pill = '<span class="pill pill-bad">Weak / Avoid</span>'
     elif greens >= 6:
-        verdict = "Strong Setup"
-        pill = '<span class="pill pill-good">Strong Setup</span>'
+        verdict = "Strong Setup"; pill = '<span class="pill pill-good">Strong Setup</span>'
     else:
-        verdict = "Constructive"
-        pill = '<span class="pill pill-warn">Constructive</span>'
+        verdict = "Constructive"; pill = '<span class="pill pill-warn">Constructive</span>'
 
-    # One-line summary for tables
-    summary = f"{verdict}; Float {float_m:.1f}M, MC {mcap_m:.0f}M, Gap {gap_pct:.0f}%, PM$ {pm_dol_m:.1f}M, PM% {pm_pct_of_pred:.0f}%, RVOL {rvol:.0f}×"
+    pos = [s.split(" (")[0] for s in good][:3]
+    neg = [s.split(" (")[0] for s in risk][:3]
+    summary_bits = []
+    if pos: summary_bits.append("Good: " + ", ".join(pos))
+    if neg: summary_bits.append("Risk: " + ", ".join(neg))
+    summary = " | ".join(summary_bits) if summary_bits else "—"
 
     return {
-        "lines": lines,
-        "verdict": verdict,
-        "verdict_pill": pill,
-        "greens": greens,
-        "reds": reds,
-        "summary": summary
+        "greens": greens, "reds": reds,
+        "good": good, "warn": warn, "risk": risk,
+        "verdict": verdict, "pill": pill, "summary": summary
     }
 
 # ---------- Tabs ----------
@@ -542,7 +542,7 @@ with tab_add:
                     "Very Low FT")
         ft_display = f"{ft_pct:.1f}% ({ft_label})"
 
-        # === NEW: Premarket Checklist (data-driven, read-only) ===
+        # === Premarket Checklist (structured; read-only) ===
         checklist = make_premarket_checklist(
             float_m=float_m, mcap_m=mc_m, atr_usd=atr_usd,
             gap_pct=gap_pct, pm_vol_m=pm_vol_m, pm_dol_m=pm_dol_m,
@@ -587,12 +587,15 @@ with tab_add:
             "_Catalyst": float(catalyst_points),
             "_Dilution": float(dilution_points),
 
-            # NEW: checklist & summary
+            # checklist & summary (structured)
             "PremarketVerdict": checklist["verdict"],
-            "PremarketSummary": checklist["summary"],
-            "PremarketChecklist": "\n".join(checklist["lines"]),
-            "PremarketReds": checklist["reds"],
+            "PremarketPill": checklist["pill"],
             "PremarketGreens": checklist["greens"],
+            "PremarketReds": checklist["reds"],
+            "PremarketGood": checklist["good"],
+            "PremarketWarn": checklist["warn"],
+            "PremarketRisk": checklist["risk"],
+            "PremarketSummary": checklist["summary"],
         }
 
         st.session_state.rows.append(row)
@@ -626,13 +629,34 @@ with tab_add:
         d5.metric("FT Probability", f"{l.get('FT_Prob_%',0):.1f}%")
         d5.caption(f"FT Label: {l.get('FT_Label','—')}")
 
-        # NEW: Premarket Checklist UI
+        # ---------- Structured Premarket Checklist UI ----------
         with st.expander("Premarket Checklist (data-driven)", expanded=True):
             verdict = l.get("PremarketVerdict","—")
             greens = l.get("PremarketGreens",0)
             reds = l.get("PremarketReds",0)
-            st.markdown(f"**Verdict:** {verdict} · ✅ {greens} · 🚫 {reds}")
-            st.markdown("<div class='checklist'><pre>" + l.get("PremarketChecklist","(no checks)") + "</pre></div>", unsafe_allow_html=True)
+            pill = l.get("PremarketPill","")
+            st.markdown(
+                f"**Verdict:** {pill if pill else verdict} &nbsp;&nbsp;|&nbsp; ✅ {greens} &nbsp;·&nbsp; 🚫 {reds}",
+                unsafe_allow_html=True
+            )
+
+            g_col, w_col, r_col = st.columns(3)
+
+            def _ul(items):
+                if not items:
+                    return "<ul><li><span class='hint'>None</span></li></ul>"
+                return "<ul>" + "".join([f"<li>{x}</li>" for x in items]) + "</ul>"
+
+            with g_col:
+                st.markdown("**Good**")
+                st.markdown(_ul(l.get("PremarketGood", [])), unsafe_allow_html=True)
+            with w_col:
+                st.markdown("**Caution**")
+                st.markdown(_ul(l.get("PremarketWarn", [])), unsafe_allow_html=True)
+            with r_col:
+                st.markdown("**Risk**")
+                st.markdown(_ul(l.get("PremarketRisk", [])), unsafe_allow_html=True)
+
             st.caption(f"Summary: {l.get('PremarketSummary','—')}")
 
 # ---------- Ranking tab ----------
@@ -646,7 +670,7 @@ with tab_rank:
         if "FinalScore" in df.columns:
             df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
-        # NEW: include verdict & concise summary in both views
+        # include verdict & concise summary in both views
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
