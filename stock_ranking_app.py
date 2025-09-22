@@ -184,7 +184,7 @@ _SYNONYMS = {
     "rvol":          ["rvol @ bo","rvol","relative volume","rvol bo"],
     "atr_usd":       ["atr","atr $","atr (usd)","atr $/day"],
     "si_pct": [
-        "short interest %","short interest","si %","shortinterest %",
+        "short interest %","SI","si %","shortinterest %",
         "short float %","short %","short float","shortinterest float %",
         "short interest (float) %","short interest percent","short ratio %"
     ],
