@@ -383,36 +383,6 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
     ft_num   = build_numeric_table(ft_raw)
     fail_num = build_numeric_table(fail_raw)
 
-    def usable_counts(df: pd.DataFrame) -> pd.DataFrame:
-      keys = ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m",
-              "float_m","mcap_m","fr_x","pmmc_pct","pm_pct_pred","daily_vol_m"]
-      rows = []
-      for k in keys:
-          if k in df.columns:
-              s = pd.to_numeric(df[k], errors="coerce")
-              ok = s[np.isfinite(s)]
-              pos = ok[ok > 0]
-              rows.append({
-                  "var": k,
-                  "non_null": int(ok.shape[0]),
-                  "positive": int(pos.shape[0]),
-                  "unique": int(ok.nunique())
-              })
-          else:
-              rows.append({"var": k, "non_null": 0, "positive": 0, "unique": 0})
-      return pd.DataFrame(rows)
-  
-  # inside learn_all_curves_from_excel(...)
-  ft_num   = build_numeric_table(ft_raw)
-  fail_num = build_numeric_table(fail_raw)
-  all_num  = pd.concat([ft_num.assign(_y=1), fail_num.assign(_y=0)], ignore_index=True)
-  
-  st.markdown("**Usable rows (after cleaning)**")
-  c1, c2, c3 = st.columns(3)
-  with c1: st.caption("FT usable");  st.dataframe(usable_counts(ft_num), use_container_width=True, hide_index=True)
-  with c2: st.caption("Fail usable"); st.dataframe(usable_counts(fail_num), use_container_width=True, hide_index=True)
-  with c3: st.caption("Combined");    st.dataframe(usable_counts(all_num), use_container_width=True, hide_index=True)
-
     ft_num["_y"] = 1
     fail_num["_y"] = 0
     all_num = pd.concat([ft_num, fail_num], axis=0, ignore_index=True)
