@@ -172,6 +172,9 @@ sigma_ln = st.sidebar.slider(
     help="Estimated std dev of residuals in ln(volume). 0.60 ≈ typical for your sheet."
 )
 
+# ---------- Scoring mode (NEW) ----------
+mode = st.sidebar.radio("Scoring mode", ["Weights (original)", "PHB (data-based)", "Hybrid 50/50"], index=0)
+
 # Normalize blocks separately (UNCHANGED)
 num_sum = max(1e-9, w_rvol + w_atr + w_si + w_fr + w_float)
 w_rvol, w_atr, w_si, w_fr, w_float = [w/num_sum for w in (w_rvol, w_atr, w_si, w_fr, w_float)]
@@ -222,7 +225,7 @@ def grade(score_pct: float) -> str:
             "B"   if score_pct >= 60 else
             "C"   if score_pct >= 45 else "D")
 
-# ---------- Day-volume model (millions out) (UNCHANGED) ----------
+# ---------- Day-volume model (millions out) (for PM% calc) ----------
 def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """
     ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$)
@@ -239,59 +242,7 @@ def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
     if pred_m <= 0: return 0.0, 0.0
     return pred_m * math.exp(-z * sigma_ln), pred_m * math.exp(z * sigma_ln)
 
-# ---------- FT model params (placeholders) (UNCHANGED) ----------
-_FT_INTERCEPT = -0.20
-_FT_COEF = {
-    'ln_gapf':    1.20,
-    'ln_pmvol_f': 0.80,
-    'ln_fr':      0.30,
-    'ln_pmvol_m': 0.10,
-    'ln_mcap':   -0.40,
-    'ln_atr':    -0.30,
-    'ln_float':  -0.20,
-    'catalyst':   0.40,
-}
-_FT_MEAN  = {k: 0.0 for k in _FT_COEF.keys()}
-_FT_SCALE = {k: 1.0 for k in _FT_COEF.keys()}
-
-def _std(x, m, s):
-    s = float(s) if s not in (None, 0.0) else 1.0
-    return (x - float(m)) / s
-
-def predict_ft_prob_premarket(float_m: float, mcap_m: float, atr_usd: float,
-                              gap_pct: float, pm_vol_m: float,
-                              pred_vol_m: float, catalyst_flag: int = 0) -> float:
-    e = 1e-6
-    ln_float   = math.log(max(float_m, e))
-    ln_mcap    = math.log(max(mcap_m, e))
-    ln_atr     = math.log(max(atr_usd, e))
-    ln_gapf    = math.log(max(gap_pct, 0.0)/100.0 + e)
-    ln_pmvol_m = math.log(max(pm_vol_m, 0.0) + 1.0)
-    fr         = (pm_vol_m / max(float_m, e)) if float_m > 0 else 0.0
-    ln_fr      = math.log(fr + 1.0)
-    denom      = max(float(pred_vol_m or 0.0), 0.0)
-    pm_frac    = (pm_vol_m / denom) if denom > 0 else 0.0
-    pm_frac    = max(0.0, min(pm_frac, 5.0))
-    ln_pmvol_f = math.log(pm_frac + 1.0)
-
-    lp = _FT_INTERCEPT
-    features = {
-        'ln_float': ln_float, 'ln_mcap': ln_mcap, 'ln_atr': ln_atr, 'ln_gapf': ln_gapf,
-        'ln_pmvol_f': ln_pmvol_f, 'ln_pmvol_m': ln_pmvol_m, 'ln_fr': ln_fr,
-        'catalyst': float(catalyst_flag),
-    }
-    for name, val in features.items():
-        if name in _FT_COEF:
-            lp += _FT_COEF[name] * _std(val, _FT_MEAN.get(name, 0.0), _FT_SCALE.get(name, 1.0))
-
-    if lp >= 0:
-        p = 1.0 / (1.0 + math.exp(-lp))
-    else:
-        elp = math.exp(lp)
-        p = elp / (1.0 + elp)
-    return max(0.0, min(1.0, p))
-
-# ---------- PHB Premarket Checklist (structured, clean) ----------
+# ---------- PHB Premarket Checklist (structured, data-based) ----------
 PHB_RULES = {
     "FLOAT_MAX": 20.0, "FLOAT_SWEET_LO": 5.0, "FLOAT_SWEET_HI": 12.0,
     "MCAP_MAX": 150.0, "MCAP_HUGE": 500.0,
@@ -445,6 +396,12 @@ def make_premarket_checklist(*, float_m: float, mcap_m: float, atr_usd: float,
         "verdict": verdict, "pill": pill, "summary": summary
     }
 
+# ---------- PHB score function (for mode switch) ----------
+def phb_score_from_checklist(greens: int, reds: int) -> float:
+    # 0–100 scale, rewarding greens and penalizing reds
+    base = 10 * greens - 15 * reds          # tweakable weights
+    return float(max(0, min(100, 50 + base)))
+
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
@@ -495,14 +452,14 @@ with tab_add:
 
     # After submit
     if submitted and ticker:
-        # === Day volume prediction (M) (UNCHANGED) ===
+        # === Day volume prediction (M) ===
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
 
         # Confidence bands (millions)
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)    # ~68%
         ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)   # ~95%
 
-        # === Numeric points (UNCHANGED) ===
+        # === Numeric points (weights system) ===
         p_rvol  = pts_rvol(rvol)
         p_atr   = pts_atr(atr_usd)
         p_si    = pts_si(si_pct)
@@ -511,53 +468,47 @@ with tab_add:
         num_0_7 = (w_rvol*p_rvol) + (w_atr*p_atr) + (w_si*p_si) + (w_fr*p_fr) + (w_float*p_float)
         num_pct = (num_0_7/7.0)*100.0
 
-        # === Qualitative points (UNCHANGED) ===
+        # === Qualitative points (weights system) ===
         qual_0_7 = 0.0
         for crit in QUAL_CRITERIA:
-            sel = st.session_state.get(f"qual_{crit['name']}", (1,))[0] if isinstance(st.session_state.get(f"qual_{crit['name']}"), tuple) else st.session_state.get(f"qual_{crit['name']}", 1)
+            sel = st.session_state.get(f"qual_{crit['name']}", (1,))[0] if isinstance(st.session_state.get(f"qual_{crit['name']}", 1), tuple) else st.session_state.get(f"qual_{crit['name']}", 1)
             qual_0_7 += q_weights[crit["name"]] * float(sel)
         qual_pct = (qual_0_7/7.0)*100.0
 
-        # === Combine + modifiers (UNCHANGED) ===
-        combo_pct   = 0.5*num_pct + 0.5*qual_pct
-        final_score = round(combo_pct + (catalyst_points*10) + (dilution_points*10), 2)
-        final_score = max(0.0, min(100.0, final_score))
+        # === Combine weights (original) ===
+        final_score_weights = 0.5*num_pct + 0.5*qual_pct
+        final_score_weights = max(0.0, min(100.0, round(final_score_weights + (catalyst_points*10) + (dilution_points*10), 2)))
 
-        # === Diagnostics to save (UNCHANGED) ===
+        # === Diagnostics to save ===
         pm_pct_of_pred   = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
         pm_float_rot_x   = pm_vol_m / float_m if float_m > 0 else 0.0
         pm_dollar_vs_mc  = 100.0 * pm_dol_m / mc_m if mc_m > 0 else 0.0  # uses input $Volume (M$)
 
-        # === FT Probability (UNCHANGED) ===
-        ft_prob = predict_ft_prob_premarket(
-            float_m=float_m, mcap_m=mc_m, atr_usd=atr_usd,
-            gap_pct=gap_pct, pm_vol_m=pm_vol_m,
-            pred_vol_m=pred_vol_m,
-            catalyst_flag=1 if abs(catalyst_points) > 1e-9 else 0
-        )
-        ft_pct = round(100.0 * ft_prob, 1)
-        ft_label = ("High FT" if ft_pct >= 70 else
-                    "Moderate FT" if ft_pct >= 55 else
-                    "Low FT" if ft_pct >= 40 else
-                    "Very Low FT")
-        ft_display = f"{ft_pct:.1f}% ({ft_label})"
-
-        # === Premarket Checklist (structured; read-only) ===
+        # === Premarket Checklist (data-based) ===
         checklist = make_premarket_checklist(
             float_m=float_m, mcap_m=mc_m, atr_usd=atr_usd,
             gap_pct=gap_pct, pm_vol_m=pm_vol_m, pm_dol_m=pm_dol_m,
             rvol=rvol, pm_pct_of_pred=pm_pct_of_pred,
             catalyst_points=catalyst_points, dilution_points=dilution_points
         )
+        phb_pct = phb_score_from_checklist(checklist["greens"], checklist["reds"])
+
+        # === Scoring mode switch ===
+        if mode == "Weights (original)":
+            final_score = final_score_weights
+        elif mode == "PHB (data-based)":
+            final_score = phb_pct
+        else:  # Hybrid 50/50
+            final_score = 0.5 * final_score_weights + 0.5 * phb_pct
+        final_score = float(max(0.0, min(100.0, final_score)))
 
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
             "Level": grade(final_score),
-            "OddsScore": final_score,
             "Numeric_%": round(num_pct, 2),
             "Qual_%": round(qual_pct, 2),
-            "FinalScore": final_score,
+            "FinalScore": round(final_score, 2),
 
             # Prediction fields
             "PredVol_M": round(pred_vol_m, 2),
@@ -570,11 +521,6 @@ with tab_add:
             # Ratios
             "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
             "PM_FloatRot_x": round(pm_float_rot_x, 3),
-
-            # FT fields
-            "FT": ft_display,
-            "FT_Prob_%": ft_pct,
-            "FT_Label": ft_label,
 
             # raw inputs for debug / export
             "_MCap_M": mc_m,
@@ -596,6 +542,9 @@ with tab_add:
             "PremarketWarn": checklist["warn"],
             "PremarketRisk": checklist["risk"],
             "PremarketSummary": checklist["summary"],
+            "ScoreMode": mode,
+            "PHB_Score": round(phb_pct, 2),
+            "Weights_Score": round(final_score_weights, 2),
         }
 
         st.session_state.rows.append(row)
@@ -626,11 +575,11 @@ with tab_add:
         )
         d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
         d4.caption("PM volume ÷ predicted day volume × 100.")
-        d5.metric("FT Probability", f"{l.get('FT_Prob_%',0):.1f}%")
-        d5.caption(f"FT Label: {l.get('FT_Label','—')}")
+        d5.metric("Mode", l.get("ScoreMode","—"))
+        d5.caption(f"PHB {l.get('PHB_Score',0):.1f} · Weights {l.get('Weights_Score',0):.1f}")
 
         # ---------- Structured Premarket Checklist UI ----------
-        with st.expander("Premarket Checklist (data-driven)", expanded=True):
+        with st.expander("Premarket Checklist (data-based)", expanded=True):
             verdict = l.get("PremarketVerdict","—")
             greens = l.get("PremarketGreens",0)
             reds = l.get("PremarketReds",0)
@@ -670,17 +619,17 @@ with tab_rank:
         if "FinalScore" in df.columns:
             df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
-        # include verdict & concise summary in both views
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
+            "ScoreMode","PHB_Score","Weights_Score",
             "PremarketVerdict","PremarketReds","PremarketGreens",
             "PM$ / MC_%","PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM_%_of_Pred",
-            "FT","PremarketSummary"
+            "PremarketSummary"
         ]
         for c in cols_to_show:
             if c not in df.columns:
-                df[c] = "" if c in ("Ticker","Odds","Level","FT","PremarketVerdict","PremarketSummary") else 0.0
+                df[c] = "" if c in ("Ticker","Odds","Level","PremarketVerdict","PremarketSummary","ScoreMode") else 0.0
         df = df[cols_to_show]
 
         st.dataframe(
@@ -694,6 +643,9 @@ with tab_rank:
                 "Numeric_%": st.column_config.NumberColumn("Numeric_%", format="%.2f"),
                 "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
+                "ScoreMode": st.column_config.TextColumn("Mode"),
+                "PHB_Score": st.column_config.NumberColumn("PHB Score", format="%.2f"),
+                "Weights_Score": st.column_config.NumberColumn("Weights Score", format="%.2f"),
                 "PremarketVerdict": st.column_config.TextColumn("Premarket Verdict"),
                 "PremarketReds": st.column_config.NumberColumn("🚫 Reds"),
                 "PremarketGreens": st.column_config.NumberColumn("✅ Greens"),
@@ -702,7 +654,6 @@ with tab_rank:
                 "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
                 "PredVol_CI68_U": st.column_config.NumberColumn("Pred Vol CI68 High (M)", format="%.2f"),
                 "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
-                "FT": st.column_config.TextColumn("FT (p/label)"),
                 "PremarketSummary": st.column_config.TextColumn("Summary"),
             }
         )
