@@ -54,9 +54,7 @@ def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
     default_str = fmt.format(float(value))
     s = st.text_input(label, default_str, key=key, help=help)
     v = _parse_local_float(s)
-    if v is None:
-        st.caption('<span class="hint">Enter a number, e.g. 5,05</span>', unsafe_allow_html=True)
-        return float(value)
+    return float(value)
     # Clamp to min/max
     if v < min_value:
         st.caption(f'<span class="hint">Clamped to minimum: {fmt.format(min_value)}</span>', unsafe_allow_html=True)
