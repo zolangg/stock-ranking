@@ -29,7 +29,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================
-# Helpers
+# Small helpers
 # =========================
 def _parse_local_float(s: str) -> Optional[float]:
     if s is None: return None
@@ -127,11 +127,10 @@ def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
 # =========================
 st.sidebar.header("Dataset")
 uploaded = st.sidebar.file_uploader("Upload your Excel (.xlsx)", type=["xlsx"])
-
 learn_sheet = st.sidebar.text_input(
-    "Sheet to learn IQR from (e.g., 'PMH BO FT', 'PMH BO Merged')",
+    "Sheet to learn distributions from (e.g., 'PMH BO FT', 'PMH BO Merged')",
     value="PMH BO FT",
-    help="Use your FT (follow-through) sheet for winners-only quartiles."
+    help="Use your FT (follow-through) sheet for winners-only percentiles."
 )
 
 st.sidebar.header("Qualitative Weights")
@@ -174,19 +173,8 @@ st.sidebar.header("Prediction Uncertainty")
 sigma_ln = st.sidebar.slider("Log-space σ (residual std dev)", 0.10, 1.50, 0.60, 0.01)
 
 # =========================
-# Learn IQRs from uploaded DB
+# Data learning utilities
 # =========================
-DEFAULT_IQR = {
-    # Fallbacks if no file or column missing (units in comments)
-    "float_m":   dict(lo=0.5,  q1=5.0,  med=8.5,  q3=12.0, hi=50.0),   # M shrs
-    "mcap_m":    dict(lo=5.0,  q1=30.0, med=80.0, q3=150.0,hi=500.0),  # $M
-    "atr_usd":   dict(lo=0.10, q1=0.20, med=0.30, q3=0.40, hi=1.00),   # $
-    "gap_pct":   dict(lo=30.0, q1=70.0, med=120.0,q3=180.0,hi=280.0),  # %
-    "pm_dol_m":  dict(lo=3.0,  q1=7.0,  med=11.0, q3=15.0, hi=40.0),   # $M
-    "rvol":      dict(lo=50.0, q1=100.0,med=680.0,q3=1500.0,hi=3000.0),# ×
-    "pm_mc_pct": dict(lo=0.5,  q1=1.0,  med=3.0,  q3=6.0,  hi=20.0),   # %
-}
-
 def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip().lower().replace("\n"," ") for c in df.columns]
@@ -197,40 +185,40 @@ def _numify(s: pd.Series) -> pd.Series:
     s = s.str.replace("%","", regex=False)
     return pd.to_numeric(s, errors="coerce")
 
-def learn_iqr_from_excel(file, sheet_name: str) -> Dict[str, Dict[str, float]]:
+def learn_distributions_from_excel(file, sheet_name: str):
+    """
+    Returns:
+      MODELS: dict of per-feature models (for smooth scoring on transformed axis)
+      DISPLAY_Q: dict of per-feature original-axis quantiles for checklist:
+        {'p10','p25','p50','p75','p90'}
+    """
     try:
         xls = pd.ExcelFile(file)
     except Exception:
-        return DEFAULT_IQR.copy()
+        return None
 
+    # choose sheet
     if sheet_name not in xls.sheet_names:
-        # try to find something close
         candidates = [s for s in xls.sheet_names if sheet_name.lower() in s.lower()]
         sheet = candidates[0] if candidates else xls.sheet_names[0]
     else:
         sheet = sheet_name
 
-    try:
-        raw = pd.read_excel(xls, sheet_name=sheet)
-        df = _clean_cols(raw)
-    except Exception:
-        return DEFAULT_IQR.copy()
+    raw = pd.read_excel(xls, sheet_name=sheet)
+    df = _clean_cols(raw)
 
-    # Map likely columns
     def pick(*names):
         for n in names:
             if n in df.columns: return n
-        # fuzzy attempts
         for c in df.columns:
             cc = c.replace(" ", "")
-            if any(k in cc for k in ["floatmshares","publicfloat","float(m)"]) and "float" in cc:
-                return c
+            if "float" in cc and ("mshares" in cc or "publicfloat" in cc): return c
         return None
 
     col_float = pick("float m shares","public float (m)","float (m)","float_m")
     col_mcap  = pick("marketcap m","market cap (m)","market cap m","mcap")
     col_gap   = pick("gap %","gap%","gap pct","premarket gap %")
-    col_pmdol   = pick("pm $vol (m)","pm $ vol (m)","pm dollar vol (m)","premarket $vol (m)")
+    col_pm_d  = pick("pm $vol (m)","pm $ vol (m)","pm dollar vol (m)","premarket $vol (m)")
     col_rvol  = pick("rvol @ bo","rvol","relative volume","rv ol bo","rvol bo")
     col_atr   = pick("atr","atr $","atr (usd)","atr $/day")
 
@@ -239,102 +227,186 @@ def learn_iqr_from_excel(file, sheet_name: str) -> Dict[str, Dict[str, float]]:
     if col_mcap:  cols["mcap_m"]   = _numify(df[col_mcap])
     if col_gap:
         gap = _numify(df[col_gap])
-        # if mostly ratio (e.g., 0.84), convert to %
+        # if mostly ratio (<5), convert to percent
         if gap.dropna().lt(5).mean() > 0.6: gap = gap * 100.0
         cols["gap_pct"] = gap
-    if col_pmdol:    cols["pm_dol_m"] = _numify(df[col_pmdol])
+    if col_pm_d:   cols["pm_dol_m"] = _numify(df[col_pm_d])
     if col_rvol:   cols["rvol"]     = _numify(df[col_rvol])
     if col_atr:    cols["atr_usd"]  = _numify(df[col_atr])
 
     num = pd.DataFrame(cols)
-    # Derived: PM $Vol / MC %
+
+    # derived: PM $Vol / MC %
     if "pm_dol_m" in num.columns and "mcap_m" in num.columns:
         num["pm_mc_pct"] = 100.0 * num["pm_dol_m"] / num["mcap_m"]
 
-    # Drop zeros that are invalid for some features
-    for k in ["mcap_m","float_m","atr_usd","pm_dol_m","rvol","gap_pct","pm_mc_pct"]:
-        if k in num.columns:
-            num.loc[num[k] == 0, k] = np.nan
+    for k in num.columns:
+        num.loc[num[k] == 0, k] = np.nan
 
-    def quantiles_for(k: str) -> Dict[str, float]:
-        if k not in num.columns: return DEFAULT_IQR[k].copy()
-        s = num[k].dropna()
-        if len(s) < 10:  # need enough data
-            return DEFAULT_IQR[k].copy()
-        q1  = float(s.quantile(0.25))
-        med = float(s.quantile(0.50))
-        q3  = float(s.quantile(0.75))
-        # choose loose fences from tails (5th/95th) to allow smooth tails
-        lo  = float(s.quantile(0.05))
-        hi  = float(s.quantile(0.95))
-        if k == "gap_pct":
-            # keep an absolute viability ceiling if dataset tail is wild
-            hi = min(hi, 600.0)
-        return dict(lo=lo, q1=q1, med=med, q3=q3, hi=hi)
+    MODELS = {}
+    DISPLAY_Q = {}
 
-    learned = {}
-    for k in DEFAULT_IQR.keys():
-        learned[k] = quantiles_for(k)
+    features = ["float_m","mcap_m","atr_usd","gap_pct","pm_dol_m","pm_mc_pct","rvol"]
+    for f in features:
+        if f not in num.columns: continue
+        s = num[f].dropna().astype(float)
+        if len(s) < 20:
+            continue
 
-    return learned
+        # decide transform: log if positive & skewed
+        use_log = False
+        if (s > 0).all():
+            skew = s.skew()
+            if abs(skew) > 0.75:
+                use_log = True
 
-# cache learned IQR per session
-if "IQR" not in st.session_state:
-    st.session_state.IQR = DEFAULT_IQR.copy()
+        x = np.log(s.values) if use_log else s.values
+        x = x[np.isfinite(x)]
+        if len(x) < 20: continue
 
+        # original-axis percentiles for checklist
+        qs = np.quantile(s, [0.10,0.25,0.50,0.75,0.90])
+        DISPLAY_Q[f] = dict(p10=qs[0], p25=qs[1], p50=qs[2], p75=qs[3], p90=qs[4])
+
+        # empirical CDF on transformed axis
+        vals_t = np.sort(x)
+        n = len(vals_t)
+        perc = (np.arange(n) + 0.5) / n
+
+        # quantiles on transformed axis
+        q1_t, med_t, q3_t = np.quantile(x, [0.25,0.50,0.75])
+        iqr_t = max(1e-9, q3_t - q1_t)
+        sigma_l = max((med_t - q1_t) / 1.349, 1e-6)
+        sigma_r = max((q3_t - med_t) / 1.349, 1e-6)
+
+        MODELS[f] = dict(
+            vals_t=vals_t, perc=perc,
+            q=dict(q1_t=q1_t, med_t=med_t, q3_t=q3_t),
+            iqr=iqr_t, med_t=med_t,
+            sigma_l=sigma_l, sigma_r=sigma_r,
+            use_log=use_log
+        )
+
+    return MODELS, DISPLAY_Q
+
+# =========================
+# Session state: models & rows
+# =========================
+if "MODELS" not in st.session_state: st.session_state.MODELS = {}
+if "DISPLAY_Q" not in st.session_state: st.session_state.DISPLAY_Q = {}
+if "rows" not in st.session_state: st.session_state.rows = []
+if "last" not in st.session_state: st.session_state.last = {}
+if "flash" not in st.session_state: st.session_state.flash = None
+if st.session_state.flash:
+    st.success(st.session_state.flash)
+    st.session_state.flash = None
+
+# learn from uploaded file (if provided)
 if uploaded is not None:
-    st.session_state.IQR = learn_iqr_from_excel(uploaded, learn_sheet)
+    learned = learn_distributions_from_excel(uploaded, learn_sheet)
+    if learned is not None:
+        st.session_state.MODELS, st.session_state.DISPLAY_Q = learned
 
-IQR = st.session_state.IQR  # active windows
+MODELS = st.session_state.MODELS
+DISPLAY_Q = st.session_state.DISPLAY_Q
 
 # =========================
-# Smooth Gaussian scoring (never zero)
+# Smooth scoring
 # =========================
-EPS_FLOOR = 0.02  # minimum per-feature score (2%) so nothing is ever 0
+EPS_FLOOR = 0.02  # never zero
 
-def gauss_iqr_score(x: Optional[float], lo: float, q1: float, med: float, q3: float, hi: float) -> float:
+def _to_t(x, use_log: bool):
+    if x is None: return None
+    try:
+        x = float(x)
+    except Exception:
+        return None
+    if not np.isfinite(x): return None
+    if use_log:
+        if x <= 0: return None
+        return math.log(x)
+    return x
+
+def score_feature(x, model):
     """
-    Smooth 0..1 score that peaks at the median, decays with distance scaled by IQR.
-    - Uses Gaussian: exp(-0.5 * ((x-med)/sigma)^2), where sigma = (q3-q1)/1.349 (≈IQR/1.349 ~ std for normal)
-    - Outside [lo, hi], still returns a small value (floored by EPS_FLOOR) → never 0.
+    Hybrid score:
+      - percentile score s_p on empirical CDF (peak at 0.5; width ~0.25)
+      - asymmetric Gaussian s_g around median in transformed space
+      - final = sqrt(s_p * s_g), floored at EPS_FLOOR
     """
-    if x is None or (isinstance(x, float) and math.isnan(x)): 
+    if not model: 
+        return 0.5  # neutral when no model
+    xt = _to_t(x, model["use_log"])
+    if xt is None: 
         return EPS_FLOOR
-    x = float(x)
-    iqr = max(1e-9, (q3 - q1))
-    sigma = iqr / 1.349  # normal approx: IQR ≈ 1.349σ
-    # in case iqr is tiny (degenerate), widen sigma a bit
-    sigma = max(sigma, 1e-6)
-    z = (x - med) / sigma
-    s = math.exp(-0.5 * z * z)
-    # softly discourage extreme beyond fences: multiply by taper on each side
-    if x < lo:
-        # linear distance to lo converted to sigmoid-ish damp
-        d = (lo - x) / max(1e-9, abs(hi - lo))
-        s *= 1.0 / (1.0 + 15.0 * d)
-    elif x > hi:
-        d = (x - hi) / max(1e-9, abs(hi - lo))
-        s *= 1.0 / (1.0 + 15.0 * d)
-    return max(EPS_FLOOR, min(1.0, s))
 
-# Feature weights (sum ~1, renormalized)
+    vals_t = model["vals_t"]; perc = model["perc"]
+
+    if xt <= vals_t[0]: p = 1e-6
+    elif xt >= vals_t[-1]: p = 1 - 1e-6
+    else:
+        p = float(np.interp(xt, vals_t, perc))
+
+    # Percentile bell around 0.5
+    width = 0.25  # can make dynamic if desired
+    z_p = (p - 0.5) / width
+    s_p = math.exp(-0.5 * z_p * z_p)
+
+    # Asymmetric Gaussian around median
+    med_t = model["med_t"]; sigma_l = model["sigma_l"]; sigma_r = model["sigma_r"]
+    if xt < med_t:
+        z = (xt - med_t) / sigma_l
+    else:
+        z = (xt - med_t) / sigma_r
+    s_g = math.exp(-0.5 * z * z)
+
+    return max(EPS_FLOOR, math.sqrt(s_p * s_g))
+
+# Weights for Numeric % (sum ≈ 1)
 W = {
     "float_m":   0.18,
     "mcap_m":    0.15,
     "atr_usd":   0.12,
     "gap_pct":   0.18,
     "pm_dol_m":  0.12,
-    "pm_mc_pct": 0.07,   # NEW: PM $Vol / MC %
+    "pm_mc_pct": 0.07,   # NEW feature
     "rvol":      0.16,
-    "catalyst":  0.01,   # light
-    "dilution":  0.01,   # light
+    "catalyst":  0.01,
+    "dilution":  0.01,
 }
 Wsum = sum(W.values()) or 1.0
 for k in W: W[k] = W[k]/Wsum
 
 # =========================
-# Checklist & Numeric% (Gaussian over data-driven IQR)
+# Qualitative weights (kept)
 # =========================
+def qualitative_percent(q_weights: Dict[str, float]) -> float:
+    qual_0_7 = 0.0
+    for crit in QUAL_CRITERIA:
+        key = f"qual_{crit['name']}"
+        sel = st.session_state.get(key, (1,))[0] if isinstance(st.session_state.get(key, 1), tuple) else st.session_state.get(key, 1)
+        qual_0_7 += q_weights[crit["name"]] * float(sel)
+    return (qual_0_7/7.0)*100.0
+
+# =========================
+# Checklist builder (percentile bands + info lines)
+# =========================
+def percentile_band_text(name: str, x: Optional[float], feature_key: str, fmt: str, good, warn, risk):
+    if x is None or (isinstance(x, float) and not np.isfinite(x)):
+        warn.append(f"{name}: missing"); return
+    q = DISPLAY_Q.get(feature_key)
+    val = fmt.format(x) if isinstance(x, (int,float)) else str(x)
+    if not q:
+        warn.append(f"{name}: {val}")
+        return
+    p10, p25, p50, p75, p90 = q["p10"], q["p25"], q["p50"], q["p75"], q["p90"]
+    if p25 <= x <= p75:
+        good.append(f"{name} in 25–75 pct (you {val})")
+    elif (p10 <= x < p25) or (p75 < x <= p90):
+        warn.append(f"{name} in 10–25/75–90 pct (you {val})")
+    else:
+        risk.append(f"{name} in tails (<10 or >90 pct; you {val})")
+
 def make_premarket_checklist(
     *, float_m: float, mcap_m: float, atr_usd: float,
     gap_pct: float, pm_vol_m: float, pm_dol_m: float,
@@ -343,55 +415,37 @@ def make_premarket_checklist(
 ) -> Dict[str, Any]:
     good, warn, risk = [], [], []
 
-    # Per-feature scores
-    s_float = gauss_iqr_score(float_m,   **IQR["float_m"])
-    s_mcap  = gauss_iqr_score(mcap_m,    **IQR["mcap_m"])
-    s_atr   = gauss_iqr_score(atr_usd,   **IQR["atr_usd"])
-    s_gap   = gauss_iqr_score(gap_pct,   **IQR["gap_pct"])
-    s_pmdol   = gauss_iqr_score(pm_dol_m,  **IQR["pm_dol_m"])
-    s_rvol  = gauss_iqr_score(rvol,      **IQR["rvol"])
-    s_pmmc  = gauss_iqr_score(pm_mc_pct, **IQR["pm_mc_pct"]) if pm_mc_pct is not None else EPS_FLOOR
+    # Per-feature smooth scores
+    s_float = score_feature(float_m,   MODELS.get("float_m"))
+    s_mcap  = score_feature(mcap_m,    MODELS.get("mcap_m"))
+    s_atr   = score_feature(atr_usd,   MODELS.get("atr_usd"))
+    s_gap   = score_feature(gap_pct,   MODELS.get("gap_pct"))
+    s_pm_d  = score_feature(pm_dol_m,  MODELS.get("pm_dol_m"))
+    s_pmmc  = score_feature(pm_mc_pct, MODELS.get("pm_mc_pct")) if pm_mc_pct is not None else 0.5
+    s_rvol  = score_feature(rvol,      MODELS.get("rvol"))
+    s_cat   = score_feature(catalyst_points, MODELS.get("catalyst")) if "catalyst" in MODELS else 0.5
+    s_dil   = score_feature(dilution_points, MODELS.get("dilution")) if "dilution" in MODELS else 0.5
 
-    # Catalyst/Dilution → map -1..+1 into 0..1 smoothly around IQRs learned for sliders
-    # If you want them excluded from scoring, set weights to 0 above.
-    s_cat = gauss_iqr_score(catalyst_points, **IQR.get("catalyst", dict(lo=-1, q1=-0.2, med=0.2, q3=0.6, hi=1)))
-    s_dil = gauss_iqr_score(dilution_points, **IQR.get("dilution", dict(lo=-1, q1=-0.2, med=0.0, q3=0.2, hi=1)))
+    # Checklist text via percentile bands
+    percentile_band_text("Float (M)",            float_m,   "float_m",   "{:.2f}", good, warn, risk)
+    percentile_band_text("Market Cap ($M)",      mcap_m,    "mcap_m",    "{:.0f}", good, warn, risk)
+    percentile_band_text("ATR ($)",              atr_usd,   "atr_usd",   "{:.2f}", good, warn, risk)
+    percentile_band_text("Gap (%)",              gap_pct,   "gap_pct",   "{:.1f}", good, warn, risk)
+    percentile_band_text("Premarket $Vol ($M)",  pm_dol_m,  "pm_dol_m",  "{:.1f}", good, warn, risk)
+    percentile_band_text("PM $Vol / MC (%)",     pm_mc_pct, "pm_mc_pct", "{:.1f}", good, warn, risk)
+    percentile_band_text("RVOL (×)",             rvol,      "rvol",      "{:.0f}", good, warn, risk)
 
-    # Text checklist (IQR-based: inside IQR → Good, near edges → Caution, far outside → Risk)
-    def band_text(name, x, key, fmt="{:.2f}"):
-        if x is None or (isinstance(x, float) and math.isnan(x)): 
-            warn.append(f"{name}: missing")
-            return
-        p = IQR[key]
-        lo, q1, med, q3, hi = p["lo"], p["q1"], p["med"], p["q3"], p["hi"]
-        val = fmt.format(x) if isinstance(x, (int, float)) else str(x)
-        if q1 <= x <= q3:
-            good.append(f"{name} in IQR [{q1:.2f}–{q3:.2f}] (you {val})")
-        elif lo <= x <= hi:
-            warn.append(f"{name} near edge (IQR [{q1:.2f}–{q3:.2f}]; you {val})")
-        else:
-            risk.append(f"{name} outside fences (lo {lo:.2f} / hi {hi:.2f}; you {val})")
-
-    band_text("Float (M)",            float_m,   "float_m",   "{:.2f}")
-    band_text("Market Cap ($M)",      mcap_m,    "mcap_m",    "{:.0f}")
-    band_text("ATR ($)",              atr_usd,   "atr_usd",   "{:.2f}")
-    band_text("Gap (%)",              gap_pct,   "gap_pct",   "{:.1f}")
-    band_text("Premarket $Vol ($M)",  pm_dol_m,  "pm_dol_m",  "{:.1f}")
-    band_text("RVOL (×)",             rvol,      "rvol",      "{:.0f}")
-    if pm_mc_pct is not None and not (isinstance(pm_mc_pct,float) and math.isnan(pm_mc_pct)):
-        band_text("PM $Vol / MC (%)", pm_mc_pct, "pm_mc_pct", "{:.1f}")
-
-    # Informational metric (requested): PM Vol / Predicted Vol %
+    # Informational line requested: PM Vol / Predicted Vol %
     if pm_pct_of_pred is not None and pm_pct_of_pred == pm_pct_of_pred:
-        warn.append(f"Info: PM Vol / Predicted Vol = {pm_pct_of_pred:.1f}%")
+        warn.append(f"Info: PM Vol / Predicted Day Vol = {pm_pct_of_pred:.1f}%")
 
-    # Weighted numeric % (0..100)
+    # Weighted Numeric %
     soft = (
         W["float_m"]   * s_float +
         W["mcap_m"]    * s_mcap  +
         W["atr_usd"]   * s_atr   +
         W["gap_pct"]   * s_gap   +
-        W["pm_dol_m"]  * s_pmdol   +
+        W["pm_dol_m"]  * s_pm_d  +
         W["pm_mc_pct"] * s_pmmc  +
         W["rvol"]      * s_rvol  +
         W["catalyst"]  * s_cat   +
@@ -399,7 +453,7 @@ def make_premarket_checklist(
     )
     numeric_pct = float(max(0.0, min(100.0, 100.0 * soft)))
 
-    # Verdict from the same signal
+    # Verdict from same signal (so it aligns)
     if numeric_pct >= 75.0:
         verdict = "Strong Setup"; pill = '<span class="pill pill-good">Strong Setup</span>'
     elif numeric_pct >= 55.0:
@@ -407,16 +461,17 @@ def make_premarket_checklist(
     else:
         verdict = "Weak / Avoid"; pill = '<span class="pill pill-bad">Weak / Avoid</span>'
 
-    # Greens/Reds counters for UI
+    # Greens/Reds counters by percentile bands
     greens = 0; reds = 0
-    for key, x in [("float_m", float_m), ("mcap_m", mcap_m), ("atr_usd", atr_usd),
-                   ("gap_pct", gap_pct), ("pm_dol_m", pm_dol_m), ("rvol", rvol), ("pm_mc_pct", pm_mc_pct)]:
-        if x is None: continue
-        p = IQR[key]
-        if p["q1"] <= x <= p["q3"]:
-            greens += 1
-        elif x <= p["lo"] or x >= p["hi"]:
-            reds   += 1
+    for key, val in [("float_m", float_m), ("mcap_m", mcap_m), ("atr_usd", atr_usd),
+                     ("gap_pct", gap_pct), ("pm_dol_m", pm_dol_m), ("pm_mc_pct", pm_mc_pct),
+                     ("rvol", rvol)]:
+        q = DISPLAY_Q.get(key)
+        if q and val is not None and np.isfinite(val):
+            if q["p25"] <= val <= q["p75"]:
+                greens += 1
+            elif val < q["p10"] or val > q["p90"]:
+                reds += 1
 
     return {
         "greens": greens, "reds": reds,
@@ -424,16 +479,6 @@ def make_premarket_checklist(
         "verdict": verdict, "pill": pill,
         "phb_numeric": numeric_pct
     }
-
-# =========================
-# Session state for rows
-# =========================
-if "rows" not in st.session_state: st.session_state.rows = []
-if "last" not in st.session_state: st.session_state.last = {}
-if "flash" not in st.session_state: st.session_state.flash = None
-if st.session_state.flash:
-    st.success(st.session_state.flash)
-    st.session_state.flash = None
 
 # =========================
 # Tabs
@@ -485,16 +530,12 @@ with tab_add:
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
         ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)
 
-        # PM metrics
+        # PM diagnostics used in checklist
         pm_mc_pct = (100.0 * pm_dol_m / mc_m) if mc_m > 0 else float("nan")
         pm_pct_of_pred = (100.0 * pm_vol_m / pred_vol_m) if pred_vol_m > 0 else float("nan")
 
         # Qualitative %
-        qual_0_7 = 0.0
-        for crit in QUAL_CRITERIA:
-            sel = st.session_state.get(f"qual_{crit['name']}", (1,))[0] if isinstance(st.session_state.get(f"qual_{crit['name']}", 1), tuple) else st.session_state.get(f"qual_{crit['name']}", 1)
-            qual_0_7 += q_weights[crit["name"]] * float(sel)
-        qual_pct = (qual_0_7/7.0)*100.0
+        qual_pct = qualitative_percent(q_weights)
 
         # Checklist + Numeric %
         ck = make_premarket_checklist(
@@ -537,8 +578,7 @@ with tab_add:
             "PremarketWarn": ck["warn"],
             "PremarketRisk": ck["risk"],
 
-            # diagnostics for display (but not tiles)
-            "PM_MC_%": round(pm_mc_pct,1) if pm_mc_pct==pm_mc_pct else "",
+            # info lines for expander
             "PM_%_of_Pred": round(pm_pct_of_pred,1) if pm_pct_of_pred==pm_pct_of_pred else "",
         }
 
@@ -553,21 +593,21 @@ with tab_add:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
         cA, cB, cC, cD, cE = st.columns(5)
         cA.metric("Last Ticker", l.get("Ticker","—"))
-        cB.metric("Numeric % (IQR-Gauss)", f"{l.get('Numeric_%',0):.2f}%")
-        cC.metric("Qualitative %",    f"{l.get('Qual_%',0):.2f}%")
-        cD.metric("Final Score",      f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
+        cB.metric("Numeric % (Smooth)", f"{l.get('Numeric_%',0):.2f}%")
+        cC.metric("Qualitative %",      f"{l.get('Qual_%',0):.2f}%")
+        cD.metric("Final Score",        f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
         cE.metric("Odds", l.get("Odds","—"))
 
+        # We remove PM Float Rotation / PM $Vol / MC / Gap tiles as requested.
         d1, d2 = st.columns(2)
         d1.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
         d1.caption(
             f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
             f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
         )
-        d2.metric("—", " ")  # spacer to keep layout simple
+        d2.metric("—", " ")  # spacer for clean layout
 
-        # Checklist expander
-        with st.expander("Premarket Checklist (data-driven IQR)", expanded=True):
+        with st.expander("Premarket Checklist (smooth, data-driven)", expanded=True):
             verdict = l.get("PremarketVerdict","—")
             greens = l.get("PremarketGreens",0)
             reds = l.get("PremarketReds",0)
@@ -577,13 +617,12 @@ with tab_add:
                 unsafe_allow_html=True
             )
 
-            # Append the requested PM Vol / Predicted Vol % info prominently
+            # Requested informational line
             pmpred = l.get("PM_%_of_Pred","")
             if pmpred != "":
                 st.markdown(f"**PM Vol / Predicted Day Vol:** {pmpred}%")
 
             g_col, w_col, r_col = st.columns(3)
-
             def _ul(items):
                 if not items:
                     return "<ul><li><span class='hint'>None</span></li></ul>"
@@ -628,7 +667,7 @@ with tab_rank:
                 "Ticker": st.column_config.TextColumn("Ticker"),
                 "Odds": st.column_config.TextColumn("Odds"),
                 "Level": st.column_config.TextColumn("Level"),
-                "Numeric_%": st.column_config.NumberColumn("Numeric_% (IQR-Gauss)", format="%.2f"),
+                "Numeric_%": st.column_config.NumberColumn("Numeric_% (Smooth)", format="%.2f"),
                 "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
                 "PremarketVerdict": st.column_config.TextColumn("Premarket Verdict"),
