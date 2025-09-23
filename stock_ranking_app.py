@@ -13,7 +13,7 @@ except Exception:
     _EXCEL_ENGINE = None  # pandas will try; if missing, we'll warn
 
 # =============== Page & Styles ===============
-st.set_page_config(page_title="Premarket Stock Ranking (Smooth Curves + Soft Tail Risk)", layout="wide")
+st.set_page_config(page_title="Premarket Stock Ranking (Smooth, Data-Driven)", layout="wide")
 st.title("Premarket Stock Ranking")
 
 st.markdown("""
@@ -23,7 +23,6 @@ st.markdown("""
   .stMetric label { font-size: 0.85rem; font-weight: 600; color:#374151; }
   .stMetric [data-testid="stMetricValue"] { font-size: 1.15rem; }
   .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 16px 0; }
-  section[data-testid="stSidebar"] .stSlider { margin-bottom: 6px; }
   .hint { color:#6b7280; font-size:12px; margin-top:-6px; }
   .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-weight:600; font-size:.75rem; }
   .pill-good { background:#e7f5e9; color:#166534; border:1px solid #bbf7d0; }
@@ -40,7 +39,7 @@ st.markdown("""
 PER_VAR_CLIP = 0.9      # per-variable log-odds delta clip (±)
 TAU = 0.70              # global temperature for curve contributions
 
-# NEW: penalties have their own “temperature”
+# Penalties have their own “temperature”
 PEN_TAU = 0.60          # penalties scaled by this (softer than TAU)
 
 # caps (log-odds)
@@ -140,65 +139,9 @@ def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float
     ln_y = 3.1435 + 0.1608*math.log(mc + e) + 0.6704*math.log(gp + e) - 0.3878*math.log(atr + e)
     return math.exp(ln_y)
 
-def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
+def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float) -> Tuple[float, float]:
     if pred_m <= 0: return 0.0, 0.0
     return pred_m * math.exp(-z * sigma_ln), pred_m * math.exp(z * sigma_ln)
-
-# =============== Sidebar: Upload & Learn ===============
-st.sidebar.header("Database (learn smooth curves)")
-uploaded = st.sidebar.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-ft_sheet   = st.sidebar.text_input("FT (winners) sheet name", "PMH BO FT")
-fail_sheet = st.sidebar.text_input("Fail sheet name", "PMH BO Fail")
-learn_btn  = st.sidebar.button("Learn curves from uploaded file", use_container_width=True)
-
-# Qualitative block (unchanged)
-st.sidebar.header("Qualitative Weights")
-QUAL_CRITERIA = [
-    {"name":"GapStruct","question":"Gap & Trend Development:","options":[
-        "Gap fully reversed: price loses >80% of gap.",
-        "Choppy reversal: price loses 50–80% of gap.",
-        "Partial retracement: price loses 25–50% of gap.",
-        "Sideways consolidation: gap holds, price within top 25% of gap.",
-        "Uptrend with deep pullbacks (>30% retrace).",
-        "Uptrend with moderate pullbacks (10–30% retrace).",
-        "Clean uptrend, only minor pullbacks (<10%).",
-    ],"weight":0.15},
-    {"name":"LevelStruct","question":"Key Price Levels:","options":[
-        "Fails at all major support/resistance; cannot hold any key level.",
-        "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
-        "Holds one support but unable to break resistance; capped below a key level.",
-        "Breaks above resistance but cannot stay; dips below reclaimed level.",
-        "Breaks and holds one major level; most resistance remains above.",
-        "Breaks and holds several major levels; clears most overhead resistance.",
-        "Breaks and holds above all resistance; blue sky.",
-    ],"weight":0.15},
-    {"name":"Monthly","question":"Monthly/Weekly Chart Context:","options":[
-        "Sharp, accelerating downtrend; new lows repeatedly.",
-        "Persistent downtrend; still lower lows.",
-        "Downtrend losing momentum; flattening.",
-        "Clear base; sideways consolidation.",
-        "Bottom confirmed; higher low after base.",
-        "Uptrend begins; breaks out of base.",
-        "Sustained uptrend; higher highs, blue sky.",
-    ],"weight":0.10},
-]
-q_weights = {}
-for crit in QUAL_CRITERIA:
-    q_weights[crit["name"]] = st.sidebar.slider(crit["name"], 0.0, 1.0, crit["weight"], 0.01)
-qual_sum = max(1e-9, sum(q_weights.values()))
-for k in q_weights: q_weights[k] = q_weights[k] / qual_sum
-
-st.sidebar.header("Prediction Uncertainty")
-sigma_ln = st.sidebar.slider("Log-space σ (residual std dev)", 0.10, 1.50, 0.60, 0.01)
-
-# =============== Session State ===============
-if "CURVES" not in st.session_state: st.session_state.CURVES = {}
-if "rows"   not in st.session_state: st.session_state.rows = []
-if "last"   not in st.session_state: st.session_state.last = {}
-if "flash"  not in st.session_state: st.session_state.flash = None
-if st.session_state.flash:
-    st.success(st.session_state.flash)
-    st.session_state.flash = None
 
 # =============== Column Detection (Robust) ===============
 _SYNONYMS = {
@@ -425,6 +368,49 @@ def _rebalance_group_weights(reliab: Dict[str, float]) -> Dict[str, float]:
                 r[k] = r.get(k, 0.0) * scale
     return r
 
+# =============== Domain priors (direction/shape hints) ===============
+# Each variable gets a weak prior curve (0..1) that we blend with learned curve (to avoid absurd results like SI=1.4% -> p≈100%).
+# kind: "hump" (sweet-spot), "high_better", "low_better"
+PRIORS = {
+    "gap_pct":     {"kind":"hump", "c":100.0, "w":60.0},      # sweet ~100%, fades outside
+    "rvol":        {"kind":"hump", "c":10.0,  "w":8.0},       # sweet ~10x, fades if too low/high
+    "pm_dol_m":    {"kind":"hump", "c":10.0,  "w":10.0},      # $7–15M sweet
+    "pm_vol_m":    {"kind":"high_better"},                    # more PM shares (to a point) usually fine; tail-risk will cap
+    "pm_pct_pred": {"kind":"hump", "c":18.0,  "w":12.0},      # ~10–25% sweet
+    "pmmc_pct":    {"kind":"hump", "c":15.0,  "w":15.0},      # ~5–30% ok; too high bloated
+    "atr_usd":     {"kind":"hump", "c":0.30,  "w":0.20},      # 0.2–0.4 sweet
+    "float_m":     {"kind":"low_better"},                     # smaller float better until extreme
+    "mcap_m":      {"kind":"low_better"},                     # smaller cap better
+    "si_pct":      {"kind":"high_better"},                    # higher SI better (until very extreme)
+    "fr_x":        {"kind":"hump", "c":0.25,  "w":0.20},      # ~0.1–0.5x sweet; too high => front-loaded
+}
+
+PRIOR_BLEND = 0.30  # 0..1 weight of domain prior blended into learned p(x)
+
+def _prior_p(var: str, x: float) -> float:
+    if not np.isfinite(x): return 0.5
+    info = PRIORS.get(var, None)
+    if info is None: return 0.5
+    kind = info.get("kind","hump")
+    if kind == "hump":
+        c = float(info.get("c", 0.0)); w = float(info.get("w", 1.0))
+        # smooth hump via Gaussian around center c, width w
+        return float(np.clip(np.exp(-0.5 * ((x - c)/max(w,1e-6))**2), 1e-3, 1-1e-3))
+    elif kind == "high_better":
+        # smooth logistic rising; set scale from data-free heuristic
+        # center at 25th percentile-ish proxy -> use soft fixed pivot
+        pivot =  (10.0 if var=="si_pct" else 3.0)
+        scale = (5.0  if var=="si_pct" else 2.0)
+        z = (x - pivot) / max(scale, 1e-6)
+        return float(1.0 / (1.0 + math.exp(-z)))
+    elif kind == "low_better":
+        # logistic decreasing
+        pivot = (15.0 if var=="float_m" else 150.0 if var=="mcap_m" else 10.0)
+        scale = (6.0  if var=="float_m" else 80.0 if var=="mcap_m" else 5.0)
+        z = -(x - pivot) / max(scale, 1e-6)
+        return float(1.0 / (1.0 + math.exp(-z)))
+    return 0.5
+
 # =============== Learn from Excel (with reliability & priors) ===============
 def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[str, Any]:
     if _EXCEL_ENGINE is None:
@@ -496,6 +482,10 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
             reliab[v] = 0.0; ref_logit[v] = 0.0
             continue
         p_hat = _prob_from_curve(m, x)
+        # Blend a weak domain prior to avoid pathological shapes
+        p_prior = np.array([_prior_p(v, xi) for xi in x], dtype=float)
+        p_hat = (1.0 - PRIOR_BLEND) * p_hat + PRIOR_BLEND * p_prior
+
         auc  = _safe_auc(y, p_hat)
         gamma = 0.8
         w = (2.0 * abs(auc - 0.5)) ** gamma
@@ -522,7 +512,7 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
 DOMAIN_OVERRIDES = {
     "gap_pct":     {"low": 30.0,  "high": 300.0},  # <30 rarely runs; >300 exhaustion risk
     "rvol":        {"low": 3.0,   "high": 3000.0},
-    "pm_dol_m":    {"low": 3.0,   "high": 40.0},   # $3–15M sweet; >40 bloated
+    "pm_dol_m":    {"low": 3.0,   "high": 40.0},   # $7–15M sweet; >40 bloated
     "pm_vol_m":    {"low": None,  "high": None},   # data-driven
     "pm_pct_pred": {"low": 5.0,   "high": 35.0},   # <5% weak fuel; >35% front-loaded
     "pmmc_pct":    {"low": None,  "high": 35.0},   # >30–40% often bloaty
@@ -599,12 +589,6 @@ def tail_penalty_bidirectional_soft(x: float, low: Optional[float], high: Option
                                     deadzone_frac: float = 0.05,
                                     alpha: float = 0.60,
                                     eps: float = 1e-9) -> float:
-    """
-    Smooth negative log-odds penalty outside [low, high].
-    - deadzone_frac: no penalty until ~5% beyond the guardrail
-    - alpha < 1 => sub-linear growth (gentler tails)
-    - rel_w scales by variable reliability (evidence-weighted)
-    """
     if not np.isfinite(x):
         return 0.0
     pen = 0.0
@@ -618,11 +602,17 @@ def tail_penalty_bidirectional_soft(x: float, low: Optional[float], high: Option
         if margin > 0.0:
             dist = margin / (max(abs(high), 1.0) + eps)
             pen -= (k_high * (math.log1p(dist) ** alpha)) * rel_w
-    # cap per-var penalty
     pen = float(np.clip(pen, -MAX_PER_VAR_PEN, MAX_PER_VAR_PEN))
     return pen
 
-# =============== Sidebar: Tail-Risk Controls ===============
+# =============== Sidebar: Modifiers & Uncertainty ===============
+st.sidebar.header("Modifiers")
+catalyst_points = st.sidebar.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
+dilution_points = st.sidebar.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
+
+st.sidebar.header("Prediction Uncertainty")
+sigma_ln = st.sidebar.slider("Log-space σ (residual std dev)", 0.10, 1.50, 0.60, 0.01)
+
 st.sidebar.header("Tail-Risk (global)")
 tail_scale = st.sidebar.slider("Global tail-risk strength", 0.25, 1.50, 1.00, 0.05,
                                help="Multiplies all variable penalty strengths.")
@@ -630,69 +620,75 @@ tail_scale = st.sidebar.slider("Global tail-risk strength", 0.25, 1.50, 1.00, 0.
 adv_tail = st.sidebar.checkbox("Advanced tail-risk tuning", value=False,
                                help="Show per-variable penalty multipliers.")
 per_var_mult = {}
-if adv_tail:
-    st.sidebar.caption("Per-variable penalty multipliers (low/high):")
-    for v in BASE_PEN_STRENGTH.keys():
+for v in BASE_PEN_STRENGTH.keys():
+    if adv_tail:
         c1, c2 = st.sidebar.columns(2)
         with c1:
             per_var_mult[(v,"low")]  = st.slider(f"{v} low×", 0.25, 2.00, 1.00, 0.05, key=f"{v}_low_mult")
         with c2:
             per_var_mult[(v,"high")] = st.slider(f"{v} high×",0.25, 2.00, 1.00, 0.05, key=f"{v}_high_mult")
-else:
-    for v in BASE_PEN_STRENGTH.keys():
+    else:
         per_var_mult[(v,"low")]  = 1.00
         per_var_mult[(v,"high")] = 1.00
 
-# =============== Learn Button ===============
+# =============== Session State ===============
+if "CURVES" not in st.session_state: st.session_state.CURVES = {}
+if "rows"   not in st.session_state: st.session_state.rows = []
+if "last"   not in st.session_state: st.session_state.last = {}
+if "flash"  not in st.session_state: st.session_state.flash = None
+if st.session_state.flash:
+    st.success(st.session_state.flash)
+    st.session_state.flash = None
+
+# =============== Upload & Learn (MAIN AREA) ===============
+st.markdown('<div class="section-title">1) Upload your database & learn curves</div>', unsafe_allow_html=True)
+col_ul, col_cfg = st.columns([1.6, 1.0])
+with col_ul:
+    uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+with col_cfg:
+    ft_sheet   = st.text_input("FT (winners) sheet name", "PMH BO FT")
+    fail_sheet = st.text_input("Fail sheet name", "PMH BO Fail")
+learn_btn  = st.button("Learn curves from uploaded file", use_container_width=True)
+
 if learn_btn:
     if not uploaded:
-        st.sidebar.error("Upload an Excel first.")
+        st.error("Upload an Excel first.")
     else:
         try:
             learned = learn_all_curves_from_excel(uploaded, ft_sheet, fail_sheet)
             st.session_state.CURVES = learned
             if learned["learned_count"] == 0:
-                st.sidebar.warning("No curves learned. Check mapping tables and ensure ≥30 valid rows per variable across FT+Fail.")
+                st.warning("No curves learned. Check mapping below and ensure ≥30 valid rows per variable across FT+Fail.")
             else:
-                st.sidebar.success(f"Curves learned for {learned['learned_count']} variables. Base FT rate ≈ {learned['base_rate']*100:.1f}%.")
+                st.success(f"Curves learned for {learned['learned_count']} variables. Base FT rate ≈ {learned['base_rate']*100:.1f}%.")
         except Exception as e:
-            st.sidebar.error(f"Learning failed: {e}")
+            st.error(f"Learning failed: {e}")
 
-# =============== Show mapping & training summary ===============
 if st.session_state.CURVES:
-    st.markdown('<div class="section-title">Detected Column Mapping</div>', unsafe_allow_html=True)
-    cols = st.columns(2)
-    with cols[0]:
-        st.markdown("**FT sheet mapping**")
-        st.dataframe(st.session_state.CURVES.get("ft_map", pd.DataFrame()), use_container_width=True, hide_index=True)
-    with cols[1]:
-        st.markdown("**Fail sheet mapping**")
-        st.dataframe(st.session_state.CURVES.get("fail_map", pd.DataFrame()), use_container_width=True, hide_index=True)
+    with st.expander("Detected Column Mapping (click to open)"):
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("**FT sheet mapping**")
+            st.dataframe(st.session_state.CURVES.get("ft_map", pd.DataFrame()), use_container_width=True, hide_index=True)
+        with cols[1]:
+            st.markdown("**Fail sheet mapping**")
+            st.dataframe(st.session_state.CURVES.get("fail_map", pd.DataFrame()), use_container_width=True, hide_index=True)
 
-    st.markdown('<div class="section-title">Learned curve training summary</div>', unsafe_allow_html=True)
-    st.dataframe(st.session_state.CURVES.get("summary", pd.DataFrame()), use_container_width=True, hide_index=True)
+    with st.expander("Learned curve training summary (click to open)"):
+        st.dataframe(st.session_state.CURVES.get("summary", pd.DataFrame()), use_container_width=True, hide_index=True)
 
-# =============== Qualitative % helper (FIX) ===============
-def qualitative_percent(q_weights: Dict[str, float]) -> float:
-    qual_0_7 = 0.0
-    for crit in [
-        {"name":"GapStruct"},{"name":"LevelStruct"},{"name":"Monthly"}
-    ]:
-        key = f"qual_{crit['name']}"
-        sel = st.session_state.get(key, (1,))[0] if isinstance(st.session_state.get(key, 1), tuple) else st.session_state.get(key, 1)
-        w   = float(q_weights.get(crit["name"], 0.0))
-        qual_0_7 += w * float(sel)
-    return (qual_0_7/7.0)*100.0
+st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
 
 # =============== Tabs ===============
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 with tab_add:
-    st.markdown('<div class="section-title">Numeric & Modifiers</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">2) Enter inputs</div>', unsafe_allow_html=True)
 
     with st.form("add_form", clear_on_submit=True):
         col1, col2, col3 = st.columns([1.2, 1.2, 0.9])
 
+        # Inputs (numeric only — no qualitative)
         with col1:
             ticker   = st.text_input("Ticker", "").strip().upper()
             mc_m     = input_float("Market Cap (Millions $)", 0.0, min_value=0.0, decimals=2)
@@ -707,22 +703,7 @@ with tab_add:
             pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
 
         with col3:
-            st.markdown("**Modifiers**")
-            catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
-            dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
-
-        st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Qualitative Context</div>', unsafe_allow_html=True)
-
-        q_cols = st.columns(3)
-        for i, crit in enumerate(QUAL_CRITERIA):
-            with q_cols[i % 3]:
-                st.radio(
-                    crit["question"],
-                    options=list(enumerate(crit["options"], 1)),
-                    format_func=lambda x: x[1],
-                    key=f"qual_{crit['name']}",
-                )
+            st.caption("Catalyst / Dilution are in the sidebar ➜")
 
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
@@ -750,30 +731,33 @@ with tab_add:
         # Guardrails (data + domain, blended)
         guardrails = build_guardrails(curves_pack)
 
-        # Per-variable probabilities with diagnostics
+        # Per-variable probabilities with diagnostics + domain-prior blend
         st.session_state["DEBUG_POF"] = {}
         def p_of(var_key, x) -> float:
             dbg = st.session_state.setdefault("DEBUG_POF", {})
             m = curves.get(var_key)
             if m is None:
-                dbg[var_key] = "neutral: no curve learned"
-                return 0.5
-            if x is None or not np.isfinite(x):
-                dbg[var_key] = "neutral: input missing/non-finite"
-                return 0.5
-            if m.get("use_log", False) and x <= 0:
-                dbg[var_key] = "neutral: input <=0 but curve is log-scale"
-                return 0.5
-            try:
-                p = float(m["predict"]([x])[0])
-                if not np.isfinite(p):
-                    dbg[var_key] = "neutral: prediction NaN"
+                # fall back to domain prior if curve missing
+                p_curve = 0.5
+            else:
+                if x is None or not np.isfinite(x):
+                    dbg[var_key] = "neutral: input missing/non-finite"
                     return 0.5
-                dbg[var_key] = f"ok: {p:.3f}"
-                return max(1e-3, min(1 - 1e-3, p))
-            except Exception as e:
-                dbg[var_key] = f"neutral: error {e}"
-                return 0.5
+                if m.get("use_log", False) and x <= 0:
+                    dbg[var_key] = "neutral: input <=0 but curve is log-scale"
+                    return 0.5
+                try:
+                    p_curve = float(m["predict"]([x])[0])
+                    if not np.isfinite(p_curve):
+                        p_curve = 0.5
+                except Exception as e:
+                    dbg[var_key] = f"neutral: curve error {e}"
+                    p_curve = 0.5
+            p_prior = _prior_p(var_key, float(x) if x is not None else np.nan)
+            p = (1.0 - PRIOR_BLEND) * p_curve + PRIOR_BLEND * p_prior
+            p = float(np.clip(p, 1e-3, 1-1e-3))
+            dbg[var_key] = f"ok: curve={p_curve:.3f}, prior={p_prior:.3f}, blend={p:.3f}"
+            return p
 
         # Evaluate all variables
         probs = {
@@ -797,7 +781,7 @@ with tab_add:
             z0  = float(ref_logit.get(k, 0.0))
             dz  = np.clip(z_k - z0, -PER_VAR_CLIP, PER_VAR_CLIP)
             w   = float(np.clip(reliab.get(k, 0.0), 0.0, 1.0))
-            z_sum += w * dz
+            z_sum += TAU * w * dz
 
         # --- Soft tail-risk penalties for ALL variables ---
         penalty_debug = {}
@@ -835,20 +819,14 @@ with tab_add:
         z_sum += CATALYST_LOGODDS_COEF * float(catalyst_points)
         z_sum += DILUTION_LOGODDS_COEF * float(dilution_points)
 
-        # Temperature for curve contributions already applied; penalties scaled by PEN_TAU above
+        # Final numeric probability
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
-        numeric_pct  = 100.0 * numeric_prob
+        final_score  = float(np.clip(numeric_prob*100.0, 0.0, 100.0))
 
-        # Qualitative %
-        qual_pct = qualitative_percent(q_weights)
-
-        # Final score (50/50)
-        final_score = float(max(0.0, min(100.0, 0.5*numeric_pct + 0.5*qual_pct)))
-
-        # Verdict pill (based on numeric %)
-        if numeric_pct >= 75.0:
+        # Verdict pill (based on final score only)
+        if final_score >= 75.0:
             verdict = "Strong Setup"; pill = '<span class="pill pill-good">Strong Setup</span>'
-        elif numeric_pct >= 55.0:
+        elif final_score >= 55.0:
             verdict = "Constructive"; pill = '<span class="pill pill-warn">Constructive</span>'
         else:
             verdict = "Weak / Avoid"; pill = '<span class="pill pill-bad">Weak / Avoid</span>'
@@ -866,63 +844,60 @@ with tab_add:
             dz  = float(np.clip(z_k - z0, -PER_VAR_CLIP, PER_VAR_CLIP))
             w   = float(np.clip(reliab.get(var_key, 0.0), 0.0, 1.0))
             eff = TAU * w * dz
-            if eff >= 0.25:        return "good"
-            elif eff <= -0.25:     return "risk"
-            else:                  return "warn"
+            if eff >= 0.25:        return "supports"
+            elif eff <= -0.25:     return "headwind"
+            else:                  return "neutral"
 
-        good, warn, risk = [], [], []
-        for k, p in probs.items():
-            label = contribution_label(k, p)
-            txt = f"{names_map.get(k,k)}: {'supports' if label=='good' else 'headwind' if label=='risk' else 'neutral'} (p≈{p*100:.0f}%)"
-            if label == "good":   good.append(txt)
-            elif label == "risk": risk.append(txt)
-            else:                 warn.append(txt)
+        # Build readable checklist rows with values + probs
+        checklist_rows = []
+        value_map = {
+            "Gap %": gap_pct, "ATR $": atr_usd, "RVOL": rvol, "Short Interest %": si_pct,
+            "PM Volume (M)": pm_vol_m, "PM $Vol (M)": pm_dol_m, "Float (M)": float_m,
+            "MarketCap (M)": mc_m, "PM Float Rotation ×": fr_x, "PM $Vol / MC %": pmmc_pct,
+            "PM Vol % of Pred": pm_pct_pred,
+        }
+        for key, p in probs.items():
+            label = names_map.get(key, key)
+            role = contribution_label(key, p)
+            v = value_map.get(label, None)
+            if v is None or not np.isfinite(v):
+                val_str = "—"
+            else:
+                # Compact numeric formatting
+                if abs(v) >= 1000: val_str = f"{v:,.0f}"
+                elif abs(v) >= 100: val_str = f"{v:.0f}"
+                elif abs(v) >= 10:  val_str = f"{v:.1f}"
+                else:               val_str = f"{v:.2f}"
+            checklist_rows.append(f"- **{label}**: {val_str} → *{role}* (p≈{p*100:.0f}%)")
 
-        # Explicit tail-risk flags (band breaches)
-        def add_tail_flag(var_key: str, value: float):
-            band = guardrails.get(var_key, {})
-            low, high = band.get("low", None), band.get("high", None)
-            nm = names_map.get(var_key, var_key)
-            if np.isfinite(value):
-                if (low is not None) and (value < low):
-                    risk.append(f"{nm}: below guardrail ({value:.3g} < {low:.3g})")
-                if (high is not None) and (value > high):
-                    risk.append(f"{nm}: above guardrail ({value:.3g} > {high:.3g})")
-
-        for _v in ["gap_pct","rvol","pm_dol_m","pm_vol_m","pm_pct_pred","pmmc_pct","atr_usd","float_m","mcap_m","si_pct","fr_x"]:
-            add_tail_flag(_v, {
-                "gap_pct":gap_pct,"rvol":rvol,"pm_dol_m":pm_dol_m,"pm_vol_m":pm_vol_m,
-                "pm_pct_pred":pm_pct_pred,"pmmc_pct":pmmc_pct,"atr_usd":atr_usd,"float_m":float_m,
-                "mcap_m":mc_m,"si_pct":si_pct,"fr_x":fr_x
-            }[_v])
+        # Add prediction info into checklist
+        pred_ci68 = f"{ci68_l:.2f}–{ci68_u:.2f}M"
+        pred_ci95 = f"{ci95_l:.2f}–{ci95_u:.2f}M"
+        if np.isfinite(pred_vol_m):
+            checklist_rows.insert(0, f"- **Predicted Day Volume**: {pred_vol_m:.2f}M  (CI68 {pred_ci68} · CI95 {pred_ci95})")
+        if np.isfinite(pm_pct_pred):
+            checklist_rows.insert(1, f"- **PM Vol / Predicted Day Vol**: {pm_pct_pred:.1f}%")
 
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
             "Level": grade(final_score),
-            "Numeric_%": round(numeric_pct, 2),
-            "Qual_%": round(qual_pct, 2),
             "FinalScore": round(final_score, 2),
 
-            # Prediction fields
+            # Prediction fields (shown in checklist, but kept here for table export)
             "PredVol_M": round(pred_vol_m, 2),
             "PredVol_CI68_L": round(ci68_l, 2),
             "PredVol_CI68_U": round(ci68_u, 2),
-            "PredVol_CI95_L": round(ci95_l, 2),
-            "PredVol_CI95_U": round(ci95_u, 2),
-            "PM_%_of_Pred": round(100.0 * pm_vol_m / pred_vol_m, 1) if pred_vol_m > 0 else "",
 
-            # Inputs for export/debug
+            # Inputs (for export/debug)
             "_MCap_M": mc_m, "_Gap_%": gap_pct, "_SI_%": si_pct, "_ATR_$": atr_usd,
             "_PM_M": pm_vol_m, "_PM$_M": pm_dol_m, "_Float_M": float_m,
             "_Catalyst": float(catalyst_points), "_Dilution": float(dilution_points),
 
-            # Checklist sets
+            # Display
             "PremarketVerdict": verdict,
             "PremarketPill": pill,
-            "PremarketGood": good,
-            "PremarketWarn": warn,
-            "PremarketRisk": risk,
+            "PremarketChecklist": checklist_rows,
 
             # Debug penalties
             "_TailPenalties": penalty_debug,
@@ -937,71 +912,47 @@ with tab_add:
     l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
     if l:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
-        cA, cB, cC, cD, cE = st.columns(5)
+        cA, cB, cC = st.columns(3)
         cA.metric("Last Ticker", l.get("Ticker","—"))
-        cB.metric("Numeric % (Smooth FT)", f"{l.get('Numeric_%',0):.2f}%")
-        cC.metric("Qualitative %",         f"{l.get('Qual_%',0):.2f}%")
-        cD.metric("Final Score",           f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
-        cE.metric("Odds", l.get("Odds","—"))
+        cB.metric("Final Score", f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
+        cC.metric("Odds", l.get("Odds","—"))
 
-        d1, d2 = st.columns(2)
-        d1.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
-        d1.caption(
-            f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
-            f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
-        )
-        pmpred = l.get("PM_%_of_Pred","")
-        if pmpred != "":
-            d2.metric("PM Vol / Predicted Day Vol", f"{pmpred}%")
-
-        with st.expander("Premarket Checklist (smooth + soft tail risk)", expanded=True):
+        with st.expander("Premarket Checklist", expanded=True):
             verdict = l.get("PremarketVerdict","—")
             pill = l.get("PremarketPill","")
             st.markdown(f"**Verdict:** {pill if pill else verdict}", unsafe_allow_html=True)
-
-            if pmpred != "":
-                st.markdown(f"<div class='mono'>PM Vol / Pred. Day Vol: {pmpred}%</div>", unsafe_allow_html=True)
-
-            g_col, w_col, r_col = st.columns(3)
-            def _ul(items):
-                if not items:
-                    return "<ul><li><span class='hint'>None</span></li></ul>"
-                return "<ul>" + "".join([f"<li>{x}</li>" for x in items]) + "</ul>"
-
-            with g_col:
-                st.markdown("**Good**"); st.markdown(_ul(l.get("PremarketGood", [])), unsafe_allow_html=True)
-            with w_col:
-                st.markdown("**Caution**"); st.markdown(_ul(l.get("PremarketWarn", [])), unsafe_allow_html=True)
-            with r_col:
-                st.markdown("**Risk**"); st.markdown(_ul(l.get("PremarketRisk", [])), unsafe_allow_html=True)
-
-  # Diagnostics
-with st.expander("Diagnostics (curves & tail penalties)"):
-    dbg = st.session_state.get("DEBUG_POF", {})
-    if dbg:
-        dd = pd.DataFrame([{"Variable": k, "Status": v} for k, v in dbg.items()])
-        st.dataframe(dd, hide_index=True, use_container_width=True)
-
-    pen_debug = l.get("_TailPenalties", {})
-    if pen_debug:
-        pen_rows = []
-        for k, v in pen_debug.items():
-            if isinstance(v, dict):
-                pen_rows.append({
-                    "Variable": k,
-                    "Low": v.get("low", None),
-                    "High": v.get("high", None),
-                    "Penalty (Δlogodds)": round(v.get("pen_raw", 0.0), 3)
-                })
+            items = l.get("PremarketChecklist", [])
+            if not items:
+                st.caption("No checklist yet.")
             else:
-                # e.g., the aggregated "_total_penalty" entry is a float
-                pen_rows.append({
-                    "Variable": k,
-                    "Low": "",
-                    "High": "",
-                    "Penalty (Δlogodds)": round(float(v), 3)
-                })
-        st.dataframe(pd.DataFrame(pen_rows), hide_index=True, use_container_width=True)
+                st.markdown("\n".join(items))
+
+        # Diagnostics
+        with st.expander("Diagnostics (curves & tail penalties)"):
+            dbg = st.session_state.get("DEBUG_POF", {})
+            if dbg:
+                dd = pd.DataFrame([{"Variable": k, "Status": v} for k, v in dbg.items()])
+                st.dataframe(dd, hide_index=True, use_container_width=True)
+
+            pen_debug = l.get("_TailPenalties", {})
+            if pen_debug:
+                pen_rows = []
+                for k, v in pen_debug.items():
+                    if isinstance(v, dict):
+                        pen_rows.append({
+                            "Variable": k,
+                            "Low": v.get("low", None),
+                            "High": v.get("high", None),
+                            "Penalty (Δlogodds)": round(v.get("pen_raw", 0.0), 3)
+                        })
+                    else:
+                        pen_rows.append({
+                            "Variable": k,
+                            "Low": "",
+                            "High": "",
+                            "Penalty (Δlogodds)": round(float(v), 3)
+                        })
+                st.dataframe(pd.DataFrame(pen_rows), hide_index=True, use_container_width=True)
 
 # =============== Ranking Tab ===============
 with tab_rank:
@@ -1011,11 +962,11 @@ with tab_rank:
         df = pd.DataFrame(st.session_state.rows)
         df = df.loc[:, ~df.columns.duplicated(keep="first")]
         if "FinalScore" in df.columns:
-            df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
+            df = df.sort_values("FinalScore", descending=False if False else True).reset_index(drop=True)
 
         cols_to_show = [
             "Ticker","Odds","Level",
-            "Numeric_%","Qual_%","FinalScore",
+            "FinalScore",
             "PremarketVerdict",
             "PredVol_M","PredVol_CI68_L","PredVol_CI68_U",
         ]
@@ -1030,9 +981,7 @@ with tab_rank:
                 "Ticker": st.column_config.TextColumn("Ticker"),
                 "Odds": st.column_config.TextColumn("Odds"),
                 "Level": st.column_config.TextColumn("Level"),
-                "Numeric_%": st.column_config.NumberColumn("Numeric_% (Smooth FT)", format="%.2f"),
-                "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
-                "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
+                "FinalScore": st.column_config.NumberColumn("Final Score", format="%.2f"),
                 "PremarketVerdict": st.column_config.TextColumn("Premarket Verdict"),
                 "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
                 "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
