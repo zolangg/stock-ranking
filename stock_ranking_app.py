@@ -143,7 +143,7 @@ def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float
     return math.exp(ln_y)
 
 # ================= Rank-hist learning (DB-derived) =================
-BINS = 5
+BINS = 20
 STRETCH_EPS = 0.10
 CLASS_LIFT = 0.08  # checklist Good/Risk offset vs local baseline
 
