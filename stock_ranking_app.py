@@ -34,21 +34,22 @@ st.sidebar.header("Settings")
 
 sb_bw       = st.sidebar.slider("Smoothing bandwidth (rank space)", 0.02, 0.12, 0.06, 0.005)
 sb_grid     = st.sidebar.slider("Curve grid points", 101, 401, 201, 50)
-sb_minrows  = st.sidebar.slider("Min rows per variable", 20, 120, 30, 5)
-sb_support  = st.sidebar.slider("Min local support (sweet/risk)", 2, 12, 3, 1)
-sb_lift     = st.sidebar.slider("Lift threshold over baseline (sweet/risk)", 0.02, 0.12, 0.06, 0.01)
-sb_gapmerge = st.sidebar.slider("Gap merge (rank span)", 0.00, 0.05, 0.02, 0.005)
-sb_minspan  = st.sidebar.slider("Min span (rank) to keep interval", 0.01, 0.10, 0.03, 0.005)
+sb_minrows  = st.sidebar.slider("Min rows per variable", 20, 200, 40, 5)
+sb_support  = st.sidebar.slider("Min local support (sweet/risk)", 2, 20, 4, 1)
+sb_lift     = st.sidebar.slider("Lift threshold over baseline (sweet/risk)", 0.01, 0.20, 0.06, 0.01)
+sb_gapmerge = st.sidebar.slider("Sweet/risk merge gap (rank span)", 0.00, 0.10, 0.02, 0.005)
+sb_minspan  = st.sidebar.slider("Min span (rank) to keep interval", 0.005, 0.10, 0.03, 0.005)
 
 st.sidebar.markdown("---")
-tail_strength = st.sidebar.slider("Tail penalty strength (exhaustion vars)", 0.0, 1.0, 0.7, 0.05)
+tail_strength = st.sidebar.slider("Tail penalty strength (exhaustion vars)", 0.0, 1.0, 0.70, 0.05)
 st.sidebar.caption("Higher → stronger cut of lift at extreme ranks (Gap, RVOL, PM$Vol, PM$Vol/MC, FR).")
-dilution_coeff = st.sidebar.slider("Dilution penalty (Δ log-odds for Dilution=1)", -2.0, 0.0, -0.75, 0.05)
+dilution_coeff = st.sidebar.slider("Dilution penalty (Δ log-odds if Dilution=1)", -2.0, 0.0, -0.90, 0.05)
 
 st.sidebar.markdown("---")
 show_baseline = st.sidebar.checkbox("Show baseline on curves", True)
+plot_all_curves = st.sidebar.checkbox("Curves tab: plot ALL variables", False)
 sel_curve_var = st.sidebar.selectbox(
-    "Curves tab · variable",
+    "Or pick a single variable",
     ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m","float_m","mcap_m","fr_x","pmmc_pct","catalyst"]
 )
 
@@ -143,8 +144,71 @@ st.markdown('<div class="section-title">Upload workbook (sheet: PMH BO Merged)</
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], label_visibility="collapsed")
 merged_sheet = st.text_input("Sheet name", "PMH BO Merged")
 
-if uploaded:
-    st.caption("Click **Learn rank-curves** to build variable curves & weights from your merged sheet.")
+def _norm(s: str) -> str:
+    s = re.sub(r"\s+", " ", str(s).strip().lower())
+    return s.replace("$","").replace("%","").replace("’","").replace("'","")
+
+def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = list(df.columns); nm = {c:_norm(c) for c in cols}
+    for cand in candidates:
+        n = _norm(cand)
+        for c in cols:
+            if nm[c] == n: return c
+    for cand in candidates:
+        n = _norm(cand)
+        for c in cols:
+            if n in nm[c]: return c
+    return None
+
+def _tail_penalize(var_key: str, grid: np.ndarray, p: np.ndarray, p0: float, strength: float) -> np.ndarray:
+    EXH = {"gap_pct","rvol","pm_dol_m","pmmc_pct","fr_x"}
+    if var_key not in EXH or strength <= 0: return p
+    tail = np.clip((grid - 0.90) / 0.08, 0, 1)   # 0 until 0.90, ramps to 1 by ~0.98
+    penalty = 1.0 - strength * tail
+    return p0 + (p - p0) * penalty
+
+def rank_smooth(x, y, bandwidth=0.06, grid_points=201, min_rows=40):
+    x = pd.to_numeric(pd.Series(x), errors="coerce")
+    y = pd.to_numeric(pd.Series(y), errors="coerce")
+    mask = x.notna() & y.notna()
+    x, y = x[mask].to_numpy(float), y[mask].to_numpy(float)
+    if x.size < min_rows: return None
+
+    ranks = pd.Series(x).rank(pct=True).to_numpy()
+    grid = np.linspace(0, 1, grid_points)
+    h = float(bandwidth)
+    p_grid = np.empty_like(grid)
+    for i, g in enumerate(grid):
+        w = np.exp(-0.5 * ((ranks - g)/h)**2)
+        sw = w.sum()
+        p_grid[i] = (w*y).sum()/sw if sw > 0 else np.nan
+    p0 = float(y.mean())
+    p_grid = pd.Series(p_grid).interpolate(limit_direction="both").fillna(p0).to_numpy()
+
+    # local support (for sweet/risk)
+    bins = np.linspace(0,1,51)
+    counts, _ = np.histogram(ranks, bins=bins)
+    bin_idx = np.clip(np.searchsorted(bins, grid, side="right")-1, 0, len(counts)-1)
+    support = counts[bin_idx]
+
+    pr = np.linspace(0,1,41)
+    vals = np.quantile(x, pr)
+    return {"grid":grid, "p_grid":p_grid, "p0":p0, "support":support,
+            "ranks":ranks, "n":x.size, "quantiles":{"pr":pr,"vals":vals}}
+
+def auc_weight(x, y) -> float:
+    x = pd.to_numeric(pd.Series(x), errors="coerce")
+    y = pd.to_numeric(pd.Series(y), errors="coerce")
+    mask = x.notna() & y.notna()
+    x, y = x[mask], y[mask]
+    if y.nunique()!=2 or len(y) < 10: return 0.0
+    r = x.rank(method="average")
+    n1 = int((y==1).sum()); n0 = int((y==0).sum())
+    if n1==0 or n0==0: return 0.0
+    s1 = r[y==1].sum()
+    auc = (s1 - n1*(n1+1)/2) / (n1*n0)
+    w = max(0.05, abs(float(auc)-0.5)*2.0)   # 0..1 with floor
+    return float(w)
 
 if st.button("Learn rank-curves", use_container_width=True):
     if not uploaded:
@@ -155,25 +219,9 @@ if st.button("Learn rank-curves", use_container_width=True):
             if merged_sheet not in xls.sheet_names:
                 st.error(f"Sheet '{merged_sheet}' not found. Available: {xls.sheet_names}")
             else:
-                # Column mapping helpers
-                def _norm(s: str) -> str:
-                    s = re.sub(r"\s+", " ", str(s).strip().lower())
-                    return s.replace("$","").replace("%","").replace("’","").replace("'","")
-                def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-                    cols = list(df.columns); nm = {c:_norm(c) for c in cols}
-                    for cand in candidates:
-                        n = _norm(cand)
-                        for c in cols:
-                            if nm[c] == n: return c
-                    for cand in candidates:
-                        n = _norm(cand)
-                        for c in cols:
-                            if n in nm[c]: return c
-                    return None
-
                 raw = pd.read_excel(xls, merged_sheet)
 
-                # Map columns (merged sheet contains FT=1/0)
+                # Map columns in merged sheet
                 col_ft    = _pick(raw, ["ft"])
                 col_gap   = _pick(raw, ["gap %","gap%","premarket gap"])
                 col_atr   = _pick(raw, ["atr","atr $"])
@@ -203,92 +251,37 @@ if st.button("Learn rank-curves", use_container_width=True):
                     df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
 
                 df = df[df["FT"].notna()]
-                y = df["FT"].astype(float)
+                if df.empty:
+                    st.error("No valid rows after cleaning FT. Check your sheet.")
+                else:
+                    y = df["FT"].astype(float)
+                    var_list = [v for v in [
+                        "gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m",
+                        "float_m","mcap_m","fr_x","pmmc_pct","catalyst"
+                    ] if v in df.columns]
 
-                # Core: rank-smoothed curve
-                def rank_smooth(x, y, bandwidth=0.06, grid_points=201, min_rows=30):
-                    x = pd.to_numeric(pd.Series(x), errors="coerce")
-                    y = pd.to_numeric(pd.Series(y), errors="coerce")
-                    mask = x.notna() & y.notna()
-                    x, y = x[mask].to_numpy(float), y[mask].to_numpy(float)
-                    if x.size < min_rows: return None
-                    ranks = pd.Series(x).rank(pct=True).to_numpy()
-                    grid = np.linspace(0, 1, grid_points)
-                    h = float(bandwidth)
-                    p_grid = np.empty_like(grid)
-                    for i, g in enumerate(grid):
-                        w = np.exp(-0.5 * ((ranks - g)/h)**2)
-                        sw = w.sum()
-                        p_grid[i] = (w*y).sum()/sw if sw > 0 else np.nan
-                    p0 = float(y.mean())
-                    p_grid = pd.Series(p_grid).interpolate(limit_direction="both").fillna(p0).to_numpy()
-                    # support for sweet/risk
-                    bins = np.linspace(0,1,51)
-                    counts, _ = np.histogram(ranks, bins=bins)
-                    bin_idx = np.clip(np.searchsorted(bins, grid, side="right")-1, 0, len(counts)-1)
-                    support = counts[bin_idx]
-                    # quantiles for value->rank mapping
-                    pr = np.linspace(0,1,41)
-                    vals = np.quantile(x, pr)
-                    return {"grid":grid, "p_grid":p_grid, "p0":p0, "support":support,
-                            "ranks":ranks, "n":x.size, "quantiles":{"pr":pr,"vals":vals}}
+                    curves, weights = {}, {}
+                    for v in var_list:
+                        # lower min_rows for binary catalyst
+                        min_rows = sb_minrows if v != "catalyst" else max(10, int(sb_minrows/2))
+                        model = rank_smooth(df[v], y, bandwidth=sb_bw, grid_points=sb_grid, min_rows=min_rows)
+                        if model is not None:
+                            curves[v] = model
+                            weights[v] = auc_weight(df[v], y)
 
-                def auc_weight(x, y) -> float:
-                    x = pd.to_numeric(pd.Series(x), errors="coerce")
-                    y = pd.to_numeric(pd.Series(y), errors="coerce")
-                    mask = x.notna() & y.notna()
-                    x, y = x[mask], y[mask]
-                    if y.nunique()!=2: return 0.0
-                    r = x.rank(method="average")
-                    n1 = int((y==1).sum()); n0 = int((y==0).sum())
-                    if n1==0 or n0==0: return 0.0
-                    s1 = r[y==1].sum()
-                    auc = (s1 - n1*(n1+1)/2) / (n1*n0)
-                    w = max(0.05, abs(float(auc)-0.5)*2.0)   # scale 0..1; floor 0.05
-                    return float(w)
+                    sw = sum(weights.values()) or 1.0
+                    weights = {k: v/sw for k,v in weights.items()}
 
-                var_list = [v for v in [
-                    "gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m",
-                    "float_m","mcap_m","fr_x","pmmc_pct","catalyst"
-                ] if v in df.columns]
-
-                curves, weights = {}, {}
-                for v in var_list:
-                    model = rank_smooth(df[v], y, bandwidth=sb_bw, grid_points=sb_grid,
-                                        min_rows=sb_minrows if v!="catalyst" else 10)
-                    if model is not None:
-                        curves[v] = model
-                        weights[v] = auc_weight(df[v], y)
-
-                # normalize weights
-                sw = sum(weights.values()) or 1.0
-                weights = {k: v/sw for k,v in weights.items()}
-
-                st.session_state.CURVES  = {"curves":curves, "base_p":float(y.mean())}
-                st.session_state.WEIGHTS = weights
-                st.session_state.BASEP   = float(y.mean())
-
-                st.success(f"Learned {len(curves)} curves · base P(FT) ≈ {y.mean():.2f}")
-                with st.expander("Detected column mapping (optional)", expanded=False):
-                    st.json({
-                        "FT": col_ft, "gap_pct": col_gap, "atr_usd": col_atr, "rvol": col_rvol,
-                        "pm_vol_m": col_pmvol, "pm_dol_m": col_pmdol, "float_m": col_float,
-                        "mcap_m": col_mcap, "si_pct": col_si, "catalyst": col_cat
-                    })
+                    st.session_state.CURVES  = {"curves":curves, "base_p":float(y.mean())}
+                    st.session_state.WEIGHTS = weights
+                    st.session_state.BASEP   = float(y.mean())
+                    st.success(f"Learned {len(curves)} curves · baseline P(FT) ≈ {y.mean():.2f}")
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
 # =========================================================
 # Core funcs after learning
 # =========================================================
-_EXHAUSTION_VARS = {"gap_pct","rvol","pm_dol_m","pmmc_pct","fr_x"}
-
-def _tail_penalize(var_key: str, grid: np.ndarray, p: np.ndarray, p0: float, strength: float) -> np.ndarray:
-    if var_key not in _EXHAUSTION_VARS or strength <= 0: return p
-    tail = np.clip((grid - 0.90) / 0.08, 0, 1)             # 0 until 0.90, ramps to 1 by 0.98
-    penalty = 1.0 - strength * tail                        # cut lift up to strength at top tail
-    return p0 + (p - p0) * penalty
-
 def _value_to_rank(model: Dict[str,Any], x_val: float) -> float:
     q = model.get("quantiles", None)
     if q is None or not np.isfinite(x_val): return 0.5
@@ -306,7 +299,10 @@ def _value_to_rank(model: Dict[str,Any], x_val: float) -> float:
 
 def _prob_from_model(model: Dict[str,Any], var_key: str, x_val: float, tail_strength: float) -> float:
     if model is None or not np.isfinite(x_val): return 0.5
-    grid = model["grid"]; p_grid = model["p_grid"]; p0 = model["p0"]
+    grid = model["grid"].copy()
+    p_grid = model["p_grid"].copy()
+    p0 = model["p0"]
+    # tail penalty if needed
     p_grid = _tail_penalize(var_key, grid, p_grid, p0, tail_strength)
     r = _value_to_rank(model, x_val)
     j = int(np.clip(round(r * (len(grid)-1)), 0, len(grid)-1))
@@ -359,11 +355,9 @@ with tab_add:
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
     if submitted and ticker:
-        # Deriveds
         fr_x = (pm_vol_m / float_m) if float_m > 0 else float("nan")
         pmmc_pct = (100.0 * pm_dol_m / mc_m) if mc_m > 0 else float("nan")
 
-        # Predicted Day Vol & PM% of Pred (display info only)
         sigma_ln = 0.60
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
@@ -385,16 +379,13 @@ with tab_add:
             m = curves.get(k)
             p = _prob_from_model(m, k, x, tail_strength) if m else 0.5
             parts[k] = {"p": p, "x": x, "w": weights.get(k, 0.0)}
-            # weight in log-odds domain
             z = math.log(p/(1-p))
             log_odds_sum += weights.get(k, 0.0) * z
 
-        # Dilution penalty (binary)
         log_odds_sum += dilution_coeff * float(dilution_flag)
-
-        # Map back to probability safely
-        log_odds_sum = float(np.clip(log_odds_sum, -12, 12))  # clamp to avoid overflow
+        log_odds_sum = float(np.clip(log_odds_sum, -12, 12))
         numeric_prob = 1.0 / (1.0 + math.exp(-log_odds_sum))
+
         final_score = float(np.clip(numeric_prob*100.0, 0.0, 100.0))
         odds_name = odds_label(final_score)
         level = grade(final_score)
@@ -404,11 +395,12 @@ with tab_add:
             '<span class="pill pill-bad">Weak / Avoid</span>'
         )
 
-        # Checklist (value + p)
         def stance(var, p):
             # exhaustion vars rarely "Good" at extremes; keep neutral unless lift strong
-            if p >= base_p + sb_lift and var not in _EXHAUSTION_VARS: return "Good"
-            if p <= base_p - sb_lift: return "Risk"
+            if p >= base_p + sb_lift and var not in {"gap_pct","rvol","pm_dol_m","pmmc_pct","fr_x"}:
+                return "Good"
+            if p <= base_p - sb_lift:
+                return "Risk"
             return "Caution"
 
         name_map = {
@@ -443,7 +435,6 @@ with tab_add:
         st.session_state.last = row
         st.success(f"Saved {ticker} — Odds {row['Odds']} (Score {row['FinalScore']})")
 
-    # Preview card
     l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
     if l:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
@@ -503,22 +494,45 @@ with tab_curves:
     if not curves:
         st.info("Upload + Learn first.")
     else:
-        var = sel_curve_var
-        m = curves.get(var)
-        if m is None:
-            st.warning(f"No curve learned for '{var}'.")
-        else:
-            grid = m["grid"].copy()
-            p    = m["p_grid"].copy()
-            p    = _tail_penalize(var, grid, p, m["p0"], tail_strength)
-            fig, ax = plt.subplots(figsize=(6.2, 3.2))
-            ax.plot(grid, p, lw=2)
-            if show_baseline:
-                ax.axhline(base_p, ls="--", lw=1, color="gray")
-            ax.set_xlabel("Rank (percentile of variable)")
-            ax.set_ylabel("P(FT | rank)")
-            ax.set_title(f"{var} — rank-smoothed curve")
+        if plot_all_curves:
+            # plot all learned curves in a grid
+            learned_vars = list(curves.keys())
+            n = len(learned_vars)
+            ncols = 3
+            nrows = int(np.ceil(n / ncols))
+            fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*4.8, nrows*3.2))
+            axes = np.atleast_2d(axes)
+            for i, var in enumerate(learned_vars):
+                ax = axes[i//ncols, i % ncols]
+                m = curves[var]
+                grid = m["grid"].copy()
+                p    = _tail_penalize(var, grid, m["p_grid"].copy(), m["p0"], tail_strength)
+                ax.plot(grid, p, lw=2)
+                if show_baseline:
+                    ax.axhline(base_p, ls="--", lw=1, color="gray")
+                ax.set_title(var)
+                ax.set_xlabel("Rank")
+                ax.set_ylabel("P(FT)")
+            # hide unused axes
+            for j in range(i+1, nrows*ncols):
+                fig.delaxes(axes[j//ncols, j % ncols])
             st.pyplot(fig, clear_figure=True)
+        else:
+            var = sel_curve_var
+            m = curves.get(var)
+            if m is None:
+                st.warning(f"No curve learned for '{var}'.")
+            else:
+                grid = m["grid"].copy()
+                p    = _tail_penalize(var, grid, m["p_grid"].copy(), m["p0"], tail_strength)
+                fig, ax = plt.subplots(figsize=(6.4, 3.2))
+                ax.plot(grid, p, lw=2)
+                if show_baseline:
+                    ax.axhline(base_p, ls="--", lw=1, color="gray")
+                ax.set_xlabel("Rank (percentile of variable)")
+                ax.set_ylabel("P(FT | rank)")
+                ax.set_title(f"{var} — rank-smoothed curve")
+                st.pyplot(fig, clear_figure=True)
 
 # =========================================================
 # Sweet Spots (table)
@@ -526,98 +540,88 @@ with tab_curves:
 with tab_spots:
     st.markdown('<div class="section-title">Sweet Spots (lift over baseline, tail-aware)</div>', unsafe_allow_html=True)
     curves = (st.session_state.CURVES or {}).get("curves", {})
-    if not uploaded or not curves:
+    base_p = float(st.session_state.BASEP or 0.5)
+    if not curves or not uploaded:
         st.info("Upload + Learn first.")
     else:
         try:
             xls = pd.ExcelFile(uploaded)
             raw = pd.read_excel(xls, merged_sheet)
 
-            # mapping like above
-            def _norm(s: str) -> str:
-                s = re.sub(r"\s+", " ", str(s).strip().lower())
-                return s.replace("$","").replace("%","").replace("’","").replace("'","")
-            def _pick(df: pd.DataFrame, cands: List[str]) -> Optional[str]:
-                cols = list(df.columns); nm = {c:_norm(c) for c in cols}
-                for cand in cands:
-                    n = _norm(cand)
-                    for c in cols:
-                        if nm[c]==n: return c
-                for cand in cands:
-                    n = _norm(cand)
-                    for c in cols:
-                        if n in nm[c]: return c
-                return None
-
             col_ft    = _pick(raw, ["ft"])
-            col_gap   = _pick(raw, ["gap %","gap%","premarket gap"])
-            col_atr   = _pick(raw, ["atr","atr $"])
-            col_rvol  = _pick(raw, ["rvol @ bo","rvol"])
-            col_pmvol = _pick(raw, ["pm vol (m)","premarket vol (m)","pm volume (m)"])
-            col_pmdol = _pick(raw, ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)"])
-            col_float = _pick(raw, ["float m shares","public float (m)","float (m)"])
-            col_mcap  = _pick(raw, ["marketcap m","market cap (m)","mcap m","mcap"])
-            col_si    = _pick(raw, ["si","short interest %","short float %"])
-            col_cat   = _pick(raw, ["catalyst","news","pr"])
-
             df = pd.DataFrame()
-            if col_ft:    df["FT"]       = pd.to_numeric(raw[col_ft],    errors="coerce")
-            if col_gap:   df["gap_pct"]  = pd.to_numeric(raw[col_gap],   errors="coerce")
-            if col_atr:   df["atr_usd"]  = pd.to_numeric(raw[col_atr],   errors="coerce")
-            if col_rvol:  df["rvol"]     = pd.to_numeric(raw[col_rvol],  errors="coerce")
-            if col_pmvol: df["pm_vol_m"] = pd.to_numeric(raw[col_pmvol], errors="coerce")
-            if col_pmdol: df["pm_dol_m"] = pd.to_numeric(raw[col_pmdol], errors="coerce")
-            if col_float: df["float_m"]  = pd.to_numeric(raw[col_float], errors="coerce")
-            if col_mcap:  df["mcap_m"]   = pd.to_numeric(raw[col_mcap],  errors="coerce")
-            if col_si:    df["si_pct"]   = pd.to_numeric(raw[col_si],    errors="coerce")
-            if col_cat:   df["catalyst"] = pd.to_numeric(raw[col_cat],   errors="coerce")
+            if col_ft is None:
+                st.error("No 'FT' column found in merged sheet.")
+            else:
+                df["FT"] = pd.to_numeric(raw[col_ft], errors="coerce")
+                # reuse the same mapping keys used to build curves
+                keys = ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m","float_m","mcap_m","catalyst"]
+                mapping = {
+                    "gap_pct": ["gap %","gap%","premarket gap"],
+                    "atr_usd": ["atr","atr $"],
+                    "rvol": ["rvol @ bo","rvol"],
+                    "si_pct": ["si","short interest %","short float %","short interest (float) %"],
+                    "pm_vol_m": ["pm vol (m)","premarket vol (m)","pm volume (m)"],
+                    "pm_dol_m": ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)"],
+                    "float_m": ["float m shares","public float (m)","float (m)"],
+                    "mcap_m": ["marketcap m","market cap (m)","mcap m","mcap"],
+                    "catalyst": ["catalyst","news","pr"]
+                }
+                for k in keys:
+                    col = _pick(raw, mapping[k])
+                    if col is not None:
+                        df[k] = pd.to_numeric(raw[col], errors="coerce")
+                if {"pm_vol_m","float_m"}.issubset(df.columns):
+                    df["fr_x"] = df["pm_vol_m"] / df["float_m"]
+                if {"pm_dol_m","mcap_m"}.issubset(df.columns):
+                    df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
 
-            if {"pm_vol_m","float_m"}.issubset(df.columns):
-                df["fr_x"] = df["pm_vol_m"] / df["float_m"]
-            if {"pm_dol_m","mcap_m"}.issubset(df.columns):
-                df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
-            df = df[df["FT"].notna()]
+                df = df[df["FT"].notna()]
 
-            base_p = float(st.session_state.BASEP or 0.5)
-
-            def sweet_risk_table(df, lift_thr=0.05, min_span=0.03, max_gap=0.02, min_support=3):
                 rows = []
-                for v in [c for c in ["gap_pct","atr_usd","rvol","pm_vol_m","pm_dol_m","float_m","mcap_m","si_pct","fr_x","pmmc_pct","catalyst"] if c in df.columns]:
+                for v, m in curves.items():
+                    # skip if we don't have raw values for quantile back-mapping
+                    if v not in df.columns: 
+                        rows.append({"Variable": v, "Base p(FT)": round(base_p,3),
+                                     "Sweet rank": "", "Sweet values": "", "Risk rank": "", "Risk values": ""})
+                        continue
                     x = pd.to_numeric(df[v], errors="coerce")
                     y = pd.to_numeric(df["FT"], errors="coerce")
                     mask = x.notna() & y.notna()
-                    x, y = x[mask].to_numpy(float), y[mask].to_numpy(float)
-                    if x.size < sb_minrows: continue
+                    x = x[mask].to_numpy(float); y = y[mask].to_numpy(float)
+                    if x.size < sb_minrows:
+                        rows.append({"Variable": v, "Base p(FT)": round(base_p,3),
+                                     "Sweet rank": "", "Sweet values": "", "Risk rank": "", "Risk values": ""})
+                        continue
+
+                    # Use learned curve (already smoothed) with support from this dataset
+                    grid  = m["grid"].copy()
+                    p     = _tail_penalize(v, grid, m["p_grid"].copy(), m["p0"], tail_strength)
                     ranks = pd.Series(x).rank(pct=True).to_numpy()
-                    grid  = np.linspace(0,1,sb_grid)
-                    h = sb_bw
-                    p_grid = np.empty_like(grid)
-                    for i,g in enumerate(grid):
-                        w = np.exp(-0.5*((ranks-g)/h)**2)
-                        sw = w.sum()
-                        p_grid[i] = (w*y).sum()/sw if sw>0 else np.nan
-                    p_grid = pd.Series(p_grid).interpolate(limit_direction="both").fillna(y.mean()).to_numpy()
+
+                    # Local support along grid for THIS var using ranks
                     bins = np.linspace(0,1,51)
                     counts,_ = np.histogram(ranks, bins=bins)
                     bin_idx = np.clip(np.searchsorted(bins, grid, side="right")-1, 0, len(counts)-1)
                     sup = counts[bin_idx]
-                    # tail penalty
-                    p = _tail_penalize(v, grid, p_grid, y.mean(), tail_strength)
-                    # thresholds
+
                     peak = float(np.nanmax(p))
-                    thr = max(base_p + lift_thr, peak - 0.08)
+                    thr  = max(base_p + sb_lift, peak - 0.08)   # adaptive threshold
                     sweet_mask = (p >= thr) & (sup >= sb_support)
-                    risk_mask  = (p <= base_p - lift_thr) & (sup >= sb_support)
+                    risk_mask  = (p <= base_p - sb_lift) & (sup >= sb_support)
 
-                    def _intervals(mask, grid):
-                        return _intervals_with_gap(mask, grid, max_gap=sb_gapmerge, min_span=sb_minspan)
+                    s_rank = _intervals_with_gap(sweet_mask, grid, max_gap=sb_gapmerge, min_span=sb_minspan)
+                    r_rank = _intervals_with_gap(risk_mask,  grid, max_gap=sb_gapmerge, min_span=sb_minspan)
 
-                    s_rank = _intervals(sweet_mask, grid)
-                    r_rank = _intervals(risk_mask, grid)
+                    # Map rank intervals to value intervals using variable quantiles from learned model
+                    pr = m["quantiles"]["pr"]; vals = m["quantiles"]["vals"]
+                    def r2v(lo, hi):
+                        lo_v = float(np.interp(lo, pr, vals))
+                        hi_v = float(np.interp(hi, pr, vals))
+                        return lo_v, hi_v
 
-                    def r2v(ivals):
-                        return [(float(np.nanquantile(x, lo)), float(np.nanquantile(x, hi))) for lo,hi in ivals]
-                    s_vals = r2v(s_rank); r_vals = r2v(r_rank)
+                    s_vals = [r2v(lo,hi) for lo,hi in s_rank]
+                    r_vals = [r2v(lo,hi) for lo,hi in r_rank]
 
                     rows.append({
                         "Variable": v,
@@ -627,14 +631,13 @@ with tab_spots:
                         "Risk rank": "; ".join([f"[{lo:.2f},{hi:.2f}]" for lo,hi in r_rank]) or "",
                         "Risk values": "; ".join([f"[{_fmt_value(lo)},{_fmt_value(hi)}]" for lo,hi in r_vals]) or "",
                     })
-                return pd.DataFrame(rows)
 
-            tbl = sweet_risk_table(df, lift_thr=sb_lift, min_span=sb_minspan, max_gap=sb_gapmerge, min_support=sb_support)
-            if tbl.empty:
-                st.info("No robust sweet/risk intervals at current thresholds. Loosen lift/support or increase sample.")
-            else:
-                st.dataframe(tbl, use_container_width=True, hide_index=True)
-                st.download_button("Download sweet/risk table (CSV)", tbl.to_csv(index=False).encode("utf-8"),
-                                   "sweet_risk_table.csv","text/csv", use_container_width=True)
+                tbl = pd.DataFrame(rows)
+                if tbl.empty:
+                    st.info("No robust sweet/risk intervals. Loosen lift/support or increase sample.")
+                else:
+                    st.dataframe(tbl, use_container_width=True, hide_index=True)
+                    st.download_button("Download sweet/risk table (CSV)", tbl.to_csv(index=False).encode("utf-8"),
+                                       "sweet_risk_table.csv","text/csv", use_container_width=True)
         except Exception as e:
             st.error(f"Sweet-spot analysis failed: {e}")
