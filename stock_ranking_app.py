@@ -151,6 +151,21 @@ with c4:
 st.sidebar.header("Prediction Uncertainty")
 sigma_ln = st.sidebar.slider("Predicted Day Vol log-σ", 0.10, 1.50, 0.60, 0.01)
 
+# ---- Model tuning (put in sidebar or details expander) ----
+st.sidebar.header("Model tuning")
+curve_sharpness = st.sidebar.slider(
+    "Curve sharpness (bandwidth scale)", 0.30, 1.50, 0.70, 0.05,
+    help="Lower = sharper curves (less smoothing)."
+)
+curve_temperature = st.sidebar.slider(
+    "Curve temperature (probability contrast)", 0.50, 1.20, 0.70, 0.05,
+    help="Lower (<1) increases contrast; higher (>1) flattens."
+)
+anchor_target = st.sidebar.slider(
+    "Sweet-spot anchor p*", 0.60, 0.90, 0.75, 0.01,
+    help="Target probability at the prior 'center' for hump-shaped variables."
+)
+
 # ================= Mapping & cleaning =================
 _SYNONYMS = {
     "gap_pct":       ["gap %","gap%","gap pct","premarket gap","pm gap"],
@@ -274,14 +289,16 @@ def _kernel_prob(x_train, y_train, x_eval, bandwidth):
         out[i] = (w * y_train).sum() / sw if sw > 0 else np.nan
     return out
 
-def fit_curve(series: pd.Series, labels: pd.Series, force_log: bool=False):
+def fit_curve(series: pd.Series, labels: pd.Series, force_log: bool=False,
+              sharpness: float = 0.70, temperature: float = 0.70,
+              anchor_target: float = 0.75, var_name: str = ""):
     x_raw = pd.to_numeric(series, errors="coerce").to_numpy()
     y_raw = pd.to_numeric(labels, errors="coerce").to_numpy()
     mask = np.isfinite(x_raw) & np.isfinite(y_raw)
     x_raw = x_raw[mask]; y_raw = y_raw[mask]
     if len(x_raw) < MIN_ROWS: return None
 
-    # auto log for skewed positive vars; SI forced log because high SI maps better in log space
+    # force log for SI, auto-log for skewed positive
     use_log = False
     if force_log and (x_raw > 0).all(): use_log = True
     elif (x_raw > 0).all() and abs(pd.Series(x_raw).skew()) > 0.75: use_log = True
@@ -293,11 +310,52 @@ def fit_curve(series: pd.Series, labels: pd.Series, force_log: bool=False):
     else:
         x_t = x_raw.copy()
 
+    # Base bandwidth (Silverman-ish), scaled by sharpness
     std = np.std(x_t); n = len(x_t)
-    h = 0.6 * std * (n ** (-1/5)) if std > 0 else 0.3
+    h0 = 0.6 * std * (n ** (-1/5)) if std > 0 else 0.3
+    h = max(1e-6, h0 * float(sharpness))
+
     lo = np.nanpercentile(x_t, 2); hi = np.nanpercentile(x_t, 98)
     if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi: return None
-    grid = np.linspace(lo, hi, 161); p_grid = _kernel_prob(x_t, y_raw, grid, h)
+    grid = np.linspace(lo, hi, 201)
+
+    # kernel regression on transformed axis
+    def _kernel_prob(x_train, y_train, x_eval, bandwidth):
+        x_train = np.asarray(x_train, dtype=float)
+        y_train = np.asarray(y_train, dtype=float)
+        x_eval  = np.asarray(x_eval, dtype=float)
+        h = max(1e-6, float(bandwidth))
+        out = np.zeros_like(x_eval, dtype=float)
+        for i, xe in enumerate(x_eval):
+            w = np.exp(-0.5 * ((xe - x_train)/h)**2)
+            sw = w.sum()
+            out[i] = (w * y_train).sum() / sw if sw > 0 else np.nan
+        return out
+
+    p_grid_raw = _kernel_prob(x_t, y_raw, grid, h)
+    p_grid_raw = np.where(np.isfinite(p_grid_raw), p_grid_raw, 0.5)
+    p_grid_raw = np.clip(p_grid_raw, 1e-3, 1-1e-3)
+
+    # ---- calibration in logit space: temperature + anchor to prior center ----
+    z_grid = stable_logit(p_grid_raw)
+    T = float(max(0.5, min(1.2, temperature)))  # safety
+    zT = z_grid / T
+
+    # anchor: pick a center 'c' from PRIORS (for hump vars); otherwise no shift
+    bias = 0.0
+    if var_name in PRIORS and PRIORS[var_name].get("kind") == "hump":
+        c = PRIORS[var_name].get("c", None)
+        if c is not None:
+            # find grid x (in original scale) closest to c
+            grid_x = np.exp(grid) if use_log else grid
+            idx = int(np.argmin(np.abs(grid_x - float(c))))
+            target = float(np.clip(anchor_target, 0.55, 0.9))
+            b = stable_logit(target) - zT[idx]
+            bias = float(b)
+
+    z_cal = zT + bias
+    p_grid_cal = 1.0 / (1.0 + np.exp(-np.clip(z_cal, -50, 50)))
+    p_grid_cal = np.clip(p_grid_cal, 1e-3, 1-1e-3)
 
     def predict(x_new):
         x_new = np.array(x_new, dtype=float)
@@ -307,14 +365,26 @@ def fit_curve(series: pd.Series, labels: pd.Series, force_log: bool=False):
             z[ok] = np.log(x_new[ok])
         else:
             z = x_new
-        res = _kernel_prob(x_t, y_raw, z, h)
-        res = np.where(np.isfinite(res), res, 0.5)
-        return np.clip(res, 1e-3, 1-1e-3)
+        p = _kernel_prob(x_t, y_raw, z, h)
+        p = np.where(np.isfinite(p), p, 0.5)
+        p = np.clip(p, 1e-3, 1-1e-3)
+        # apply the same calibration: temperature + bias
+        z_ = stable_logit(p) / T + bias
+        p_ = 1.0 / (1.0 + np.exp(-np.clip(z_, -50, 50)))
+        return np.clip(p_, 1e-3, 1-1e-3)
 
     q10, q25, q50, q75, q90 = [float(pd.Series(x_raw).quantile(p)) for p in [0.10,0.25,0.50,0.75,0.90]]
-    return {"use_log": use_log, "grid_t": grid, "p_grid": p_grid, "predict": predict,
-            "n": len(x_t), "bandwidth_t": h,
-            "q": {"p10": q10, "p25": q25, "p50": q50, "p75": q75, "p90": q90}}
+    return {
+        "use_log": use_log,
+        "grid_t": grid,
+        "p_grid": p_grid_cal,     # calibrated curve for plotting
+        "predict": predict,       # calibrated predictor
+        "n": len(x_t),
+        "bandwidth_t": h,
+        "temperature": T,
+        "bias": bias,
+        "q": {"p10": q10, "p25": q25, "p50": q50, "p75": q75, "p90": q90}
+    }
 
 # ================= Priors & Guardrails =================
 PRIORS = {
@@ -443,7 +513,14 @@ def learn_all_curves_and_weights(file, merged_sheet: str, ft_sheet: str, fail_sh
     curves, summary_rows = {}, []
     for v in var_list:
         if v in num.columns:
-            model = fit_curve(num[v], num["_y"], force_log=(v=="si_pct"))
+            model = fit_curve(
+                num[v], num["_y"],
+                force_log=(v=="si_pct"),
+                sharpness=curve_sharpness,
+                temperature=curve_temperature,
+                anchor_target=anchor_target,
+                var_name=v
+            )
             if model:
                 curves[v] = model
                 q = model["q"]
