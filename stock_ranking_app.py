@@ -28,9 +28,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ============================== Sidebar (minimal) ==============================
-st.sidebar.header("Curves & Penalty")
-tail_strength = st.sidebar.slider("High-tail penalty (exhaustion vars)", 0.0, 1.0, 0.55, 0.05)
+# ============================== Sidebar (Curves only) ==============================
+st.sidebar.header("Curves")
 show_baseline = st.sidebar.checkbox("Curves: show baseline", True)
 plot_all_curves = st.sidebar.checkbox("Curves: plot ALL variables", False)
 sel_curve_var = st.sidebar.selectbox(
@@ -44,6 +43,8 @@ if "MODELS" not in st.session_state: st.session_state.MODELS = {}   # var -> mod
 if "WEIGHTS" not in st.session_state: st.session_state.WEIGHTS = {} # var -> weight
 if "rows"   not in st.session_state: st.session_state.rows = []
 if "last"   not in st.session_state: st.session_state.last = {}
+if "ODDS_CUTS" not in st.session_state: st.session_state.ODDS_CUTS = {}
+if "GRADE_CUTS" not in st.session_state: st.session_state.GRADE_CUTS = {}
 
 # ============================== Helpers ==============================
 def _parse_local_float(s: str) -> Optional[float]:
@@ -73,6 +74,7 @@ def _fmt_value(v: float) -> str:
     if abs(v) >= 1:    return f"{v:.2f}"
     return f"{v:.3f}"
 
+# (Kept for backward compatibility if ever used elsewhere)
 def odds_label(score: float) -> str:
     if score >= 85: return "Very High Odds"
     elif score >= 70: return "High Odds"
@@ -131,7 +133,7 @@ def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float
 # ================= Rank-hist learning (DB-derived) =================
 BINS = 5
 STRETCH_EPS = 0.10
-CLASS_LIFT = 0.08
+CLASS_LIFT = 0.08  # checklist Good/Risk offset vs local baseline
 
 def moving_average(y: np.ndarray, w: int = 3) -> np.ndarray:
     if w <= 1: return y
@@ -232,7 +234,7 @@ def value_to_prob(var_key: str, model: Dict[str,Any], x_val: float) -> float:
     p_local = float(p[j])
     return float(np.clip(p_local, 1e-6, 1-1e-6))
 
-# ---------- Prior & simple anchors (keep) ----------
+# ---------- Prior & simple anchors (kept) ----------
 def si_directional_prior(x: float) -> Optional[float]:
     if not np.isfinite(x): return None
     k = 0.25; x0 = 10.0
@@ -290,7 +292,65 @@ def _baseline_at_value(model: dict, x: float) -> float:
         pb = float(pb_curve[j])
         if np.isfinite(pb):
             return pb
-    return float(model.get("p_base_var_scalar", model.get("p_base_var", 0.5)))
+    return float(model.get("p_base_var", 0.5))
+
+# ---------- Calibration helpers (percentile-based) ----------
+def _stack_prob_for_row(models: Dict[str,dict], weights: Dict[str,float], row: dict) -> float:
+    """Recompute model-based prob for one historical row (for calibration)."""
+    z_sum = 0.0
+    use_pm_daily = "pm_pct_daily" in models
+    var_vals = {
+        "gap_pct": row.get("gap_pct", np.nan),
+        "atr_usd": row.get("atr_usd", np.nan),
+        "rvol":    row.get("rvol", np.nan),
+        "si_pct":  row.get("si_pct", np.nan),
+        "float_m": row.get("float_m", np.nan),
+        "mcap_m":  row.get("mcap_m", np.nan),
+        "fr_x":    row.get("fr_x", np.nan),
+        "pmmc_pct":row.get("pmmc_pct", np.nan),
+        ("pm_pct_daily" if use_pm_daily else "pm_pct_pred"): row.get("pm_pct_pred", np.nan),
+        "catalyst": row.get("catalyst", 0.0),
+    }
+    if use_pm_daily:
+        var_vals["pm_pct_daily"] = row.get("pm_pct_pred", np.nan)
+
+    for k, x in var_vals.items():
+        mdl = models.get(k)
+        if mdl is None: 
+            continue
+        p = value_to_prob(k, mdl, x)
+        pb_local = _baseline_at_value(mdl, x)
+
+        # SI prior
+        p = blend_with_prior(k, x, p)
+
+        # domain anchors
+        if k == "atr_usd":
+            p = anchor_atr(p, x, pb_local)
+        p = anchor_pm_percent(k, p, x, pb_local)
+
+        p = float(np.clip(p, 1e-6, 1-1e-6))
+        w = float(weights.get(k, 0.0))
+        z_sum += w * math.log(p/(1-p))
+
+    z_sum = float(np.clip(z_sum, -12, 12))
+    prob = 1.0 / (1.0 + math.exp(-z_sum))
+    return float(prob)
+
+def _prob_to_odds(prob: float, cuts: Dict[str, float]) -> str:
+    if prob >= cuts["very_high"]: return "Very High Odds"
+    if prob >= cuts["high"]:      return "High Odds"
+    if prob >= cuts["moderate"]:  return "Moderate Odds"
+    if prob >= cuts["low"]:       return "Low Odds"
+    return "Very Low Odds"
+
+def _prob_to_grade(prob: float, cuts: Dict[str, float]) -> str:
+    if prob >= cuts["App"]: return "A++"
+    if prob >= cuts["Ap"]:  return "A+"
+    if prob >= cuts["A"]:   return "A"
+    if prob >= cuts["B"]:   return "B"
+    if prob >= cuts["C"]:   return "C"
+    return "D"
 
 # ============================== Upload & Learn (Main Pane) ==============================
 st.markdown('<div class="section-title">Upload workbook (sheet: PMH BO Merged)</div>', unsafe_allow_html=True)
@@ -358,7 +418,7 @@ if learn_btn:
                     df = df[df["FT"].notna()]
                     y = df["FT"].astype(float)
 
-                    # learn models per variable (no generic anchors, no guardrails)
+                    # learn models per variable (no sweet-band anchors, no guardrails)
                     candidates = [
                         "gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m",
                         "fr_x","pmmc_pct","pm_pct_daily","pm_pct_pred","catalyst"
@@ -371,23 +431,13 @@ if learn_btn:
                                 centers = m["centers"]
                                 p_base_var = m["p_base_var"]
 
-                                # (keep) optional high-tail smoothing knob — still applied,
-                                # but since guardrails are removed, it's just a mild taper.
-                                def _tail_penalize_simple(centers_arr, p_arr, base_p, strength):
-                                    if strength <= 0: return p_arr
-                                    tail = np.clip((centers_arr - 0.90)/0.10, 0, 1)
-                                    penalty = 1.0 - strength * tail
-                                    return base_p + (p_arr - base_p) * penalty
-
-                                p_tp = _tail_penalize_simple(centers, m["p_raw"], p_base_var, tail_strength)
-                                p_use = stretch_curve_to_unit(p_tp, base_p=p_base_var)
+                                # stretch raw curve (no penalty/guardrails)
+                                p_use = stretch_curve_to_unit(m["p_raw"], base_p=p_base_var)
                                 m["p"] = p_use
-                                m["p_tp"] = p_tp
 
-                                # local baseline curve (kept)
+                                # local baseline curve
                                 pb_curve = _smooth_local_baseline(centers, p_use, m["support"], bandwidth=0.22)
                                 m["pb_curve"] = pb_curve
-                                m["p_base_var_scalar"] = p_base_var
 
                                 models[v] = m
 
@@ -396,13 +446,58 @@ if learn_btn:
                                 amp   = float(np.nanstd(p_use))
                                 weights[v] = max(0.05, min(1.0, 0.7*w_sep + 0.3*(amp*4)))
 
+                    # normalize weights
                     if weights:
                         s = sum(weights.values()) or 1.0
                         weights = {k: v/s for k, v in weights.items()}
 
+                    # ---------- Calibration on the merged sheet ----------
+                    cal_probs = []
+                    if models and weights:
+                        # ensure derived fields exist
+                        if {"pm_vol_m","float_m"}.issubset(df.columns) and "fr_x" not in df.columns:
+                            df["fr_x"] = df["pm_vol_m"] / df["float_m"]
+                        if {"pm_dol_m","mcap_m"}.issubset(df.columns) and "pmmc_pct" not in df.columns:
+                            df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
+
+                        if {"mcap_m","gap_pct","atr_usd","pm_vol_m"}.issubset(df.columns):
+                            def _pred_row_cal(r):
+                                try:
+                                    return predict_day_volume_m_premarket(r["mcap_m"], r["gap_pct"], r["atr_usd"])
+                                except Exception:
+                                    return np.nan
+                            pred_cal = df.apply(_pred_row_cal, axis=1)
+                            df["pm_pct_pred"] = np.where(
+                                (pred_cal > 0) & np.isfinite(pred_cal),
+                                100.0 * df.get("pm_vol_m", np.nan) / pred_cal,
+                                df.get("pm_pct_pred", np.nan)
+                            )
+
+                        needed = {"gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m","fr_x","pmmc_pct","pm_pct_pred","catalyst"}
+                        for _, rr in df.iterrows():
+                            rowd = {k: (float(rr[k]) if k in df.columns else np.nan) for k in needed}
+                            cal_probs.append(_stack_prob_for_row(models, weights, rowd))
+
+                    cal_probs = np.array(cal_probs, dtype=float)
+                    cal_probs = cal_probs[np.isfinite(cal_probs)]
+
+                    # Odds: VH 10%, H 20%, M 30%, L 25%, VL 15%
+                    odds_qs = {"very_high": 0.90, "high": 0.70, "moderate": 0.40, "low": 0.15}
+                    odds_cuts = {k: float(np.quantile(cal_probs, q)) if cal_probs.size else v 
+                                 for k, q in odds_qs.items()}
+
+                    # Grades: A++ 3%, A+ 10%, A 25%, B 55%, C 80%, else D
+                    grade_qs = {"App": 0.97, "Ap": 0.90, "A": 0.75, "B": 0.45, "C": 0.20}
+                    grade_cuts = {k: float(np.quantile(cal_probs, q)) if cal_probs.size else v
+                                  for k, q in grade_qs.items()}
+
+                    # Save
                     st.session_state.MODELS  = models
                     st.session_state.WEIGHTS = weights
-                    st.success(f"Learned {len(models)} variables.")
+                    st.session_state.ODDS_CUTS = odds_cuts
+                    st.session_state.GRADE_CUTS = grade_cuts
+
+                    st.success(f"Learned {len(models)} variables and calibrated thresholds.")
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
@@ -422,7 +517,7 @@ with tab_add:
             gap_pct  = input_float("Gap %", 0.0, min_value=0.0, decimals=1)
         with c2:
             atr_usd  = input_float("ATR ($)", 0.0, min_value=0.0, decimals=2)
-            rvol     = input_float("RVOL @ BO", 0.0, min_value=0.0, decimals=2)
+            rvol     = input_float("RVOL", 0.0, min_value=0.0, decimals=2)
             pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
             pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
             dilution_flag = st.select_slider("Dilution present?", options=[0,1], value=0,
@@ -441,6 +536,7 @@ with tab_add:
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
         pm_pct_pred = (100.0 * pm_vol_m / pred_vol_m) if pred_vol_m > 0 else float("nan")
 
+        # Models & weights
         models  = st.session_state.MODELS or {}
         weights = st.session_state.WEIGHTS or {}
 
@@ -453,23 +549,23 @@ with tab_add:
             "catalyst": 1.0 if catalyst_flag=="Yes" else 0.0
         }
         if use_pm_pct_daily:
-            # During premarket, position inside curve with pm_pct_pred value
+            # During premarket, use pm_pct_pred as proxy value to position inside the curve
             var_vals["pm_pct_daily"] = pm_pct_pred
 
-        # Combine with priors + simple anchors (no generic anchors, no guardrails)
+        # Odds stacking with local baselines, SI prior, ATR/PM% anchors
         parts: Dict[str, Dict[str, float]] = {}
         z_sum = 0.0
         for k, x in var_vals.items():
             mdl = models.get(k)
             if mdl is None:
                 continue
-            p = value_to_prob(k, mdl, x)
+            p = value_to_prob(k, mdl, x)        # learned curve at x
             pb_local = _baseline_at_value(mdl, x)
 
             # directional prior
             p = blend_with_prior(k, x, p)
 
-            # explicit domain anchors
+            # explicit domain anchors (no sweet-band, no guardrails)
             if k == "atr_usd":
                 p = anchor_atr(p, x, pb_local)
             p = anchor_pm_percent(k, p, x, pb_local)
@@ -479,23 +575,28 @@ with tab_add:
             p_clip = float(np.clip(p, 1e-6, 1-1e-6))
             z_sum += w * math.log(p_clip/(1-p_clip))
 
-        # dilution penalty
+        # dilution penalty (binary)
         z_sum += -0.90 * float(dilution_flag)
         z_sum = float(np.clip(z_sum, -12, 12))
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
 
+        # Use calibrated thresholds
+        odds_cuts = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
+        grade_cuts = st.session_state.get("GRADE_CUTS", {"App":0.92,"Ap":0.85,"A":0.75,"B":0.65,"C":0.50})
+
+        odds_name = _prob_to_odds(numeric_prob, odds_cuts)
+        level = _prob_to_grade(numeric_prob, grade_cuts)
+
         final_score = float(np.clip(numeric_prob*100.0, 0.0, 100.0))
-        odds_name = odds_label(final_score)
-        level = grade(final_score)
         verdict_pill = (
-            '<span class="pill pill-good">Strong Setup</span>' if final_score >= 70 else
-            '<span class="pill pill-warn">Constructive</span>' if final_score >= 55 else
+            '<span class="pill pill-good">Strong Setup</span>' if level in ("A++","A+","A") else
+            '<span class="pill pill-warn">Constructive</span>' if level in ("B","C") else
             '<span class="pill pill-bad">Weak / Avoid</span>'
         )
 
-        # Checklist (vs local baseline)
+        # Checklist with Good/Caution/Risk relative to local baseline
         name_map = {
-            "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL @ BO","si_pct":"Short Interest %",
+            "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
             "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
             "pmmc_pct":"PM $Vol / MC %","pm_pct_daily":"PM Vol % of Daily",
             "pm_pct_pred":"PM Vol % of Pred","catalyst":"Catalyst"
@@ -509,6 +610,7 @@ with tab_add:
             elif p <= pb - CLASS_LIFT: risk.append(f"{nm}: {_fmt_value(x)} — risk (p≈{p_pct}%)")
             else:                      warn.append(f"{nm}: {_fmt_value(x)} — caution (p≈{p_pct}%)")
 
+        # Save row
         row = {
             "Ticker": ticker,
             "Odds": odds_name,
@@ -596,7 +698,9 @@ with tab_curves:
                 ax.set_xlabel("Rank (percentile)", fontsize=10)
                 ax.set_ylabel("P(FT)", fontsize=10)
                 ax.tick_params(labelsize=9)
-            for j in range(i+1, nrows*ncols):
+            # remove any empty subplots
+            total_axes = nrows * ncols
+            for j in range(n, total_axes):
                 fig.delaxes(axes[j//ncols, j % ncols])
             st.pyplot(fig, clear_figure=True)
         else:
@@ -619,3 +723,17 @@ with tab_curves:
                 ax.set_title(f"{var} — FT curve (baseline dashed)", fontsize=11)
                 ax.tick_params(labelsize=9)
                 st.pyplot(fig, clear_figure=True)
+
+        # Show calibrated cuts for transparency
+        odds_cuts = st.session_state.get("ODDS_CUTS")
+        grade_cuts = st.session_state.get("GRADE_CUTS")
+        if odds_cuts and grade_cuts:
+            st.caption(
+                f"Odds cuts (prob): Very High ≥ {odds_cuts['very_high']:.3f}, "
+                f"High ≥ {odds_cuts['high']:.3f}, Moderate ≥ {odds_cuts['moderate']:.3f}, "
+                f"Low ≥ {odds_cuts['low']:.3f}."
+            )
+            st.caption(
+                f"Grade cuts (prob): A++ ≥ {grade_cuts['App']:.3f}, A+ ≥ {grade_cuts['Ap']:.3f}, "
+                f"A ≥ {grade_cuts['A']:.3f}, B ≥ {grade_cuts['B']:.3f}, C ≥ {grade_cuts['C']:.3f}."
+            )
