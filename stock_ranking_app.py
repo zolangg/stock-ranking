@@ -397,7 +397,7 @@ if learn_btn:
                     for v in candidates:
                         if v in df.columns:
                            m = rank_hist_model(df[v], y, bins=sb_bins)
-                            if m is not None:
+                           if m is not None:
                                   # 1) tail-penalize on the raw smoothed curve
                                   centers = m["centers"]
                                   p_base  = m["p0"]
