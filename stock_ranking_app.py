@@ -120,6 +120,18 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             if n in nm[c]: return c
     return None
 
+# ---------- Exponential percentile warping ----------
+# s is a percentile in [0,1].
+# We use s' = 1 - (1 - s)^alpha  (alpha > 1 makes the TOP tail rarer)
+def _warp_p(s: float, alpha: float) -> float:
+    s = float(np.clip(s, 0.0, 1.0))
+    return float(1.0 - (1.0 - s) ** alpha)
+
+# Inverse warp: given desired warped percentile s', find the raw percentile to sample
+def _inv_warp_p(s_warped: float, alpha: float) -> float:
+    s_warped = float(np.clip(s_warped, 0.0, 1.0))
+    return float(1.0 - (1.0 - s_warped) ** (1.0 / max(1e-9, alpha)))
+
 # ================= Predicted Day Volume (for PM% fallback) =================
 def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """ ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$) """
@@ -450,7 +462,6 @@ if learn_btn:
                     if weights:
                         s = sum(weights.values()) or 1.0
                         weights = {k: v/s for k, v in weights.items()}
-
                     # ---------- Calibration on the merged sheet ----------
                     cal_probs = []
                     if models and weights:
@@ -459,7 +470,7 @@ if learn_btn:
                             df["fr_x"] = df["pm_vol_m"] / df["float_m"]
                         if {"pm_dol_m","mcap_m"}.issubset(df.columns) and "pmmc_pct" not in df.columns:
                             df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
-
+                    
                         if {"mcap_m","gap_pct","atr_usd","pm_vol_m"}.issubset(df.columns):
                             def _pred_row_cal(r):
                                 try:
@@ -472,32 +483,55 @@ if learn_btn:
                                 100.0 * df.get("pm_vol_m", np.nan) / pred_cal,
                                 df.get("pm_pct_pred", np.nan)
                             )
-
+                    
                         needed = {"gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m","fr_x","pmmc_pct","pm_pct_pred","catalyst"}
                         for _, rr in df.iterrows():
                             rowd = {k: (float(rr[k]) if k in df.columns else np.nan) for k in needed}
                             cal_probs.append(_stack_prob_for_row(models, weights, rowd))
-
+                    
                     cal_probs = np.array(cal_probs, dtype=float)
                     cal_probs = cal_probs[np.isfinite(cal_probs)]
-
-                    # Odds: VH 10%, H 20%, M 30%, L 25%, VL 15%
-                    odds_qs = {"very_high": 0.90, "high": 0.70, "moderate": 0.40, "low": 0.15}
-                    odds_cuts = {k: float(np.quantile(cal_probs, q)) if cal_probs.size else v 
-                                 for k, q in odds_qs.items()}
-
-                    # Grades: A++ 3%, A+ 10%, A 25%, B 55%, C 80%, else D
-                    grade_qs = {"App": 0.97, "Ap": 0.90, "A": 0.75, "B": 0.45, "C": 0.20}
-                    grade_cuts = {k: float(np.quantile(cal_probs, q)) if cal_probs.size else v
-                                  for k, q in grade_qs.items()}
-
-                    # Save
+                    
+                    # ---------- Exponential distribution for cuts ----------
+                    # Tunable “steepness”: larger alpha => rarer top buckets
+                    ALPHA_ODDS  = 2.2   # how aggressively we thin the top for Odds
+                    ALPHA_GRADE = 2.8   # grades even steeper by default
+                    
+                    # Choose target *warped* percentiles (what you want to see in the UI)
+                    # Odds: ~ Very High 2%, High ~8%, Moderate ~20–25%, Low ~30%, rest Very Low
+                    odds_targets_warped = {
+                        "very_high": 0.98,
+                        "high":      0.90,
+                        "moderate":  0.65,
+                        "low":       0.35,
+                    }
+                    
+                    # Grades: A++ ~0.5%, A+ ~3%, A ~10%, B ~35%, C ~65%, else D
+                    grade_targets_warped = {
+                        "App": 0.995,  # A++
+                        "Ap":  0.97,   # A+
+                        "A":   0.90,   # A
+                        "B":   0.65,   # B
+                        "C":   0.35,   # C
+                    }
+                    
+                    # Convert warped percentiles back to RAW percentiles to pull quantiles from cal_probs
+                    def _cut_from_probs(probs: np.ndarray, warped_p: float, alpha: float) -> float:
+                        if probs.size == 0:
+                            return float(warped_p)  # fallback
+                        raw_p = _inv_warp_p(warped_p, alpha)
+                        return float(np.quantile(probs, raw_p))
+                    
+                    odds_cuts = {k: _cut_from_probs(cal_probs, v, ALPHA_ODDS) for k, v in odds_targets_warped.items()}
+                    grade_cuts = {k: _cut_from_probs(cal_probs, v, ALPHA_GRADE) for k, v in grade_targets_warped.items()}
+                    
+                    # Save to session for live scoring
                     st.session_state.MODELS  = models
                     st.session_state.WEIGHTS = weights
                     st.session_state.ODDS_CUTS = odds_cuts
                     st.session_state.GRADE_CUTS = grade_cuts
-
-                    st.success(f"Learned {len(models)} variables and calibrated thresholds.")
+                    
+                    st.success(f"Learned {len(models)} variables and set exponential-calibrated thresholds.")
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
