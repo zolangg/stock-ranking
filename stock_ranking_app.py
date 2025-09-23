@@ -522,7 +522,6 @@ if st.session_state.CURVES:
         st.dataframe(st.session_state.CURVES.get("weights_table", pd.DataFrame()), use_container_width=True, hide_index=True)
 
 # ================= Per-variable prob helpers =================
-def _prior_p(var: str, x: float) -> float  # noqa: re-declare for type hints
 def per_var_prob(curves: Dict[str, Any], var_key: str, xval: float) -> float:
     m = curves.get(var_key)
     if m is None: return 0.5
