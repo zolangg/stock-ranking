@@ -399,6 +399,56 @@ PRIOR_BLEND_MAP = {
     "catalyst": 0.60,    # stronger blend for catalyst (binary)
 }
 
+# =============== Domain priors (direction/shape hints) ===============
+# Each variable gets a weak/medium prior curve (0..1) blended with learned curve.
+# kind: "hump" (sweet-spot), "high_better", "low_better"
+PRIORS = {
+    "gap_pct":     {"kind":"hump", "c":100.0, "w":60.0},
+    "rvol":        {"kind":"hump", "c":10.0,  "w":8.0},
+    "pm_dol_m":    {"kind":"hump", "c":10.0,  "w":10.0},
+    "pm_vol_m":    {"kind":"high_better"},
+    "pm_pct_pred": {"kind":"hump", "c":18.0,  "w":12.0},
+    "pmmc_pct":    {"kind":"hump", "c":15.0,  "w":15.0},
+    "atr_usd":     {"kind":"hump", "c":0.30,  "w":0.20},
+    "float_m":     {"kind":"low_better"},
+    "mcap_m":      {"kind":"low_better"},
+    "si_pct":      {"kind":"high_better", "pivot":10.0, "scale":5.0},
+    "fr_x":        {"kind":"hump", "c":0.25,  "w":0.20},
+    "catalyst":    {"kind":"high_better", "pivot":0.5, "scale":0.35},
+}
+
+DEFAULT_PRIOR_BLEND = 0.30
+PRIOR_BLEND_MAP = {
+    "si_pct":   0.55,
+    "catalyst": 0.60,
+}
+
+def _prior_p(var: str, x: float) -> float:
+    if not np.isfinite(x):
+        return 0.5
+    info = PRIORS.get(var, None)
+    if info is None:
+        return 0.5
+    kind = info.get("kind", "hump")
+    if kind == "hump":
+        c = float(info.get("c", 0.0))
+        w = float(info.get("w", 1.0))
+        return float(np.clip(np.exp(-0.5 * ((x - c)/max(w,1e-6))**2), 1e-3, 1-1e-3))
+    elif kind == "high_better":
+        pivot = float(info.get("pivot", 3.0))
+        scale = float(info.get("scale", 2.0))
+        z = (x - pivot) / max(scale, 1e-6)
+        return float(1.0 / (1.0 + math.exp(-z)))
+    elif kind == "low_better":
+        pivot = (15.0 if var=="float_m" else 150.0 if var=="mcap_m" else 10.0)
+        scale = (6.0  if var=="float_m" else 80.0  if var=="mcap_m" else 5.0)
+        z = -(x - pivot) / max(scale, 1e-6)
+        return float(1.0 / (1.0 + math.exp(-z)))
+    return 0.5
+
+def _prior_blend_weight(var: str) -> float:
+    return float(PRIOR_BLEND_MAP.get(var, DEFAULT_PRIOR_BLEND))
+
 # =============== Learn from Excel (with reliability & priors) ===============
 def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[str, Any]:
     if _EXCEL_ENGINE is None:
