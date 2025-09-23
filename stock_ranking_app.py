@@ -14,7 +14,7 @@ st.title("Premarket Stock Ranking — Data-derived (PMH BO Merged)")
 st.markdown("""
 <style>
   html, body, [class*="css"] { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; font-size:13px; }
-  .section-title { font-weight: 700; font-size: 1.5rem; letter-spacing:.1px; margin: 4px 0 8px 0; }
+  .section-title { font-weight: 700; font-size: 0.95rem; letter-spacing:.1px; margin: 4px 0 8px 0; }
   .block-divider { border-bottom: 1px solid #e5e7eb; margin: 10px 0 12px 0; }
   .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-weight:600; font-size:.72rem; }
   .pill-good { background:#e7f5e9; color:#166534; border:1px solid #bbf7d0; }
