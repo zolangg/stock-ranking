@@ -13,18 +13,18 @@ st.title("Premarket Stock Ranking — Data-derived (PMH BO Merged)")
 
 st.markdown("""
 <style>
-  html, body, [class*="css"] { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; font-size:13px; }
-  .section-title { font-weight: 700; font-size: 0.95rem; letter-spacing:.1px; margin: 4px 0 8px 0; }
-  .block-divider { border-bottom: 1px solid #e5e7eb; margin: 10px 0 12px 0; }
-  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-weight:600; font-size:.72rem; }
+  html, body, [class*="css"] { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; font-size:14.25px; }
+  .section-title { font-weight: 700; font-size: 1.02rem; letter-spacing:.12px; margin: 4px 0 8px 0; }
+  .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 14px 0; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-weight:600; font-size:.78rem; }
   .pill-good { background:#e7f5e9; color:#166534; border:1px solid #bbf7d0; }
   .pill-warn { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; }
   .pill-bad  { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 11px; color:#374151; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 11.5px; color:#374151; }
   ul { margin: 4px 0 0 0; padding-left: 16px; }
-  li { margin-bottom: 1px; }
-  [data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.0rem; }
-  [data-testid="stMetric"] label { font-size: 0.75rem; color:#374151; }
+  li { margin-bottom: 2px; }
+  [data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.12rem; }
+  [data-testid="stMetric"] label { font-size: 0.82rem; color:#374151; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -236,17 +236,27 @@ def value_to_prob(var_key: str, model: Dict[str,Any], x_val: float) -> float:
     p_local = float(p[j])
     return float(np.clip(p_local, 1e-6, 1-1e-6))
 
-# Catalyst override & PM% anchor
+# ---------- Priors, anchors & guardrails ----------
+def si_directional_prior(x: float) -> Optional[float]:
+    if not np.isfinite(x): return None
+    # 0%→~0.25, 10%→~0.57, 20%→~0.73, 30%→~0.82
+    k = 0.25
+    x0 = 10.0
+    base = 0.25 + 0.65 / (1 + math.exp(-k * (x - x0)))
+    return float(np.clip(base, 0.20, 0.90))
+
+def blend_with_prior(var_key: str, x: float, p_learned: float) -> float:
+    if var_key == "si_pct":
+        prior = si_directional_prior(x)
+        if prior is not None:
+            p_learned = 0.40*prior + 0.60*p_learned
+    return float(np.clip(p_learned, 1e-6, 1-1e-6))
+
+# PM% & ATR special-case anchors (optional; generic anchor applies to all variables too)
 ANCHORS = {
     "pm_pct_daily": (8.0, 25.0),   # %
     "pm_pct_pred":  (8.0, 25.0),   # %
 }
-
-def catalyst_force_good(p: float, x_val: float, pb: float) -> float:
-    """If catalyst is on, ensure p is at least pb + CLASS_LIFT + small margin."""
-    if np.isfinite(x_val) and x_val >= 0.5:
-        return float(max(p, pb + CLASS_LIFT + 0.02))
-    return p
 
 def anchor_pm_percent(var_key: str, p: float, x_val: float, pb: float) -> float:
     band = ANCHORS.get(var_key)
@@ -254,8 +264,85 @@ def anchor_pm_percent(var_key: str, p: float, x_val: float, pb: float) -> float:
         return p
     lo, hi = band
     if lo <= x_val <= hi:
-        return float(max(p, pb + 0.10))  # +10pp lift min
+        return float(max(p, min(0.95, pb + 0.10)))  # +10pp lift target cap
     return p
+
+def anchor_atr(p: float, x: float, pb: float) -> float:
+    if not np.isfinite(x): return p
+    if 0.15 <= x <= 0.40:
+        return max(p, min(0.92, pb + 0.10))
+    if x < 0.10:
+        return min(p, 0.50)
+    return p
+
+# Learned sweet band per variable (generic)
+def _learn_anchor_band(centers: np.ndarray, p_curve: np.ndarray, pb: float, margin: float = 0.05):
+    above = p_curve >= (pb + margin)
+    if not np.any(above):
+        return None
+    idx = np.where(above)[0]
+    return float(centers[idx.min()]), float(centers[idx.max()])
+
+def _rank_from_value(model: dict, x: float) -> Optional[float]:
+    if not np.isfinite(x): return None
+    pr, vals = model["quantiles"]["pr"], model["quantiles"]["vals"]
+    if x <= vals.min(): return 0.0
+    if x >= vals.max(): return 1.0
+    idx = np.searchsorted(vals, x)
+    i0 = max(1, min(idx, len(vals)-1))
+    x0, x1 = vals[i0-1], vals[i0]
+    p0, p1 = pr[i0-1], pr[i0]
+    t = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
+    return float(p0 + t*(p1 - p0))
+
+def apply_anchor_generic(var_key: str, model: dict, x: float, p: float, lift: float = 0.10) -> float:
+    band = model.get("anchor_band", None)
+    if band is None: 
+        return p
+    r = _rank_from_value(model, x)
+    if r is None: 
+        return p
+    lo, hi = band
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
+        return p
+    if r < lo or r > hi:
+        weight = 0.0
+    else:
+        t = (r - lo) / max(1e-9, (hi - lo))
+        weight = 0.5 - 0.5 * math.cos(math.pi * t)
+    if weight <= 0.0:
+        return p
+    pb = float(model.get("p_base_var", 0.5))
+    target = min(0.95, pb + lift)
+    p_new = p + weight * (target - p)
+    return float(np.clip(p_new, 1e-6, 1-1e-6))
+
+def apply_rule_overrides(var_key: str, x: float, p: float) -> float:
+    # --- GAP ---
+    if var_key == "gap_pct" and np.isfinite(x):
+        if x > 350:
+            p = min(p, 0.35)   # hard cap → risk zone
+        elif x > 240:
+            p = min(p, 0.50)   # caution cap
+    # --- RVOL ---
+    if var_key == "rvol" and np.isfinite(x):
+        if x > 4000:
+            p = min(p, 0.38)
+        elif x > 3000:
+            p = min(p, 0.52)
+    # --- PM $Vol / MC ---
+    if var_key == "pmmc_pct" and np.isfinite(x):
+        if x > 200:
+            p = min(p, 0.40)
+        elif x > 100:
+            p = min(p, 0.55)
+    # --- PM Float Rotation ---
+    if var_key == "fr_x" and np.isfinite(x):
+        if x > 10:
+            p = min(p, 0.45)
+        elif x > 5:
+            p = min(p, 0.58)
+    return float(np.clip(p, 1e-6, 1-1e-6))
 
 # ============================== Upload & Learn (Main Pane) ==============================
 st.markdown('<div class="section-title">Upload workbook (sheet: PMH BO Merged)</div>', unsafe_allow_html=True)
@@ -342,6 +429,11 @@ if learn_btn:
                                 p_use = stretch_curve_to_unit(p_tp, base_p=p_base_var)
                                 m["p"] = p_use
                                 m["p_tp"] = p_tp
+
+                                # learn & store sweet-band anchor (rank space) for this variable
+                                band = _learn_anchor_band(centers, p_use, p_base_var, margin=0.05)
+                                m["anchor_band"] = band
+
                                 models[v] = m
 
                                 # weights from separation & amplitude
@@ -379,7 +471,7 @@ with tab_add:
             rvol     = input_float("RVOL @ BO", 0.0, min_value=0.0, decimals=2)
             pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
             pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
-            # Dilution slider under PM $ volume (as requested)
+            # Dilution slider under PM $ volume
             dilution_flag = st.select_slider("Dilution present?", options=[0,1], value=0,
                                              help="0 = none/negligible, 1 = present/overhang (penalizes log-odds)")
         with c3:
@@ -409,24 +501,32 @@ with tab_add:
             "catalyst": 1.0 if catalyst_flag=="Yes" else 0.0
         }
         if use_pm_pct_daily:
-            var_vals["pm_pct_daily"] = pm_pct_pred  # proxy value during premarket
+            # During premarket, use pm_pct_pred as proxy value to position inside the curve
+            var_vals["pm_pct_daily"] = pm_pct_pred
 
-        # Odds stacking with per-variable baselines, catalyst force, pm% anchor
+        # Odds stacking with per-variable baselines, priors, anchors, guardrails
         parts: Dict[str, Dict[str, float]] = {}
         z_sum = 0.0
         for k, x in var_vals.items():
             mdl = models.get(k)
             if mdl is None:
                 continue
-            p = value_to_prob(k, mdl, x)
+            p = value_to_prob(k, mdl, x)        # learned curve
             pb = float(mdl.get("p_base_var", 0.5))
 
-            # PM% anchor (8–25%)
+            # directional prior(s)
+            p = blend_with_prior(k, x, p)
+
+            # generic learned anchor (sweet band per variable)
+            p = apply_anchor_generic(k, mdl, x, p, lift=0.10)
+
+            # special-case anchors (keep if you want extra domain nudge)
+            if k == "atr_usd":
+                p = anchor_atr(p, x, pb)
             p = anchor_pm_percent(k, p, x, pb)
 
-            # Catalyst override to ensure Good when Yes
-            if k == "catalyst":
-                p = catalyst_force_good(p, x, pb)
+            # hard guardrails for exhaustion
+            p = apply_rule_overrides(k, x, p)
 
             w = float(weights.get(k, 0.0))
             parts[k] = {"x": x, "p": p, "w": w, "pb": pb}
@@ -483,10 +583,10 @@ with tab_add:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
         a,b,c,d,e = st.columns(5)
         a.metric("Last Ticker", l.get("Ticker","—"))
-        b.metric("Final Score", f"{l.get('FinalScore',0):.2f}")
+        b.metric("Final Score", f"{l.get("FinalScore",0):.2f}")
         c.metric("Grade", l.get("Level","—"))
         d.metric("Odds", l.get("Odds","—"))
-        e.metric("PredVol (M)", f"{l.get('PredVol_M',0):.2f}")
+        e.metric("PredVol (M)", f"{l.get("PredVol_M",0):.2f}")
 
         with st.expander("Premarket Checklist", expanded=True):
             st.markdown(f"**Verdict:** {l.get('VerdictPill','—')}", unsafe_allow_html=True)
@@ -534,14 +634,14 @@ with tab_curves:
             n = len(learned_vars)
             ncols = 3
             nrows = int(np.ceil(n / ncols))
-            fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*4.4, nrows*3.0))
+            fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*4.6, nrows*3.2))
             axes = np.atleast_2d(axes)
             for i, var in enumerate(learned_vars):
                 ax = axes[i//ncols, i % ncols]
                 m = models[var]
                 centers = m["centers"]; p = m["p"]; pb = m["p_base_var"]
                 ax.plot(centers, p, lw=2)
-                if show_baseline: ax.axhline(pb, ls="--", lw=1, color="gray")
+                if show_baseline: ax.axhline(pb, ls="--", lw=1)
                 ax.set_title(var, fontsize=11)
                 ax.set_xlabel("Rank (percentile)", fontsize=10)
                 ax.set_ylabel("P(FT)", fontsize=10)
@@ -556,9 +656,9 @@ with tab_curves:
                 st.warning(f"No curve learned for '{var}'.")
             else:
                 centers = m["centers"]; p = m["p"]; pb = m["p_base_var"]
-                fig, ax = plt.subplots(figsize=(6.0, 3.0))
+                fig, ax = plt.subplots(figsize=(6.4, 3.4))
                 ax.plot(centers, p, lw=2)
-                if show_baseline: ax.axhline(pb, ls="--", lw=1, color="gray")
+                if show_baseline: ax.axhline(pb, ls="--", lw=1)
                 ax.set_xlabel("Rank (percentile of variable)", fontsize=10)
                 ax.set_ylabel("P(FT | rank)", fontsize=10)
                 ax.set_title(f"{var} — FT curve (baseline dashed)", fontsize=11)
