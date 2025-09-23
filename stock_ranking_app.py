@@ -147,224 +147,100 @@ with c3:
 with c4:
     learn_btn = st.button("📚 Learn curves + weights", use_container_width=True)
 
-# ====================== TAB: Variable Sweet Spots ======================
 import numpy as np
 import pandas as pd
-import math
-import re
-import io
 
-def _nz(v, default=np.nan):
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-def _rank_smooth_curve(x: np.ndarray, y: np.ndarray, bandwidth=0.06, grid_points=201):
-    """Rank-transform x in [0,1], smooth P(FT|x) via Gaussian kernel."""
-    mask = np.isfinite(x) & np.isfinite(y)
-    x, y = x[mask], y[mask]
-    if len(x) < 30:
-        return None, None, None, None
-
+# --- Rank-smoothing (Gaussian kernel on rank space) ---
+def _rank_smooth(x, y, bandwidth=0.06, grid_points=201, min_rows=20):
+    x = pd.to_numeric(pd.Series(x), errors="coerce")
+    y = pd.to_numeric(pd.Series(y), errors="coerce")
+    mask = x.notna() & y.notna()
+    x, y = x[mask].to_numpy(float), y[mask].to_numpy(float)
+    if x.size < min_rows:
+        return None
     ranks = pd.Series(x).rank(pct=True).to_numpy()
     grid = np.linspace(0, 1, grid_points)
-
     h = float(bandwidth)
-    if not np.isfinite(h) or h <= 0: h = 0.06
-
-    # Nadaraya–Watson in rank space
-    out = np.empty_like(grid)
+    p_grid = np.empty_like(grid)
     for i, g in enumerate(grid):
-        w = np.exp(-0.5 * ((ranks - g) / h) ** 2)
+        w = np.exp(-0.5 * ((ranks - g)/h)**2)
         sw = w.sum()
-        out[i] = (w * y).sum() / sw if sw > 0 else np.nan
+        p_grid[i] = (w*y).sum()/sw if sw > 0 else np.nan
+    # fill ends
+    p_grid = pd.Series(p_grid).interpolate(limit_direction="both").fillna(y.mean()).to_numpy()
 
-    p_grid = np.where(np.isfinite(out), out, np.nan)
-    # light fill for NaNs at edges
-    if np.isnan(p_grid).any():
-        s = pd.Series(p_grid).interpolate(limit_direction="both").fillna(0.5)
-        p_grid = s.to_numpy()
+    # local support via rank histogram
+    bins = np.linspace(0,1,51)
+    counts, _ = np.histogram(ranks, bins=bins)
+    bin_idx = np.clip(np.searchsorted(bins, grid, side="right")-1, 0, len(counts)-1)
+    support = counts[bin_idx]
+    return {"grid":grid, "p_grid":p_grid, "p0":float(y.mean()), "support":support}
 
-    return ranks, grid, p_grid, len(x)
-
-def _zones_from_curve(grid, p_grid, sweet_thr=0.60, risk_thr=0.40, min_span=0.03):
-    """Return contiguous (lo,hi) rank-intervals for sweet/risk zones."""
-    sweet, risk = [], []
-    # sweet
-    m = p_grid >= sweet_thr
-    i = 0
-    while i < len(grid):
-        if m[i]:
-            j = i
-            while j+1 < len(grid) and m[j+1]:
-                j += 1
-            lo, hi = grid[i], grid[j]
-            if (hi - lo) >= min_span:
-                sweet.append((float(lo), float(hi)))
-            i = j + 1
+# --- Merge mask runs allowing tiny gaps ---
+def _intervals_with_gap(mask, x, max_gap=0.02, min_span=0.03):
+    idx = np.where(mask)[0]
+    if idx.size == 0: return []
+    ivals, start, last = [], idx[0], idx[0]
+    for k in idx[1:]:
+        if (x[k] - x[last]) <= max_gap:
+            last = k
         else:
-            i += 1
-    # risk
-    m = p_grid <= risk_thr
-    i = 0
-    while i < len(grid):
-        if m[i]:
-            j = i
-            while j+1 < len(grid) and m[j+1]:
-                j += 1
-            lo, hi = grid[i], grid[j]
+            lo, hi = x[start], x[last]
             if (hi - lo) >= min_span:
-                risk.append((float(lo), float(hi)))
-            i = j + 1
-        else:
-            i += 1
-    return sweet, risk
+                ivals.append((float(lo), float(hi)))
+            start = last = k
+    lo, hi = x[start], x[last]
+    if (hi - lo) >= min_span:
+        ivals.append((float(lo), float(hi)))
+    return ivals
 
-def _rank_to_value_interval(x: np.ndarray, lo_rank: float, hi_rank: float):
-    """Map rank-interval back to original value interval via quantiles."""
-    lo_v = np.nanquantile(x, max(0.0, min(1.0, lo_rank)))
-    hi_v = np.nanquantile(x, max(0.0, min(1.0, hi_rank)))
-    return float(lo_v), float(hi_v)
+# --- Tail penalty for exhaustion-prone variables (damp lift beyond ~95th rank) ---
+_EXHAUSTION_VARS = {"gap_pct","rvol","pm_dol_m","pmmc_pct","fr_x"}
 
-def _format_intervals_rank(ivals):
-    if not ivals: return ""
-    return "; ".join([f"[{lo:.2f}, {hi:.2f}]" for lo,hi in ivals])
+def _apply_tail_penalty(var_key, grid, p_grid, p0):
+    if var_key not in _EXHAUSTION_VARS:
+        return p_grid
+    # linear ramp from rank 0.90->0.98; keep at most 30% of the lift at the very top
+    tail = np.clip((grid - 0.90) / 0.08, 0, 1)
+    penalty = 1.0 - 0.7 * tail
+    return p0 + (p_grid - p0) * penalty
 
-def _format_intervals_val(ivals):
-    if not ivals: return ""
-    # compact formatting with thousands where needed
-    def fmt(v):
-        if abs(v) >= 1000: return f"{v:,.0f}"
-        if abs(v) >= 100:  return f"{v:.1f}"
-        if abs(v) >= 1:    return f"{v:.2f}"
-        return f"{v:.3f}"
-    return "; ".join([f"[{fmt(lo)}, {fmt(hi)}]" for lo,hi in ivals])
+# --- Sweet/Risk finder (lift-over-baseline + support + gap-merge + tail penalty) ---
+def find_sweet_risk_ranges(x, y, var_key,
+                           lift_thr=0.06,     # how much over baseline to call "sweet"
+                           min_support=3,     # minimum local obs
+                           max_gap=0.02,      # allow gaps in rank
+                           min_span=0.03):    # minimum span in rank
+    res = _rank_smooth(x, y, bandwidth=0.06, grid_points=201, min_rows=20)
+    if res is None:
+        return {"sweet_rank":[], "sweet_vals":[], "risk_rank":[], "risk_vals":[], "p0":np.nan}
 
-def _pick_col(df: pd.DataFrame, patterns):
-    cols = {c: re.sub(r"\s+", " ", c.strip().lower()) for c in df.columns}
-    if isinstance(patterns, str): patterns = [patterns]
-    for pat in patterns:
-        pat = pat.lower()
-        # exact
-        for c, n in cols.items():
-            if n == pat: return c
-        # contains
-        for c, n in cols.items():
-            if pat in n: return c
-    return None
+    grid, p, p0, sup = res["grid"], res["p_grid"], res["p0"], res["support"]
 
-with st.tabs(["➕ Add Stock", "📊 Ranking", "📊 Variable Sweet Spots"])[2]:
-    st.markdown('<div class="section-title">Variable Sweet Spots (from PMH BO Merged)</div>', unsafe_allow_html=True)
-    if uploaded is None:
-        st.info("Upload your Excel first in the main app pane, then return to this tab.")
-    else:
-        try:
-            xls = pd.ExcelFile(uploaded)
-            if "PMH BO Merged" not in xls.sheet_names:
-                st.error(f"'PMH BO Merged' sheet not found. Available: {xls.sheet_names}")
-            else:
-                merged = pd.read_excel(xls, "PMH BO Merged")
-                # required FT column
-                ft_col = _pick_col(merged, ["ft"])
-                if ft_col is None:
-                    st.error("Could not find 'FT' label column in PMH BO Merged.")
-                else:
-                    merged = merged.copy()
-                    y = pd.to_numeric(merged[ft_col], errors="coerce").to_numpy()
+    # penalize exhaustion tails for certain vars
+    p = _apply_tail_penalty(var_key, grid, p, p0)
 
-                    # build candidate variables (flexible names)
-                    var_specs = [
-                        ("gap %",            ["gap %","gap%","premarket gap"]),
-                        ("atr $",            ["atr","atr $"]),
-                        ("rvol @ bo",        ["rvol @ bo","rvol"]),
-                        ("si (short interest %)", ["si","short interest","short float"]),
-                        ("pm vol (m)",       ["pm vol (m)","premarket vol (m)","pm volume (m)"]),
-                        ("pm $vol (m)",      ["pm $vol (m)","pm dollar vol (m)","premarket $vol (m)"]),
-                        ("float m shares",   ["float m shares","public float (m)","float (m)"]),
-                        ("marketcap m",      ["marketcap m","market cap (m)","mcap m","mcap"]),
-                        ("fr @ bo (×)",      ["fr @ bo","float rotation","rotation @ bo","fr bo"]),
-                        ("pm $vol / mc %",   ["pm $vol / mc %","pm$ / mc %","pm dollar / mcap %"]),
-                        ("pm vol % of pred", ["pm vol % of pred","pm%pred","pm vol pct of predicted"]),
-                        ("catalyst (0/1)",   ["catalyst","news","pr"])  # binary-ish if present
-                    ]
+    # define sweet/risk by lift vs baseline and support
+    sweet_mask = (p >= p0 + lift_thr) & (sup >= min_support)
+    risk_mask  = (p <= p0 - lift_thr) & (sup >= min_support)
 
-                    rows = []
-                    for label, pats in var_specs:
-                        col = _pick_col(merged, pats)
-                        if col is None:
-                            # silently skip missing variables
-                            continue
-                        x = pd.to_numeric(merged[col], errors="coerce").to_numpy()
+    sweet_rank = _intervals_with_gap(sweet_mask, grid, max_gap=max_gap, min_span=min_span)
+    risk_rank  = _intervals_with_gap(risk_mask,  grid, max_gap=max_gap, min_span=min_span)
 
-                        # rank-smooth
-                        res = _rank_smooth_curve(x, y, bandwidth=0.06, grid_points=201)
-                        if res[0] is None:
-                            continue
-                        ranks, grid, p_grid, n = res
+    # map rank intervals -> original value intervals
+    xv = pd.to_numeric(pd.Series(x), errors="coerce").dropna().to_numpy(float)
+    def r2v(ivals):
+        out=[]
+        for lo,hi in ivals:
+            lo_v = float(np.nanquantile(xv, lo))
+            hi_v = float(np.nanquantile(xv, hi))
+            out.append((lo_v, hi_v))
+        return out
 
-                        sweet, risk = _zones_from_curve(grid, p_grid, sweet_thr=0.60, risk_thr=0.40, min_span=0.03)
-                        # map intervals to original units
-                        sweet_vals = [_rank_to_value_interval(x, lo, hi) for (lo,hi) in sweet]
-                        risk_vals  = [_rank_to_value_interval(x, lo, hi) for (lo,hi) in risk]
-
-                        # peak
-                        i_peak = int(np.nanargmax(p_grid))
-                        peak_rank = float(grid[i_peak])
-                        peak_val  = float(np.nanquantile(x, peak_rank))
-                        peak_p    = float(p_grid[i_peak])
-
-                        rows.append({
-                            "Variable": label,
-                            "N": int(n),
-                            "Sweet rank": _format_intervals_rank(sweet),
-                            "Sweet values": _format_intervals_val(sweet_vals),
-                            "Risk rank": _format_intervals_rank(risk),
-                            "Risk values": _format_intervals_val(risk_vals),
-                            "Peak p(FT)": round(peak_p, 3),
-                            "Peak rank": round(peak_rank, 3),
-                            "Peak value": peak_val if math.isfinite(peak_val) else ""
-                        })
-
-                    if not rows:
-                        st.warning("No usable variables found or too few rows (need ≥30).")
-                    else:
-                        out_df = pd.DataFrame(rows)
-                        # pretty numeric formatting for Peak value
-                        def _fmt_peak(v):
-                            try:
-                                v = float(v)
-                                if abs(v) >= 1000: return f"{v:,.0f}"
-                                if abs(v) >= 100:  return f"{v:.1f}"
-                                if abs(v) >= 1:    return f"{v:.2f}"
-                                return f"{v:.3f}"
-                            except Exception:
-                                return v
-                        out_df["Peak value"] = out_df["Peak value"].apply(_fmt_peak)
-
-                        st.dataframe(
-                            out_df,
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "Variable": st.column_config.TextColumn("Variable"),
-                                "N": st.column_config.NumberColumn("Rows", format="%d"),
-                                "Sweet rank": st.column_config.TextColumn("Sweet spot (rank)"),
-                                "Sweet values": st.column_config.TextColumn("Sweet spot (original units)"),
-                                "Risk rank": st.column_config.TextColumn("Risk zone (rank)"),
-                                "Risk values": st.column_config.TextColumn("Risk zone (original units)"),
-                                "Peak p(FT)": st.column_config.NumberColumn("Peak p(FT)", format="%.3f"),
-                                "Peak rank": st.column_config.NumberColumn("Peak rank", format="%.3f"),
-                                "Peak value": st.column_config.TextColumn("Peak value"),
-                            }
-                        )
-
-                        # Download CSV
-                        csv = out_df.to_csv(index=False).encode("utf-8")
-                        st.download_button("Download sweet/risk table (CSV)", csv, "sweet_risk_table.csv", "text/csv", use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Analysis failed: {e}")
+    sweet_vals = r2v(sweet_rank)
+    risk_vals  = r2v(risk_rank)
+    return {"sweet_rank":sweet_rank, "sweet_vals":sweet_vals,
+            "risk_rank":risk_rank,   "risk_vals":risk_vals, "p0":p0}
           
 # ================= Sidebar (utility controls only) =================
 st.sidebar.header("Prediction Uncertainty")
