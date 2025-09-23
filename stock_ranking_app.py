@@ -545,6 +545,20 @@ if st.session_state.CURVES:
         st.markdown("**Logistic meta-weights (normalized)**")
         st.dataframe(st.session_state.CURVES.get("weights_table", pd.DataFrame()), use_container_width=True, hide_index=True)
 
+# --- Curve plots ---
+if st.session_state.CURVES:
+    curves = st.session_state.CURVES.get("curves", {})
+    if curves:
+        st.markdown('<div class="section-title">📈 Learned probability curves</div>', unsafe_allow_html=True)
+        for v, m in curves.items():
+            if "grid_t" in m and "p_grid" in m:
+                df_curve = pd.DataFrame({
+                    "x": np.exp(m["grid_t"]) if m["use_log"] else m["grid_t"],
+                    "p_ft": m["p_grid"]
+                })
+                st.line_chart(df_curve.set_index("x"), height=200)
+                st.caption(f"{v} — learned P(FT|x) curve (log scale: {m['use_log']})")
+              
 # ================= Per-variable prob helpers =================
 def per_var_prob(curves: Dict[str, Any], var_key: str, xval: float) -> float:
     m = curves.get(var_key)
