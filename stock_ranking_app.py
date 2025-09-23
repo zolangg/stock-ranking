@@ -42,8 +42,7 @@ PEN_TAU = 0.60          # penalties scaled by this (softer than TAU)
 MAX_PER_VAR_PEN = 0.50  # max |Δlogodds| per variable from tail penalty
 MAX_TOTAL_PEN   = 1.20  # max |sum of penalties| in log-odds (~ -20–25 ppt)
 
-# Modifiers (shown in Checklist as manual)
-CATALYST_LOGODDS_COEF = 0.35
+# Modifiers (Catalyst is learned from DB; Dilution is manual)
 DILUTION_LOGODDS_COEF = -0.35
 
 # Correlated PM activity cluster
@@ -149,9 +148,14 @@ _SYNONYMS = {
     "rvol":          ["rvol @ bo","rvol","relative volume","rvol bo"],
     "atr_usd":       ["atr","atr $","atr (usd)","atr $/day"],
     "si_pct": [
-        "short interest %","SI","si %","shortinterest %",
+        "short interest %","si","si %","shortinterest %",
         "short float %","short %","short float","shortinterest float %",
         "short interest (float) %","short interest percent","short ratio %"
+    ],
+    # Catalyst column (binary 0/1 or Y/N)
+    "catalyst": [
+        "catalyst","news","pr","press release","has news","has catalyst","catalyst flag",
+        "headline","filing","8-k","positive catalyst","binary catalyst"
     ],
 }
 
@@ -191,8 +195,11 @@ def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 def _numify(s: pd.Series) -> pd.Series:
     s = pd.Series(s).astype(str).str.replace(",","", regex=False).str.replace("'","", regex=False).str.strip()
-    s = s.str.replace("%","", regex=False)
-    return pd.to_numeric(s, errors="coerce")
+    # convert typical booleans/strings into 0/1 where appropriate
+    s_low = s.str.lower()
+    s_low = s_low.replace({"true":"1","false":"0","yes":"1","no":"0","y":"1","n":"0"})
+    s_low = s_low.str.replace("%","", regex=False)
+    return pd.to_numeric(s_low, errors="coerce")
 
 def _ensure_gap_pct(series: pd.Series) -> pd.Series:
     s = _numify(series)
@@ -211,6 +218,7 @@ def build_numeric_table(df: pd.DataFrame) -> pd.DataFrame:
     col_rvol  = _pick(df, "rvol")
     col_atr   = _pick(df, "atr_usd")
     col_si    = _pick(df, "si_pct")
+    col_cat   = _pick(df, "catalyst")
 
     out = pd.DataFrame()
     if col_gap:   out["gap_pct"]     = _ensure_gap_pct(df[col_gap])
@@ -222,6 +230,7 @@ def build_numeric_table(df: pd.DataFrame) -> pd.DataFrame:
     if col_float: out["float_m"]     = _numify(df[col_float])
     if col_mcap:  out["mcap_m"]      = _numify(df[col_mcap])
     if col_daily: out["daily_vol_m"] = _numify(df[col_daily])
+    if col_cat:   out["catalyst"]    = (_numify(df[col_cat]).round().clip(0,1))  # force 0/1
 
     # Derived
     if "pm_vol_m" in out and "float_m" in out:
@@ -245,7 +254,7 @@ def build_numeric_table(df: pd.DataFrame) -> pd.DataFrame:
 def reveal_mapping(df: pd.DataFrame) -> pd.DataFrame:
     dfc = _clean_cols(df)
     rows = []
-    for key in ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m","float_m","mcap_m","daily_vol_m"]:
+    for key in ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m","float_m","mcap_m","daily_vol_m","catalyst"]:
         col = _pick(dfc, key)
         rows.append({"Logical": key, "Matched Column": col if col else "(not found)"})
     return pd.DataFrame(rows)
@@ -263,8 +272,10 @@ def fit_curve(series: pd.Series, labels: pd.Series):
     if len(x_raw) < MIN_ROWS:
         return None
 
+    # auto-log for positive skewed, but keep binary as-is
     use_log = False
-    if (x_raw > 0).all():
+    is_binary = np.isclose(x_raw, 0).sum() + np.isclose(x_raw, 1).sum() == len(x_raw)
+    if (x_raw > 0).all() and (not is_binary):
         if abs(pd.Series(x_raw).skew()) > 0.75:
             use_log = True
 
@@ -368,47 +379,25 @@ def _rebalance_group_weights(reliab: Dict[str, float]) -> Dict[str, float]:
 # kind: "hump" (sweet-spot), "high_better", "low_better"
 PRIORS = {
     "gap_pct":     {"kind":"hump", "c":100.0, "w":60.0},   # sweet ~100%, fades outside
-    "rvol":        {"kind":"hump", "c":10.0,  "w":8.0},    # sweet ~10x, fades low/high (too high overheats)
+    "rvol":        {"kind":"hump", "c":10.0,  "w":8.0},    # sweet ~10x, fades low/high
     "pm_dol_m":    {"kind":"hump", "c":10.0,  "w":10.0},   # $7–15M sweet
     "pm_vol_m":    {"kind":"high_better"},                 # more PM shares (to a point)
     "pm_pct_pred": {"kind":"hump", "c":18.0,  "w":12.0},   # ~10–25% sweet
-    "pmmc_pct":    {"kind":"hump", "c":15.0,  "w":15.0},   # ~5–30% ok; very high bloated
+    "pmmc_pct":    {"kind":"hump", "c":15.0,  "w":15.0},   # ~5–30% ok
     "atr_usd":     {"kind":"hump", "c":0.30,  "w":0.20},   # 0.2–0.4 sweet
     "float_m":     {"kind":"low_better"},                  # smaller float better until extreme
     "mcap_m":      {"kind":"low_better"},                  # smaller cap better
-    "si_pct":      {"kind":"high_better", "pivot":10.0, "scale":5.0},  # <<< skewed high-is-better
-    "fr_x":        {"kind":"hump", "c":0.25,  "w":0.20},   # ~0.1–0.5x sweet; too high => front-loaded
+    "si_pct":      {"kind":"high_better", "pivot":10.0, "scale":5.0},  # high SI helps
+    "fr_x":        {"kind":"hump", "c":0.25,  "w":0.20},   # ~0.1–0.5x sweet
+    "catalyst":    {"kind":"high_better", "pivot":0.5, "scale":0.35},  # 0/1; 1 strongly helps
 }
 
 # Prior blend weights (per-variable)
 DEFAULT_PRIOR_BLEND = 0.30
 PRIOR_BLEND_MAP = {
-    "si_pct": 0.55,    # stronger blend for SI so low SI doesn't look great; high SI helps
-    # others inherit DEFAULT_PRIOR_BLEND
+    "si_pct":   0.55,    # stronger blend for SI
+    "catalyst": 0.60,    # stronger blend for catalyst (binary)
 }
-
-def _prior_p(var: str, x: float) -> float:
-    if not np.isfinite(x): return 0.5
-    info = PRIORS.get(var, None)
-    if info is None: return 0.5
-    kind = info.get("kind","hump")
-    if kind == "hump":
-        c = float(info.get("c", 0.0)); w = float(info.get("w", 1.0))
-        return float(np.clip(np.exp(-0.5 * ((x - c)/max(w,1e-6))**2), 1e-3, 1-1e-3))
-    elif kind == "high_better":
-        pivot = float(info.get("pivot", 3.0))
-        scale = float(info.get("scale", 2.0))
-        z = (x - pivot) / max(scale, 1e-6)
-        return float(1.0 / (1.0 + math.exp(-z)))
-    elif kind == "low_better":
-        pivot = (15.0 if var=="float_m" else 150.0 if var=="mcap_m" else 10.0)
-        scale = (6.0  if var=="float_m" else 80.0  if var=="mcap_m" else 5.0)
-        z = -(x - pivot) / max(scale, 1e-6)
-        return float(1.0 / (1.0 + math.exp(-z)))
-    return 0.5
-
-def _prior_blend_weight(var: str) -> float:
-    return float(PRIOR_BLEND_MAP.get(var, DEFAULT_PRIOR_BLEND))
 
 # =============== Learn from Excel (with reliability & priors) ===============
 def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[str, Any]:
@@ -440,7 +429,8 @@ def learn_all_curves_from_excel(file, ft_sheet: str, fail_sheet: str) -> Dict[st
     var_list = [
         "gap_pct","atr_usd","rvol","si_pct",
         "pm_vol_m","pm_dol_m","float_m","mcap_m",
-        "fr_x","pmmc_pct","pm_pct_pred"
+        "fr_x","pmmc_pct","pm_pct_pred",
+        "catalyst",   # NEW: learned from DB
     ]
     curves = {}
     for v in var_list:
@@ -520,6 +510,7 @@ DOMAIN_OVERRIDES = {
     "mcap_m":      {"low": None,  "high": 150.0},
     "si_pct":      {"low": 0.5,   "high": 35.0},
     "fr_x":        {"low": 1e-3,  "high": 1.00},
+    "catalyst":    {"low": None,  "high": None},  # binary; no tail penalties
 }
 
 BASE_PEN_STRENGTH = {
@@ -534,6 +525,7 @@ BASE_PEN_STRENGTH = {
     "mcap_m":      (0.10, 0.30),
     "si_pct":      (0.10, 0.25),
     "fr_x":        (0.15, 0.45),
+    "catalyst":    (0.00, 0.00),   # no tail penalties for binary catalyst
 }
 
 def _qr_band(s: pd.Series, p_lo=5, p_hi=95) -> Tuple[float, float]:
@@ -558,7 +550,7 @@ def _blend(a_low, a_high, b_low, b_high, w=0.35):
 def build_guardrails(curves_pack: Dict[str,Any]) -> Dict[str, Dict[str,float]]:
     out = {}
     train = curves_pack.get("train_num", pd.DataFrame())
-    vars_all = ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m","float_m","mcap_m","fr_x","pmmc_pct","pm_pct_pred"]
+    vars_all = ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m","float_m","mcap_m","fr_x","pmmc_pct","pm_pct_pred","catalyst"]
     for v in vars_all:
         if v in train.columns:
             lo_d, hi_d = _qr_band(train[v], 5, 95)
@@ -597,13 +589,7 @@ def tail_penalty_bidirectional_soft(x: float, low: Optional[float], high: Option
     pen = float(np.clip(pen, -MAX_PER_VAR_PEN, MAX_PER_VAR_PEN))
     return pen
 
-# =============== Sidebar: Modifiers & Uncertainty ===============
-st.sidebar.header("Manual Modifiers")
-catalyst_points = st.sidebar.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05,
-                                    help="Manual catalyst strength. Positive moves odds up.")
-dilution_points = st.sidebar.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05,
-                                    help="Manual dilution/ATM/overhang. Negative moves odds down.")
-
+# =============== Sidebar: Uncertainty & Tail tuning ===============
 st.sidebar.header("Prediction Uncertainty")
 sigma_ln = st.sidebar.slider("Log-space σ (residual std dev)", 0.10, 1.50, 0.60, 0.01)
 
@@ -684,7 +670,7 @@ with tab_add:
     st.markdown('<div class="section-title">2) Enter inputs</div>', unsafe_allow_html=True)
 
     with st.form("add_form", clear_on_submit=True):
-        col1, col2, col3 = st.columns([1.2, 1.2, 0.9])
+        col1, col2, col3 = st.columns([1.2, 1.2, 1.0])
 
         with col1:
             ticker   = st.text_input("Ticker", "").strip().upper()
@@ -698,9 +684,13 @@ with tab_add:
             rvol     = input_float("RVOL",    0.0, min_value=0.0, decimals=2)
             pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
             pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
+            dilution_points = st.slider("Dilution (manual)  −1.0 … +1.0", -1.0, 1.0, 0.0, 0.05,
+                                        help="Manual dilution/ATM/overhang. Negative moves odds down.")
 
         with col3:
-            st.caption("Catalyst / Dilution are set in the sidebar ➜")
+            catalyst_manual = st.selectbox("Catalyst present?", ["Auto (from DB curve)", "Yes", "No"], index=0,
+                                           help="This only changes the text label shown; the *probability* comes from the learned Catalyst curve. Choose Yes/No if you want the checklist label to reflect your read today.")
+            st.caption("Catalyst probability contribution is learned from the DB (no slider).")
 
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
@@ -728,8 +718,31 @@ with tab_add:
         # Guardrails (data + domain, blended)
         guardrails = build_guardrails(curves_pack)
 
-        # Per-variable probabilities with diagnostics + domain-prior blend (SI gets stronger blend)
+        # Per-variable probabilities with diagnostics + domain-prior blend (SI/Catalyst have stronger prior)
         st.session_state["DEBUG_POF"] = {}
+        def _prior_p(var: str, x: float) -> float:
+            if not np.isfinite(x): return 0.5
+            info = PRIORS.get(var, None)
+            if info is None: return 0.5
+            kind = info.get("kind","hump")
+            if kind == "hump":
+                c = float(info.get("c", 0.0)); w = float(info.get("w", 1.0))
+                return float(np.clip(np.exp(-0.5 * ((x - c)/max(w,1e-6))**2), 1e-3, 1-1e-3))
+            elif kind == "high_better":
+                pivot = float(info.get("pivot", 3.0))
+                scale = float(info.get("scale", 2.0))
+                z = (x - pivot) / max(scale, 1e-6)
+                return float(1.0 / (1.0 + math.exp(-z)))
+            elif kind == "low_better":
+                pivot = (15.0 if var=="float_m" else 150.0 if var=="mcap_m" else 10.0)
+                scale = (6.0  if var=="float_m" else 80.0  if var=="mcap_m" else 5.0)
+                z = -(x - pivot) / max(scale, 1e-6)
+                return float(1.0 / (1.0 + math.exp(-z)))
+            return 0.5
+
+        def _prior_blend_weight(var: str) -> float:
+            return float(PRIOR_BLEND_MAP.get(var, DEFAULT_PRIOR_BLEND))
+
         def p_of(var_key, x) -> float:
             dbg = st.session_state.setdefault("DEBUG_POF", {})
             m = curves.get(var_key)
@@ -756,7 +769,7 @@ with tab_add:
             dbg[var_key] = f"ok: curve={p_curve:.3f}, prior={p_prior:.3f}, blend_w={w_blend:.2f}, blend={p:.3f}"
             return p
 
-        # Evaluate all variables
+        # Evaluate variables including catalyst (from DB)
         probs = {
             "gap_pct":     p_of("gap_pct", gap_pct),
             "atr_usd":     p_of("atr_usd", atr_usd),
@@ -769,6 +782,7 @@ with tab_add:
             "fr_x":        p_of("fr_x", fr_x),
             "pmmc_pct":    p_of("pmmc_pct", pmmc_pct),
             "pm_pct_pred": p_of("pm_pct_pred", pm_pct_pred),
+            "catalyst":    p_of("catalyst", 1.0 if catalyst_manual=="Yes" else 0.0 if catalyst_manual=="No" else 1.0),  # show optimistic label if Auto; prob still from curve form 1.0/0.0 input
         }
 
         # --- Calibrated odds stacking (curves) ---
@@ -780,7 +794,7 @@ with tab_add:
             w   = float(np.clip(reliab.get(k, 0.0), 0.0, 1.0))
             z_sum += TAU * w * dz
 
-        # --- Soft tail-risk penalties for ALL variables ---
+        # --- Soft tail-risk penalties (Catalyst has none) ---
         penalty_debug = {}
         def apply_pen(var_key: str, value: float):
             band = guardrails.get(var_key, {})
@@ -788,22 +802,17 @@ with tab_add:
             base_low, base_high = BASE_PEN_STRENGTH.get(var_key, (0.25, 0.25))
             kL = tail_scale * base_low  * per_var_mult.get((var_key,"low"), 1.0)
             kH = tail_scale * base_high * per_var_mult.get((var_key,"high"),1.0)
-            rel_w = float(np.clip(reliab.get(var_key, 0.0), 0.0, 1.0))  # evidence-weighted
+            rel_w = float(np.clip(reliab.get(var_key, 0.0), 0.0, 1.0))
             pen = tail_penalty_bidirectional_soft(value, low, high, kL, kH, rel_w,
                                                   deadzone_frac=0.05, alpha=0.60)
             penalty_debug[var_key] = {"low":low,"high":high,"pen_raw":pen}
             return pen
 
-        pen_list = []
         for vkey in ["gap_pct","rvol","pm_dol_m","pm_vol_m","pm_pct_pred","pmmc_pct","atr_usd","float_m","mcap_m","si_pct","fr_x"]:
-            pen_list.append(apply_pen(vkey, locals().get(vkey, float("nan"))))
-        pen_total = float(np.sum(pen_list))
-        pen_total = float(np.clip(pen_total, -MAX_TOTAL_PEN, MAX_TOTAL_PEN))
-        z_sum += PEN_TAU * pen_total
-        penalty_debug["_total_penalty"] = round(PEN_TAU * pen_total, 3)
+            z_sum += PEN_TAU * apply_pen(vkey, locals().get(vkey, float("nan")))
+        penalty_debug["_note"] = "No tail penalties for binary 'catalyst'."
 
-        # Modifiers (manual)
-        z_sum += CATALYST_LOGODDS_COEF * float(catalyst_points)
+        # Manual Dilution modifier
         z_sum += DILUTION_LOGODDS_COEF * float(dilution_points)
 
         # Final numeric probability
@@ -822,9 +831,11 @@ with tab_add:
         names_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
             "pm_vol_m":"PM Volume (M)","pm_dol_m":"PM $Vol (M)","float_m":"Float (M)","mcap_m":"MarketCap (M)",
-            "fr_x":"PM Float Rotation ×","pmmc_pct":"PM $Vol / MC %","pm_pct_pred":"PM Vol % of Pred"
+            "fr_x":"PM Float Rotation ×","pmmc_pct":"PM $Vol / MC %","pm_pct_pred":"PM Vol % of Pred",
+            "catalyst":"Catalyst",
         }
 
+        # Contribution label
         def contribution_label(var_key: str, p: float) -> str:
             z_k = math.log(max(p,1e-6) / max(1 - p, 1e-6))
             z0  = float(ref_logit.get(var_key, 0.0))
@@ -837,12 +848,6 @@ with tab_add:
 
         # Build readable checklist rows with values + probs
         checklist_rows = []
-        value_map = {
-            "Gap %": gap_pct, "ATR $": atr_usd, "RVOL": rvol, "Short Interest %": si_pct,
-            "PM Volume (M)": pm_vol_m, "PM $Vol (M)": pm_dol_m, "Float (M)": float_m,
-            "MarketCap (M)": mc_m, "PM Float Rotation ×": fr_x, "PM $Vol / MC %": pmmc_pct,
-            "PM Vol % of Pred": pm_pct_pred,
-        }
         # Prediction info first
         if np.isfinite(pred_vol_m):
             pred_ci68 = f"{ci68_l:.2f}–{ci68_u:.2f}M"
@@ -851,6 +856,12 @@ with tab_add:
         if np.isfinite(pm_pct_pred):
             checklist_rows.append(f"- **PM Vol / Predicted Day Vol**: {pm_pct_pred:.1f}%")
 
+        value_map = {
+            "Gap %": gap_pct, "ATR $": atr_usd, "RVOL": rvol, "Short Interest %": si_pct,
+            "PM Volume (M)": pm_vol_m, "PM $Vol (M)": pm_dol_m, "Float (M)": float_m,
+            "MarketCap (M)": mc_m, "PM Float Rotation ×": fr_x, "PM $Vol / MC %": pmmc_pct,
+            "PM Vol % of Pred": pm_pct_pred, "Catalyst": (1.0 if catalyst_manual=="Yes" else 0.0 if catalyst_manual=="No" else float('nan')),
+        }
         for key, p in probs.items():
             label = names_map.get(key, key)
             role = contribution_label(key, p)
@@ -858,15 +869,15 @@ with tab_add:
             if v is None or not np.isfinite(v):
                 val_str = "—"
             else:
-                if abs(v) >= 1000: val_str = f"{v:,.0f}"
+                if label == "Catalyst":
+                    val_str = "Yes" if v >= 0.5 else "No"
+                elif abs(v) >= 1000: val_str = f"{v:,.0f}"
                 elif abs(v) >= 100: val_str = f"{v:.0f}"
                 elif abs(v) >= 10:  val_str = f"{v:.1f}"
                 else:               val_str = f"{v:.2f}"
             checklist_rows.append(f"- **{label}**: {val_str} → *{role}* (p≈{p*100:.0f}%)")
 
-        # Manual modifiers at the end (explicit)
-        if abs(catalyst_points) > 1e-9:
-            checklist_rows.append(f"- **Catalyst (manual)**: {catalyst_points:+.2f} → Δlogodds ≈ {CATALYST_LOGODDS_COEF*catalyst_points:+.2f}")
+        # Manual Dilution at the end (explicit)
         if abs(dilution_points) > 1e-9:
             checklist_rows.append(f"- **Dilution (manual)**: {dilution_points:+.2f} → Δlogodds ≈ {DILUTION_LOGODDS_COEF*dilution_points:+.2f}")
 
@@ -884,7 +895,7 @@ with tab_add:
             # Inputs for export/debug
             "_MCap_M": mc_m, "_Gap_%": gap_pct, "_SI_%": si_pct, "_ATR_$": atr_usd,
             "_PM_M": pm_vol_m, "_PM$_M": pm_dol_m, "_Float_M": float_m,
-            "_Catalyst": float(catalyst_points), "_Dilution": float(dilution_points),
+            "_Dilution": float(dilution_points),
 
             # Display
             "PremarketVerdict": verdict,
