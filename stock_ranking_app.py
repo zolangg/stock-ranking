@@ -367,7 +367,7 @@ def _prob_to_grade(prob: float, cuts: Dict[str, float]) -> str:
     return "D"
 
 # ============================== Upload & Learn (Main Pane) ==============================
-st.markdown('<div class="section-title">Upload workbook (sheet: PMH BO Merged)</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Upload workbook</div>', unsafe_allow_html=True)
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], label_visibility="collapsed")
 merged_sheet = st.text_input("Sheet name", "PMH BO Merged")
 learn_btn = st.button("Learn rules from merged", use_container_width=True)
