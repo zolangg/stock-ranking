@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt
 from typing import Optional, Dict, Any, List
 
 # ============================== Page & CSS ==============================
-st.set_page_config(page_title="Premarket Stock Ranking — PMH BO Merged", layout="wide")
-st.title("Premarket Stock Ranking — Data-derived (PMH BO Merged)")
+st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
+st.title("Premarket Stock Ranking")
 
 st.markdown("""
 <style>
