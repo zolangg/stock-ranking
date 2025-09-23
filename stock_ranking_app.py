@@ -51,8 +51,8 @@ show_baseline   = st.sidebar.checkbox("Curves: show baseline", True)
 plot_all_curves = st.sidebar.checkbox("Curves: plot ALL variables", False)
 sel_curve_var   = st.sidebar.selectbox(
     "Or plot one variable",
-    ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m","float_m","mcap_m",
-     "fr_x","pmmc_pct","pm_pct_pred","catalyst"]
+    ["gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m","fr_x",
+     "pmmc_pct","pm_pct_daily","pm_pct_pred","catalyst"]
 )
 
 # ============================== Session State ==============================
@@ -135,7 +135,7 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             if n in nm[c]: return c
     return None
 
-# ================= Predicted Day Volume (for checklist) =================
+# ================= Predicted Day Volume (for checklist fallback) =================
 def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """ ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$) """
     e = 1e-6
@@ -145,12 +145,8 @@ def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float
     ln_y = 3.1435 + 0.1608*math.log(mc + e) + 0.6704*math.log(gp + e) - 0.3878*math.log(atr + e)
     return math.exp(ln_y)
 
-def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
-    if pred_m <= 0: return 0.0, 0.0
-    return pred_m * math.exp(-z), pred_m * math.exp(z)
-
 # ================= Rank-hist learning (DB-derived) =================
-EXHAUSTION_VARS = {"gap_pct","rvol","pm_dol_m","pmmc_pct","fr_x"}
+EXHAUSTION_VARS = {"gap_pct","rvol","pmmc_pct","fr_x"}  # raw PM $Vol removed; we use pmmc_pct
 
 def moving_average(y: np.ndarray, w: int = 3) -> np.ndarray:
     if w <= 1: return y
@@ -161,20 +157,14 @@ def moving_average(y: np.ndarray, w: int = 3) -> np.ndarray:
 
 def stretch_curve_to_unit(p: np.ndarray, base_p: float,
                           eps: float = 0.01, gamma: float = 0.20) -> np.ndarray:
-    """
-    Linearly stretch a probability curve so its min→eps and max→1−eps,
-    then softly blend back toward the baseline by gamma.
-    """
+    """Stretch curve min→ε and max→1−ε; softly blend to baseline by γ."""
     p = np.asarray(p, dtype=float)
     pmin, pmax = float(np.nanmin(p)), float(np.nanmax(p))
     if not np.isfinite(pmin) or not np.isfinite(pmax) or pmax <= pmin:
         return np.full_like(p, base_p)
     scale = max(1e-9, (pmax - pmin))
     p_stretched = eps + (1.0 - 2.0*eps) * (p - pmin) / scale
-    if gamma > 0:
-        p_final = (1.0 - gamma) * p_stretched + gamma * base_p
-    else:
-        p_final = p_stretched
+    p_final = (1.0 - gamma) * p_stretched + gamma * base_p if gamma>0 else p_stretched
     return np.clip(p_final, 1e-6, 1.0 - 1e-6)
 
 def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,Any]]:
@@ -233,13 +223,9 @@ def tail_penalize(var_key: str, centers: np.ndarray, p: np.ndarray, p0: float, s
     return p0 + (p - p0) * penalty
 
 def find_intervals_adaptive(var_key: str, model: Dict[str,Any], lift: float, min_support: int,
-                            gap_merge: float, min_span: float, strength: float) -> Tuple[List[Tuple[float,float]],List[Tuple[float,float]],float]:
-    """
-    Extract sweet/risk intervals in rank. If none found, relax lift down to ~30% of initial.
-    Returns (sweet_val_ranges, risk_val_ranges, used_lift).
-    """
+                            gap_merge: float, min_span: float, strength: float):
+    """Extract sweet/risk intervals in rank; relax lift if empty."""
     centers = model["centers"]; p = model["p"].copy(); p0 = model["p0"]; sup = model["support"]
-    # (tail already applied in learn step)
     def _merge(mask, gl=gap_merge, ms=min_span):
         idx = np.where(mask)[0]
         if idx.size == 0: return []
@@ -253,11 +239,7 @@ def find_intervals_adaptive(var_key: str, model: Dict[str,Any], lift: float, min
                 start = last = centers[k]
         if (last - start) >= ms: intervals.append((float(start), float(last)))
         return intervals
-
     used_lift = lift
-    sweet_r, risk_r = [], []
-    pr = model["quantiles"]["pr"]; vals = model["quantiles"]["vals"]
-
     for _ in range(6):
         s_mask = (p >= p0 + used_lift) & (sup >= min_support)
         r_mask = (p <= p0 - used_lift) & (sup >= min_support)
@@ -266,16 +248,16 @@ def find_intervals_adaptive(var_key: str, model: Dict[str,Any], lift: float, min
         if sweet_r or risk_r: break
         used_lift *= 0.8
 
+    pr = model["quantiles"]["pr"]; vals = model["quantiles"]["vals"]
     def r2v(lo, hi):
         lo_v = float(np.interp(lo, pr, vals))
         hi_v = float(np.interp(hi, pr, vals))
         return lo_v, hi_v
-
     sweet_v = [r2v(a,b) for a,b in sweet_r]
     risk_v  = [r2v(a,b) for a,b in risk_r]
     return sweet_v, risk_v, used_lift
 
-def value_to_prob(var_key: str, model: Dict[str,Any], x_val: float, tail_strength: float) -> float:
+def value_to_prob(var_key: str, model: Dict[str,Any], x_val: float) -> float:
     """Map raw value to FT probability via rank lookup on the **stretched** curve."""
     if model is None or not np.isfinite(x_val): return 0.5
     pr, vals = model["quantiles"]["pr"], model["quantiles"]["vals"]
@@ -288,11 +270,25 @@ def value_to_prob(var_key: str, model: Dict[str,Any], x_val: float, tail_strengt
         p0, p1 = pr[i0-1], pr[i0]
         t = (x_val - x0) / (x1 - x0) if x1 != x0 else 0.0
         r = float(p0 + t*(p1 - p0))
-
-    centers = model["centers"]; p = model["p"];  # p is already stretched and tail-adjusted
+    centers = model["centers"]; p = model["p"]  # already tail-adjusted & stretched
     j = int(np.clip(np.searchsorted(centers, r), 0, len(centers)-1))
     p_local = float(p[j])
     return float(np.clip(p_local, 1e-6, 1-1e-6))
+
+# Catalyst prior: when Yes, give a small positive prior lift so it reads as GOOD unless DB contradicts strongly.
+def catalyst_prior_adjust(p_learned: float, x_val: float, base_p: float) -> float:
+    # x_val: 1 for Yes, 0 for No
+    if not np.isfinite(x_val): return p_learned
+    if x_val >= 0.5:
+        prior_yes = min(0.92, base_p + 0.18)  # cap near 92%
+        blend = 0.40                           # blend 40% prior, 60% learned
+        p_adj = blend * prior_yes + (1.0 - blend) * p_learned
+        return float(np.clip(p_adj, 1e-6, 1-1e-6))
+    else:
+        # No catalyst -> keep learned or softly nudge to baseline
+        blend = 0.15
+        p_adj = blend * base_p + (1.0 - blend) * p_learned
+        return float(np.clip(p_adj, 1e-6, 1-1e-6))
 
 # ============================== Upload & Learn (Main Pane) ==============================
 st.markdown('<div class="section-title">Upload workbook (sheet: PMH BO Merged)</div>', unsafe_allow_html=True)
@@ -346,6 +342,9 @@ if learn_btn:
                         df["fr_x"] = df["pm_vol_m"] / df["float_m"]
                     if {"pm_dol_m","mcap_m"}.issubset(df.columns):
                         df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
+                    if {"pm_vol_m","daily_vol_m"}.issubset(df.columns):
+                        df["pm_pct_daily"] = 100.0 * df["pm_vol_m"] / df["daily_vol_m"]
+                    # predicted daily fallback for later, but keep curve available
                     if {"mcap_m","gap_pct","atr_usd","pm_vol_m"}.issubset(df.columns):
                         def _pred_row(r):
                             try:
@@ -361,30 +360,28 @@ if learn_btn:
 
                     # learn models
                     candidates = [
-                        "gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m",
-                        "float_m","mcap_m","fr_x","pmmc_pct","pm_pct_pred","catalyst"
+                        "gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m",
+                        "fr_x","pmmc_pct","pm_pct_daily","pm_pct_pred","catalyst"
                     ]
                     models, weights = {}, {}
                     for v in candidates:
                         if v in df.columns:
                             m = rank_hist_model(df[v], y, bins=sb_bins)
                             if m is not None:
-                                # 1) tail-penalize on the raw curve
+                                # 1) tail-penalize on the raw curve (only for exhaustion vars)
                                 centers = m["centers"]
                                 p_base  = m["p0"]
                                 p_raw   = m["p_raw"]
                                 p_tp    = tail_penalize(v, centers, p_raw, p_base, tail_strength)
 
                                 # 2) stretch + blend to baseline
-                                if stretch_on:
-                                    p_use = stretch_curve_to_unit(p_tp, base_p=p_base,
-                                                                  eps=stretch_eps, gamma=stretch_blend)
-                                else:
-                                    p_use = p_tp
+                                p_use = stretch_curve_to_unit(p_tp, base_p=p_base,
+                                                              eps=stretch_eps if stretch_on else 0.0,
+                                                              gamma=stretch_blend if stretch_on else 0.0)
                                 m["p"] = p_use
                                 m["p_raw_tp"] = p_tp  # optional debug
 
-                                # 3) find intervals on the working curve
+                                # 3) sweet/risk intervals
                                 tmp_model = dict(m)
                                 sweet_v, risk_v, used_lift = find_intervals_adaptive(
                                     v, tmp_model, lift=sb_lift, min_support=sb_support,
@@ -432,6 +429,7 @@ with tab_add:
             rvol     = input_float("RVOL @ BO", 0.0, min_value=0.0, decimals=2)
             pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
             pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
+            # Dilution slider lives under PM $ volume (as requested)
             dilution_flag = st.select_slider("Dilution present?", options=[0,1], value=0,
                                              help="0 = none/negligible, 1 = present/overhang (penalizes log-odds)")
         with c3:
@@ -444,32 +442,40 @@ with tab_add:
         fr_x = (pm_vol_m / float_m) if float_m > 0 else float("nan")
         pmmc_pct = (100.0 * pm_dol_m / mc_m) if mc_m > 0 else float("nan")
 
-        # Predicted Day Vol & PM% of Predicted
-        sigma_ln = 0.60
+        # Predicted daily (for fallback %)
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
-        ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
         pm_pct_pred = (100.0 * pm_vol_m / pred_vol_m) if pred_vol_m > 0 else float("nan")
 
+        # From learned DB we don't have today's daily volume; for premarket we prefer % of Pred.
+        # If your merged sheet had pm_pct_daily curve learned, we will use that curve preferentially.
         models  = st.session_state.MODELS or {}
         weights = st.session_state.WEIGHTS or {}
         base_p  = float(st.session_state.BASEP or 0.5)
 
-        var_vals = {
+        # Compose the variable set for scoring (no raw PM vol / PM $ vol)
+        # Prefer pm_pct_daily curve if learned; else use pm_pct_pred
+        use_pm_pct_daily = "pm_pct_daily" in models
+        var_vals: Dict[str, float] = {
             "gap_pct": gap_pct, "atr_usd": atr_usd, "rvol": rvol, "si_pct": si_pct,
-            "pm_vol_m": pm_vol_m, "pm_dol_m": pm_dol_m, "float_m": float_m, "mcap_m": mc_m,
-            "fr_x": fr_x, "pmmc_pct": pmmc_pct, "pm_pct_pred": pm_pct_pred,
+            "float_m": float_m, "mcap_m": mc_m, "fr_x": fr_x, "pmmc_pct": pmmc_pct,
+            ("pm_pct_daily" if use_pm_pct_daily else "pm_pct_pred"): (np.nan if use_pm_pct_daily else pm_pct_pred),
             "catalyst": 1.0 if catalyst_flag=="Yes" else 0.0
         }
+        # if using pm_pct_daily but we don't know it intraday, set to pm_pct_pred for evaluation
+        if use_pm_pct_daily:
+            var_vals["pm_pct_daily"] = pm_pct_pred  # fallback live proxy
 
-        # per-variable probability from learned (stretched) curves
         parts: Dict[str, Dict[str, float]] = {}
         z_sum = 0.0
         for k, x in var_vals.items():
             mdl = models.get(k)
-            p = value_to_prob(k, mdl, x, tail_strength) if mdl else base_p
+            p = value_to_prob(k, mdl, x) if mdl else base_p
+            # Catalyst prior bump so "Yes" reads as a tailwind
+            if k == "catalyst":
+                p = catalyst_prior_adjust(p, x, base_p)
             w = float(weights.get(k, 0.0))
             parts[k] = {"x": x, "p": p, "w": w}
-            if p <= 0 or p >= 1: p = float(np.clip(p, 1e-6, 1-1e-6))
+            p = float(np.clip(p, 1e-6, 1-1e-6))
             z_sum += w * math.log(p/(1-p))
 
         # dilution penalty (binary)
@@ -486,11 +492,11 @@ with tab_add:
             '<span class="pill pill-bad">Weak / Avoid</span>'
         )
 
-        # checklist: Good/Caution/Risk by data-derived lift (per-variable)
+        # Checklist (show actual inputs & probabilities). Replace PM Vol/M with % metrics:
         name_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL @ BO","si_pct":"Short Interest %",
-            "pm_vol_m":"PM Volume (M)","pm_dol_m":"PM $Vol (M)","float_m":"Float (M)","mcap_m":"MarketCap (M)",
-            "fr_x":"PM Float Rotation ×","pmmc_pct":"PM $Vol / MC %","pm_pct_pred":"PM Vol % of Pred",
+            "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
+            "pmmc_pct":"PM $Vol / MC %","pm_pct_daily":"PM Vol % of Daily","pm_pct_pred":"PM Vol % of Pred",
             "catalyst":"Catalyst"
         }
         good, warn, risk = [], [], []
@@ -506,19 +512,23 @@ with tab_add:
             else:
                 warn.append(f"{nm}: {_fmt_value(x)} — caution (p≈{p_pct}%)")
 
-        pm_pred_line = f"PM Vol % of Pred: {_fmt_value(pm_pct_pred)}%" if np.isfinite(pm_pct_pred) else "PM Vol % of Pred: —"
+        # Display line: prefer % of Daily if learned/used; else % of Pred
+        if use_pm_pct_daily:
+            pm_line = f"PM Vol % of Daily (proxy via Pred): {_fmt_value(var_vals['pm_pct_daily'])}%"
+        else:
+            pm_line = f"PM Vol % of Pred: {_fmt_value(pm_pct_pred)}%"
 
+        # Save row
         row = {
             "Ticker": ticker,
             "Odds": odds_name,
             "Level": level,
             "FinalScore": round(final_score, 2),
+            # keep predicted daily info handy
             "PredVol_M": round(pred_vol_m, 2),
-            "PredVol_CI68_L": round(ci68_l, 2),
-            "PredVol_CI68_U": round(ci68_u, 2),
             "VerdictPill": verdict_pill,
             "GoodList": good, "WarnList": warn, "RiskList": risk,
-            "PM_Pct_Pred_Line": pm_pred_line
+            "PM_Line": pm_line
         }
         st.session_state.rows.append(row)
         st.session_state.last = row
@@ -534,11 +544,10 @@ with tab_add:
         c.metric("Grade", l.get("Level","—"))
         d.metric("Odds", l.get("Odds","—"))
         e.metric("PredVol (M)", f"{l.get('PredVol_M',0):.2f}")
-        st.caption(f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M")
 
         with st.expander("Premarket Checklist", expanded=True):
             st.markdown(f"**Verdict:** {l.get('VerdictPill','—')}", unsafe_allow_html=True)
-            st.markdown(f"<div class='mono'>{l.get('PM_Pct_Pred_Line','')}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='mono'>{l.get('PM_Line','')}</div>", unsafe_allow_html=True)
             g,w,r = st.columns(3)
             def ul(items): return "<ul>"+"".join([f"<li>{x}</li>" for x in items])+"</ul>" if items else "<ul><li>—</li></ul>"
             with g: st.markdown("**Good**");    st.markdown(ul(l.get("GoodList",[])), unsafe_allow_html=True)
@@ -550,7 +559,7 @@ with tab_rank:
     st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows).sort_values("FinalScore", ascending=False).reset_index(drop=True)
-        cols_to_show = ["Ticker","Odds","Level","FinalScore","PredVol_M","PredVol_CI68_L","PredVol_CI68_U"]
+        cols_to_show = ["Ticker","Odds","Level","FinalScore","PredVol_M"]
         for c in cols_to_show:
             if c not in df.columns: df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
         st.dataframe(
@@ -561,8 +570,6 @@ with tab_rank:
                 "Level": st.column_config.TextColumn("Grade"),
                 "FinalScore": st.column_config.NumberColumn("Final Score", format="%.2f"),
                 "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
-                "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
-                "PredVol_CI68_U": st.column_config.NumberColumn("Pred Vol CI68 High (M)", format="%.2f"),
             }
         )
         st.download_button(
