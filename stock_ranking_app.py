@@ -30,6 +30,7 @@ st.markdown("""
 
 # ============================== Sidebar (Curves only) ==============================
 st.sidebar.header("Curves")
+BINS = st.sidebar.slider("Curve bins (histogram)", min_value=5, max_value=50, value=5, step=1)
 show_baseline = st.sidebar.checkbox("Curves: show baseline", True)
 plot_all_curves = st.sidebar.checkbox("Curves: plot ALL variables", False)
 sel_curve_var = st.sidebar.selectbox(
@@ -74,20 +75,20 @@ def _fmt_value(v: float) -> str:
     if abs(v) >= 1:    return f"{v:.2f}"
     return f"{v:.3f}"
 
-# (Kept for backward compatibility if ever used elsewhere)
+# (legacy helpers not used for labels anymore; kept just in case)
 def odds_label(score: float) -> str:
     if score >= 85: return "Very High Odds"
-    elif score >= 75: return "High Odds"
-    elif score >= 60: return "Moderate Odds"
+    elif score >= 70: return "High Odds"
+    elif score >= 55: return "Moderate Odds"
     elif score >= 40: return "Low Odds"
     else: return "Very Low Odds"
 
 def grade(score_pct: float) -> str:
-    return ("A++" if score_pct >= 95 else
-            "A+"  if score_pct >= 90 else
-            "A"   if score_pct >= 80 else
+    return ("A++" if score_pct >= 90 else
+            "A+"  if score_pct >= 85 else
+            "A"   if score_pct >= 75 else
             "B"   if score_pct >= 65 else
-            "C"   if score_pct >= 45 else "D")
+            "C"   if score_pct >= 50 else "D")
 
 def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
     keep = [c for c in cols if c in df.columns]
@@ -120,18 +121,6 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             if n in nm[c]: return c
     return None
 
-# ---------- Exponential percentile warping ----------
-# s is a percentile in [0,1].
-# We use s' = 1 - (1 - s)^alpha  (alpha > 1 makes the TOP tail rarer)
-def _warp_p(s: float, alpha: float) -> float:
-    s = float(np.clip(s, 0.0, 1.0))
-    return float(1.0 - (1.0 - s) ** alpha)
-
-# Inverse warp: given desired warped percentile s', find the raw percentile to sample
-def _inv_warp_p(s_warped: float, alpha: float) -> float:
-    s_warped = float(np.clip(s_warped, 0.0, 1.0))
-    return float(1.0 - (1.0 - s_warped) ** (1.0 / max(1e-9, alpha)))
-
 # ================= Predicted Day Volume (for PM% fallback) =================
 def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """ ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$) """
@@ -143,7 +132,6 @@ def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float
     return math.exp(ln_y)
 
 # ================= Rank-hist learning (DB-derived) =================
-BINS = 20
 STRETCH_EPS = 0.10
 CLASS_LIFT = 0.08  # checklist Good/Risk offset vs local baseline
 
@@ -177,7 +165,7 @@ def _smooth_local_baseline(centers: np.ndarray, p_curve: np.ndarray, support: np
     pb = pd.Series(pb).interpolate(limit_direction="both").fillna(np.nanmean(pb)).to_numpy()
     return pb
 
-def rank_hist_model(x: pd.Series, y: pd.Series) -> Optional[Dict[str,Any]]:
+def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,Any]]:
     x = pd.to_numeric(x, errors="coerce")
     y = pd.to_numeric(y, errors="coerce")
     mask = x.notna() & y.notna()
@@ -186,16 +174,17 @@ def rank_hist_model(x: pd.Series, y: pd.Series) -> Optional[Dict[str,Any]]:
         return None
 
     ranks = x.rank(pct=True)
-    edges = np.linspace(0,1,BINS+1)
-    idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, BINS-1)
+    edges = np.linspace(0, 1, int(bins) + 1)
+    idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, int(bins)-1)
 
-    total = np.bincount(idx, minlength=BINS)
-    ft    = np.bincount(idx[y==1], minlength=BINS)
+    total = np.bincount(idx, minlength=int(bins))
+    ft    = np.bincount(idx[y==1], minlength=int(bins))
     with np.errstate(divide='ignore', invalid='ignore'):
         p_bin = np.where(total>0, ft/total, np.nan)
 
     p_series = pd.Series(p_bin).interpolate(limit_direction="both")
     p_fill   = p_series.fillna(p_series.mean()).to_numpy()
+    # window 3 still ok for larger bins; it just smooths lightly
     p_smooth = moving_average(p_fill, w=3)
 
     centers = (edges[:-1] + edges[1:]) / 2.0
@@ -306,7 +295,20 @@ def _baseline_at_value(model: dict, x: float) -> float:
             return pb
     return float(model.get("p_base_var", 0.5))
 
-# ---------- Calibration helpers (percentile-based) ----------
+# ---------- Exponential percentile warping (for calibration) ----------
+def _warp_p(s: float, alpha: float) -> float:
+    s = float(np.clip(s, 0.0, 1.0))
+    return float(1.0 - (1.0 - s) ** alpha)
+
+def _inv_warp_p(s_warped: float, alpha: float) -> float:
+    s_warped = float(np.clip(s_warped, 0.0, 1.0))
+    return float(1.0 - (1.0 - s_warped) ** (1.0 / max(1e-9, alpha)))
+
+# ---------- Hard floors to prevent absurd labels ----------
+ODDS_FLOORS  = {"very_high": 0.85, "high": 0.70, "moderate": 0.55, "low": 0.40}
+GRADE_FLOORS = {"App": 0.92, "Ap": 0.85, "A": 0.75, "B": 0.65, "C": 0.50}
+
+# ---------- Calibration helpers ----------
 def _stack_prob_for_row(models: Dict[str,dict], weights: Dict[str,float], row: dict) -> float:
     """Recompute model-based prob for one historical row (for calibration)."""
     z_sum = 0.0
@@ -438,7 +440,7 @@ if learn_btn:
                     models, weights = {}, {}
                     for v in candidates:
                         if v in df.columns:
-                            m = rank_hist_model(df[v], y)
+                            m = rank_hist_model(df[v], y, bins=BINS)
                             if m is not None:
                                 centers = m["centers"]
                                 p_base_var = m["p_base_var"]
@@ -462,6 +464,7 @@ if learn_btn:
                     if weights:
                         s = sum(weights.values()) or 1.0
                         weights = {k: v/s for k, v in weights.items()}
+
                     # ---------- Calibration on the merged sheet ----------
                     cal_probs = []
                     if models and weights:
@@ -470,7 +473,7 @@ if learn_btn:
                             df["fr_x"] = df["pm_vol_m"] / df["float_m"]
                         if {"pm_dol_m","mcap_m"}.issubset(df.columns) and "pmmc_pct" not in df.columns:
                             df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
-                    
+
                         if {"mcap_m","gap_pct","atr_usd","pm_vol_m"}.issubset(df.columns):
                             def _pred_row_cal(r):
                                 try:
@@ -483,55 +486,58 @@ if learn_btn:
                                 100.0 * df.get("pm_vol_m", np.nan) / pred_cal,
                                 df.get("pm_pct_pred", np.nan)
                             )
-                    
+
                         needed = {"gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m","fr_x","pmmc_pct","pm_pct_pred","catalyst"}
                         for _, rr in df.iterrows():
                             rowd = {k: (float(rr[k]) if k in df.columns else np.nan) for k in needed}
                             cal_probs.append(_stack_prob_for_row(models, weights, rowd))
-                    
+
                     cal_probs = np.array(cal_probs, dtype=float)
                     cal_probs = cal_probs[np.isfinite(cal_probs)]
-                    
+
                     # ---------- Exponential distribution for cuts ----------
-                    # Tunable “steepness”: larger alpha => rarer top buckets
-                    ALPHA_ODDS  = 2.2   # how aggressively we thin the top for Odds
-                    ALPHA_GRADE = 2.8   # grades even steeper by default
-                    
-                    # Choose target *warped* percentiles (what you want to see in the UI)
-                    # Odds: ~ Very High 2%, High ~8%, Moderate ~20–25%, Low ~30%, rest Very Low
+                    ALPHA_ODDS  = 2.2   # more aggressive = rarer top odds
+                    ALPHA_GRADE = 2.8   # grades even steeper
+
+                    # target warped percentiles (UI distribution intent)
                     odds_targets_warped = {
-                        "very_high": 0.98,
-                        "high":      0.90,
-                        "moderate":  0.65,
-                        "low":       0.35,
+                        "very_high": 0.98,  # ~top 2%
+                        "high":      0.90,  # ~top 10%
+                        "moderate":  0.65,  # ~top 35%
+                        "low":       0.35,  # ~top 65%
                     }
-                    
-                    # Grades: A++ ~0.5%, A+ ~3%, A ~10%, B ~35%, C ~65%, else D
                     grade_targets_warped = {
-                        "App": 0.995,  # A++
-                        "Ap":  0.97,   # A+
-                        "A":   0.90,   # A
-                        "B":   0.65,   # B
-                        "C":   0.35,   # C
+                        "App": 0.995,  # A++ ~ top 0.5%
+                        "Ap":  0.97,   # A+  ~ top 3%
+                        "A":   0.90,   # A   ~ top 10%
+                        "B":   0.65,   # B   ~ top 35%
+                        "C":   0.35,   # C   ~ top 65%
                     }
-                    
-                    # Convert warped percentiles back to RAW percentiles to pull quantiles from cal_probs
+
                     def _cut_from_probs(probs: np.ndarray, warped_p: float, alpha: float) -> float:
                         if probs.size == 0:
                             return float(warped_p)  # fallback
                         raw_p = _inv_warp_p(warped_p, alpha)
                         return float(np.quantile(probs, raw_p))
-                    
+
                     odds_cuts = {k: _cut_from_probs(cal_probs, v, ALPHA_ODDS) for k, v in odds_targets_warped.items()}
                     grade_cuts = {k: _cut_from_probs(cal_probs, v, ALPHA_GRADE) for k, v in grade_targets_warped.items()}
-                    
-                    # Save to session for live scoring
+
+                    # Raise calibrated cuts up to hard floors (prevents e.g. 0.51 -> A+/High)
+                    for k, floor in ODDS_FLOORS.items():
+                        if k in odds_cuts:
+                            odds_cuts[k] = max(odds_cuts[k], floor)
+                    for k, floor in GRADE_FLOORS.items():
+                        if k in grade_cuts:
+                            grade_cuts[k] = max(grade_cuts[k], floor)
+
+                    # Save
                     st.session_state.MODELS  = models
                     st.session_state.WEIGHTS = weights
                     st.session_state.ODDS_CUTS = odds_cuts
                     st.session_state.GRADE_CUTS = grade_cuts
-                    
-                    st.success(f"Learned {len(models)} variables and set exponential-calibrated thresholds.")
+
+                    st.success(f"Learned {len(models)} variables with {BINS} bins and set exponential-calibrated thresholds.")
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
