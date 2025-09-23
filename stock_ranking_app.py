@@ -129,11 +129,9 @@ def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float
     return math.exp(ln_y)
 
 # ================= Rank-hist learning (DB-derived) =================
-EXHAUSTION_VARS = {"gap_pct","rvol","pmmc_pct","fr_x"}  # high tails can exhaust
-
-BINS = 5                # fixed
-STRETCH_EPS = 0.10      # fixed (min→0.10, max→0.90)
-CLASS_LIFT = 0.08       # threshold for Good/Risk vs baseline
+BINS = 5
+STRETCH_EPS = 0.10
+CLASS_LIFT = 0.08
 
 def moving_average(y: np.ndarray, w: int = 3) -> np.ndarray:
     if w <= 1: return y
@@ -143,7 +141,6 @@ def moving_average(y: np.ndarray, w: int = 3) -> np.ndarray:
     return np.convolve(ypad, kernel, mode='valid')
 
 def stretch_curve_to_unit(p: np.ndarray, base_p: float) -> np.ndarray:
-    """Stretch curve min→ε and max→1−ε."""
     eps = STRETCH_EPS
     p = np.asarray(p, dtype=float)
     pmin, pmax = float(np.nanmin(p)), float(np.nanmax(p))
@@ -153,22 +150,8 @@ def stretch_curve_to_unit(p: np.ndarray, base_p: float) -> np.ndarray:
     p_stretched = eps + (1.0 - 2.0*eps) * (p - pmin) / scale
     return np.clip(p_stretched, 1e-6, 1.0 - 1e-6)
 
-def tail_penalize(var_key: str, centers: np.ndarray, p: np.ndarray, p_base: float, strength: float) -> np.ndarray:
-    """Penalize extreme high ranks for exhaustion variables only, around the per-variable base."""
-    if var_key not in EXHAUSTION_VARS or strength <= 0:
-        return p
-    # ramp down from rank 0.90 → 1.00
-    tail = np.clip((centers - 0.90) / 0.10, 0, 1)
-    penalty = 1.0 - strength * tail
-    return p_base + (p - p_base) * penalty
-
-# ---------- New: local baseline smoothing ----------
+# ---------- Local baseline smoothing ----------
 def _smooth_local_baseline(centers: np.ndarray, p_curve: np.ndarray, support: np.ndarray, bandwidth: float = 0.22) -> np.ndarray:
-    """
-    Kernel-smoothed local baseline around each rank center.
-    Uses Gaussian weights and support (counts) as importance weights.
-    Returns pb_curve aligned to centers.
-    """
     c = centers.astype(float)
     p = p_curve.astype(float)
     n = (support.astype(float) + 1e-9)
@@ -181,7 +164,6 @@ def _smooth_local_baseline(centers: np.ndarray, p_curve: np.ndarray, support: np
     return pb
 
 def rank_hist_model(x: pd.Series, y: pd.Series) -> Optional[Dict[str,Any]]:
-    """Learn FT curve in rank space (bins=5), smooth, tail-penalize later, stretch to ε=0.1..0.9"""
     x = pd.to_numeric(x, errors="coerce")
     y = pd.to_numeric(y, errors="coerce")
     mask = x.notna() & y.notna()
@@ -189,7 +171,7 @@ def rank_hist_model(x: pd.Series, y: pd.Series) -> Optional[Dict[str,Any]]:
     if len(x) < 40 or y.nunique() != 2:
         return None
 
-    ranks = x.rank(pct=True)   # 0..1
+    ranks = x.rank(pct=True)
     edges = np.linspace(0,1,BINS+1)
     idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, BINS-1)
 
@@ -198,14 +180,13 @@ def rank_hist_model(x: pd.Series, y: pd.Series) -> Optional[Dict[str,Any]]:
     with np.errstate(divide='ignore', invalid='ignore'):
         p_bin = np.where(total>0, ft/total, np.nan)
 
-    # Light smooth (bins already small)
     p_series = pd.Series(p_bin).interpolate(limit_direction="both")
     p_fill   = p_series.fillna(p_series.mean()).to_numpy()
     p_smooth = moving_average(p_fill, w=3)
 
     centers = (edges[:-1] + edges[1:]) / 2.0
     p0_global = float(y.mean())
-    p_base_var = float(np.average(p_smooth, weights=(total + 1e-9)))  # per-variable baseline (scalar)
+    p_base_var = float(np.average(p_smooth, weights=(total + 1e-9)))
 
     pr = np.linspace(0,1,41)
     vals = np.quantile(x, pr)
@@ -214,15 +195,14 @@ def rank_hist_model(x: pd.Series, y: pd.Series) -> Optional[Dict[str,Any]]:
         "edges": edges,
         "centers": centers,
         "support": total,
-        "p_raw": p_smooth,        # smoothed but not tail-penalized
-        "p0_global": p0_global,   # dataset-wide baseline
-        "p_base_var": p_base_var, # per-variable baseline (scalar)
+        "p_raw": p_smooth,
+        "p0_global": p0_global,
+        "p_base_var": p_base_var,
         "quantiles": {"pr": pr, "vals": vals},
         "n": int(len(x))
     }
 
 def auc_weight(x: pd.Series, y: pd.Series) -> float:
-    """AUC-like separation → 0..1 (with floor)."""
     x = pd.to_numeric(x, errors="coerce"); y = pd.to_numeric(y, errors="coerce")
     mask = x.notna() & y.notna()
     x,y = x[mask], y[mask]
@@ -232,11 +212,10 @@ def auc_weight(x: pd.Series, y: pd.Series) -> float:
     if n1==0 or n0==0: return 0.0
     s1 = r[y==1].sum()
     auc = (s1 - n1*(n1+1)/2) / (n1*n0)
-    sep = abs(auc-0.5)*2.0  # 0..1
+    sep = abs(auc-0.5)*2.0
     return float(max(0.05, sep))
 
 def value_to_prob(var_key: str, model: Dict[str,Any], x_val: float) -> float:
-    """Map raw value to FT probability via rank lookup on the finalized curve (after tail & stretch)."""
     if model is None or not np.isfinite(x_val): return 0.5
     pr, vals = model["quantiles"]["pr"], model["quantiles"]["vals"]
     if x_val <= vals.min(): r = 0.0
@@ -253,12 +232,10 @@ def value_to_prob(var_key: str, model: Dict[str,Any], x_val: float) -> float:
     p_local = float(p[j])
     return float(np.clip(p_local, 1e-6, 1-1e-6))
 
-# ---------- Priors, anchors & guardrails ----------
+# ---------- Prior & simple anchors (keep) ----------
 def si_directional_prior(x: float) -> Optional[float]:
     if not np.isfinite(x): return None
-    # 0%→~0.25, 10%→~0.57, 20%→~0.73, 30%→~0.82
-    k = 0.25
-    x0 = 10.0
+    k = 0.25; x0 = 10.0
     base = 0.25 + 0.65 / (1 + math.exp(-k * (x - x0)))
     return float(np.clip(base, 0.20, 0.90))
 
@@ -269,19 +246,18 @@ def blend_with_prior(var_key: str, x: float, p_learned: float) -> float:
             p_learned = 0.40*prior + 0.60*p_learned
     return float(np.clip(p_learned, 1e-6, 1-1e-6))
 
-# PM% & ATR special-case anchors (optional; generic anchor applies to all variables too)
 ANCHORS = {
-    "pm_pct_daily": (8.0, 25.0),   # %
-    "pm_pct_pred":  (8.0, 25.0),   # %
+    "pm_pct_daily": (8.0, 25.0),
+    "pm_pct_pred":  (8.0, 25.0),
 }
 
 def anchor_pm_percent(var_key: str, p: float, x_val: float, pb: float) -> float:
     band = ANCHORS.get(var_key)
-    if not band or not np.isfinite(x_val):
+    if not band or not np.isfinite(x_val): 
         return p
     lo, hi = band
     if lo <= x_val <= hi:
-        return float(max(p, min(0.95, pb + 0.10)))  # +10pp lift target cap
+        return float(max(p, min(0.95, pb + 0.10)))
     return p
 
 def anchor_atr(p: float, x: float, pb: float) -> float:
@@ -306,7 +282,6 @@ def _rank_from_value(model: dict, x: float) -> Optional[float]:
     return float(p0 + t*(p1 - p0))
 
 def _baseline_at_value(model: dict, x: float) -> float:
-    """Return local baseline pb at x's rank if pb_curve exists; else fallback to scalar."""
     pb_curve = model.get("pb_curve", None)
     centers  = model.get("centers", None)
     if pb_curve is not None and centers is not None and np.isfinite(x):
@@ -316,65 +291,6 @@ def _baseline_at_value(model: dict, x: float) -> float:
         if np.isfinite(pb):
             return pb
     return float(model.get("p_base_var_scalar", model.get("p_base_var", 0.5)))
-
-def apply_anchor_generic(var_key: str, model: dict, x: float, p: float, lift: float = 0.10) -> float:
-    """
-    If x's rank sits inside this variable's learned sweet band, lift p toward local pb+lift.
-    Smoothly taper as you approach band edges; zero outside.
-    """
-    band = model.get("anchor_band", None)
-    if band is None:
-        return p
-    r = _rank_from_value(model, x)
-    if r is None:
-        return p
-    lo, hi = band
-    if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
-        return p
-    if r < lo or r > hi:
-        weight = 0.0
-    else:
-        t = (r - lo) / max(1e-9, (hi - lo))
-        weight = 0.5 - 0.5 * math.cos(math.pi * t)
-    if weight <= 0.0:
-        return p
-    # local baseline at this rank
-    pb_curve = model.get("pb_curve")
-    if pb_curve is not None:
-        j = int(np.clip(np.searchsorted(model["centers"], r), 0, len(model["centers"]) - 1))
-        pb_local = float(pb_curve[j])
-    else:
-        pb_local = float(model.get("p_base_var", 0.5))
-    target = min(0.95, pb_local + lift)
-    p_new = p + weight * (target - p)
-    return float(np.clip(p_new, 1e-6, 1-1e-6))
-
-def apply_rule_overrides(var_key: str, x: float, p: float) -> float:
-    # --- GAP ---
-    if var_key == "gap_pct" and np.isfinite(x):
-        if x > 350:
-            p = min(p, 0.35)   # hard cap → risk zone
-        elif x > 240:
-            p = min(p, 0.50)   # caution cap
-    # --- RVOL ---
-    if var_key == "rvol" and np.isfinite(x):
-        if x > 4000:
-            p = min(p, 0.38)
-        elif x > 3000:
-            p = min(p, 0.52)
-    # --- PM $Vol / MC ---
-    if var_key == "pmmc_pct" and np.isfinite(x):
-        if x > 200:
-            p = min(p, 0.40)
-        elif x > 100:
-            p = min(p, 0.55)
-    # --- PM Float Rotation ---
-    if var_key == "fr_x" and np.isfinite(x):
-        if x > 10:
-            p = min(p, 0.45)
-        elif x > 5:
-            p = min(p, 0.58)
-    return float(np.clip(p, 1e-6, 1-1e-6))
 
 # ============================== Upload & Learn (Main Pane) ==============================
 st.markdown('<div class="section-title">Upload workbook (sheet: PMH BO Merged)</div>', unsafe_allow_html=True)
@@ -393,7 +309,7 @@ if learn_btn:
             else:
                 raw = pd.read_excel(xls, merged_sheet)
 
-                # column mapping (simple robust)
+                # column mapping
                 col_ft    = _pick(raw, ["ft","FT"])
                 col_gap   = _pick(raw, ["gap %","gap%","premarket gap","gap"])
                 col_atr   = _pick(raw, ["atr","atr $","atr$","atr (usd)"])
@@ -423,14 +339,13 @@ if learn_btn:
                     if col_cat:   df["catalyst"] = pd.to_numeric(raw[col_cat],   errors="coerce").clip(0,1)
                     if col_daily: df["daily_vol_m"] = pd.to_numeric(raw[col_daily], errors="coerce")
 
-                    # derived from DB
+                    # derived
                     if {"pm_vol_m","float_m"}.issubset(df.columns):
                         df["fr_x"] = df["pm_vol_m"] / df["float_m"]
                     if {"pm_dol_m","mcap_m"}.issubset(df.columns):
                         df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
                     if {"pm_vol_m","daily_vol_m"}.issubset(df.columns):
                         df["pm_pct_daily"] = 100.0 * df["pm_vol_m"] / df["daily_vol_m"]
-                    # predicted daily fallback curve
                     if {"mcap_m","gap_pct","atr_usd","pm_vol_m"}.issubset(df.columns):
                         def _pred_row(r):
                             try:
@@ -443,7 +358,7 @@ if learn_btn:
                     df = df[df["FT"].notna()]
                     y = df["FT"].astype(float)
 
-                    # learn models per variable
+                    # learn models per variable (no generic anchors, no guardrails)
                     candidates = [
                         "gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m",
                         "fr_x","pmmc_pct","pm_pct_daily","pm_pct_pred","catalyst"
@@ -455,27 +370,24 @@ if learn_btn:
                             if m is not None:
                                 centers = m["centers"]
                                 p_base_var = m["p_base_var"]
-                                # tail-penalize
-                                p_tp = tail_penalize(v, centers, m["p_raw"], p_base_var, tail_strength)
-                                # stretch to ε=0.10..0.90
+
+                                # (keep) optional high-tail smoothing knob — still applied,
+                                # but since guardrails are removed, it's just a mild taper.
+                                def _tail_penalize_simple(centers_arr, p_arr, base_p, strength):
+                                    if strength <= 0: return p_arr
+                                    tail = np.clip((centers_arr - 0.90)/0.10, 0, 1)
+                                    penalty = 1.0 - strength * tail
+                                    return base_p + (p_arr - base_p) * penalty
+
+                                p_tp = _tail_penalize_simple(centers, m["p_raw"], p_base_var, tail_strength)
                                 p_use = stretch_curve_to_unit(p_tp, base_p=p_base_var)
                                 m["p"] = p_use
                                 m["p_tp"] = p_tp
 
-                                # NEW: learn local baseline curve & save scalar as fallback
+                                # local baseline curve (kept)
                                 pb_curve = _smooth_local_baseline(centers, p_use, m["support"], bandwidth=0.22)
                                 m["pb_curve"] = pb_curve
                                 m["p_base_var_scalar"] = p_base_var
-
-                                # learned sweet-band anchor (rank space)
-                                def _learn_anchor_band(centers_arr: np.ndarray, p_curve: np.ndarray, pb_scalar: float, margin: float = 0.05):
-                                    above = p_curve >= (pb_scalar + margin)
-                                    if not np.any(above):
-                                        return None
-                                    idxs = np.where(above)[0]
-                                    return float(centers_arr[idxs.min()]), float(centers_arr[idxs.max()])
-                                band = _learn_anchor_band(centers, p_use, p_base_var, margin=0.05)
-                                m["anchor_band"] = band
 
                                 models[v] = m
 
@@ -484,7 +396,6 @@ if learn_btn:
                                 amp   = float(np.nanstd(p_use))
                                 weights[v] = max(0.05, min(1.0, 0.7*w_sep + 0.3*(amp*4)))
 
-                    # normalize weights
                     if weights:
                         s = sum(weights.values()) or 1.0
                         weights = {k: v/s for k, v in weights.items()}
@@ -530,7 +441,6 @@ with tab_add:
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
         pm_pct_pred = (100.0 * pm_vol_m / pred_vol_m) if pred_vol_m > 0 else float("nan")
 
-        # Models & weights
         models  = st.session_state.MODELS or {}
         weights = st.session_state.WEIGHTS or {}
 
@@ -543,39 +453,33 @@ with tab_add:
             "catalyst": 1.0 if catalyst_flag=="Yes" else 0.0
         }
         if use_pm_pct_daily:
-            # During premarket, use pm_pct_pred as proxy value to position inside the curve
+            # During premarket, position inside curve with pm_pct_pred value
             var_vals["pm_pct_daily"] = pm_pct_pred
 
-        # Odds stacking with local baselines, priors, anchors, guardrails
+        # Combine with priors + simple anchors (no generic anchors, no guardrails)
         parts: Dict[str, Dict[str, float]] = {}
         z_sum = 0.0
         for k, x in var_vals.items():
             mdl = models.get(k)
             if mdl is None:
                 continue
-            p = value_to_prob(k, mdl, x)        # learned curve at x
+            p = value_to_prob(k, mdl, x)
             pb_local = _baseline_at_value(mdl, x)
 
             # directional prior
             p = blend_with_prior(k, x, p)
 
-            # generic learned anchor (uses local baseline)
-            p = apply_anchor_generic(k, mdl, x, p, lift=0.10)
-
-            # optional domain anchors (use pb_local)
+            # explicit domain anchors
             if k == "atr_usd":
                 p = anchor_atr(p, x, pb_local)
             p = anchor_pm_percent(k, p, x, pb_local)
-
-            # hard guardrails
-            p = apply_rule_overrides(k, x, p)
 
             w = float(weights.get(k, 0.0))
             parts[k] = {"x": x, "p": p, "w": w, "pb": pb_local}
             p_clip = float(np.clip(p, 1e-6, 1-1e-6))
             z_sum += w * math.log(p_clip/(1-p_clip))
 
-        # dilution penalty (binary)
+        # dilution penalty
         z_sum += -0.90 * float(dilution_flag)
         z_sum = float(np.clip(z_sum, -12, 12))
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
@@ -589,7 +493,7 @@ with tab_add:
             '<span class="pill pill-bad">Weak / Avoid</span>'
         )
 
-        # Checklist with Good/Caution/Risk relative to local baseline
+        # Checklist (vs local baseline)
         name_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL @ BO","si_pct":"Short Interest %",
             "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
@@ -605,7 +509,6 @@ with tab_add:
             elif p <= pb - CLASS_LIFT: risk.append(f"{nm}: {_fmt_value(x)} — risk (p≈{p_pct}%)")
             else:                      warn.append(f"{nm}: {_fmt_value(x)} — caution (p≈{p_pct}%)")
 
-        # Save row
         row = {
             "Ticker": ticker,
             "Odds": odds_name,
@@ -693,9 +596,7 @@ with tab_curves:
                 ax.set_xlabel("Rank (percentile)", fontsize=10)
                 ax.set_ylabel("P(FT)", fontsize=10)
                 ax.tick_params(labelsize=9)
-            # remove any empty subplots
-            total_axes = nrows * ncols
-            for j in range(n, total_axes):
+            for j in range(i+1, nrows*ncols):
                 fig.delaxes(axes[j//ncols, j % ncols])
             st.pyplot(fig, clear_figure=True)
         else:
