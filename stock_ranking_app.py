@@ -583,10 +583,10 @@ with tab_add:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
         a,b,c,d,e = st.columns(5)
         a.metric("Last Ticker", l.get("Ticker","—"))
-        b.metric("Final Score", f"{l.get("FinalScore",0):.2f}")
-        c.metric("Grade", l.get("Level","—"))
-        d.metric("Odds", l.get("Odds","—"))
-        e.metric("PredVol (M)", f"{l.get("PredVol_M",0):.2f}")
+        b.metric("Final Score", f"{l.get('FinalScore', 0):.2f}")
+        c.metric("Grade", l.get('Level', "—"))
+        d.metric("Odds", l.get('Odds', "—"))
+        e.metric("PredVol (M)", f"{l.get('PredVol_M', 0):.2f}")
 
         with st.expander("Premarket Checklist", expanded=True):
             st.markdown(f"**Verdict:** {l.get('VerdictPill','—')}", unsafe_allow_html=True)
