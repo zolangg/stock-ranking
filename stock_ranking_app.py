@@ -29,7 +29,7 @@ st.markdown("""
 # ============================== Sidebar (settings) ==============================
 st.sidebar.header("Learning / Scoring")
 
-sb_bins     = st.sidebar.slider("Histogram bins (rank space)", 20, 120, 60, 5)
+sb_bins     = st.sidebar.slider("Histogram bins (rank space)", 5, 120, 60, 5)
 sb_lift     = st.sidebar.slider("Lift over var baseline for Good/Risk", 0.02, 0.25, 0.08, 0.01)
 sb_support  = st.sidebar.slider("Min samples per bin", 2, 50, 6, 1)
 sb_gapmerge = st.sidebar.slider("Merge gaps ≤ (rank width)", 0.00, 0.10, 0.02, 0.005)
