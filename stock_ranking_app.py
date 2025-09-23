@@ -29,7 +29,7 @@ st.markdown("""
 # ============================== Sidebar (settings) ==============================
 st.sidebar.header("Learning / Scoring")
 
-sb_bins     = st.sidebar.slider("Histogram bins (rank space)", 0, 120, 60, 5)
+sb_bins     = st.sidebar.slider("Histogram bins (rank space)", 20, 120, 60, 5)
 sb_lift     = st.sidebar.slider("Lift over baseline for sweet/risk", 0.02, 0.25, 0.08, 0.01)
 sb_support  = st.sidebar.slider("Min samples per bin", 2, 50, 6, 1)
 sb_gapmerge = st.sidebar.slider("Merge gaps ≤ (rank width)", 0.00, 0.10, 0.02, 0.005)
@@ -40,19 +40,20 @@ tail_strength = st.sidebar.slider("High-tail penalty (exhaustion vars)", 0.0, 1.
 weight_dampen = st.sidebar.slider("Weight dampening", 0.0, 1.0, 0.20, 0.05)
 
 st.sidebar.markdown("---")
-show_baseline = st.sidebar.checkbox("Curves: show baseline", True)
-plot_all_curves = st.sidebar.checkbox("Curves: plot ALL variables", False)
-sel_curve_var = st.sidebar.selectbox(
-    "Or plot one variable",
-    ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m","float_m","mcap_m","fr_x","pmmc_pct","pm_pct_pred","catalyst"]
-)
+stretch_on    = st.sidebar.checkbox("Stretch curves to full 0–100%", True)
+stretch_eps   = st.sidebar.slider("Stretch floor/ceiling ε", 0.0, 0.10, 0.01, 0.005,
+                                  help="Min becomes ε, max becomes 1−ε")
+stretch_blend = st.sidebar.slider("Blend to baseline γ", 0.0, 1.0, 0.20, 0.05,
+                                  help="0 = pure stretched curve; 1 = baseline only")
 
 st.sidebar.markdown("---")
-stretch_on   = st.sidebar.checkbox("Stretch curves to full 0–100%", True)
-stretch_eps  = st.sidebar.slider("Stretch floor/ceiling ε", 0.0, 0.10, 0.01, 0.005,
-                                 help="Min becomes ε, max becomes 1−ε")
-stretch_blend= st.sidebar.slider("Blend with baseline γ", 0.0, 1.0, 0.20, 0.05,
-                                 help="0 = pure stretched curve; 1 = baseline only")
+show_baseline   = st.sidebar.checkbox("Curves: show baseline", True)
+plot_all_curves = st.sidebar.checkbox("Curves: plot ALL variables", False)
+sel_curve_var   = st.sidebar.selectbox(
+    "Or plot one variable",
+    ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m","float_m","mcap_m",
+     "fr_x","pmmc_pct","pm_pct_pred","catalyst"]
+)
 
 # ============================== Session State ==============================
 if "MODELS" not in st.session_state: st.session_state.MODELS = {}   # var -> model
@@ -84,12 +85,10 @@ def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
 
 def _fmt_value(v: float) -> str:
     if v is None or not np.isfinite(v): return "—"
-    if abs(v) >= 1_000_000: return f"{v/1_000_000:,.1f}M" # e.g. 1.2M
     if abs(v) >= 1000: return f"{v:,.0f}"
     if abs(v) >= 100:  return f"{v:.1f}"
     if abs(v) >= 1:    return f"{v:.2f}"
-    if abs(v) > 0.001: return f"{v:.3f}" # for very small numbers
-    return f"{v:.0e}" # scientific for extremely small
+    return f"{v:.3f}"
 
 def odds_label(score: float) -> str:
     if score >= 85: return "Very High Odds"
@@ -130,7 +129,7 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n: return c
-    for cand in candidates: # second pass for partial matches
+    for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if n in nm[c]: return c
@@ -139,16 +138,16 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
 # ================= Predicted Day Volume (for checklist) =================
 def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """ ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$) """
-    e = 1e-6 # small epsilon to prevent log(0)
-    mc  = max(float(mcap_m or 0.0), e)
-    gp  = max(float(gap_pct or 0.0), e) / 100.0
-    atr = max(float(atr_usd or 0.0), e)
-    ln_y = 3.1435 + 0.1608*math.log(mc) + 0.6704*math.log(gp) - 0.3878*math.log(atr)
+    e = 1e-6
+    mc  = max(float(mcap_m or 0.0), 0.0)
+    gp  = max(float(gap_pct or 0.0), 0.0) / 100.0
+    atr = max(float(atr_usd or 0.0), 0.0)
+    ln_y = 3.1435 + 0.1608*math.log(mc + e) + 0.6704*math.log(gp + e) - 0.3878*math.log(atr + e)
     return math.exp(ln_y)
 
 def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
-    if pred_m <= 0 or not np.isfinite(pred_m): return 0.0, 0.0
-    return pred_m * math.exp(-z * sigma_ln), pred_m * math.exp(z * sigma_ln)
+    if pred_m <= 0: return 0.0, 0.0
+    return pred_m * math.exp(-z), pred_m * math.exp(z)
 
 # ================= Rank-hist learning (DB-derived) =================
 EXHAUSTION_VARS = {"gap_pct","rvol","pm_dol_m","pmmc_pct","fr_x"}
@@ -156,34 +155,26 @@ EXHAUSTION_VARS = {"gap_pct","rvol","pm_dol_m","pmmc_pct","fr_x"}
 def moving_average(y: np.ndarray, w: int = 3) -> np.ndarray:
     if w <= 1: return y
     pad = w//2
-    # Use 'reflect' mode for padding to prevent edge effects
-    ypad = np.pad(y, (pad,pad), mode='reflect')
+    ypad = np.pad(y, (pad,pad), mode='edge')
     kernel = np.ones(w) / w
     return np.convolve(ypad, kernel, mode='valid')
 
 def stretch_curve_to_unit(p: np.ndarray, base_p: float,
                           eps: float = 0.01, gamma: float = 0.20) -> np.ndarray:
     """
-    Linearly stretch a probability curve so its min→eps and max→1-eps,
+    Linearly stretch a probability curve so its min→eps and max→1−eps,
     then softly blend back toward the baseline by gamma.
     """
     p = np.asarray(p, dtype=float)
     pmin, pmax = float(np.nanmin(p)), float(np.nanmax(p))
     if not np.isfinite(pmin) or not np.isfinite(pmax) or pmax <= pmin:
-        # degenerate -> just baseline
         return np.full_like(p, base_p)
-
-    # 1) linear stretch to [eps, 1-eps]
-    scale = max(1e-9, (pmax - pmin)) # Ensure scale is not zero
+    scale = max(1e-9, (pmax - pmin))
     p_stretched = eps + (1.0 - 2.0*eps) * (p - pmin) / scale
-
-    # 2) optional soft blend back to baseline
     if gamma > 0:
         p_final = (1.0 - gamma) * p_stretched + gamma * base_p
     else:
         p_final = p_stretched
-
-    # keep numeric sanity
     return np.clip(p_final, 1e-6, 1.0 - 1e-6)
 
 def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,Any]]:
@@ -196,7 +187,6 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
 
     ranks = x.rank(pct=True)   # 0..1
     edges = np.linspace(0,1,bins+1)
-    # Ensure idx stays within bounds for bincount
     idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, bins-1)
 
     total = np.bincount(idx, minlength=bins)
@@ -204,98 +194,81 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
     with np.errstate(divide='ignore', invalid='ignore'):
         p = np.where(total>0, ft/total, np.nan)
 
-    # Interpolate gaps then smooth
-    p_series = pd.Series(p).interpolate(method='linear', limit_direction="both")
-    p_fill = p_series.fillna(p_series.mean()).to_numpy() # Fill remaining NaNs with mean
+    p_series = pd.Series(p).interpolate(limit_direction="both")
+    p_fill = p_series.fillna(p_series.mean()).to_numpy()
     p_smooth = moving_average(p_fill, w=5)
-    
-    # Define quantiles before returning
+
     pr = np.linspace(0,1,41)
     vals = np.quantile(x, pr)
 
-    # Store the raw smoothed curve. Stretching/tail-penalizing will happen later.
     return {
         "edges": edges,
         "centers": (edges[:-1]+edges[1:])/2,
-        "p_raw": p_smooth.copy(),            # <— store raw smoothed curve
+        "p_raw": p_smooth,            # raw smoothed curve; we will tail-penalize then stretch
         "support": total,
-        "p0": float(y.mean()),     # baseline
+        "p0": float(y.mean()),        # baseline FT rate (from DB)
         "quantiles": {"pr": pr, "vals": vals},
         "n": int(len(x))
     }
 
 def auc_weight(x: pd.Series, y: pd.Series) -> float:
-    """AUC-like separation → 0..1 (with floor), then dampened later."""
+    """AUC-like separation → 0..1 (with floor)."""
     x = pd.to_numeric(x, errors="coerce"); y = pd.to_numeric(y, errors="coerce")
     mask = x.notna() & y.notna()
     x,y = x[mask], y[mask]
     if len(x) < 40 or y.nunique()!=2: return 0.0
-    
+    r = x.rank(method="average")
     n1 = int((y==1).sum()); n0 = int((y==0).sum())
     if n1==0 or n0==0: return 0.0
-
-    r = x.rank(method="average") # Use average rank for AUC calculation
     s1 = r[y==1].sum()
     auc = (s1 - n1*(n1+1)/2) / (n1*n0)
-    
-    # Ensure AUC is between 0 and 1, then calculate separation
-    auc = np.clip(auc, 0, 1)
     sep = abs(auc-0.5)*2.0  # 0..1
-
-    # also scale by curve amplitude so flat curves don’t get weight (this part will be done outside)
-    # The amplitude consideration will be integrated into the main learning loop
-    return float(max(0.05, sep)) # floor at 0.05 to give some base weight
+    return float(max(0.05, sep))
 
 def tail_penalize(var_key: str, centers: np.ndarray, p: np.ndarray, p0: float, strength: float) -> np.ndarray:
     """Penalize extreme high ranks for exhaustion variables."""
     if var_key not in EXHAUSTION_VARS or strength <= 0: return p
-    # ramp penalty in top tail (rank > 0.90 → up to strength)
-    tail = np.clip((centers - 0.90) / 0.08, 0, 1)  # 0→1 over 0.90..0.98
-    penalty_factor = 1.0 - strength * tail
-    return p0 + (p - p0) * penalty_factor
+    tail = np.clip((centers - 0.90) / 0.08, 0, 1)  # ramp over 0.90..0.98
+    penalty = 1.0 - strength * tail
+    return p0 + (p - p0) * penalty
 
 def find_intervals_adaptive(var_key: str, model: Dict[str,Any], lift: float, min_support: int,
                             gap_merge: float, min_span: float, strength: float) -> Tuple[List[Tuple[float,float]],List[Tuple[float,float]],float]:
     """
-    Extract sweet/risk intervals in rank. If none found, relax lift down to 30% of initial.
+    Extract sweet/risk intervals in rank. If none found, relax lift down to ~30% of initial.
     Returns (sweet_val_ranges, risk_val_ranges, used_lift).
     """
-    centers = model["centers"]; p_curve = model["p"].copy(); p0 = model["p0"]; sup = model["support"]
-    
-    # Apply tail penalty to the curve used for interval detection
-    p_tail_adjusted = tail_penalize(var_key, centers, p_curve, p0, strength)
-
+    centers = model["centers"]; p = model["p"].copy(); p0 = model["p0"]; sup = model["support"]
+    # (tail already applied in learn step)
     def _merge(mask, gl=gap_merge, ms=min_span):
         idx = np.where(mask)[0]
         if idx.size == 0: return []
         intervals = []
-        start_rank = centers[idx[0]]; last_rank = centers[idx[0]]
+        start = centers[idx[0]]; last = centers[idx[0]]
         for k in idx[1:]:
-            if (centers[k] - last_rank) <= gl:
-                last_rank = centers[k]
+            if (centers[k] - last) <= gl:
+                last = centers[k]
             else:
-                if (last_rank - start_rank) >= ms: intervals.append((float(start_rank), float(last_rank)))
-                start_rank = last_rank = centers[k]
-        if (last_rank - start_rank) >= ms: intervals.append((float(start_rank), float(last_rank)))
+                if (last - start) >= ms: intervals.append((float(start), float(last)))
+                start = last = centers[k]
+        if (last - start) >= ms: intervals.append((float(start), float(last)))
         return intervals
 
     used_lift = lift
     sweet_r, risk_r = [], []
     pr = model["quantiles"]["pr"]; vals = model["quantiles"]["vals"]
 
-    for step in range(6):  # relax up to ~lift*0.8^5 ~ lift*0.32
-        s_mask = (p_tail_adjusted >= p0 + used_lift) & (sup >= min_support)
-        r_mask = (p_tail_adjusted <= p0 - used_lift) & (sup >= min_support)
+    for _ in range(6):
+        s_mask = (p >= p0 + used_lift) & (sup >= min_support)
+        r_mask = (p <= p0 - used_lift) & (sup >= min_support)
         sweet_r = _merge(s_mask)
         risk_r  = _merge(r_mask)
-        if sweet_r or risk_r:
-            break
-        used_lift *= 0.8  # relax lift threshold
+        if sweet_r or risk_r: break
+        used_lift *= 0.8
 
-    def r2v(lo_rank, hi_rank):
-        # Interpolate ranks to values. Ensure bounds are handled.
-        lo_v = float(np.interp(np.clip(lo_rank, 0, 1), pr, vals))
-        hi_v = float(np.interp(np.clip(hi_rank, 0, 1), pr, vals))
+    def r2v(lo, hi):
+        lo_v = float(np.interp(lo, pr, vals))
+        hi_v = float(np.interp(hi, pr, vals))
         return lo_v, hi_v
 
     sweet_v = [r2v(a,b) for a,b in sweet_r]
@@ -303,27 +276,23 @@ def find_intervals_adaptive(var_key: str, model: Dict[str,Any], lift: float, min
     return sweet_v, risk_v, used_lift
 
 def value_to_prob(var_key: str, model: Dict[str,Any], x_val: float, tail_strength: float) -> float:
-    """Map raw value to FT probability via rank lookup + tail adjust."""
+    """Map raw value to FT probability via rank lookup on the **stretched** curve."""
     if model is None or not np.isfinite(x_val): return 0.5
-    
     pr, vals = model["quantiles"]["pr"], model["quantiles"]["vals"]
-    
-    # Clamp x_val to the range of learned values to avoid interpolation errors
-    x_val_clamped = np.clip(x_val, vals.min(), vals.max())
-    
-    # Interpolate x_val to its corresponding rank percentile
-    r = float(np.interp(x_val_clamped, vals, pr))
+    if x_val <= vals.min(): r = 0.0
+    elif x_val >= vals.max(): r = 1.0
+    else:
+        idx = np.searchsorted(vals, x_val)
+        i0 = max(1, min(idx, len(vals)-1))
+        x0, x1 = vals[i0-1], vals[i0]
+        p0, p1 = pr[i0-1], pr[i0]
+        t = (x_val - x0) / (x1 - x0) if x1 != x0 else 0.0
+        r = float(p0 + t*(p1 - p0))
 
-    centers = model["centers"]; p_curve = model["p"]; base = model["p0"]
-    
-    # Find the corresponding bin in the learned curve
+    centers = model["centers"]; p = model["p"];  # p is already stretched and tail-adjusted
     j = int(np.clip(np.searchsorted(centers, r), 0, len(centers)-1))
-    p_local = float(p_curve[j])
-    
-    # Apply tail penalty to this specific point
-    p_adj = tail_penalize(var_key, np.array([centers[j]]), np.array([p_local]), base, tail_strength)[0]
-    
-    return float(np.clip(p_adj, 1e-6, 1-1e-6)) # Ensure probability is not exactly 0 or 1
+    p_local = float(p[j])
+    return float(np.clip(p_local, 1e-6, 1-1e-6))
 
 # ============================== Upload & Learn (Main Pane) ==============================
 st.markdown('<div class="section-title">Upload workbook (sheet: PMH BO Merged)</div>', unsafe_allow_html=True)
@@ -343,24 +312,23 @@ if learn_btn:
                 raw = pd.read_excel(xls, merged_sheet)
 
                 # column mapping (robust-ish)
-                col_ft    = _pick(raw, ["ft","FT","f/t","follow through"])
+                col_ft    = _pick(raw, ["ft","FT"])
                 col_gap   = _pick(raw, ["gap %","gap%","premarket gap","gap"])
                 col_atr   = _pick(raw, ["atr","atr $","atr$","atr (usd)"])
-                col_rvol  = _pick(raw, ["rvol @ bo","rvol","relative volume","relative vol"])
+                col_rvol  = _pick(raw, ["rvol @ bo","rvol","relative volume"])
                 col_pmvol = _pick(raw, ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)"])
                 col_pmdol = _pick(raw, ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol"])
                 col_float = _pick(raw, ["float m shares","public float (m)","float (m)","float"])
                 col_mcap  = _pick(raw, ["marketcap m","market cap (m)","mcap m","mcap"])
                 col_si    = _pick(raw, ["si","short interest %","short float %","short interest (float) %"])
-                col_cat   = _pick(raw, ["catalyst","news","pr","catalyst present"])
-                col_daily = _pick(raw, ["daily vol (m)","day volume (m)","volume (m)","volume at close (m)"])
+                col_cat   = _pick(raw, ["catalyst","news","pr"])
+                col_daily = _pick(raw, ["daily vol (m)","day volume (m)","volume (m)"])
 
                 if col_ft is None:
-                    st.error("No 'FT' (Follow-Through) column found in merged sheet. Please ensure it's labeled clearly like 'FT' or 'ft'.")
+                    st.error("No 'FT' column found in merged sheet.")
                 else:
                     df = pd.DataFrame()
-                    # Ensure FT is boolean-like (0 or 1) for probability calculation
-                    df["FT"] = pd.to_numeric(raw[col_ft], errors="coerce").fillna(0).astype(int).clip(0,1)
+                    df["FT"] = pd.to_numeric(raw[col_ft], errors="coerce")
 
                     if col_gap:   df["gap_pct"]  = pd.to_numeric(raw[col_gap],   errors="coerce")
                     if col_atr:   df["atr_usd"]  = pd.to_numeric(raw[col_atr],   errors="coerce")
@@ -370,26 +338,24 @@ if learn_btn:
                     if col_float: df["float_m"]  = pd.to_numeric(raw[col_float], errors="coerce")
                     if col_mcap:  df["mcap_m"]   = pd.to_numeric(raw[col_mcap],  errors="coerce")
                     if col_si:    df["si_pct"]   = pd.to_numeric(raw[col_si],    errors="coerce")
-                    # Catalyst should be 0 or 1
-                    if col_cat:   df["catalyst"] = pd.to_numeric(raw[col_cat],   errors="coerce").fillna(0).clip(0,1)
+                    if col_cat:   df["catalyst"] = pd.to_numeric(raw[col_cat],   errors="coerce").clip(0,1)
                     if col_daily: df["daily_vol_m"] = pd.to_numeric(raw[col_daily], errors="coerce")
 
                     # derived — from DB
-                    # Adding checks for division by zero or NaN
-                    df["fr_x"] = df.apply(lambda r: r["pm_vol_m"] / r["float_m"] if pd.notna(r["pm_vol_m"]) and r["float_m"] > 0 else np.nan, axis=1)
-                    df["pmmc_pct"] = df.apply(lambda r: 100.0 * r["pm_dol_m"] / r["mcap_m"] if pd.notna(r["pm_dol_m"]) and r["mcap_m"] > 0 else np.nan, axis=1)
-                    
+                    if {"pm_vol_m","float_m"}.issubset(df.columns):
+                        df["fr_x"] = df["pm_vol_m"] / df["float_m"]
+                    if {"pm_dol_m","mcap_m"}.issubset(df.columns):
+                        df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
                     if {"mcap_m","gap_pct","atr_usd","pm_vol_m"}.issubset(df.columns):
                         def _pred_row(r):
                             try:
                                 return predict_day_volume_m_premarket(r["mcap_m"], r["gap_pct"], r["atr_usd"])
-                            except Exception: # Catch potential errors from log(0)
+                            except Exception:
                                 return np.nan
                         pred = df.apply(_pred_row, axis=1)
-                        df["pm_pct_pred"] = df.apply(lambda r: 100.0 * r["pm_vol_m"] / r["predicted_vol"] if pd.notna(r["pm_vol_m"]) and r["predicted_vol"] > 0 else np.nan, predicted_vol=pred, axis=1)
-                        df["predicted_day_vol_m"] = pred # Keep for potential use/display
+                        df["pm_pct_pred"] = 100.0 * df["pm_vol_m"] / pred
 
-                    df = df[df["FT"].notna()] # Filter out rows where FT is NaN
+                    df = df[df["FT"].notna()]
                     y = df["FT"].astype(float)
                     base_p = float(y.mean())
 
@@ -400,53 +366,45 @@ if learn_btn:
                     ]
                     models, weights = {}, {}
                     for v in candidates:
-                        if v in df.columns and df[v].notna().sum() > 40: # Only try to learn if enough non-null data
-                           m = rank_hist_model(df[v], y, bins=sb_bins)
-                           if m is not None:
-                                  # 1) tail-penalize on the raw smoothed curve (p_raw)
-                                  centers = m["centers"]
-                                  p_base  = m["p0"]
-                                  p_raw_smoothed = m["p_raw"] # This is the curve coming out of rank_hist_model
-                                  p_tp    = tail_penalize(v, centers, p_raw_smoothed, p_base, tail_strength)
-                              
-                                  # 2) optional stretch to 0..1 (with eps) and blend to baseline
-                                  if stretch_on:
-                                      p_use = stretch_curve_to_unit(p_tp, base_p=p_base,
-                                                                    eps=stretch_eps, gamma=stretch_blend)
-                                  else:
-                                      p_use = p_tp
-                              
-                                  # save the working curve (p) and optionally the raw tail-penalized curve
-                                  m["p"] = p_use       # <— this is what the rest of the app uses now
-                                  m["p_raw_tp"] = p_tp # (optional) keep for debugging/plots if needed
-                              
-                                  # 3) find intervals using the working curve (p)
-                                  # The `find_intervals_adaptive` function needs the 'p' key in the model.
-                                  # Since we just assigned `p_use` to `m["p"]`, we can directly pass `m`.
-                                  sweet_v, risk_v, used_lift = find_intervals_adaptive(
-                                      v, m, lift=sb_lift, min_support=sb_support,
-                                      gap_merge=sb_gapmerge, min_span=sb_minspan, strength=tail_strength
-                                  )
-                                  m["sweet_vals"] = sweet_v
-                                  m["risk_vals"]  = risk_v
-                                  m["used_lift"]  = used_lift
-                              
-                                  models[v] = m
-                                  # weights calculation
-                                  w_sep = auc_weight(df[v], y)
-                                  # Use the actual amplitude of the *final working curve* for weighting
-                                  amp = float(np.nanstd(p_use))
-                                  # Combine separation and amplitude for a more robust weight
-                                  weights[v] = max(0.05, min(1.0, 0.7*w_sep + 0.3*(amp*4))) # 'amp*4' is a heuristic to scale amplitude to a similar range as AUC separation
+                        if v in df.columns:
+                            m = rank_hist_model(df[v], y, bins=sb_bins)
+                            if m is not None:
+                                # 1) tail-penalize on the raw curve
+                                centers = m["centers"]
+                                p_base  = m["p0"]
+                                p_raw   = m["p_raw"]
+                                p_tp    = tail_penalize(v, centers, p_raw, p_base, tail_strength)
 
-                    # dampen & normalize weights
+                                # 2) stretch + blend to baseline
+                                if stretch_on:
+                                    p_use = stretch_curve_to_unit(p_tp, base_p=p_base,
+                                                                  eps=stretch_eps, gamma=stretch_blend)
+                                else:
+                                    p_use = p_tp
+                                m["p"] = p_use
+                                m["p_raw_tp"] = p_tp  # optional debug
+
+                                # 3) find intervals on the working curve
+                                tmp_model = dict(m)
+                                sweet_v, risk_v, used_lift = find_intervals_adaptive(
+                                    v, tmp_model, lift=sb_lift, min_support=sb_support,
+                                    gap_merge=sb_gapmerge, min_span=sb_minspan, strength=tail_strength
+                                )
+                                m["sweet_vals"] = sweet_v
+                                m["risk_vals"]  = risk_v
+                                m["used_lift"]  = used_lift
+                                models[v] = m
+
+                                # weights
+                                w_sep = auc_weight(df[v], y)
+                                amp   = float(np.nanstd(p_use))
+                                weights[v] = max(0.05, min(1.0, 0.7*w_sep + 0.3*(amp*4)))
+
+                    # dampen & normalize
                     if weights:
                         damp = {k: (1.0 - weight_dampen) * w for k, w in weights.items()}
-                        s = sum(damp.values())
-                        if s > 0: # Avoid division by zero if all weights are zero
-                           weights = {k: v/s for k, v in damp.items()}
-                        else:
-                           weights = {k: 0.0 for k in weights} # Set all to 0 if sum is 0
+                        s = sum(damp.values()) or 1.0
+                        weights = {k: v/s for k, v in damp.items()}
 
                     st.session_state.MODELS  = models
                     st.session_state.WEIGHTS = weights
@@ -454,7 +412,6 @@ if learn_btn:
                     st.success(f"Learned {len(models)} variables · Baseline P(FT) ≈ {base_p:.2f}")
         except Exception as e:
             st.error(f"Learning failed: {e}")
-            st.exception(e) # Show full traceback for debugging
 
 # ============================== Tabs ==============================
 tab_add, tab_rank, tab_curves, tab_spots = st.tabs(["➕ Add Stock", "📊 Ranking", "📈 Curves", "🎯 Sweet Spots"])
@@ -475,7 +432,210 @@ with tab_add:
             rvol     = input_float("RVOL @ BO", 0.0, min_value=0.0, decimals=2)
             pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
             pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
+            dilution_flag = st.select_slider("Dilution present?", options=[0,1], value=0,
+                                             help="0 = none/negligible, 1 = present/overhang (penalizes log-odds)")
         with c3:
             catalyst_flag = st.selectbox("Catalyst?", ["No","Yes"])
-            dilution_flag = st.select_slider("Dilution present?", options=[0,1], value=0,
-                                             help="0 = none/negligible, 1 = present/
+
+        submitted = st.form_submit_button("Add / Score", use_container_width=True)
+
+    if submitted and ticker:
+        # Derived live
+        fr_x = (pm_vol_m / float_m) if float_m > 0 else float("nan")
+        pmmc_pct = (100.0 * pm_dol_m / mc_m) if mc_m > 0 else float("nan")
+
+        # Predicted Day Vol & PM% of Predicted
+        sigma_ln = 0.60
+        pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
+        ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
+        pm_pct_pred = (100.0 * pm_vol_m / pred_vol_m) if pred_vol_m > 0 else float("nan")
+
+        models  = st.session_state.MODELS or {}
+        weights = st.session_state.WEIGHTS or {}
+        base_p  = float(st.session_state.BASEP or 0.5)
+
+        var_vals = {
+            "gap_pct": gap_pct, "atr_usd": atr_usd, "rvol": rvol, "si_pct": si_pct,
+            "pm_vol_m": pm_vol_m, "pm_dol_m": pm_dol_m, "float_m": float_m, "mcap_m": mc_m,
+            "fr_x": fr_x, "pmmc_pct": pmmc_pct, "pm_pct_pred": pm_pct_pred,
+            "catalyst": 1.0 if catalyst_flag=="Yes" else 0.0
+        }
+
+        # per-variable probability from learned (stretched) curves
+        parts: Dict[str, Dict[str, float]] = {}
+        z_sum = 0.0
+        for k, x in var_vals.items():
+            mdl = models.get(k)
+            p = value_to_prob(k, mdl, x, tail_strength) if mdl else base_p
+            w = float(weights.get(k, 0.0))
+            parts[k] = {"x": x, "p": p, "w": w}
+            if p <= 0 or p >= 1: p = float(np.clip(p, 1e-6, 1-1e-6))
+            z_sum += w * math.log(p/(1-p))
+
+        # dilution penalty (binary)
+        z_sum += -0.90 * float(dilution_flag)
+        z_sum = float(np.clip(z_sum, -12, 12))
+        numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
+
+        final_score = float(np.clip(numeric_prob*100.0, 0.0, 100.0))
+        odds_name = odds_label(final_score)
+        level = grade(final_score)
+        verdict_pill = (
+            '<span class="pill pill-good">Strong Setup</span>' if final_score >= 70 else
+            '<span class="pill pill-warn">Constructive</span>' if final_score >= 55 else
+            '<span class="pill pill-bad">Weak / Avoid</span>'
+        )
+
+        # checklist: Good/Caution/Risk by data-derived lift (per-variable)
+        name_map = {
+            "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL @ BO","si_pct":"Short Interest %",
+            "pm_vol_m":"PM Volume (M)","pm_dol_m":"PM $Vol (M)","float_m":"Float (M)","mcap_m":"MarketCap (M)",
+            "fr_x":"PM Float Rotation ×","pmmc_pct":"PM $Vol / MC %","pm_pct_pred":"PM Vol % of Pred",
+            "catalyst":"Catalyst"
+        }
+        good, warn, risk = [], [], []
+        for k, d in parts.items():
+            nm = name_map.get(k, k)
+            p = d["p"]; x = d["x"]
+            p_pct = int(round(p*100))
+            used_lift = models.get(k,{}).get("used_lift", sb_lift)
+            if p >= base_p + used_lift:
+                good.append(f"{nm}: {_fmt_value(x)} — good (p≈{p_pct}%)")
+            elif p <= base_p - used_lift:
+                risk.append(f"{nm}: {_fmt_value(x)} — risk (p≈{p_pct}%)")
+            else:
+                warn.append(f"{nm}: {_fmt_value(x)} — caution (p≈{p_pct}%)")
+
+        pm_pred_line = f"PM Vol % of Pred: {_fmt_value(pm_pct_pred)}%" if np.isfinite(pm_pct_pred) else "PM Vol % of Pred: —"
+
+        row = {
+            "Ticker": ticker,
+            "Odds": odds_name,
+            "Level": level,
+            "FinalScore": round(final_score, 2),
+            "PredVol_M": round(pred_vol_m, 2),
+            "PredVol_CI68_L": round(ci68_l, 2),
+            "PredVol_CI68_U": round(ci68_u, 2),
+            "VerdictPill": verdict_pill,
+            "GoodList": good, "WarnList": warn, "RiskList": risk,
+            "PM_Pct_Pred_Line": pm_pred_line
+        }
+        st.session_state.rows.append(row)
+        st.session_state.last = row
+        st.success(f"Saved {ticker} — Odds {row['Odds']} (Score {row['FinalScore']})")
+
+    # preview card
+    l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
+    if l:
+        st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
+        a,b,c,d,e = st.columns(5)
+        a.metric("Last Ticker", l.get("Ticker","—"))
+        b.metric("Final Score", f"{l.get('FinalScore',0):.2f}")
+        c.metric("Grade", l.get("Level","—"))
+        d.metric("Odds", l.get("Odds","—"))
+        e.metric("PredVol (M)", f"{l.get('PredVol_M',0):.2f}")
+        st.caption(f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M")
+
+        with st.expander("Premarket Checklist", expanded=True):
+            st.markdown(f"**Verdict:** {l.get('VerdictPill','—')}", unsafe_allow_html=True)
+            st.markdown(f"<div class='mono'>{l.get('PM_Pct_Pred_Line','')}</div>", unsafe_allow_html=True)
+            g,w,r = st.columns(3)
+            def ul(items): return "<ul>"+"".join([f"<li>{x}</li>" for x in items])+"</ul>" if items else "<ul><li>—</li></ul>"
+            with g: st.markdown("**Good**");    st.markdown(ul(l.get("GoodList",[])), unsafe_allow_html=True)
+            with w: st.markdown("**Caution**"); st.markdown(ul(l.get("WarnList",[])), unsafe_allow_html=True)
+            with r: st.markdown("**Risk**");    st.markdown(ul(l.get("RiskList",[])), unsafe_allow_html=True)
+
+# ============================== Ranking ==============================
+with tab_rank:
+    st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
+    if st.session_state.rows:
+        df = pd.DataFrame(st.session_state.rows).sort_values("FinalScore", ascending=False).reset_index(drop=True)
+        cols_to_show = ["Ticker","Odds","Level","FinalScore","PredVol_M","PredVol_CI68_L","PredVol_CI68_U"]
+        for c in cols_to_show:
+            if c not in df.columns: df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
+        st.dataframe(
+            df[cols_to_show], use_container_width=True, hide_index=True,
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "Odds": st.column_config.TextColumn("Odds"),
+                "Level": st.column_config.TextColumn("Grade"),
+                "FinalScore": st.column_config.NumberColumn("Final Score", format="%.2f"),
+                "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
+                "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
+                "PredVol_CI68_U": st.column_config.NumberColumn("Pred Vol CI68 High (M)", format="%.2f"),
+            }
+        )
+        st.download_button(
+            "Download CSV",
+            df[cols_to_show].to_csv(index=False).encode("utf-8"),
+            "ranking.csv", "text/csv", use_container_width=True
+        )
+    else:
+        st.info("Add at least one stock.")
+
+# ============================== Curves ==============================
+with tab_curves:
+    st.markdown('<div class="section-title">Learned Curves (rank-space FT rate)</div>', unsafe_allow_html=True)
+    models = st.session_state.MODELS or {}
+    base_p = float(st.session_state.BASEP or 0.5)
+    if not models:
+        st.info("Upload + Learn first.")
+    else:
+        if plot_all_curves:
+            learned_vars = list(models.keys())
+            n = len(learned_vars)
+            ncols = 3
+            nrows = int(np.ceil(n / ncols))
+            fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*4.8, nrows*3.2))
+            axes = np.atleast_2d(axes)
+            for i, var in enumerate(learned_vars):
+                ax = axes[i//ncols, i % ncols]
+                m = models[var]
+                centers = m["centers"]; p = m["p"]
+                ax.plot(centers, p, lw=2)
+                if show_baseline: ax.axhline(base_p, ls="--", lw=1, color="gray")
+                ax.set_title(var)
+                ax.set_xlabel("Rank (percentile)")
+                ax.set_ylabel("P(FT)")
+            for j in range(i+1, nrows*ncols):
+                fig.delaxes(axes[j//ncols, j % ncols])
+            st.pyplot(fig, clear_figure=True)
+        else:
+            var = sel_curve_var
+            m = models.get(var)
+            if m is None:
+                st.warning(f"No curve learned for '{var}'.")
+            else:
+                centers = m["centers"]; p = m["p"]
+                fig, ax = plt.subplots(figsize=(6.4, 3.2))
+                ax.plot(centers, p, lw=2)
+                if show_baseline: ax.axhline(base_p, ls="--", lw=1, color="gray")
+                ax.set_xlabel("Rank (percentile of variable)")
+                ax.set_ylabel("P(FT | rank)")
+                ax.set_title(f"{var} — FT rate curve")
+                st.pyplot(fig, clear_figure=True)
+
+# ============================== Sweet Spots ==============================
+with tab_spots:
+    st.markdown('<div class="section-title">Sweet Spots & Danger Zones (value intervals)</div>', unsafe_allow_html=True)
+    models = st.session_state.MODELS or {}
+    if not models:
+        st.info("Upload + Learn first.")
+    else:
+        rows = []
+        for v, m in models.items():
+            sweet_v = m.get("sweet_vals", [])
+            risk_v  = m.get("risk_vals", [])
+            used_lift = m.get("used_lift", sb_lift)
+            rows.append({
+                "Variable": v,
+                "Baseline p(FT)": round(m["p0"],3),
+                "Used Lift": round(used_lift,3),
+                "Sweet (values)": "; ".join([f"[{_fmt_value(a)},{_fmt_value(b)}]" for a,b in sweet_v]) or "",
+                "Risk (values)":  "; ".join([f"[{_fmt_value(a)},{_fmt_value(b)}]" for a,b in risk_v]) or "",
+                "N": m.get("n",0)
+            })
+        tbl = pd.DataFrame(rows)
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
+        st.download_button("Download sweet/risk intervals (CSV)", tbl.to_csv(index=False).encode("utf-8"),
+                           "sweet_risk_intervals.csv", "text/csv", use_container_width=True)
