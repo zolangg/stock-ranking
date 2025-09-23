@@ -630,4 +630,4 @@ with tab_curves:
                 ax.set_xlabel("Rank (percentile of variable)", fontsize=10)
                 ax.set_ylabel("P(FT | rank)", fontsize=10)
                 ax.set_title(f"{var} — FT curve (baseline dashed)", fontsize=11)
-                ax.tick_params(labelsize=
+                ax.tick_params(labelsize=9)
