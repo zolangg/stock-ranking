@@ -47,6 +47,13 @@ sel_curve_var = st.sidebar.selectbox(
     ["gap_pct","atr_usd","rvol","si_pct","pm_vol_m","pm_dol_m","float_m","mcap_m","fr_x","pmmc_pct","pm_pct_pred","catalyst"]
 )
 
+st.sidebar.markdown("---")
+stretch_on   = st.sidebar.checkbox("Stretch curves to full 0–100%", True)
+stretch_eps  = st.sidebar.slider("Stretch floor/ceiling ε", 0.0, 0.10, 0.01, 0.005,
+                                 help="Min becomes ε, max becomes 1−ε")
+stretch_blend= st.sidebar.slider("Blend with baseline γ", 0.0, 1.0, 0.20, 0.05,
+                                 help="0 = pure stretched curve; 1 = baseline only")
+
 # ============================== Session State ==============================
 if "MODELS" not in st.session_state: st.session_state.MODELS = {}   # var -> model
 if "WEIGHTS" not in st.session_state: st.session_state.WEIGHTS = {} # var -> weight
@@ -151,6 +158,31 @@ def moving_average(y: np.ndarray, w: int = 3) -> np.ndarray:
     kernel = np.ones(w) / w
     return np.convolve(ypad, kernel, mode='valid')
 
+def stretch_curve_to_unit(p: np.ndarray, base_p: float,
+                          eps: float = 0.01, gamma: float = 0.20) -> np.ndarray:
+    """
+    Linearly stretch a probability curve so its min→eps and max→1-eps,
+    then softly blend back toward the baseline by gamma.
+    """
+    p = np.asarray(p, dtype=float)
+    pmin, pmax = float(np.nanmin(p)), float(np.nanmax(p))
+    if not np.isfinite(pmin) or not np.isfinite(pmax) or pmax <= pmin:
+        # degenerate -> just baseline
+        return np.full_like(p, base_p)
+
+    # 1) linear stretch to [eps, 1-eps]
+    scale = max(1e-9, (pmax - pmin))
+    p_stretched = eps + (1.0 - 2.0*eps) * (p - pmin) / scale
+
+    # 2) optional soft blend back to baseline
+    if gamma > 0:
+        p_final = (1.0 - gamma) * p_stretched + gamma * base_p
+    else:
+        p_final = p_stretched
+
+    # keep numeric sanity
+    return np.clip(p_final, 1e-6, 1.0 - 1e-6)
+
 def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,Any]]:
     """Learn FT-rate curve in rank space with smoothing and interpolation."""
     x = pd.to_numeric(x, errors="coerce")
@@ -172,6 +204,23 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
     p_series = pd.Series(p).interpolate(limit_direction="both")
     p_fill = p_series.fillna(p_series.mean()).to_numpy()
     p_smooth = moving_average(p_fill, w=5)
+    
+    # existing:
+    # p_smooth = moving_average(p_fill, w=5)
+    
+    # replace/add this line:
+    p_cal = p_smooth.copy()  # keep raw smoothed
+    
+    # store raw; stretched will be applied later in learn step (so tail penalty happens first)
+    return {
+        "edges": edges,
+        "centers": (edges[:-1]+edges[1:])/2,
+        "p_raw": p_cal,            # <— store raw smoothed curve
+        "support": total,
+        "p0": float(y.mean()),     # baseline
+        "quantiles": {"pr": pr, "vals": vals},
+        "n": int(len(x))
+    }
 
     pr = np.linspace(0,1,41)
     vals = np.quantile(x, pr)
@@ -347,22 +396,43 @@ if learn_btn:
                     models, weights = {}, {}
                     for v in candidates:
                         if v in df.columns:
-                            m = rank_hist_model(df[v], y, bins=sb_bins)
-                            if m is not None:
-                                # find intervals; ADAPTIVE lift so we don't end up empty
-                                sweet_v, risk_v, used_lift = find_intervals_adaptive(
-                                    v, m, lift=sb_lift, min_support=sb_support,
-                                    gap_merge=sb_gapmerge, min_span=sb_minspan, strength=tail_strength
-                                )
-                                m["sweet_vals"]  = sweet_v
-                                m["risk_vals"]   = risk_v
-                                m["used_lift"]   = used_lift
-                                models[v] = m
-
-                                # weight from separation + curve amplitude
-                                w_sep = auc_weight(df[v], y)
-                                amp = float(np.nanstd(m["p"]))  # how wavy the curve is
-                                weights[v] = max(0.05, min(1.0, 0.7*w_sep + 0.3*(amp*4)))
+                           m = rank_hist_model(df[v], y, bins=sb_bins)
+                              if m is not None:
+                                  # 1) tail-penalize on the raw smoothed curve
+                                  centers = m["centers"]
+                                  p_base  = m["p0"]
+                                  p_raw   = m["p_raw"]
+                                  p_tp    = tail_penalize(v, centers, p_raw, p_base, tail_strength)
+                              
+                                  # 2) optional stretch to 0..1 (with eps) and blend to baseline
+                                  if stretch_on:
+                                      p_use = stretch_curve_to_unit(p_tp, base_p=p_base,
+                                                                    eps=stretch_eps, gamma=stretch_blend)
+                                  else:
+                                      p_use = p_tp
+                              
+                                  # save the working curve
+                                  m["p"] = p_use       # <— this is what the rest of the app uses now
+                                  m["p_raw_tp"] = p_tp # (optional) keep for debugging/plots
+                              
+                                  # 3) find intervals using the working curve (p)
+                                  # temporarily swap p into the model for the extractor
+                                  tmp_model = dict(m)
+                                  tmp_model["p"] = p_use
+                              
+                                  sweet_v, risk_v, used_lift = find_intervals_adaptive(
+                                      v, tmp_model, lift=sb_lift, min_support=sb_support,
+                                      gap_merge=sb_gapmerge, min_span=sb_minspan, strength=tail_strength
+                                  )
+                                  m["sweet_vals"] = sweet_v
+                                  m["risk_vals"]  = risk_v
+                                  m["used_lift"]  = used_lift
+                              
+                                  models[v] = m
+                                  # weights (unchanged)
+                                  w_sep = auc_weight(df[v], y)
+                                  amp = float(np.nanstd(p_use))
+                                  weights[v] = max(0.05, min(1.0, 0.7*w_sep + 0.3*(amp*4)))
 
                     # dampen & normalize
                     if weights:
