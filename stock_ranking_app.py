@@ -980,32 +980,32 @@ with tab_add:
             else:
                 st.markdown("\n".join(items))
 
-        # Diagnostics
-        with st.expander("Diagnostics (curves & tail penalties)"):
-            dbg = st.session_state.get("DEBUG_POF", {})
-            if dbg:
-                dd = pd.DataFrame([{"Variable": k, "Status": v} for k, v in dbg.items()])
-                st.dataframe(dd, hide_index=True, use_container_width=True)
+    # Diagnostics
+with st.expander("Diagnostics (curves & tail penalties)"):
+    dbg = st.session_state.get("DEBUG_POF", {})
+    if dbg:
+        dd = pd.DataFrame([{"Variable": k, "Status": v} for k, v in dbg.items()])
+        st.dataframe(dd, hide_index=True, use_container_width=True)
 
-            pen_debug = l.get("_TailPenalties", {})
-            if pen_debug:
-                pen_rows = []
-                for k, v in pen_debug.items():
-                    if isinstance(v, dict):
-                        pen_rows.append({
-                            "Variable": k,
-                            "Low": v.get("low", None),
-                            "High": v.get("high", None),
-                            "Penalty (Δlogodds)": round(v.get("pen_raw", 0.0), 3)
-                        })
-                    else:
-                        pen_rows.append({
-                            "Variable": k,
-                            "Low": "",
-                            "High": "",
-                            "Penalty (Δlogodds)": round(float(v), 3)
-                        })
-                st.dataframe(pd.DataFrame(pen_rows), hide_index=True, use_container_width=True)
+    pen_debug = l.get("_TailPenalties", {})
+    if pen_debug:
+        pen_rows = []
+        for k, v in pen_debug.items():
+            # Only keep dict-shaped entries with a numeric penalty
+            if not isinstance(v, dict):
+                continue
+            pen = v.get("pen_raw", None)
+            if isinstance(pen, (int, float)) and np.isfinite(pen):
+                pen_rows.append({
+                    "Variable": k,
+                    "Low": v.get("low", None),
+                    "High": v.get("high", None),
+                    "Penalty (Δlogodds)": round(float(pen), 3)
+                })
+        if pen_rows:
+            st.dataframe(pd.DataFrame(pen_rows), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No numeric tail penalties to display.")
 
 # =============== Ranking Tab ===============
 with tab_rank:
