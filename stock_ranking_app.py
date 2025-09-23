@@ -91,6 +91,21 @@ def grade(score_pct: float) -> str:
             "B"   if score_pct >= 60 else
             "C"   if score_pct >= 45 else "D")
 
+# ================= Stable math helpers =================
+def stable_sigmoid(z):
+    z = np.asarray(z, dtype=float)
+    z = np.clip(z, -50.0, 50.0)
+    return 1.0 / (1.0 + np.exp(-z))
+
+def stable_logit(p):
+    p = np.asarray(p, dtype=float)
+    p = np.clip(p, 1e-9, 1.0 - 1e-9)
+    return np.log(p) - np.log(1.0 - p)
+
+def prob_from_logodds(z):
+    z = float(np.clip(z, -50.0, 50.0))
+    return 1.0 / (1.0 + math.exp(-z))
+
 # ================= Prediction model (Predicted Day Vol) =================
 def predict_day_volume_m(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """
@@ -266,7 +281,7 @@ def fit_curve(series: pd.Series, labels: pd.Series, force_log: bool=False):
     x_raw = x_raw[mask]; y_raw = y_raw[mask]
     if len(x_raw) < MIN_ROWS: return None
 
-    # auto log for skewed positive vars; SI forced log because high SI should map better in log-space
+    # auto log for skewed positive vars; SI forced log because high SI maps better in log space
     use_log = False
     if force_log and (x_raw > 0).all(): use_log = True
     elif (x_raw > 0).all() and abs(pd.Series(x_raw).skew()) > 0.75: use_log = True
@@ -303,15 +318,15 @@ def fit_curve(series: pd.Series, labels: pd.Series, force_log: bool=False):
 
 # ================= Priors & Guardrails =================
 PRIORS = {
-    "gap_pct":     {"kind":"hump", "c":110.0, "w":45.0},    # ~70–180 sweet; still workable until ~250
-    "rvol":        {"kind":"hump", "c":9.0,   "w":6.0},     # ~150–1500× ⇒ log ≈ 5.0–7.3 ; here use raw scale hump
+    "gap_pct":     {"kind":"hump", "c":110.0, "w":45.0},    # ~70–180 sweet; workable until ~250
+    "rvol":        {"kind":"hump", "c":9.0,   "w":6.0},     # this operates in raw scale; still acts as soft prior
     "pm_dol_m":    {"kind":"hump", "c":11.0,  "w":8.0},     # $7–15M sweet
     "pm_pct_pred": {"kind":"hump", "c":18.0,  "w":10.0},    # 10–20% sweet
     "pmmc_pct":    {"kind":"hump", "c":12.0,  "w":10.0},    # ~8–30% okay; very high = dilution/exhaustion risk
     "atr_usd":     {"kind":"hump", "c":0.30,  "w":0.18},    # ≥0.15; 0.2–0.4 typical
     "float_m":     {"kind":"low_better"},
     "mcap_m":      {"kind":"low_better"},
-    "si_pct":      {"kind":"high_better", "pivot": math.log(15.0), "scale": 0.35},  # log SI, pivot ~15%
+    "si_pct":      {"kind":"high_better", "pivot": math.log(15.0), "scale": 0.35},  # **log SI**, pivot ~15%
     "fr_x":        {"kind":"hump", "c":0.25,  "w":0.15},
     "catalyst":    {"kind":"high_better", "pivot":0.8, "scale":0.25},
 }
@@ -350,19 +365,30 @@ BASE_PEN_STRENGTH = {
 }
 
 def _prior_p(var: str, x: float) -> float:
-    if x is None or not np.isfinite(x): return 0.5
-    spec = PRIORS.get(var, {"kind":"flat"}); kind = spec.get("kind","flat")
+    if x is None or not np.isfinite(x): 
+        return 0.5
+    spec = PRIORS.get(var, {"kind":"flat"})
+    kind = spec.get("kind","flat")
+
     if kind == "hump":
-        c = spec.get("c", 0.0); w = spec.get("w", 1.0)
-        p = math.exp(-0.5 * ((x - c) / max(1e-6,w))**2)
-        return 0.2 + 0.6 * p
+        c = float(spec.get("c", 0.0)); w = max(1e-6, float(spec.get("w", 1.0)))
+        t = (x - c) / w
+        t = np.clip(t, -1e3, 1e3)
+        p = np.exp(-0.5 * (t**2))
+        return float(np.clip(0.2 + 0.6 * p, 1e-3, 1-1e-3))
+
     if kind == "low_better":
-        s = 1.0 / (1.0 + math.exp( (x - 12.0) / 4.0 ))
-        return 0.2 + 0.6 * s
+        z = -(x - 12.0) / 4.0
+        s = stable_sigmoid(z)
+        return float(np.clip(0.2 + 0.6 * s, 1e-3, 1-1e-3))
+
     if kind == "high_better":
-        pivot = spec.get("pivot", 0.0); scale = spec.get("scale", 1.0)
-        z = (x - pivot) / max(1e-6, scale); s = 1.0 / (1.0 + math.exp(-z))
-        return 0.2 + 0.6 * s
+        pivot = float(spec.get("pivot", 0.0))
+        scale = max(1e-6, float(spec.get("scale", 1.0)))
+        z = (x - pivot) / scale
+        s = stable_sigmoid(z)
+        return float(np.clip(0.2 + 0.6 * s, 1e-3, 1-1e-3))
+
     return 0.5
 
 def blend_with_prior(var: str, p_learned: float, x: float) -> float:
@@ -391,10 +417,8 @@ def tail_penalty_bidirectional_soft(x, low, high, k_low, k_high, reliability, de
 # ================= Learn Curves + Weights =================
 def learn_all_curves_and_weights(file, merged_sheet: str, ft_sheet: str, fail_sheet: str):
     xls = pd.ExcelFile(file)
-    used_merged = False
     if merged_sheet in xls.sheet_names:
         raw = pd.read_excel(xls, merged_sheet)
-        used_merged = True
         mapping = reveal_mapping(raw)
         num = build_numeric_table(raw)
         if "_y" not in num.columns or num["_y"].nunique() < 2:
@@ -416,12 +440,12 @@ def learn_all_curves_and_weights(file, merged_sheet: str, ft_sheet: str, fail_sh
         "pm_vol_m","pm_dol_m","float_m","mcap_m",
         "fr_x","pmmc_pct","pm_pct_pred","catalyst"
     ]
-    curves, summary_rows, learned = {}, [], 0
+    curves, summary_rows = {}, []
     for v in var_list:
         if v in num.columns:
             model = fit_curve(num[v], num["_y"], force_log=(v=="si_pct"))
             if model:
-                curves[v] = model; learned += 1
+                curves[v] = model
                 q = model["q"]
                 summary_rows.append({
                     "Variable": v, "n": model["n"], "Used Log": model["use_log"],
@@ -455,24 +479,24 @@ def learn_all_curves_and_weights(file, merged_sheet: str, ft_sheet: str, fail_sh
     X = np.vstack(X).T  # N x K
     y = num["_y"].to_numpy(dtype=float)
 
-    # Ridge logistic regression (IRLS)
+    # Ridge logistic regression (IRLS) — stable
     def fit_logreg_ridge(X: np.ndarray, y: np.ndarray, l2: float = 1.0, maxit: int = 50) -> Tuple[np.ndarray, float]:
         N, K = X.shape
         X1 = np.concatenate([np.ones((N,1)), X], axis=1)
         beta = np.zeros(K+1)
         for _ in range(maxit):
-            z = X1 @ beta
-            p = 1.0 / (1.0 + np.exp(-z))
-            W = np.clip(p*(1-p), 1e-6, None)
-            R = y - p
-            WX = X1 * W[:,None]
-            H = X1.T @ WX
+            z   = np.clip(X1 @ beta, -50.0, 50.0)
+            p   = 1.0 / (1.0 + np.exp(-z))
+            W   = np.clip(p*(1-p), 1e-6, None)
+            R   = y - p
+            WX  = X1 * W[:,None]
+            H   = X1.T @ WX
             H[1:,1:] += l2 * np.eye(K)
-            g = X1.T @ (W*(z + R/W))
+            g   = X1.T @ (W*(z + R/np.clip(W,1e-9,None)))
             try:
                 beta_new = np.linalg.solve(H, g)
             except np.linalg.LinAlgError:
-                break
+                beta_new = beta + 0.1 * (g - H @ beta)
             if np.max(np.abs(beta_new - beta)) < 1e-6:
                 beta = beta_new; break
             beta = beta_new
@@ -536,8 +560,7 @@ def tail_penalty_for(k: str, v: float, reliability: float) -> float:
     band = DOMAIN_OVERRIDES.get(k, {})
     low, high = band.get("low", None), band.get("high", None)
     base_low, base_high = BASE_PEN_STRENGTH.get(k, (0.25, 0.25))
-    kL = base_low; kH = base_high
-    return tail_penalty_bidirectional_soft(v, low, high, kL, kH, reliability, deadzone_frac=0.05, alpha=0.60)
+    return tail_penalty_bidirectional_soft(v, low, high, base_low, base_high, reliability, deadzone_frac=0.05, alpha=0.60)
 
 def bucket_line(var_label: str, value: Optional[float], p: float, reason: str) -> str:
     if value is None or not np.isfinite(value): v_str = "—"
@@ -578,7 +601,6 @@ with tab_add:
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
     if submitted and ticker:
-        # curves & weights
         curves = (st.session_state.CURVES or {}).get("curves", {}) if isinstance(st.session_state.CURVES, dict) else {}
         learned_w = st.session_state.WEIGHTS or {}
 
@@ -589,13 +611,12 @@ with tab_add:
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
         pm_pct_pred = (100.0 * pm_vol_m / pred_vol_m) if (pred_vol_m and pred_vol_m>0) else float("nan")
 
-        # catalyst input value
+        # catalyst override
         if catalyst_override.startswith("Auto"):
-            catalyst_val = np.nan  # let curve handle; NA -> neutral then prior blend elevates by DB if learned
+            catalyst_val = np.nan
         else:
             catalyst_val = 1.0 if catalyst_override == "Yes" else 0.0
 
-        # values map
         val_map = {
             "gap_pct": gap_pct, "atr_usd": atr_usd, "rvol": rvol, "si_pct": si_pct,
             "pm_vol_m": pm_vol_m, "pm_dol_m": pm_dol_m, "float_m": float_m, "mcap_m": mc_m,
@@ -604,18 +625,13 @@ with tab_add:
         }
 
         # per-variable probs
-        probs = {}
-        for k, v in val_map.items():
-            probs[k] = per_var_prob(curves, k, v)
+        probs = {k: per_var_prob(curves, k, v) for k, v in val_map.items()}
 
-        # reliability (if we learned a curve, trust more)
+        # reliability: we trust learned curves more
         reliab = {k: (1.0 if k in curves else 0.3) for k in val_map.keys()}
 
-        # soft tail penalties (Δlogodds), summed later
-        pen_vec = []
-        for k, v in val_map.items():
-            pen_vec.append(tail_penalty_for(k, v, reliab.get(k, 0.5)))
-        pen_vec = np.array(pen_vec, dtype=float)
+        # penalties (Δlogodds), including soft guardrails
+        pen_vec = np.array([tail_penalty_for(k, val_map[k], reliab.get(k,0.5)) for k in val_map.keys()], dtype=float)
 
         # learned weights for variables (weighted average, not stacking)
         feat_keys = list(val_map.keys())
@@ -627,12 +643,12 @@ with tab_add:
         p_vec = np.array([probs[k] for k in feat_keys], dtype=float)
 
         # weighted mean probability
-        p_final_mean = float(np.clip(np.sum(weights_vec * p_vec), 0.0, 1.0))
+        p_final_mean = float(np.clip(np.sum(weights_vec * p_vec), 1e-6, 1.0 - 1e-6))
 
-        # convert combined tail penalties + dilution to probability shift in log-odds
-        z = math.log(max(p_final_mean,1e-6)/max(1-p_final_mean,1e-6))
+        # convert to log-odds, add penalties + dilution
+        z = stable_logit(p_final_mean)
         z_pen = float(np.clip(pen_vec.sum(), -1.5, 0.0)) + (-0.35 if dilution_flag==1 else 0.0)
-        p_numeric = 1.0 / (1.0 + math.exp(-(z + z_pen)))
+        p_numeric = prob_from_logodds(z + z_pen)
         final_score = float(np.clip(100.0 * p_numeric, 0.0, 100.0))
         odds = odds_label(final_score); level = grade(final_score)
 
@@ -641,7 +657,7 @@ with tab_add:
         elif final_score >= 55.0: verdict = "Constructive"; pill = '<span class="pill pill-warn">Constructive</span>'
         else: verdict = "Weak / Avoid"; pill = '<span class="pill pill-bad">Weak / Avoid</span>'
 
-        # Checklist 3 buckets
+        # Checklist buckets
         names_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
             "pm_vol_m":"PM Volume (M)","pm_dol_m":"PM $Vol (M)","float_m":"Float (M)","mcap_m":"MarketCap (M)",
@@ -663,7 +679,14 @@ with tab_add:
         for k in names_map.keys():
             label = names_map[k]; val = val_map.get(k, None); p = probs.get(k, 0.5)
             bucket, reason = bucket_for(k, p, val if isinstance(val,(int,float)) else np.nan)
-            line = bucket_line(label, val, p, reason)
+            # show input value and probability
+            if val is None or not np.isfinite(val): v_str = "—"
+            else:
+                if abs(val) >= 1000: v_str = f"{val:,.0f}"
+                elif abs(val) >= 100: v_str = f"{val:.0f}"
+                elif abs(val) >= 10:  v_str = f"{val:.1f}"
+                else: v_str = f"{val:.2f}"
+            line = f"- **{label}**: {v_str} — *{reason}* (p≈{p*100:.0f}%)"
             if bucket == "good": good_items.append(line)
             elif bucket == "risk": risk_items.append(line)
             else: caution_items.append(line)
