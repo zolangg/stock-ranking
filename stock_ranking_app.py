@@ -77,17 +77,17 @@ def _fmt_value(v: float) -> str:
 # (Kept for backward compatibility if ever used elsewhere)
 def odds_label(score: float) -> str:
     if score >= 85: return "Very High Odds"
-    elif score >= 70: return "High Odds"
-    elif score >= 55: return "Moderate Odds"
+    elif score >= 75: return "High Odds"
+    elif score >= 60: return "Moderate Odds"
     elif score >= 40: return "Low Odds"
     else: return "Very Low Odds"
 
 def grade(score_pct: float) -> str:
-    return ("A++" if score_pct >= 90 else
-            "A+"  if score_pct >= 85 else
-            "A"   if score_pct >= 75 else
+    return ("A++" if score_pct >= 95 else
+            "A+"  if score_pct >= 90 else
+            "A"   if score_pct >= 80 else
             "B"   if score_pct >= 65 else
-            "C"   if score_pct >= 50 else "D")
+            "C"   if score_pct >= 45 else "D")
 
 def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
     keep = [c for c in cols if c in df.columns]
