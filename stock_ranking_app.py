@@ -30,7 +30,7 @@ st.markdown("""
 
 # ============================== Sidebar (Curves only) ==============================
 st.sidebar.header("Curves")
-BINS = st.sidebar.slider("Curve bins (histogram)", min_value=2, max_value=100, value=2, step=1)
+BINS = st.sidebar.slider("Curve bins (histogram)", min_value=2, max_value=10, value=2, step=1)
 show_baseline = st.sidebar.checkbox("Curves: show baseline", True)
 plot_all_curves = st.sidebar.checkbox("Curves: plot ALL variables", False)
 sel_curve_var = st.sidebar.selectbox(
