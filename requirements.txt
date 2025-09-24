@@ -4,5 +4,3 @@ openpyxl
 numpy
 matplotlib
 scikit-learn
-re
-math
