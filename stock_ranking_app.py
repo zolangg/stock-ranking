@@ -160,22 +160,61 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
     if len(x) < 40 or y.nunique() != 2:
         return None
 
+    # ranks & bins
     ranks = x.rank(pct=True)
-    edges = np.linspace(0, 1, int(bins) + 1)
-    idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, int(bins)-1)
+    B = int(bins)
+    edges = np.linspace(0, 1, B + 1)
+    idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, B-1)
 
-    total = np.bincount(idx, minlength=int(bins))
-    ft    = np.bincount(idx[y==1], minlength=int(bins))
+    # counts
+    total = np.bincount(idx, minlength=B)
+    ft    = np.bincount(idx[y==1], minlength=B)
+    p0_global = float(y.mean())
+
+    # --- Laplace/Bayesian smoothing toward global baseline ---
+    # kappa controls pull strength; increase when data is tiny
+    kappa = max(6.0, 0.1 * len(x) / max(1, B))  # heuristic
     with np.errstate(divide='ignore', invalid='ignore'):
-        p_bin = np.where(total>0, ft/total, np.nan)
+        p_bin_raw = np.where(total>0, ft/total, np.nan)
+        p_bin = (ft + kappa * p0_global) / (total + kappa)
 
-    p_series = pd.Series(p_bin).interpolate(limit_direction="both")
-    p_fill   = p_series.fillna(p_series.mean()).to_numpy()
-    p_smooth = moving_average(p_fill, w=3)
+    # Smooth a touch for B>2
+    if B > 2:
+        p_series = pd.Series(p_bin).interpolate(limit_direction="both")
+        p_fill   = p_series.fillna(p_series.mean()).to_numpy()
+        p_smooth = moving_average(p_fill, w=3)
+    else:
+        # For 2 bins, keep the smoothed values we just computed
+        p_smooth = p_bin
 
     centers = (edges[:-1] + edges[1:]) / 2.0
-    p0_global = float(y.mean())
     p_base_var = float(np.average(p_smooth, weights=(total + 1e-9)))
+
+    # --- When B==2: build a linear, directional curve across rank ---
+    if B == 2:
+        p_low, p_high = float(p_smooth[0]), float(p_smooth[1])
+        # slope across rank 0..1, centered on per-variable baseline
+        # linear map: p(r) = pb + (p_high - p_low) * (r - 0.5)
+        # clamp to reasonable prob range to avoid extremes in tiny data
+        p_line = p_base_var + (p_high - p_low) * (centers - 0.5)
+        p_line = np.clip(p_line, 0.05, 0.95)
+        p_ready = p_line
+    else:
+        p_ready = p_smooth
+
+    # Stretch to epsilon band to avoid degeneracy, but milder when B==2
+    eps_before = STRETCH_EPS
+    eps_use = 0.08 if B == 2 else eps_before
+    pmin, pmax = float(np.min(p_ready)), float(np.max(p_ready))
+    if np.isfinite(pmin) and np.isfinite(pmax) and pmax > pmin:
+        scale = (pmax - pmin)
+        p_use = eps_use + (1.0 - 2.0*eps_use) * (p_ready - pmin) / scale
+    else:
+        p_use = np.full_like(p_ready, p_base_var)
+    p_use = np.clip(p_use, 1e-6, 1 - 1e-6)
+
+    # local baseline curve (for checklist comparisons)
+    pb_curve = _smooth_local_baseline(centers, p_use, total, bandwidth=0.30 if B==2 else 0.22)
 
     pr = np.linspace(0,1,41)
     vals = np.quantile(x, pr)
@@ -184,9 +223,10 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
         "edges": edges,
         "centers": centers,
         "support": total,
-        "p_raw": p_smooth,
+        "p_raw": p_use,            # already final for use
         "p0_global": p0_global,
         "p_base_var": p_base_var,
+        "pb_curve": pb_curve,
         "quantiles": {"pr": pr, "vals": vals},
         "n": int(len(x))
     }
