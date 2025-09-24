@@ -267,20 +267,20 @@ ODDS_FLOORS  = {"very_high": 0.85, "high": 0.70, "moderate": 0.55, "low": 0.40}
 GRADE_FLOORS = {"App": 0.92, "Ap": 0.85, "A": 0.75, "B": 0.65, "C": 0.50}
 
 # ---------- Caution / Risk / Good adjustments (logit space) ----------
-CAUTION_PENALTY = 0.28    # per "unit" (caution near baseline)
-CAUTION_POWER   = 2.0     # center-heavy
+CAUTION_PENALTY = 0.4    # per "unit" (caution near baseline)
+CAUTION_POWER   = 3.0     # center-heavy
 USE_BETA_SCALE  = True
 MIN_BETA_SCALE  = 0.6
-GAMMA_FRAC      = 0.25    # global shrink with many caution vars
+GAMMA_FRAC      = 0.4    # global shrink with many caution vars
 
-RISK_PENALTY    = 0.42    # <<< NEW: stronger hit than caution
-RISK_POWER      = 2.0     # <<< NEW: heavier with deeper risk
+RISK_PENALTY    = 0.5    # <<< NEW: stronger hit than caution
+RISK_POWER      = 3.0     # <<< NEW: heavier with deeper risk
 
-GOOD_BONUS      = 0.18    # <<< NEW: bonus for “good”
-GOOD_POWER      = 1.5     # <<< NEW: smoother than risk
+GOOD_BONUS      = 0.4    # <<< NEW: bonus for “good”
+GOOD_POWER      = 3.0     # <<< NEW: smoother than risk
 
-GLOBAL_GOOD_GAIN_FRAC = 0.15  # <<< NEW: mild global boost for many goods
-GLOBAL_RISK_SHRINK_FRAC = 0.30 # <<< NEW: extra shrink when many in risk
+GLOBAL_GOOD_GAIN_FRAC = 0.4  # <<< NEW: mild global boost for many goods
+GLOBAL_RISK_SHRINK_FRAC = 0.5 # <<< NEW: extra shrink when many in risk
 
 # ---------- Logistic stacking (ridge) ----------
 def _safe_logit(p: np.ndarray) -> np.ndarray:
