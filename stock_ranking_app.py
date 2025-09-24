@@ -690,63 +690,69 @@ with tab_add:
         )
 
         # Checklist with Good/Caution/Risk relative to local baseline (display only)
-        name_map = {
-            "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
-            "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
-            "pmmc_pct":"PM $Vol / MC %","pm_pct_daily":"PM Vol % of Daily",
-            "pm_pct_pred":"PM Vol % of Pred","catalyst":"Catalyst"
-        }
-        good, warn, risk = [], [], []
-        for k in stack_keys:
-            mdl = models.get(k)
-            x = var_vals.get(k, np.nan)
-            if mdl is None: 
-                continue
-            p = value_to_prob(k, mdl, x)
-            pb = _baseline_at_value(mdl, x)
-            p = blend_with_prior(k, x, p)
-            if k == "atr_usd":
-                p = anchor_atr(p, x, pb)
-            p = anchor_pm_percent(k, p, x, pb)
-            p = float(np.clip(p,1e-6,1-1e-6))
-            p_pct = int(round(p*100))
-            nm = name_map.get(k, k)
-            if p >= pb + CLASS_LIFT:   good.append(f"{nm}: {_fmt_value(x)} — good (p≈{p_pct}%)")
-            elif p <= pb - CLASS_LIFT: risk.append(f"{nm}: {_fmt_value(x)} — risk (p≈{p_pct}%)")
-            else:                      warn.append(f"{nm}: {_fmt_value(x)} — caution (p≈{p_pct}%)")
+name_map = {
+    "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
+    "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
+    "pmmc_pct":"PM $Vol / MC %","pm_pct_daily":"PM Vol % of Daily",
+    "pm_pct_pred":"PM Vol % of Pred","catalyst":"Catalyst"
+}
 
-        # Save row
-        row = {
-            "Ticker": ticker,
-            "Odds": odds_name,
-            "Level": level,
-            "FinalScore": round(final_score, 2),
-            "PredVol_M": round(pred_vol_m, 2),
-            "VerdictPill": verdict_pill,
-            "GoodList": good, "WarnList": warn, "RiskList": risk,
-        }
-        st.session_state.rows.append(row)
-        st.session_state.last = row
-        st.success(f"Saved {ticker} — Odds {row['Odds']} (Score {row['FinalScore']})")
+# grab learned stacking to compute contributions
+stack_keys = st.session_state.get("STACK_KEYS", [])
+coef_ = st.session_state.get("STACK_COEF", None)
 
-    # preview card
-    l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
-    if l:
-        st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
-        a,b,c,d,e = st.columns(5)
-        a.metric("Last Ticker", l.get("Ticker","—"))
-        b.metric("Final Score", f"{l.get('FinalScore',0):.2f}")
-        c.metric("Grade", l.get('Level','—'))
-        d.metric("Odds", l.get('Odds','—'))
-        e.metric("PredVol (M)", f"{l.get('PredVol_M',0):.2f}")
+def _logit(x): 
+    x = float(np.clip(x, 1e-6, 1-1e-6))
+    return math.log(x/(1-x))
 
-        with st.expander("Premarket Checklist", expanded=True):
-            st.markdown(f"**Verdict:** {l.get('VerdictPill','—')}", unsafe_allow_html=True)
-            g,w,r = st.columns(3)
-            def ul(items): return "<ul>"+"".join([f"<li>{x}</li>" for x in items])+"</ul>" if items else "<ul><li>—</li></ul>"
-            with g: st.markdown("**Good**");    st.markdown(ul(l.get("GoodList",[])), unsafe_allow_html=True)
-            with w: st.markdown("**Caution**"); st.markdown(ul(l.get("WarnList",[])), unsafe_allow_html=True)
-            with r: st.markdown("**Risk**");    st.markdown(ul(l.get("RiskList",[])), unsafe_allow_html=True)
+good, warn, risk = [], [], []
+detail_rows = []  # optional: for a debugging table
+
+# thresholds for contribution buckets (logit-space * weight units)
+# tune: 0.25 ~= noticeable, 0.10 ~= small tilt
+TH_GOOD = 0.25
+TH_RISK = -0.25
+
+for i, k in enumerate(stack_keys):
+    mdl = models.get(k)
+    x  = var_vals.get(k, np.nan)
+    if mdl is None:
+        continue
+
+    # recompute adjusted per-var prob the same way features were built
+    p = value_to_prob(k, mdl, x)
+    pb = _baseline_at_value(mdl, x)
+    p  = blend_with_prior(k, x, p)
+    if k == "atr_usd":
+        p = anchor_atr(p, x, pb)
+    p  = anchor_pm_percent(k, p, x, pb)
+    p  = float(np.clip(p, 1e-6, 1-1e-6))
+    pb = float(np.clip(pb,1e-6,1-1e-6))
+
+    # contribution uses learned coef; if none (rare), default to 1.0
+    beta = float(coef_[i]) if (coef_ is not None and i < len(coef_)) else 1.0
+    contrib = beta * (_logit(p) - _logit(pb))
+
+    nm = name_map.get(k, k)
+    p_pct = int(round(p*100))
+    # bucket by contribution
+    if contrib >= TH_GOOD:
+        good.append(f"{nm}: {_fmt_value(x)} — good (p≈{p_pct}%, Δlogit×β=+{contrib:.2f})")
+    elif contrib <= TH_RISK:
+        risk.append(f"{nm}: {_fmt_value(x)} — risk (p≈{p_pct}%, Δlogit×β={contrib:.2f})")
+    else:
+        warn.append(f"{nm}: {_fmt_value(x)} — caution (p≈{p_pct}%, Δlogit×β={contrib:.2f})")
+
+    # keep an internal row if you want to show a table later
+    detail_rows.append({
+        "Variable": nm,
+        "Value": _fmt_value(x),
+        "p": round(p,4),
+        "pb": round(pb,4),
+        "beta": round(beta,3),
+        "Δlogit": round(_logit(p) - _logit(pb),3),
+        "Contribution": round(contrib,3),
+    })
 
 # ============================== Ranking ==============================
 with tab_rank:
