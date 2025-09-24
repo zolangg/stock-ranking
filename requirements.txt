@@ -3,6 +3,6 @@ pandas
 openpyxl
 numpy
 matplotlib
-sklearn
+scikit-learn
 re
 math
