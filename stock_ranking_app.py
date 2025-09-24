@@ -77,21 +77,6 @@ def _fmt_value(v: float) -> str:
     if abs(v) >= 1:    return f"{v:.2f}"
     return f"{v:.3f}"
 
-def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
-    keep = [c for c in cols if c in df.columns]
-    if not keep: return "| (no data) |\n| --- |"
-    sub = df.loc[:, keep].copy().fillna("")
-    header = "| " + " | ".join(keep) + " |"
-    sep    = "| " + " | ".join(["---"] * len(keep)) + " |"
-    lines = [header, sep]
-    for _, row in sub.iterrows():
-        cells = []
-        for c in keep:
-            v = row[c]
-            cells.append(f"{v:.2f}" if isinstance(v, float) else str(v))
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
 def _norm(s: str) -> str:
     s = re.sub(r"\s+", " ", str(s).strip().lower())
     return s.replace("$","").replace("%","").replace("’","").replace("'","")
@@ -281,14 +266,21 @@ def _inv_warp_p(s_warped: float, alpha: float) -> float:
 ODDS_FLOORS  = {"very_high": 0.85, "high": 0.70, "moderate": 0.55, "low": 0.40}
 GRADE_FLOORS = {"App": 0.92, "Ap": 0.85, "A": 0.75, "B": 0.65, "C": 0.50}
 
-# ---------- Stronger Caution penalty controls ----------
-CAUTION_PENALTY = 0.28   # base strength per "unit" of caution
-CAUTION_POWER   = 2.0    # 2=quadratic center weight (stronger near baseline)
-USE_BETA_SCALE  = True   # scale per-var penalty by |beta|
-MIN_BETA_SCALE  = 0.6    # floor for weak betas
-GAMMA_FRAC      = 0.25   # global shrink proportional to fraction in caution
-HARD_CAP_CAUTION_FRAC = 0.75   # if >= 75% vars in caution...
-HARD_CAP_PROB         = 0.80   # ...cap final prob at 80%
+# ---------- Caution / Risk / Good adjustments (logit space) ----------
+CAUTION_PENALTY = 0.28    # per "unit" (caution near baseline)
+CAUTION_POWER   = 2.0     # center-heavy
+USE_BETA_SCALE  = True
+MIN_BETA_SCALE  = 0.6
+GAMMA_FRAC      = 0.25    # global shrink with many caution vars
+
+RISK_PENALTY    = 0.42    # <<< NEW: stronger hit than caution
+RISK_POWER      = 2.0     # <<< NEW: heavier with deeper risk
+
+GOOD_BONUS      = 0.18    # <<< NEW: bonus for “good”
+GOOD_POWER      = 1.5     # <<< NEW: smoother than risk
+
+GLOBAL_GOOD_GAIN_FRAC = 0.15  # <<< NEW: mild global boost for many goods
+GLOBAL_RISK_SHRINK_FRAC = 0.30 # <<< NEW: extra shrink when many in risk
 
 # ---------- Logistic stacking (ridge) ----------
 def _safe_logit(p: np.ndarray) -> np.ndarray:
@@ -449,7 +441,7 @@ if learn_btn:
                     df = df[df["FT"].notna()]
                     y = df["FT"].astype(float)
 
-                    # learn models per variable (no sweet-band anchors, no guardrails)
+                    # learn models per variable
                     candidates = [
                         "gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m",
                         "fr_x","pmmc_pct","pm_pct_daily","pm_pct_pred","catalyst"
@@ -478,7 +470,7 @@ if learn_btn:
                     y_list: List[int] = []
 
                     if models:
-                        # ensure derived fields exist (in case)
+                        # ensure derived fields exist
                         if {"pm_vol_m","float_m"}.issubset(df.columns) and "fr_x" not in df.columns:
                             df["fr_x"] = df["pm_vol_m"] / df["float_m"]
                         if {"pm_dol_m","mcap_m"}.issubset(df.columns) and "pmmc_pct" not in df.columns:
@@ -639,9 +631,14 @@ with tab_add:
         else:
             z_sum = float(np.mean(X_live))
 
-        # ----- Stronger Caution penalty (logit space) -----
-        penalty_units = 0.0
+        # ----- Good/Caution/Risk effects in logit space -----
+        penalty_caution_units = 0.0
+        penalty_risk_units    = 0.0   # <<< NEW
+        bonus_good_units      = 0.0   # <<< NEW
         n_in_caution = 0
+        n_in_risk    = 0           # <<< NEW
+        n_in_good    = 0           # <<< NEW
+
         for i, k in enumerate(stack_keys):
             mdl = models.get(k)
             x = var_vals.get(k, np.nan)
@@ -657,41 +654,57 @@ with tab_add:
             p  = float(np.clip(p, 1e-6, 1-1e-6))
             pb = float(np.clip(pb,1e-6,1-1e-6))
 
-            diff = abs(p - pb)
-            if diff < CLASS_LIFT:
+            delta = p - pb
+            absdiff = abs(delta)
+
+            # beta scaling (importance)
+            if coef_ is not None and i < len(coef_) and USE_BETA_SCALE:
+                beta_scale = max(MIN_BETA_SCALE, abs(float(coef_[i])))
+            else:
+                beta_scale = 1.0
+
+            if absdiff < CLASS_LIFT:
                 n_in_caution += 1
-                # center-heavy weight: 1 at center, 0 at edge; raise power for more punch
-                w = (CLASS_LIFT - diff) / CLASS_LIFT
+                w = (CLASS_LIFT - absdiff) / CLASS_LIFT
                 w = w ** CAUTION_POWER
+                penalty_caution_units += w * beta_scale
+            elif delta >= CLASS_LIFT:
+                # GOOD: above baseline beyond threshold
+                n_in_good += 1
+                # how far into good zone (normalized past threshold)
+                over = min(1.0, (delta - CLASS_LIFT) / max(CLASS_LIFT, 1e-6))
+                w = over ** GOOD_POWER
+                bonus_good_units += w * beta_scale
+            else:
+                # RISK: below baseline beyond threshold
+                n_in_risk += 1
+                over = min(1.0, (-delta - CLASS_LIFT) / max(CLASS_LIFT, 1e-6))
+                w = over ** RISK_POWER
+                penalty_risk_units += w * beta_scale
 
-                # scale by |beta| importance (if trained)
-                if coef_ is not None and i < len(coef_) and USE_BETA_SCALE:
-                    beta_scale = abs(float(coef_[i]))
-                    beta_scale = max(MIN_BETA_SCALE, beta_scale)
-                else:
-                    beta_scale = 1.0
+        # apply all adjustments
+        z_sum +=  GOOD_BONUS   * bonus_good_units
+        z_sum -=  CAUTION_PENALTY * penalty_caution_units
+        z_sum -=  RISK_PENALTY * penalty_risk_units
 
-                penalty_units += w * beta_scale
+        # global adjustments by shares in states
+        total_vars = len(stack_keys) if len(stack_keys) > 0 else 1
+        frac_caution = n_in_caution / total_vars
+        frac_good    = n_in_good / total_vars
+        frac_risk    = n_in_risk / total_vars
 
-        # subtract total penalty (scaled) in logit space
-        z_sum -= CAUTION_PENALTY * penalty_units
+        # shrink toward neutral when many in caution
+        z_sum *= max(0.0, 1.0 - GAMMA_FRAC * frac_caution)
 
-        # global shrink toward neutral if many vars are in caution
-        if len(stack_keys) > 0:
-            frac_caution = n_in_caution / float(len(stack_keys))
-            z_sum *= max(0.0, 1.0 - GAMMA_FRAC * frac_caution)
+        # mild global boost for many goods; shrink for many risks (multiplicative on z)
+        z_sum *= (1.0 + GLOBAL_GOOD_GAIN_FRAC * frac_good)
+        z_sum *= max(0.0, 1.0 - GLOBAL_RISK_SHRINK_FRAC * frac_risk)
 
         # dilution penalty (binary) in logit space
         z_sum += -0.90 * float(dilution_flag)
 
         z_sum = float(np.clip(z_sum, -12, 12))
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
-
-        # optional hard ceiling when caution dominates
-        if len(stack_keys) > 0:
-            frac_caution = n_in_caution / float(len(stack_keys))
-            if frac_caution >= HARD_CAP_CAUTION_FRAC:
-                numeric_prob = min(numeric_prob, HARD_CAP_PROB)
 
         # Use calibrated thresholds
         odds_cuts = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
@@ -707,7 +720,7 @@ with tab_add:
             '<span class="pill pill-bad">Weak / Avoid</span>'
         )
 
-        # Checklist (shows per-var p vs baseline for context)
+        # Checklist
         name_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
             "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
