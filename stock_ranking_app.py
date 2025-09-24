@@ -5,7 +5,7 @@ import numpy as np
 import math
 import re
 import matplotlib.pyplot as plt
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 # ============================== Page & CSS ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -30,7 +30,7 @@ st.markdown("""
 
 # ============================== Sidebar (Curves only) ==============================
 st.sidebar.header("Curves")
-BINS = st.sidebar.slider("Curve bins (histogram)", min_value=1, max_value=50, value=1, step=1)
+BINS = st.sidebar.slider("Curve bins (histogram)", min_value=1, max_value=10, value=4, step=1)
 show_baseline = st.sidebar.checkbox("Curves: show baseline", True)
 plot_all_curves = st.sidebar.checkbox("Curves: plot ALL variables", False)
 sel_curve_var = st.sidebar.selectbox(
@@ -41,11 +41,13 @@ sel_curve_var = st.sidebar.selectbox(
 
 # ============================== Session State ==============================
 if "MODELS" not in st.session_state: st.session_state.MODELS = {}   # var -> model dict
-if "WEIGHTS" not in st.session_state: st.session_state.WEIGHTS = {} # var -> weight
 if "rows"   not in st.session_state: st.session_state.rows = []
 if "last"   not in st.session_state: st.session_state.last = {}
 if "ODDS_CUTS" not in st.session_state: st.session_state.ODDS_CUTS = {}
 if "GRADE_CUTS" not in st.session_state: st.session_state.GRADE_CUTS = {}
+if "STACK_KEYS" not in st.session_state: st.session_state.STACK_KEYS = []
+if "STACK_COEF" not in st.session_state: st.session_state.STACK_COEF = None
+if "STACK_BIAS" not in st.session_state: st.session_state.STACK_BIAS = 0.0
 
 # ============================== Helpers ==============================
 def _parse_local_float(s: str) -> Optional[float]:
@@ -74,21 +76,6 @@ def _fmt_value(v: float) -> str:
     if abs(v) >= 100:  return f"{v:.1f}"
     if abs(v) >= 1:    return f"{v:.2f}"
     return f"{v:.3f}"
-
-# (legacy helpers not used for labels anymore; kept just in case)
-def odds_label(score: float) -> str:
-    if score >= 85: return "Very High Odds"
-    elif score >= 70: return "High Odds"
-    elif score >= 55: return "Moderate Odds"
-    elif score >= 40: return "Low Odds"
-    else: return "Very Low Odds"
-
-def grade(score_pct: float) -> str:
-    return ("A++" if score_pct >= 90 else
-            "A+"  if score_pct >= 85 else
-            "A"   if score_pct >= 75 else
-            "B"   if score_pct >= 65 else
-            "C"   if score_pct >= 50 else "D")
 
 def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
     keep = [c for c in cols if c in df.columns]
@@ -150,7 +137,7 @@ def stretch_curve_to_unit(p: np.ndarray, base_p: float) -> np.ndarray:
         return np.full_like(p, base_p)
     scale = max(1e-9, (pmax - pmin))
     p_stretched = eps + (1.0 - 2.0*eps) * (p - pmin) / scale
-    return np.clip(p_stretched, 1e-6, 1.0 - 1e-6)
+    return np.clip(p_stretched, 1e-6, 1.0 - 1.0e-6)
 
 # ---------- Local baseline smoothing ----------
 def _smooth_local_baseline(centers: np.ndarray, p_curve: np.ndarray, support: np.ndarray, bandwidth: float = 0.22) -> np.ndarray:
@@ -184,7 +171,6 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
 
     p_series = pd.Series(p_bin).interpolate(limit_direction="both")
     p_fill   = p_series.fillna(p_series.mean()).to_numpy()
-    # window 3 still ok for larger bins; it just smooths lightly
     p_smooth = moving_average(p_fill, w=3)
 
     centers = (edges[:-1] + edges[1:]) / 2.0
@@ -204,19 +190,6 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
         "quantiles": {"pr": pr, "vals": vals},
         "n": int(len(x))
     }
-
-def auc_weight(x: pd.Series, y: pd.Series) -> float:
-    x = pd.to_numeric(x, errors="coerce"); y = pd.to_numeric(y, errors="coerce")
-    mask = x.notna() & y.notna()
-    x,y = x[mask], y[mask]
-    if len(x) < 40 or y.nunique()!=2: return 0.0
-    r = x.rank(method="average")
-    n1 = int((y==1).sum()); n0 = int((y==0).sum())
-    if n1==0 or n0==0: return 0.0
-    s1 = r[y==1].sum()
-    auc = (s1 - n1*(n1+1)/2) / (n1*n0)
-    sep = abs(auc-0.5)*2.0
-    return float(max(0.05, sep))
 
 def value_to_prob(var_key: str, model: Dict[str,Any], x_val: float) -> float:
     if model is None or not np.isfinite(x_val): return 0.5
@@ -308,49 +281,84 @@ def _inv_warp_p(s_warped: float, alpha: float) -> float:
 ODDS_FLOORS  = {"very_high": 0.85, "high": 0.70, "moderate": 0.55, "low": 0.40}
 GRADE_FLOORS = {"App": 0.92, "Ap": 0.85, "A": 0.75, "B": 0.65, "C": 0.50}
 
-# ---------- Calibration helpers ----------
-def _stack_prob_for_row(models: Dict[str,dict], weights: Dict[str,float], row: dict) -> float:
-    """Recompute model-based prob for one historical row (for calibration)."""
-    z_sum = 0.0
-    use_pm_daily = "pm_pct_daily" in models
-    var_vals = {
-        "gap_pct": row.get("gap_pct", np.nan),
-        "atr_usd": row.get("atr_usd", np.nan),
-        "rvol":    row.get("rvol", np.nan),
-        "si_pct":  row.get("si_pct", np.nan),
-        "float_m": row.get("float_m", np.nan),
-        "mcap_m":  row.get("mcap_m", np.nan),
-        "fr_x":    row.get("fr_x", np.nan),
-        "pmmc_pct":row.get("pmmc_pct", np.nan),
-        ("pm_pct_daily" if use_pm_daily else "pm_pct_pred"): row.get("pm_pct_pred", np.nan),
-        "catalyst": row.get("catalyst", 0.0),
-    }
-    if use_pm_daily:
-        var_vals["pm_pct_daily"] = row.get("pm_pct_pred", np.nan)
+# ---------- Logistic stacking (ridge) ----------
+def _safe_logit(p: np.ndarray) -> np.ndarray:
+    p = np.clip(p, 1e-6, 1-1e-6)
+    return np.log(p/(1-p))
 
-    for k, x in var_vals.items():
+def _fit_logistic_ridge(X: np.ndarray, y: np.ndarray, l2: float = 1.0, max_iter: int = 50, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
+    """
+    IRLS (Newton) for logistic regression with L2 penalty on weights (not intercept).
+    X: [n, k] features (e.g., logits of per-variable probabilities)
+    y: [n] binary {0,1}
+    Returns (coef_[k], intercept_)
+    """
+    n, k = X.shape
+    Xb = np.concatenate([np.ones((n,1)), X], axis=1)
+    w = np.zeros(k+1)
+
+    R = np.eye(k+1)
+    R[0,0] = 0.0
+    R *= l2
+
+    for _ in range(max_iter):
+        z = Xb @ w
+        p = 1.0 / (1.0 + np.exp(-np.clip(z, -35, 35)))
+        W = p * (1 - p)
+        if np.all(W < 1e-8):
+            break
+        WX = Xb * W[:, None]
+        H  = Xb.T @ WX + R
+        g  = Xb.T @ (y - p)
+        try:
+            delta = np.linalg.solve(H, g)
+        except np.linalg.LinAlgError:
+            delta = np.linalg.lstsq(H, g, rcond=None)[0]
+        w_new = w + delta
+        if np.linalg.norm(delta) < tol:
+            w = w_new
+            break
+        w = w_new
+
+    intercept_ = float(w[0])
+    coef_ = w[1:].astype(float)
+    return coef_, intercept_
+
+def _predict_logistic(X: np.ndarray, coef_: np.ndarray, intercept_: float) -> np.ndarray:
+    z = intercept_ + X @ coef_
+    z = np.clip(z, -35, 35)
+    return 1.0 / (1.0 + np.exp(-z))
+
+# ---------- Per-row per-variable probabilities (features for stacking) ----------
+def _per_var_probs_for_row(models: Dict[str,dict], row: dict) -> Tuple[List[str], np.ndarray]:
+    """
+    Produce the AFTER-adjustment per-variable probabilities used for logistic stacking.
+    Adjustments: SI prior, ATR anchor, PM% anchors.
+    """
+    use_pm_daily = "pm_pct_daily" in models
+    var_order = [
+        "gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m","fr_x","pmmc_pct",
+        ("pm_pct_daily" if use_pm_daily else "pm_pct_pred"), "catalyst"
+    ]
+
+    keys: List[str] = []
+    vals: List[float] = []
+    for k in var_order:
         mdl = models.get(k)
-        if mdl is None: 
+        if mdl is None:
             continue
+        x = row.get(k, np.nan)
         p = value_to_prob(k, mdl, x)
         pb_local = _baseline_at_value(mdl, x)
-
-        # SI prior
         p = blend_with_prior(k, x, p)
-
-        # domain anchors
         if k == "atr_usd":
             p = anchor_atr(p, x, pb_local)
         p = anchor_pm_percent(k, p, x, pb_local)
+        keys.append(k)
+        vals.append(float(np.clip(p, 1e-6, 1-1e-6)))
+    return keys, np.array(vals, dtype=float)
 
-        p = float(np.clip(p, 1e-6, 1-1e-6))
-        w = float(weights.get(k, 0.0))
-        z_sum += w * math.log(p/(1-p))
-
-    z_sum = float(np.clip(z_sum, -12, 12))
-    prob = 1.0 / (1.0 + math.exp(-z_sum))
-    return float(prob)
-
+# ---------- Calibration helpers ----------
 def _prob_to_odds(prob: float, cuts: Dict[str, float]) -> str:
     if prob >= cuts["very_high"]: return "Very High Odds"
     if prob >= cuts["high"]:      return "High Odds"
@@ -437,7 +445,7 @@ if learn_btn:
                         "gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m",
                         "fr_x","pmmc_pct","pm_pct_daily","pm_pct_pred","catalyst"
                     ]
-                    models, weights = {}, {}
+                    models: Dict[str, dict] = {}
                     for v in candidates:
                         if v in df.columns:
                             m = rank_hist_model(df[v], y, bins=BINS)
@@ -455,75 +463,88 @@ if learn_btn:
 
                                 models[v] = m
 
-                                # weights from separation & amplitude
-                                w_sep = auc_weight(df[v], y)
-                                amp   = float(np.nanstd(p_use))
-                                weights[v] = max(0.05, min(1.0, 0.7*w_sep + 0.3*(amp*4)))
+                    # ---------- Calibration on the merged sheet (logistic stacking) ----------
+                    stack_keys: List[str] = []
+                    X_list: List[np.ndarray] = []
+                    y_list: List[int] = []
 
-                    # normalize weights
-                    if weights:
-                        s = sum(weights.values()) or 1.0
-                        weights = {k: v/s for k, v in weights.items()}
-
-                    # ---------- Calibration on the merged sheet ----------
-                    cal_probs = []
-                    if models and weights:
-                        # ensure derived fields exist
+                    if models:
+                        # ensure derived fields exist (in case)
                         if {"pm_vol_m","float_m"}.issubset(df.columns) and "fr_x" not in df.columns:
                             df["fr_x"] = df["pm_vol_m"] / df["float_m"]
                         if {"pm_dol_m","mcap_m"}.issubset(df.columns) and "pmmc_pct" not in df.columns:
                             df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
 
                         if {"mcap_m","gap_pct","atr_usd","pm_vol_m"}.issubset(df.columns):
-                            def _pred_row_cal(r):
+                            def _pred_row_cal2(r):
                                 try:
                                     return predict_day_volume_m_premarket(r["mcap_m"], r["gap_pct"], r["atr_usd"])
                                 except Exception:
                                     return np.nan
-                            pred_cal = df.apply(_pred_row_cal, axis=1)
+                            pred_cal2 = df.apply(_pred_row_cal2, axis=1)
                             df["pm_pct_pred"] = np.where(
-                                (pred_cal > 0) & np.isfinite(pred_cal),
-                                100.0 * df.get("pm_vol_m", np.nan) / pred_cal,
+                                (pred_cal2 > 0) & np.isfinite(pred_cal2),
+                                100.0 * df.get("pm_vol_m", np.nan) / pred_cal2,
                                 df.get("pm_pct_pred", np.nan)
                             )
 
-                        needed = {"gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m","fr_x","pmmc_pct","pm_pct_pred","catalyst"}
                         for _, rr in df.iterrows():
-                            rowd = {k: (float(rr[k]) if k in df.columns else np.nan) for k in needed}
-                            cal_probs.append(_stack_prob_for_row(models, weights, rowd))
+                            rowd = {k: float(rr[k]) if k in df.columns and np.isfinite(rr[k]) else np.nan for k in df.columns}
+                            if "pm_pct_daily" in models:
+                                rowd.setdefault("pm_pct_daily", float(rowd.get("pm_pct_pred", np.nan)))
+                            keys, pvec = _per_var_probs_for_row(models, rowd)
+                            if not stack_keys:
+                                stack_keys = keys[:]
+                            if keys != stack_keys:
+                                key_to_p = {k: v for k, v in zip(keys, pvec)}
+                                pvec = np.array([key_to_p.get(k, 0.5) for k in stack_keys], dtype=float)
+                            X_list.append(_safe_logit(pvec))
+                            y_list.append(int(rr["FT"]))
 
-                    cal_probs = np.array(cal_probs, dtype=float)
-                    cal_probs = cal_probs[np.isfinite(cal_probs)]
+                    X = np.array(X_list, dtype=float)
+                    y_arr = np.array(y_list, dtype=float)
+
+                    logit_coef = None
+                    logit_intercept = 0.0
+                    cal_probs = np.array([], dtype=float)
+
+                    if X.size > 0 and np.unique(y_arr).size == 2:
+                        logit_coef, logit_intercept = _fit_logistic_ridge(X, y_arr, l2=1.0, max_iter=60, tol=1e-6)
+                        cal_probs = _predict_logistic(X, logit_coef, logit_intercept)
+                    else:
+                        if X.size > 0:
+                            coef_eq = np.ones(X.shape[1]) / max(1, X.shape[1])
+                            logit_coef, logit_intercept = coef_eq, 0.0
+                            cal_probs = _predict_logistic(X, logit_coef, logit_intercept)
 
                     # ---------- Exponential distribution for cuts ----------
-                    ALPHA_ODDS  = 2.2   # more aggressive = rarer top odds
-                    ALPHA_GRADE = 2.8   # grades even steeper
+                    ALPHA_ODDS  = 2.2
+                    ALPHA_GRADE = 2.8
 
-                    # target warped percentiles (UI distribution intent)
                     odds_targets_warped = {
-                        "very_high": 0.98,  # ~top 2%
-                        "high":      0.90,  # ~top 10%
-                        "moderate":  0.65,  # ~top 35%
-                        "low":       0.35,  # ~top 65%
+                        "very_high": 0.98,
+                        "high":      0.90,
+                        "moderate":  0.65,
+                        "low":       0.35,
                     }
                     grade_targets_warped = {
-                        "App": 0.995,  # A++ ~ top 0.5%
-                        "Ap":  0.97,   # A+  ~ top 3%
-                        "A":   0.90,   # A   ~ top 10%
-                        "B":   0.65,   # B   ~ top 35%
-                        "C":   0.35,   # C   ~ top 65%
+                        "App": 0.995,
+                        "Ap":  0.97,
+                        "A":   0.90,
+                        "B":   0.65,
+                        "C":   0.35,
                     }
 
                     def _cut_from_probs(probs: np.ndarray, warped_p: float, alpha: float) -> float:
                         if probs.size == 0:
-                            return float(warped_p)  # fallback
+                            return float(warped_p)
                         raw_p = _inv_warp_p(warped_p, alpha)
                         return float(np.quantile(probs, raw_p))
 
                     odds_cuts = {k: _cut_from_probs(cal_probs, v, ALPHA_ODDS) for k, v in odds_targets_warped.items()}
                     grade_cuts = {k: _cut_from_probs(cal_probs, v, ALPHA_GRADE) for k, v in grade_targets_warped.items()}
 
-                    # Raise calibrated cuts up to hard floors (prevents e.g. 0.51 -> A+/High)
+                    # Raise to hard floors
                     for k, floor in ODDS_FLOORS.items():
                         if k in odds_cuts:
                             odds_cuts[k] = max(odds_cuts[k], floor)
@@ -531,13 +552,15 @@ if learn_btn:
                         if k in grade_cuts:
                             grade_cuts[k] = max(grade_cuts[k], floor)
 
-                    # Save
-                    st.session_state.MODELS  = models
-                    st.session_state.WEIGHTS = weights
-                    st.session_state.ODDS_CUTS = odds_cuts
-                    st.session_state.GRADE_CUTS = grade_cuts
+                    # Save models + stacking
+                    st.session_state.MODELS       = models
+                    st.session_state.ODDS_CUTS    = odds_cuts
+                    st.session_state.GRADE_CUTS   = grade_cuts
+                    st.session_state.STACK_KEYS   = stack_keys
+                    st.session_state.STACK_COEF   = logit_coef
+                    st.session_state.STACK_BIAS   = logit_intercept
 
-                    st.success(f"Learned {len(models)} variables with {BINS} bins and set exponential-calibrated thresholds.")
+                    st.success(f"Learned {len(models)} variables with {BINS} bins and trained logistic stacking.")
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
@@ -576,9 +599,8 @@ with tab_add:
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
         pm_pct_pred = (100.0 * pm_vol_m / pred_vol_m) if pred_vol_m > 0 else float("nan")
 
-        # Models & weights
+        # Models
         models  = st.session_state.MODELS or {}
-        weights = st.session_state.WEIGHTS or {}
 
         # Prefer pm_pct_daily curve if learned; else use pm_pct_pred
         use_pm_pct_daily = "pm_pct_daily" in models
@@ -589,33 +611,26 @@ with tab_add:
             "catalyst": 1.0 if catalyst_flag=="Yes" else 0.0
         }
         if use_pm_pct_daily:
-            # During premarket, use pm_pct_pred as proxy value to position inside the curve
-            var_vals["pm_pct_daily"] = pm_pct_pred
+            var_vals["pm_pct_daily"] = pm_pct_pred  # proxy during premarket
 
-        # Odds stacking with local baselines, SI prior, ATR/PM% anchors
-        parts: Dict[str, Dict[str, float]] = {}
-        z_sum = 0.0
-        for k, x in var_vals.items():
-            mdl = models.get(k)
-            if mdl is None:
-                continue
-            p = value_to_prob(k, mdl, x)        # learned curve at x
-            pb_local = _baseline_at_value(mdl, x)
+        # ----- Live scoring via learned logistic stacker -----
+        keys_live, pvec_live = _per_var_probs_for_row(models, var_vals)
+        stack_keys = st.session_state.get("STACK_KEYS", keys_live)
+        coef_ = st.session_state.get("STACK_COEF", None)
+        bias_ = st.session_state.get("STACK_BIAS", 0.0)
 
-            # directional prior
-            p = blend_with_prior(k, x, p)
+        # Align features to training order
+        if keys_live != stack_keys:
+            k2p = {k:v for k,v in zip(keys_live, pvec_live)}
+            pvec_live = np.array([k2p.get(k, 0.5) for k in stack_keys], dtype=float)
+        X_live = _safe_logit(np.array(pvec_live, dtype=float))[None, :]
 
-            # explicit domain anchors (no sweet-band, no guardrails)
-            if k == "atr_usd":
-                p = anchor_atr(p, x, pb_local)
-            p = anchor_pm_percent(k, p, x, pb_local)
+        if coef_ is not None and len(coef_) == X_live.shape[1]:
+            z_sum = float(bias_ + (X_live @ coef_)[0])
+        else:
+            z_sum = float(np.mean(X_live))
 
-            w = float(weights.get(k, 0.0))
-            parts[k] = {"x": x, "p": p, "w": w, "pb": pb_local}
-            p_clip = float(np.clip(p, 1e-6, 1-1e-6))
-            z_sum += w * math.log(p_clip/(1-p_clip))
-
-        # dilution penalty (binary)
+        # dilution penalty in logit space
         z_sum += -0.90 * float(dilution_flag)
         z_sum = float(np.clip(z_sum, -12, 12))
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
@@ -634,7 +649,7 @@ with tab_add:
             '<span class="pill pill-bad">Weak / Avoid</span>'
         )
 
-        # Checklist with Good/Caution/Risk relative to local baseline
+        # Checklist with Good/Caution/Risk relative to local baseline (display only)
         name_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
             "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
@@ -642,10 +657,20 @@ with tab_add:
             "pm_pct_pred":"PM Vol % of Pred","catalyst":"Catalyst"
         }
         good, warn, risk = [], [], []
-        for k, d in parts.items():
-            nm = name_map.get(k, k)
-            p = d["p"]; x = d["x"]; pb = d["pb"]
+        for k in stack_keys:
+            mdl = models.get(k)
+            x = var_vals.get(k, np.nan)
+            if mdl is None: 
+                continue
+            p = value_to_prob(k, mdl, x)
+            pb = _baseline_at_value(mdl, x)
+            p = blend_with_prior(k, x, p)
+            if k == "atr_usd":
+                p = anchor_atr(p, x, pb)
+            p = anchor_pm_percent(k, p, x, pb)
+            p = float(np.clip(p,1e-6,1-1e-6))
             p_pct = int(round(p*100))
+            nm = name_map.get(k, k)
             if p >= pb + CLASS_LIFT:   good.append(f"{nm}: {_fmt_value(x)} — good (p≈{p_pct}%)")
             elif p <= pb - CLASS_LIFT: risk.append(f"{nm}: {_fmt_value(x)} — risk (p≈{p_pct}%)")
             else:                      warn.append(f"{nm}: {_fmt_value(x)} — caution (p≈{p_pct}%)")
