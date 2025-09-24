@@ -3,4 +3,3 @@ pandas
 openpyxl
 numpy
 matplotlib
-scikit-learn
