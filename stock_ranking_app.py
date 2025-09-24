@@ -77,6 +77,21 @@ def _fmt_value(v: float) -> str:
     if abs(v) >= 1:    return f"{v:.2f}"
     return f"{v:.3f}"
 
+def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
+    keep = [c for c in cols if c in df.columns]
+    if not keep: return "| (no data) |\n| --- |"
+    sub = df.loc[:, keep].copy().fillna("")
+    header = "| " + " | ".join(keep) + " |"
+    sep    = "| " + " | ".join(["---"] * len(keep)) + " |"
+    lines = [header, sep]
+    for _, row in sub.iterrows():
+        cells = []
+        for c in keep:
+            v = row[c]
+            cells.append(f"{v:.2f}" if isinstance(v, float) else str(v))
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
 def _norm(s: str) -> str:
     s = re.sub(r"\s+", " ", str(s).strip().lower())
     return s.replace("$","").replace("%","").replace("’","").replace("'","")
@@ -145,22 +160,61 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
     if len(x) < 40 or y.nunique() != 2:
         return None
 
+    # ranks & bins
     ranks = x.rank(pct=True)
-    edges = np.linspace(0, 1, int(bins) + 1)
-    idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, int(bins)-1)
+    B = int(bins)
+    edges = np.linspace(0, 1, B + 1)
+    idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, B-1)
 
-    total = np.bincount(idx, minlength=int(bins))
-    ft    = np.bincount(idx[y==1], minlength=int(bins))
+    # counts
+    total = np.bincount(idx, minlength=B)
+    ft    = np.bincount(idx[y==1], minlength=B)
+    p0_global = float(y.mean())
+
+    # --- Laplace/Bayesian smoothing toward global baseline ---
+    # kappa controls pull strength; increase when data is tiny
+    kappa = max(6.0, 0.1 * len(x) / max(1, B))  # heuristic
     with np.errstate(divide='ignore', invalid='ignore'):
-        p_bin = np.where(total>0, ft/total, np.nan)
+        p_bin_raw = np.where(total>0, ft/total, np.nan)
+        p_bin = (ft + kappa * p0_global) / (total + kappa)
 
-    p_series = pd.Series(p_bin).interpolate(limit_direction="both")
-    p_fill   = p_series.fillna(p_series.mean()).to_numpy()
-    p_smooth = moving_average(p_fill, w=3)
+    # Smooth a touch for B>2
+    if B > 2:
+        p_series = pd.Series(p_bin).interpolate(limit_direction="both")
+        p_fill   = p_series.fillna(p_series.mean()).to_numpy()
+        p_smooth = moving_average(p_fill, w=3)
+    else:
+        # For 2 bins, keep the smoothed values we just computed
+        p_smooth = p_bin
 
     centers = (edges[:-1] + edges[1:]) / 2.0
-    p0_global = float(y.mean())
     p_base_var = float(np.average(p_smooth, weights=(total + 1e-9)))
+
+    # --- When B==2: build a linear, directional curve across rank ---
+    if B == 2:
+        p_low, p_high = float(p_smooth[0]), float(p_smooth[1])
+        # slope across rank 0..1, centered on per-variable baseline
+        # linear map: p(r) = pb + (p_high - p_low) * (r - 0.5)
+        # clamp to reasonable prob range to avoid extremes in tiny data
+        p_line = p_base_var + (p_high - p_low) * (centers - 0.5)
+        p_line = np.clip(p_line, 0.05, 0.95)
+        p_ready = p_line
+    else:
+        p_ready = p_smooth
+
+    # Stretch to epsilon band to avoid degeneracy, but milder when B==2
+    eps_before = STRETCH_EPS
+    eps_use = 0.08 if B == 2 else eps_before
+    pmin, pmax = float(np.min(p_ready)), float(np.max(p_ready))
+    if np.isfinite(pmin) and np.isfinite(pmax) and pmax > pmin:
+        scale = (pmax - pmin)
+        p_use = eps_use + (1.0 - 2.0*eps_use) * (p_ready - pmin) / scale
+    else:
+        p_use = np.full_like(p_ready, p_base_var)
+    p_use = np.clip(p_use, 1e-6, 1 - 1e-6)
+
+    # local baseline curve (for checklist comparisons)
+    pb_curve = _smooth_local_baseline(centers, p_use, total, bandwidth=0.30 if B==2 else 0.22)
 
     pr = np.linspace(0,1,41)
     vals = np.quantile(x, pr)
@@ -169,9 +223,10 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
         "edges": edges,
         "centers": centers,
         "support": total,
-        "p_raw": p_smooth,
+        "p_raw": p_use,            # already final for use
         "p0_global": p0_global,
         "p_base_var": p_base_var,
+        "pb_curve": pb_curve,
         "quantiles": {"pr": pr, "vals": vals},
         "n": int(len(x))
     }
@@ -265,22 +320,6 @@ def _inv_warp_p(s_warped: float, alpha: float) -> float:
 # ---------- Hard floors to prevent absurd labels ----------
 ODDS_FLOORS  = {"very_high": 0.85, "high": 0.70, "moderate": 0.55, "low": 0.40}
 GRADE_FLOORS = {"App": 0.92, "Ap": 0.85, "A": 0.75, "B": 0.65, "C": 0.50}
-
-# ---------- Caution / Risk / Good adjustments (logit space) ----------
-CAUTION_PENALTY = 0.4    # per "unit" (caution near baseline)
-CAUTION_POWER   = 3.0     # center-heavy
-USE_BETA_SCALE  = True
-MIN_BETA_SCALE  = 0.6
-GAMMA_FRAC      = 0.4    # global shrink with many caution vars
-
-RISK_PENALTY    = 0.5    # <<< NEW: stronger hit than caution
-RISK_POWER      = 3.0     # <<< NEW: heavier with deeper risk
-
-GOOD_BONUS      = 0.4    # <<< NEW: bonus for “good”
-GOOD_POWER      = 3.0     # <<< NEW: smoother than risk
-
-GLOBAL_GOOD_GAIN_FRAC = 0.4  # <<< NEW: mild global boost for many goods
-GLOBAL_RISK_SHRINK_FRAC = 0.5 # <<< NEW: extra shrink when many in risk
 
 # ---------- Logistic stacking (ridge) ----------
 def _safe_logit(p: np.ndarray) -> np.ndarray:
@@ -441,7 +480,7 @@ if learn_btn:
                     df = df[df["FT"].notna()]
                     y = df["FT"].astype(float)
 
-                    # learn models per variable
+                    # learn models per variable (no sweet-band anchors, no guardrails)
                     candidates = [
                         "gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m",
                         "fr_x","pmmc_pct","pm_pct_daily","pm_pct_pred","catalyst"
@@ -470,7 +509,7 @@ if learn_btn:
                     y_list: List[int] = []
 
                     if models:
-                        # ensure derived fields exist
+                        # ensure derived fields exist (in case)
                         if {"pm_vol_m","float_m"}.issubset(df.columns) and "fr_x" not in df.columns:
                             df["fr_x"] = df["pm_vol_m"] / df["float_m"]
                         if {"pm_dol_m","mcap_m"}.issubset(df.columns) and "pmmc_pct" not in df.columns:
@@ -631,78 +670,8 @@ with tab_add:
         else:
             z_sum = float(np.mean(X_live))
 
-        # ----- Good/Caution/Risk effects in logit space -----
-        penalty_caution_units = 0.0
-        penalty_risk_units    = 0.0   # <<< NEW
-        bonus_good_units      = 0.0   # <<< NEW
-        n_in_caution = 0
-        n_in_risk    = 0           # <<< NEW
-        n_in_good    = 0           # <<< NEW
-
-        for i, k in enumerate(stack_keys):
-            mdl = models.get(k)
-            x = var_vals.get(k, np.nan)
-            if mdl is None:
-                continue
-
-            p  = value_to_prob(k, mdl, x)
-            pb = _baseline_at_value(mdl, x)
-            p  = blend_with_prior(k, x, p)
-            if k == "atr_usd":
-                p = anchor_atr(p, x, pb)
-            p  = anchor_pm_percent(k, p, x, pb)
-            p  = float(np.clip(p, 1e-6, 1-1e-6))
-            pb = float(np.clip(pb,1e-6,1-1e-6))
-
-            delta = p - pb
-            absdiff = abs(delta)
-
-            # beta scaling (importance)
-            if coef_ is not None and i < len(coef_) and USE_BETA_SCALE:
-                beta_scale = max(MIN_BETA_SCALE, abs(float(coef_[i])))
-            else:
-                beta_scale = 1.0
-
-            if absdiff < CLASS_LIFT:
-                n_in_caution += 1
-                w = (CLASS_LIFT - absdiff) / CLASS_LIFT
-                w = w ** CAUTION_POWER
-                penalty_caution_units += w * beta_scale
-            elif delta >= CLASS_LIFT:
-                # GOOD: above baseline beyond threshold
-                n_in_good += 1
-                # how far into good zone (normalized past threshold)
-                over = min(1.0, (delta - CLASS_LIFT) / max(CLASS_LIFT, 1e-6))
-                w = over ** GOOD_POWER
-                bonus_good_units += w * beta_scale
-            else:
-                # RISK: below baseline beyond threshold
-                n_in_risk += 1
-                over = min(1.0, (-delta - CLASS_LIFT) / max(CLASS_LIFT, 1e-6))
-                w = over ** RISK_POWER
-                penalty_risk_units += w * beta_scale
-
-        # apply all adjustments
-        z_sum +=  GOOD_BONUS   * bonus_good_units
-        z_sum -=  CAUTION_PENALTY * penalty_caution_units
-        z_sum -=  RISK_PENALTY * penalty_risk_units
-
-        # global adjustments by shares in states
-        total_vars = len(stack_keys) if len(stack_keys) > 0 else 1
-        frac_caution = n_in_caution / total_vars
-        frac_good    = n_in_good / total_vars
-        frac_risk    = n_in_risk / total_vars
-
-        # shrink toward neutral when many in caution
-        z_sum *= max(0.0, 1.0 - GAMMA_FRAC * frac_caution)
-
-        # mild global boost for many goods; shrink for many risks (multiplicative on z)
-        z_sum *= (1.0 + GLOBAL_GOOD_GAIN_FRAC * frac_good)
-        z_sum *= max(0.0, 1.0 - GLOBAL_RISK_SHRINK_FRAC * frac_risk)
-
-        # dilution penalty (binary) in logit space
+        # dilution penalty in logit space
         z_sum += -0.90 * float(dilution_flag)
-
         z_sum = float(np.clip(z_sum, -12, 12))
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
 
@@ -720,7 +689,7 @@ with tab_add:
             '<span class="pill pill-bad">Weak / Avoid</span>'
         )
 
-        # Checklist
+        # Checklist with Good/Caution/Risk relative to local baseline (display only)
         name_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
             "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
