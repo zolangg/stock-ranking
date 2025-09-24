@@ -30,7 +30,7 @@ st.markdown("""
 
 # ============================== Sidebar ==============================
 st.sidebar.header("Settings")
-PRECISION_FLOOR = st.sidebar.slider("Precision floor (tuning)", 0.50, 0.95, 0.65, 0.01)
+PRECISION_FLOOR = st.sidebar.slider("Precision floor (tuning)", 0.00, 0.95, 0.65, 0.01)
 
 # ============================== Session State ==============================
 if "rows"   not in st.session_state: st.session_state.rows = []
