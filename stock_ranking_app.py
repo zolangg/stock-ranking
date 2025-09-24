@@ -160,61 +160,22 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
     if len(x) < 40 or y.nunique() != 2:
         return None
 
-    # ranks & bins
     ranks = x.rank(pct=True)
-    B = int(bins)
-    edges = np.linspace(0, 1, B + 1)
-    idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, B-1)
+    edges = np.linspace(0, 1, int(bins) + 1)
+    idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, int(bins)-1)
 
-    # counts
-    total = np.bincount(idx, minlength=B)
-    ft    = np.bincount(idx[y==1], minlength=B)
-    p0_global = float(y.mean())
-
-    # --- Laplace/Bayesian smoothing toward global baseline ---
-    # kappa controls pull strength; increase when data is tiny
-    kappa = max(6.0, 0.1 * len(x) / max(1, B))  # heuristic
+    total = np.bincount(idx, minlength=int(bins))
+    ft    = np.bincount(idx[y==1], minlength=int(bins))
     with np.errstate(divide='ignore', invalid='ignore'):
-        p_bin_raw = np.where(total>0, ft/total, np.nan)
-        p_bin = (ft + kappa * p0_global) / (total + kappa)
+        p_bin = np.where(total>0, ft/total, np.nan)
 
-    # Smooth a touch for B>2
-    if B > 2:
-        p_series = pd.Series(p_bin).interpolate(limit_direction="both")
-        p_fill   = p_series.fillna(p_series.mean()).to_numpy()
-        p_smooth = moving_average(p_fill, w=3)
-    else:
-        # For 2 bins, keep the smoothed values we just computed
-        p_smooth = p_bin
+    p_series = pd.Series(p_bin).interpolate(limit_direction="both")
+    p_fill   = p_series.fillna(p_series.mean()).to_numpy()
+    p_smooth = moving_average(p_fill, w=3)
 
     centers = (edges[:-1] + edges[1:]) / 2.0
+    p0_global = float(y.mean())
     p_base_var = float(np.average(p_smooth, weights=(total + 1e-9)))
-
-    # --- When B==2: build a linear, directional curve across rank ---
-    if B == 2:
-        p_low, p_high = float(p_smooth[0]), float(p_smooth[1])
-        # slope across rank 0..1, centered on per-variable baseline
-        # linear map: p(r) = pb + (p_high - p_low) * (r - 0.5)
-        # clamp to reasonable prob range to avoid extremes in tiny data
-        p_line = p_base_var + (p_high - p_low) * (centers - 0.5)
-        p_line = np.clip(p_line, 0.05, 0.95)
-        p_ready = p_line
-    else:
-        p_ready = p_smooth
-
-    # Stretch to epsilon band to avoid degeneracy, but milder when B==2
-    eps_before = STRETCH_EPS
-    eps_use = 0.08 if B == 2 else eps_before
-    pmin, pmax = float(np.min(p_ready)), float(np.max(p_ready))
-    if np.isfinite(pmin) and np.isfinite(pmax) and pmax > pmin:
-        scale = (pmax - pmin)
-        p_use = eps_use + (1.0 - 2.0*eps_use) * (p_ready - pmin) / scale
-    else:
-        p_use = np.full_like(p_ready, p_base_var)
-    p_use = np.clip(p_use, 1e-6, 1 - 1e-6)
-
-    # local baseline curve (for checklist comparisons)
-    pb_curve = _smooth_local_baseline(centers, p_use, total, bandwidth=0.30 if B==2 else 0.22)
 
     pr = np.linspace(0,1,41)
     vals = np.quantile(x, pr)
@@ -223,10 +184,9 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
         "edges": edges,
         "centers": centers,
         "support": total,
-        "p_raw": p_use,            # already final for use
+        "p_raw": p_smooth,
         "p0_global": p0_global,
         "p_base_var": p_base_var,
-        "pb_curve": pb_curve,
         "quantiles": {"pr": pr, "vals": vals},
         "n": int(len(x))
     }
@@ -320,6 +280,9 @@ def _inv_warp_p(s_warped: float, alpha: float) -> float:
 # ---------- Hard floors to prevent absurd labels ----------
 ODDS_FLOORS  = {"very_high": 0.85, "high": 0.70, "moderate": 0.55, "low": 0.40}
 GRADE_FLOORS = {"App": 0.92, "Ap": 0.85, "A": 0.75, "B": 0.65, "C": 0.50}
+
+# ---------- Caution penalty (logit space) ----------
+CAUTION_PENALTY = 0.20   # try 0.12–0.30; higher = stronger downweight
 
 # ---------- Logistic stacking (ridge) ----------
 def _safe_logit(p: np.ndarray) -> np.ndarray:
@@ -670,8 +633,37 @@ with tab_add:
         else:
             z_sum = float(np.mean(X_live))
 
-        # dilution penalty in logit space
+        # ----- Smooth Caution penalty (logit space) -----
+        def _logit_clip(x: float) -> float:
+            x = float(np.clip(x, 1e-6, 1-1e-6))
+            return math.log(x/(1-x))
+
+        penalty_units = 0.0
+        for i, k in enumerate(stack_keys):
+            mdl = models.get(k)
+            x = var_vals.get(k, np.nan)
+            if mdl is None:
+                continue
+            p = value_to_prob(k, mdl, x)
+            pb = _baseline_at_value(mdl, x)
+            p  = blend_with_prior(k, x, p)
+            if k == "atr_usd":
+                p = anchor_atr(p, x, pb)
+            p  = anchor_pm_percent(k, p, x, pb)
+            p  = float(np.clip(p, 1e-6, 1-1e-6))
+            pb = float(np.clip(pb,1e-6,1-1e-6))
+
+            diff = abs(p - pb)
+            if diff < CLASS_LIFT:
+                # weight 1 at center, 0 at edges
+                w = (CLASS_LIFT - diff) / CLASS_LIFT
+                penalty_units += w
+
+        z_sum -= CAUTION_PENALTY * penalty_units
+
+        # dilution penalty (binary) in logit space
         z_sum += -0.90 * float(dilution_flag)
+
         z_sum = float(np.clip(z_sum, -12, 12))
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
 
@@ -689,70 +681,64 @@ with tab_add:
             '<span class="pill pill-bad">Weak / Avoid</span>'
         )
 
-        # Checklist with Good/Caution/Risk relative to local baseline (display only)
-name_map = {
-    "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
-    "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
-    "pmmc_pct":"PM $Vol / MC %","pm_pct_daily":"PM Vol % of Daily",
-    "pm_pct_pred":"PM Vol % of Pred","catalyst":"Catalyst"
-}
+        # Checklist (still shows per-var p vs baseline for context)
+        name_map = {
+            "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
+            "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
+            "pmmc_pct":"PM $Vol / MC %","pm_pct_daily":"PM Vol % of Daily",
+            "pm_pct_pred":"PM Vol % of Pred","catalyst":"Catalyst"
+        }
+        good, warn, risk = [], [], []
+        for k in stack_keys:
+            mdl = models.get(k)
+            x = var_vals.get(k, np.nan)
+            if mdl is None: 
+                continue
+            p = value_to_prob(k, mdl, x)
+            pb = _baseline_at_value(mdl, x)
+            p = blend_with_prior(k, x, p)
+            if k == "atr_usd":
+                p = anchor_atr(p, x, pb)
+            p = anchor_pm_percent(k, p, x, pb)
+            p = float(np.clip(p,1e-6,1-1e-6))
+            p_pct = int(round(p*100))
+            nm = name_map.get(k, k)
+            if p >= pb + CLASS_LIFT:   good.append(f"{nm}: {_fmt_value(x)} — good (p≈{p_pct}%)")
+            elif p <= pb - CLASS_LIFT: risk.append(f"{nm}: {_fmt_value(x)} — risk (p≈{p_pct}%)")
+            else:                      warn.append(f"{nm}: {_fmt_value(x)} — caution (p≈{p_pct}%)")
 
-# grab learned stacking to compute contributions
-stack_keys = st.session_state.get("STACK_KEYS", [])
-coef_ = st.session_state.get("STACK_COEF", None)
+        # Save row
+        row = {
+            "Ticker": ticker,
+            "Odds": odds_name,
+            "Level": level,
+            "FinalScore": round(final_score, 2),
+            "PredVol_M": round(pred_vol_m, 2),
+            "VerdictPill": verdict_pill,
+            "GoodList": good, "WarnList": warn, "RiskList": risk,
+        }
+        st.session_state.rows.append(row)
+        st.session_state.last = row
+        st.success(f"Saved {ticker} — Odds {row['Odds']} (Score {row['FinalScore']})")
 
-def _logit(x): 
-    x = float(np.clip(x, 1e-6, 1-1e-6))
-    return math.log(x/(1-x))
+    # preview card
+    l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
+    if l:
+        st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
+        a,b,c,d,e = st.columns(5)
+        a.metric("Last Ticker", l.get("Ticker","—"))
+        b.metric("Final Score", f"{l.get('FinalScore',0):.2f}")
+        c.metric("Grade", l.get('Level','—'))
+        d.metric("Odds", l.get('Odds','—'))
+        e.metric("PredVol (M)", f"{l.get('PredVol_M',0):.2f}")
 
-good, warn, risk = [], [], []
-detail_rows = []  # optional: for a debugging table
-
-# thresholds for contribution buckets (logit-space * weight units)
-# tune: 0.25 ~= noticeable, 0.10 ~= small tilt
-TH_GOOD = 0.25
-TH_RISK = -0.25
-
-for i, k in enumerate(stack_keys):
-    mdl = models.get(k)
-    x  = var_vals.get(k, np.nan)
-    if mdl is None:
-        continue
-
-    # recompute adjusted per-var prob the same way features were built
-    p = value_to_prob(k, mdl, x)
-    pb = _baseline_at_value(mdl, x)
-    p  = blend_with_prior(k, x, p)
-    if k == "atr_usd":
-        p = anchor_atr(p, x, pb)
-    p  = anchor_pm_percent(k, p, x, pb)
-    p  = float(np.clip(p, 1e-6, 1-1e-6))
-    pb = float(np.clip(pb,1e-6,1-1e-6))
-
-    # contribution uses learned coef; if none (rare), default to 1.0
-    beta = float(coef_[i]) if (coef_ is not None and i < len(coef_)) else 1.0
-    contrib = beta * (_logit(p) - _logit(pb))
-
-    nm = name_map.get(k, k)
-    p_pct = int(round(p*100))
-    # bucket by contribution
-    if contrib >= TH_GOOD:
-        good.append(f"{nm}: {_fmt_value(x)} — good (p≈{p_pct}%, Δlogit×β=+{contrib:.2f})")
-    elif contrib <= TH_RISK:
-        risk.append(f"{nm}: {_fmt_value(x)} — risk (p≈{p_pct}%, Δlogit×β={contrib:.2f})")
-    else:
-        warn.append(f"{nm}: {_fmt_value(x)} — caution (p≈{p_pct}%, Δlogit×β={contrib:.2f})")
-
-    # keep an internal row if you want to show a table later
-    detail_rows.append({
-        "Variable": nm,
-        "Value": _fmt_value(x),
-        "p": round(p,4),
-        "pb": round(pb,4),
-        "beta": round(beta,3),
-        "Δlogit": round(_logit(p) - _logit(pb),3),
-        "Contribution": round(contrib,3),
-    })
+        with st.expander("Premarket Checklist", expanded=True):
+            st.markdown(f"**Verdict:** {l.get('VerdictPill','—')}", unsafe_allow_html=True)
+            g,w,r = st.columns(3)
+            def ul(items): return "<ul>"+"".join([f"<li>{x}</li>" for x in items])+"</ul>" if items else "<ul><li>—</li></ul>"
+            with g: st.markdown("**Good**");    st.markdown(ul(l.get("GoodList",[])), unsafe_allow_html=True)
+            with w: st.markdown("**Caution**"); st.markdown(ul(l.get("WarnList",[])), unsafe_allow_html=True)
+            with r: st.markdown("**Risk**");    st.markdown(ul(l.get("RiskList",[])), unsafe_allow_html=True)
 
 # ============================== Ranking ==============================
 with tab_rank:
