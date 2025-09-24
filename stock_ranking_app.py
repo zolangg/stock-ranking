@@ -281,8 +281,14 @@ def _inv_warp_p(s_warped: float, alpha: float) -> float:
 ODDS_FLOORS  = {"very_high": 0.85, "high": 0.70, "moderate": 0.55, "low": 0.40}
 GRADE_FLOORS = {"App": 0.92, "Ap": 0.85, "A": 0.75, "B": 0.65, "C": 0.50}
 
-# ---------- Caution penalty (logit space) ----------
-CAUTION_PENALTY = 0.20   # try 0.12–0.30; higher = stronger downweight
+# ---------- Stronger Caution penalty controls ----------
+CAUTION_PENALTY = 0.28   # base strength per "unit" of caution
+CAUTION_POWER   = 2.0    # 2=quadratic center weight (stronger near baseline)
+USE_BETA_SCALE  = True   # scale per-var penalty by |beta|
+MIN_BETA_SCALE  = 0.6    # floor for weak betas
+GAMMA_FRAC      = 0.25   # global shrink proportional to fraction in caution
+HARD_CAP_CAUTION_FRAC = 0.75   # if >= 75% vars in caution...
+HARD_CAP_PROB         = 0.80   # ...cap final prob at 80%
 
 # ---------- Logistic stacking (ridge) ----------
 def _safe_logit(p: np.ndarray) -> np.ndarray:
@@ -633,18 +639,16 @@ with tab_add:
         else:
             z_sum = float(np.mean(X_live))
 
-        # ----- Smooth Caution penalty (logit space) -----
-        def _logit_clip(x: float) -> float:
-            x = float(np.clip(x, 1e-6, 1-1e-6))
-            return math.log(x/(1-x))
-
+        # ----- Stronger Caution penalty (logit space) -----
         penalty_units = 0.0
+        n_in_caution = 0
         for i, k in enumerate(stack_keys):
             mdl = models.get(k)
             x = var_vals.get(k, np.nan)
             if mdl is None:
                 continue
-            p = value_to_prob(k, mdl, x)
+
+            p  = value_to_prob(k, mdl, x)
             pb = _baseline_at_value(mdl, x)
             p  = blend_with_prior(k, x, p)
             if k == "atr_usd":
@@ -655,17 +659,39 @@ with tab_add:
 
             diff = abs(p - pb)
             if diff < CLASS_LIFT:
-                # weight 1 at center, 0 at edges
+                n_in_caution += 1
+                # center-heavy weight: 1 at center, 0 at edge; raise power for more punch
                 w = (CLASS_LIFT - diff) / CLASS_LIFT
-                penalty_units += w
+                w = w ** CAUTION_POWER
 
+                # scale by |beta| importance (if trained)
+                if coef_ is not None and i < len(coef_) and USE_BETA_SCALE:
+                    beta_scale = abs(float(coef_[i]))
+                    beta_scale = max(MIN_BETA_SCALE, beta_scale)
+                else:
+                    beta_scale = 1.0
+
+                penalty_units += w * beta_scale
+
+        # subtract total penalty (scaled) in logit space
         z_sum -= CAUTION_PENALTY * penalty_units
+
+        # global shrink toward neutral if many vars are in caution
+        if len(stack_keys) > 0:
+            frac_caution = n_in_caution / float(len(stack_keys))
+            z_sum *= max(0.0, 1.0 - GAMMA_FRAC * frac_caution)
 
         # dilution penalty (binary) in logit space
         z_sum += -0.90 * float(dilution_flag)
 
         z_sum = float(np.clip(z_sum, -12, 12))
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
+
+        # optional hard ceiling when caution dominates
+        if len(stack_keys) > 0:
+            frac_caution = n_in_caution / float(len(stack_keys))
+            if frac_caution >= HARD_CAP_CAUTION_FRAC:
+                numeric_prob = min(numeric_prob, HARD_CAP_PROB)
 
         # Use calibrated thresholds
         odds_cuts = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
@@ -681,7 +707,7 @@ with tab_add:
             '<span class="pill pill-bad">Weak / Avoid</span>'
         )
 
-        # Checklist (still shows per-var p vs baseline for context)
+        # Checklist (shows per-var p vs baseline for context)
         name_map = {
             "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
             "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
