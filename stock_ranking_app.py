@@ -30,7 +30,7 @@ st.markdown("""
 
 # ============================== Sidebar (Curves only) ==============================
 st.sidebar.header("Curves")
-BINS = st.sidebar.slider("Curve bins (histogram)", min_value=1, max_value=10, value=4, step=1)
+BINS = st.sidebar.slider("Curve bins (histogram)", min_value=2, max_value=10, value=2, step=1)
 show_baseline = st.sidebar.checkbox("Curves: show baseline", True)
 plot_all_curves = st.sidebar.checkbox("Curves: plot ALL variables", False)
 sel_curve_var = st.sidebar.selectbox(
@@ -172,10 +172,8 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
     p0_global = float(y.mean())
 
     # --- Laplace/Bayesian smoothing toward global baseline ---
-    # kappa controls pull strength; increase when data is tiny
-    kappa = max(6.0, 0.1 * len(x) / max(1, B))  # heuristic
+    kappa = max(6.0, 0.1 * len(x) / max(1, B))  # heuristic for small data
     with np.errstate(divide='ignore', invalid='ignore'):
-        p_bin_raw = np.where(total>0, ft/total, np.nan)
         p_bin = (ft + kappa * p0_global) / (total + kappa)
 
     # Smooth a touch for B>2
@@ -184,7 +182,6 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
         p_fill   = p_series.fillna(p_series.mean()).to_numpy()
         p_smooth = moving_average(p_fill, w=3)
     else:
-        # For 2 bins, keep the smoothed values we just computed
         p_smooth = p_bin
 
     centers = (edges[:-1] + edges[1:]) / 2.0
@@ -193,9 +190,6 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
     # --- When B==2: build a linear, directional curve across rank ---
     if B == 2:
         p_low, p_high = float(p_smooth[0]), float(p_smooth[1])
-        # slope across rank 0..1, centered on per-variable baseline
-        # linear map: p(r) = pb + (p_high - p_low) * (r - 0.5)
-        # clamp to reasonable prob range to avoid extremes in tiny data
         p_line = p_base_var + (p_high - p_low) * (centers - 0.5)
         p_line = np.clip(p_line, 0.05, 0.95)
         p_ready = p_line
@@ -203,8 +197,7 @@ def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,
         p_ready = p_smooth
 
     # Stretch to epsilon band to avoid degeneracy, but milder when B==2
-    eps_before = STRETCH_EPS
-    eps_use = 0.08 if B == 2 else eps_before
+    eps_use = 0.08 if B == 2 else STRETCH_EPS
     pmin, pmax = float(np.min(p_ready)), float(np.max(p_ready))
     if np.isfinite(pmin) and np.isfinite(pmax) and pmax > pmin:
         scale = (pmax - pmin)
@@ -307,6 +300,40 @@ def _baseline_at_value(model: dict, x: float) -> float:
         if np.isfinite(pb):
             return pb
     return float(model.get("p_base_var", 0.5))
+
+# Support / OOD helpers (uncertainty)
+def _support_at_value(model: dict, x: float) -> int:
+    if model is None or not np.isfinite(x): 
+        return 0
+    pr, vals = model["quantiles"]["pr"], model["quantiles"]["vals"]
+    if x <= vals.min(): r = 0.0
+    elif x >= vals.max(): r = 1.0
+    else:
+        idx = np.searchsorted(vals, x)
+        i0 = max(1, min(idx, len(vals)-1))
+        x0, x1 = vals[i0-1], vals[i0]
+        p0, p1 = pr[i0-1], pr[i0]
+        t = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
+        r = float(p0 + t*(p1 - p0))
+    centers = model["centers"]
+    j = int(np.clip(np.searchsorted(centers, r), 0, len(centers)-1))
+    supp = model.get("support", np.array([], dtype=int))
+    return int(supp[j]) if j < len(supp) else 0
+
+def _rank_percentile(model: dict, x: float) -> float:
+    if model is None or not np.isfinite(x): return 0.5
+    pr, vals = model["quantiles"]["pr"], model["quantiles"]["vals"]
+    if x <= vals.min(): return 0.0
+    if x >= vals.max(): return 1.0
+    idx = np.searchsorted(vals, x)
+    i0 = max(1, min(idx, len(vals)-1))
+    x0, x1 = vals[i0-1], vals[i0]
+    p0, p1 = pr[i0-1], pr[i0]
+    t = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
+    return float(p0 + t*(p1 - p0))
+
+def _is_ood_rank(r: float, lo: float = 0.01, hi: float = 0.99) -> bool:
+    return (r <= lo) or (r >= hi)
 
 # ---------- Exponential percentile warping (for calibration) ----------
 def _warp_p(s: float, alpha: float) -> float:
@@ -623,8 +650,9 @@ with tab_add:
             rvol     = input_float("RVOL", 0.0, min_value=0.0, decimals=2)
             pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
             pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
-            dilution_flag = st.select_slider("Dilution present?", options=[0,1], value=0,
-                                             help="0 = none/negligible, 1 = present/overhang (penalizes log-odds)")
+            # Dilution slider with 0.1 steps (0..1)
+            dilution_flag = st.slider("Dilution present? (0 = none, 1 = strong)", 0.0, 1.0, 0.0, 0.1,
+                                      help="Soft penalty applied in log-odds; try 0.2, 0.5, 1.0, etc.")
         with c3:
             catalyst_flag = st.selectbox("Catalyst?", ["No","Yes"])
 
@@ -670,8 +698,51 @@ with tab_add:
         else:
             z_sum = float(np.mean(X_live))
 
-        # dilution penalty in logit space
+        # ----- Uncertainty-aware adjustments -----
+        p_adj_list = []
+        supports = []
+        ranks = []
+        for k in stack_keys:
+            mdl = models.get(k)
+            xk = var_vals.get(k, np.nan)
+            if mdl is None:
+                continue
+            p = value_to_prob(k, mdl, xk)
+            pb = _baseline_at_value(mdl, xk)
+            p = blend_with_prior(k, xk, p)
+            if k == "atr_usd":
+                p = anchor_atr(p, xk, pb)
+            p = anchor_pm_percent(k, p, xk, pb)
+            p = float(np.clip(p, 1e-6, 1-1e-6))
+            p_adj_list.append(p)
+            supports.append(_support_at_value(mdl, xk))
+            ranks.append(_rank_percentile(mdl, xk))
+
+        # 1) Support shrink (few observations -> lower conviction)
+        if supports:
+            conf = [min(1.0, s / 40.0) for s in supports]  # 40 obs ~ confident
+            conf_mean = float(np.mean(conf))
+            SHRINK_MIN, SHRINK_MAX = 0.60, 1.00
+            shrink = SHRINK_MIN + (SHRINK_MAX - SHRINK_MIN) * conf_mean
+            z_sum *= shrink
+
+        # 2) Disagreement shrink (features disagree -> lower conviction)
+        if len(p_adj_list) >= 2:
+            std_p = float(np.std(p_adj_list))
+            DISAG_STRENGTH = 1.6
+            disag_factor = 1.0 / (1.0 + DISAG_STRENGTH * std_p)
+            disag_factor = max(0.70, min(1.0, disag_factor))
+            z_sum *= disag_factor
+
+        # 3) OOD penalty (many extreme ranks -> slight penalty)
+        if ranks:
+            ood_flags = [_is_ood_rank(r) for r in ranks]
+            ood_frac  = sum(ood_flags) / len(ranks)
+            z_sum += -0.70 * ood_frac
+
+        # dilution penalty in logit space (now continuous 0..1)
         z_sum += -0.90 * float(dilution_flag)
+
         z_sum = float(np.clip(z_sum, -12, 12))
         numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
 
