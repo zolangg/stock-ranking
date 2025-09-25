@@ -1,10 +1,16 @@
-# app.py — Premarket Ranking (Prediction-only; learns from uploaded workbook)
-# -----------------------------------------------------------------------------
-# • PM% of Day model (logit ridge) → invert to Predicted Day Volume (+ CI68), PredVol ≥ PM Vol.
-# • FT classifier (logistic IRLS) on dataset vars + ln(PredDay).
-# • Optional Max Push Daily % regression (light blend) if present.
-# • Catalyst included throughout.
-# • Column mapping follows Legend; numeric inputs accept commas.
+# app.py — Premarket Ranking: Blended Day Volume + FT (learned from uploaded workbook)
+# ------------------------------------------------------------------------------------
+# What this app does:
+#   • Learns two day-volume predictors from your DB:
+#       (A) Direct log-linear on ln(Daily Vol M).
+#       (B) PM%-of-day model → invert using PMVol.
+#     Then blends them in LOG-SPACE using weights from relative R² on your sheet.
+#     CI68 is blended in ln-space. PredVol is NEVER below PMVol.
+#   • FT classifier uses dataset variables + ln(PredDay).
+#   • Catalyst is used end-to-end (dataset + live input).
+#   • Robust column mapping per your Legend; numeric inputs accept commas.
+#
+# Run: streamlit run app.py
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -19,8 +25,8 @@ import pandas as pd
 import streamlit as st
 
 # ============================== Page & CSS ==============================
-st.set_page_config(page_title="Premarket Stock Ranking — Predictive", layout="wide")
-st.title("Premarket Stock Ranking — Predictive")
+st.set_page_config(page_title="Premarket Stock Ranking — Blended DayVol", layout="wide")
+st.title("Premarket Stock Ranking — Blended Day Volume")
 
 st.markdown(
     """
@@ -68,16 +74,16 @@ def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
 # Column finder aligned to Legend (case/spacing/units robust)
 _DEF = {
     "FT": ["FT"],
-    "MAXPCT": ["Max Push Daily %", "Max Push Daily (%)", "Max Push %"],
+    "MAXPCT": ["Max Push Daily %", "Max Push Daily (%)", "Max Push %"],  # optional
     "GAP": ["Gap %", "Gap"],
     "ATR": ["Daily ATR", "ATR $", "ATR", "ATR (USD)", "ATR$"],
     "RVOL": ["RVOL @ BO", "RVOL", "Relative Volume"],
     "PMVOL": ["PM Vol (M)", "Premarket Vol (M)", "PM Volume (M)"],
-    "PM$": ["PM $Vol (M)", "PM Dollar Vol (M)", "PM $ Volume (M)"],
+    "PM$": ["PM $Vol (M)", "PM Dollar Vol (M)", "PM $ Volume (M)"],      # optional
     "FLOAT": ["Float M Shares", "Public Float (M)", "Float (M)", "Float"],
     "MCAP": ["MarketCap M", "Market Cap (M)", "MCap M"],
     "SI": ["Short Interest %", "Short Float %", "Short Interest (Float) %"],
-    "DAILY": ["Daily Vol (M)", "Day Volume (M)", "Volume (M)"],
+    "DAILY": ["Daily Vol (M)", "Day Volume (M)", "Volume (M)"],          # for direct model target
     "CAT": ["Catalyst", "News", "PR"],
 }
 
@@ -160,7 +166,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         return
 
     df = pd.DataFrame()
-    # Force-binary FT: >=0.5 → 1.0, else 0.0
+    # Force-binary FT: >=0.5 → 1.0 else 0.0
     ft_series = pd.to_numeric(raw[col["FT"]], errors="coerce")
     df["FT"] = (ft_series.fillna(0.0) >= 0.5).astype(float)
 
@@ -188,16 +194,15 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     if {"pm_dol_m","mcap_m"}.issubset(df.columns):
         df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
 
-    # ---------- (A) PM%-of-Day model (logit) ----------
+    # ---------- (A1) PM%-of-Day model (logit) ----------
     pmcoef = None; pmbias = 0.0; pmsigma = 0.60; pm_base = 0.139; pm_feats: List[str] = []
-    if "pm_pct_daily" in df.columns and df["pm_pct_daily"].notna().sum() >= 5:
+    if "pm_pct_daily" in df.columns and df["pm_pct_daily"].notna().sum() >= 8:
         y_raw = pd.to_numeric(df["pm_pct_daily"], errors="coerce").astype(float)
         y_frac = np.clip(y_raw/100.0, 0.005, 0.95)
         y = np.log(y_frac/(1.0 - y_frac))
-
         candidates = [
-            ("ln_mcap",   lambda r: _safe_log(r.get("mcap_m")),                      "mcap_m"),
-            ("ln_gapf",   lambda r: _safe_log(_nz(r.get("gap_pct"),0.0)/100.0),      "gap_pct"),
+            ("ln_mcap",   lambda r: _safe_log(r.get("mcap_m")),                       "mcap_m"),
+            ("ln_gapf",   lambda r: _safe_log(_nz(r.get("gap_pct"),0.0)/100.0),       "gap_pct"),
             ("ln_atr",    lambda r: _safe_log(r.get("atr_usd")),                      "atr_usd"),
             ("ln_float",  lambda r: _safe_log(r.get("float_m")),                      "float_m"),
             ("ln1p_rvol", lambda r: _safe_log(1.0 + _nz(r.get("rvol"),0.0)),         "rvol"),
@@ -208,22 +213,19 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
             X = np.vstack([[f(df.iloc[i].to_dict()) for (name,f,_) in use] for i in range(len(df))]).astype(float)
             mask = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
             Xf, yf = X[mask], y[mask]
-            if Xf.shape[0] >= 5:
+            if Xf.shape[0] >= 8:
                 pmcoef = ridge_fit(Xf, yf, l2=1.2)
                 resid = yf - (Xf @ pmcoef)
                 pmbias = float(np.mean(resid))
                 pmsigma = float(np.std(resid, ddof=1)) if resid.size > 2 else 0.60
                 pm_base = float(np.nanmedian(y_raw[mask]))/100.0
                 pm_feats = [name for (name,_,_) in use]
-                st.success(f"PM% model trained on n={len(yf)} rows; features: {', '.join(pm_feats)}.")
+                st.success(f"PM% model trained (n={len(yf)}; feats: {', '.join(pm_feats)}).")
             else:
                 pm_base = float(np.nanmedian(y_raw))/100.0 if np.isfinite(np.nanmedian(y_raw)) else 0.139
-                st.success(f"PM% fallback baseline used (median≈{pm_base*100:.1f}%).")
-        else:
-            pm_base = float(np.nanmedian(y_raw))/100.0 if np.isfinite(np.nanmedian(y_raw)) else 0.139
-            st.success(f"PM% fallback baseline used (median≈{pm_base*100:.1f}%).")
+                st.info(f"PM% fallback baseline used (median≈{pm_base*100:.1f}%).")
     else:
-        st.success(f"PM% fallback baseline used (median≈{pm_base*100:.1f}%).")
+        st.info(f"PM% fallback baseline used (median≈{pm_base*100:.1f}%).")
 
     def _pm_pct_predict_row(r) -> float:
         if pmcoef is None or not pm_feats:
@@ -242,50 +244,68 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
             p = 1.0/(1.0 + math.exp(-z))
         return float(np.clip(p, 0.02, 0.95))
 
-    # ---------- (B1) Max Push Daily % regression (optional) ----------
-    mpcoef = None; mpbias = 0.0; mpscale = 1.0; mp_med_ft1 = 12.0; mp_feats: List[str] = []
-    if "MAXPCT" in col:
-        y_mp_raw = pd.to_numeric(raw[col["MAXPCT"]], errors="coerce").astype(float)
-        if np.isfinite(y_mp_raw).sum() >= 10:
-            y_mp_frac = np.clip(y_mp_raw/100.0, 1e-4, 0.999)
-            y_mp = np.log(y_mp_frac/(1.0 - y_mp_frac))
-            candidates = [
-                ("ln_mcap",  lambda r: _safe_log(r.get("mcap_m")),                      "mcap_m"),
-                ("ln_gapf",  lambda r: _safe_log(_nz(r.get("gap_pct"),0.0)/100.0),      "gap_pct"),
-                ("ln_atr",   lambda r: _safe_log(r.get("atr_usd")),                      "atr_usd"),
-                ("ln_fr",    lambda r: math.log(max(1e-6,_nz(r.get("pm_vol_m"),0.0)/max(1e-6,_nz(r.get("float_m"),0.0)))), "pm_vol_m"),
-                ("catalyst", lambda r: float(_nz(r.get("catalyst"),0.0)),               "catalyst"),
-            ]
-            use = [c for c in candidates if c[2] in df.columns]
-            if use:
-                X = np.vstack([[f(df.iloc[i].to_dict()) for (name,f,_) in use] for i in range(len(df))]).astype(float)
-                mask = np.all(np.isfinite(X), axis=1) & np.isfinite(y_mp)
-                Xf, yf = X[mask], y_mp[mask]
-                if Xf.shape[0] >= 10:
-                    mpcoef = ridge_fit(Xf, yf, l2=1.2)
-                    pred = Xf @ mpcoef
-                    mpbias = float(np.mean(yf - pred))
-                    mpscale = float(np.std(yf - pred, ddof=1)) if yf.size>2 else 0.6
-                    mp_feats = [name for (name,_,_) in use]
-                    try:
-                        mp_ft = y_mp_raw[(df["FT"]==1).to_numpy() & mask]
-                        if mp_ft.size: mp_med_ft1 = float(np.median(mp_ft))
-                    except Exception:
-                        pass
-                    st.success(f"MaxPush% model trained (features: {', '.join(mp_feats)}).")
+    # ---------- (A2) Direct Day-Volume model on ln(Daily Vol M) ----------
+    dv_coef = None; dv_bias = 0.0; dv_sigma = 0.65; dv_feats: List[str] = []; dv_r2 = 0.0
+    if "daily_vol_m" in df.columns and df["daily_vol_m"].notna().sum() >= 12:
+        y_ln = np.log(np.clip(df["daily_vol_m"].to_numpy(float), 1e-6, None))
+        dv_candidates = [
+            ("ln_mcap",   lambda r: _safe_log(r.get("mcap_m")),                       "mcap_m"),
+            ("ln_gapf",   lambda r: _safe_log(_nz(r.get("gap_pct"),0.0)/100.0),       "gap_pct"),
+            ("ln_atr",    lambda r: _safe_log(r.get("atr_usd")),                      "atr_usd"),
+            ("catalyst",  lambda r: float(_nz(r.get("catalyst"),0.0)),               "catalyst"),
+            # stabilizers (if present)
+            ("ln_float",  lambda r: _safe_log(r.get("float_m")),                      "float_m"),
+            ("ln1p_rvol", lambda r: _safe_log(1.0 + _nz(r.get("rvol"),0.0)),         "rvol"),
+        ]
+        dv_use = [c for c in dv_candidates if c[2] in df.columns]
+        if dv_use:
+            Xdv = np.vstack([[f(df.iloc[i].to_dict()) for (name,f,_) in dv_use] for i in range(len(df))]).astype(float)
+            mask = np.isfinite(y_ln) & np.all(np.isfinite(Xdv), axis=1)
+            Xf, yf = Xdv[mask], y_ln[mask]
+            if Xf.shape[0] >= 12:
+                dv_coef = ridge_fit(Xf, yf, l2=0.8)
+                pred_ln = Xf @ dv_coef
+                resid = yf - pred_ln
+                dv_bias = float(np.mean(resid))
+                dv_sigma = float(np.std(resid, ddof=1)) if resid.size > 2 else 0.65
+                ss_res = float(np.sum((resid - np.mean(resid))**2))
+                ss_tot = float(np.sum((yf - np.mean(yf))**2))
+                dv_r2  = max(0.0, 1.0 - ss_res / max(1e-9, ss_tot))
+                dv_feats = [name for (name,_,_) in dv_use]
+                st.success(f"Direct DayVol model (n={len(yf)}; R²={dv_r2:.3f}; feats: {', '.join(dv_feats)}).")
 
-    # ---------- (B2) FT classifier ----------
-    # Build PredDay using PM% predictor (ensures PredDay ≥ PM)
-    pred_day_arr = []
+    # ---------- (A3) Evaluate PM%-inversion fit on training (ln space) ----------
+    inv_r2 = 0.0; inv_sigma = 0.75
+    if {"pm_vol_m","daily_vol_m"}.issubset(df.columns):
+        pred_day_inv = []
+        for i in range(len(df)):
+            r = df.iloc[i].to_dict()
+            p = _pm_pct_predict_row(r)
+            pm = _nz(r.get("pm_vol_m"), 0.0)
+            pred_day_inv.append(max(pm, pm / max(1e-6, p)))
+        pred_day_inv = np.array(pred_day_inv, dtype=float)
+        mask = np.isfinite(df["daily_vol_m"]) & np.isfinite(pred_day_inv)
+        y_ln = np.log(np.clip(df.loc[mask, "daily_vol_m"].to_numpy(float), 1e-6, None))
+        yhat_ln = np.log(np.clip(pred_day_inv[mask], 1e-6, None))
+        resid = y_ln - yhat_ln
+        inv_sigma = float(np.std(resid, ddof=1)) if resid.size > 2 else inv_sigma
+        ss_res = float(np.sum((resid - np.mean(resid))**2))
+        ss_tot = float(np.sum((y_ln - np.mean(y_ln))**2))
+        inv_r2  = max(0.0, 1.0 - ss_res / max(1e-9, ss_tot))
+        st.info(f"PM% inversion fit on train: R²={inv_r2:.3f}, σ_ln≈{inv_sigma:.2f}.")
+
+    # ---------- (B) FT classifier ----------
+    # Build PredDay per row (using blended scheme below during live; for training we use the inversion estimate
+    # to get ln(PredDay) signal; if direct model exists, ln(PredDay) informational content overlaps—still helpful.)
+    pred_day_train = []
     for i in range(len(df)):
         r = df.iloc[i].to_dict()
         p = _pm_pct_predict_row(r)
         pm = _nz(r.get("pm_vol_m"), 0.0)
-        pred_day = max(pm, pm / max(1e-6, p))
-        pred_day_arr.append(pred_day)
-    df["pred_day_m"] = np.array(pred_day_arr, dtype=float)
+        pred_day_train.append(max(pm, pm / max(1e-6, p)))
+    df["pred_day_m"] = np.array(pred_day_train, dtype=float)
 
-    # FT feature set (coalesce NaNs to safe defaults)
+    # FT features
     def _ln1p_pmvol(r): return _safe_log(_nz(r.get("pm_vol_m"),0.0) + 1.0)
     def _ln_fr(r):
         pm = _nz(r.get("pm_vol_m"),0.0); fl = _nz(r.get("float_m"),0.0)
@@ -295,40 +315,30 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         return _safe_log(pm_dol / max(1e-6, mc) + 1.0)
 
     ft_candidates = [
-        ("ln_mcap",      lambda r: _safe_log(r.get("mcap_m")),                               ["mcap_m"]),
-        ("ln_gapf",      lambda r: _safe_log(_nz(r.get("gap_pct"),0.0)/100.0),               ["gap_pct"]),
-        ("ln_atr",       lambda r: _safe_log(r.get("atr_usd")),                               ["atr_usd"]),
-        ("ln_float",     lambda r: _safe_log(r.get("float_m")),                               ["float_m"]),
-        ("ln1p_rvol",    lambda r: _safe_log(1.0 + _nz(r.get("rvol"),0.0)),                   ["rvol"]),
-        ("ln1p_pmvol",   _ln1p_pmvol,                                                         ["pm_vol_m"]),
-        ("ln_fr",        _ln_fr,                                                               ["pm_vol_m","float_m"]),
-        ("ln1p_pmmc",    _ln1p_pmmc,                                                           ["pm_dol_m","mcap_m"]),
-        ("catalyst",     lambda r: float(_nz(r.get("catalyst"),0.0)),                          ["catalyst"]),
-        ("ln_pred_day",  lambda r: _safe_log(r.get("pred_day_m")),                             ["pred_day_m"]),
+        ("ln_mcap",      lambda r: _safe_log(r.get("mcap_m")),                       ["mcap_m"]),
+        ("ln_gapf",      lambda r: _safe_log(_nz(r.get("gap_pct"),0.0)/100.0),       ["gap_pct"]),
+        ("ln_atr",       lambda r: _safe_log(r.get("atr_usd")),                      ["atr_usd"]),
+        ("ln_float",     lambda r: _safe_log(r.get("float_m")),                      ["float_m"]),
+        ("ln1p_rvol",    lambda r: _safe_log(1.0 + _nz(r.get("rvol"),0.0)),          ["rvol"]),
+        ("ln1p_pmvol",   _ln1p_pmvol,                                               ["pm_vol_m"]),
+        ("ln_fr",        _ln_fr,                                                     ["pm_vol_m","float_m"]),
+        ("ln1p_pmmc",    _ln1p_pmmc,                                                 ["pm_dol_m","mcap_m"]),
+        ("catalyst",     lambda r: float(_nz(r.get("catalyst"),0.0)),                ["catalyst"]),
+        ("ln_pred_day",  lambda r: _safe_log(r.get("pred_day_m")),                   ["pred_day_m"]),
     ]
     ft_use = [(n,f,req) for (n,f,req) in ft_candidates if all(k in df.columns for k in req)]
 
-    if not ft_use:
-        st.error("No usable FT features found.")
-        return
-
-    Xft = np.vstack([[f(df.iloc[i].to_dict()) for (n,f,_) in ft_use] for i in range(len(df))]).astype(float)
+    Xft = np.vstack([[f(df.iloc[i].to_dict()) for (n,f,_) in ft_use] for i in range(len(df))]).astype(float) if ft_use else np.zeros((len(df),0))
     y_ft = df["FT"].to_numpy(dtype=float)
-
-    # No more row loss: coalesce any remaining nans to zeros
     Xft = np.nan_to_num(Xft, nan=0.0, posinf=0.0, neginf=0.0)
-    y_ft = np.nan_to_num(y_ft, nan=0.0)
-
-    # Need at least two classes; enforce 0/1
-    y_ft = (y_ft >= 0.5).astype(float)
+    y_ft = (np.nan_to_num(y_ft, nan=0.0) >= 0.5).astype(float)
 
     ft_coef = None; ft_bias = 0.0; ft_feats = [name for (name,_,_) in ft_use]
-    n_rows = Xft.shape[0]
-    if n_rows >= 10 and np.unique(y_ft).size == 2:
+    if Xft.shape[0] >= 12 and np.unique(y_ft).size == 2 and Xft.shape[1] > 0:
         ft_coef, ft_bias = logit_fit(Xft, y_ft, l2=1.0, max_iter=120, tol=1e-6)
-        st.success(f"FT classifier trained on n={n_rows} rows; features: {', '.join(ft_feats)}.")
+        st.success(f"FT classifier trained (n={Xft.shape[0]}; feats: {', '.join(ft_feats)}).")
     else:
-        st.error("Unable to train FT classifier (need ≥10 rows and both classes present).")
+        st.error("Unable to train FT classifier (need ≥12 rows, both classes, and valid features).")
 
     # Calibration thresholds from train preds (with floors)
     if ft_coef is not None:
@@ -355,8 +365,10 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     st.session_state.ARTIFACTS = {
         # PM% model
         "pmcoef": pmcoef, "pmbias": pmbias, "pmsigma": pmsigma, "pm_base": pm_base, "pm_feats": pm_feats,
-        # Max push
-        "mpcoef": mpcoef, "mpbias": mpbias, "mpscale": mpscale, "mp_med_ft1": mp_med_ft1, "mp_feats": mp_feats,
+        # Direct DayVol
+        "dv_coef": dv_coef, "dv_bias": dv_bias, "dv_sigma": dv_sigma, "dv_feats": dv_feats,
+        # Fit scores for blending
+        "dv_r2": dv_r2, "inv_r2": inv_r2, "inv_sigma": inv_sigma,
         # FT
         "ft_coef": ft_coef, "ft_bias": ft_bias, "ft_feats": ft_feats,
     }
@@ -384,7 +396,6 @@ def _pm_pct_predict(mc_m: float, gap_pct: float, atr_usd: float, float_m: float,
     pmcoef = A.get("pmcoef"); pmbias = float(A.get("pmbias") or 0.0)
     pmsigma = float(A.get("pmsigma") or 0.60); pm_base = float(A.get("pm_base") or 0.139)
     feats = A.get("pm_feats") or []
-
     if pmcoef is None or not feats:
         p = float(np.clip(pm_base, 0.02, 0.95))
     else:
@@ -406,24 +417,76 @@ def _pm_pct_predict(mc_m: float, gap_pct: float, atr_usd: float, float_m: float,
     lo = float(np.clip(lo, 0.01, 0.98)); hi = float(np.clip(hi, 0.01, 0.98))
     return p, lo, hi
 
-def predict_day_volume_from_pm(pm_vol_m: float, p_pm: float, lo: float, hi: float) -> Tuple[float,float,float]:
-    """Invert PM% → Day volume. Guarantees PredVol ≥ PM volume."""
+def _predict_dayvol_direct(mc_m: float, gap_pct: float, atr_usd: float,
+                           float_m: float, rvol: float, catalyst: float) -> Optional[float]:
+    """Direct log-linear DayVol prediction from learned DV model; returns None if model not available."""
+    A = st.session_state.ARTIFACTS or {}
+    coef, bias, feats = A.get("dv_coef"), A.get("dv_bias"), A.get("dv_feats") or []
+    if coef is None or not feats:
+        return None
+    vals = []
+    for name in feats:
+        if   name == "ln_mcap":   vals.append(_safe_log(mc_m))
+        elif name == "ln_gapf":   vals.append(_safe_log(_nz(gap_pct,0.0)/100.0))
+        elif name == "ln_atr":    vals.append(_safe_log(atr_usd))
+        elif name == "catalyst":  vals.append(float(_nz(catalyst,0.0)))
+        elif name == "ln_float":  vals.append(_safe_log(float_m))
+        elif name == "ln1p_rvol": vals.append(_safe_log(1.0 + _nz(rvol,0.0)))
+        else: vals.append(0.0)
+    ln_pred = float(np.dot(vals, coef) + bias)
+    return float(max(1e-6, math.exp(ln_pred)))
+
+def predict_day_volume_blend(pm_vol_m: float, mc_m: float, gap_pct: float, atr_usd: float,
+                             float_m: float, rvol: float, catalyst: float) -> Tuple[float,float,float,float,float]:
+    """
+    Returns:
+      pred_M, ci68_lo_M, ci68_hi_M, implied_pm_frac_pct, blend_weight_direct
+    """
     pm_vol_m = _nz(pm_vol_m, 0.0)
-    p = max(1e-6, min(0.95, _nz(p_pm, 0.139)))
-    pred = max(pm_vol_m, pm_vol_m / p)
-    lo_v = max(pm_vol_m, pm_vol_m / max(1e-6, _nz(hi, p)))
-    hi_v = max(pm_vol_m, pm_vol_m / max(1e-6, _nz(lo, p)))
-    return float(pred), float(lo_v), float(hi_v)
+
+    # Inversion path
+    p_pm, p_lo, p_hi = _pm_pct_predict(mc_m, gap_pct, atr_usd, float_m, rvol, catalyst)
+    pred_inv = max(pm_vol_m, pm_vol_m / max(1e-6, p_pm))
+
+    # Direct path
+    pred_dir = _predict_dayvol_direct(mc_m, gap_pct, atr_usd, float_m, rvol, catalyst)
+    if pred_dir is None:
+        pred_dir = pred_inv
+    else:
+        pred_dir = max(pred_dir, pm_vol_m)
+
+    # Blend weight from R²
+    A = st.session_state.ARTIFACTS or {}
+    dv_r2  = float(A.get("dv_r2") or 0.0)
+    inv_r2 = float(A.get("inv_r2") or 0.0)
+    if dv_r2 + inv_r2 <= 1e-9:
+        w_dir = 0.65
+    else:
+        w_dir = dv_r2 / (dv_r2 + inv_r2)
+
+    # Blend in ln-space
+    ln_pred = w_dir * math.log(pred_dir) + (1.0 - w_dir) * math.log(pred_inv)
+    pred = float(max(pm_vol_m, math.exp(ln_pred)))
+
+    # CI68: blend variances in ln-space
+    dv_sig  = float(A.get("dv_sigma") or 0.65)
+    inv_sig = float(A.get("inv_sigma") or 0.75)
+    sig = math.sqrt(max(1e-9, (w_dir*dv_sig)**2 + ((1.0 - w_dir)*inv_sig)**2))
+    lo = float(max(pm_vol_m, math.exp(ln_pred - sig)))
+    hi = float(max(pm_vol_m, math.exp(ln_pred + sig)))
+
+    implied_pm_frac_pct = 100.0 * pm_vol_m / max(1e-6, pred)
+    return pred, lo, hi, implied_pm_frac_pct, w_dir
 
 def predict_ft_prob(mc_m: float, gap_pct: float, atr_usd: float, float_m: float, si_pct: float,
                     rvol: float, pm_vol_m: float, pm_dol_m: float, catalyst: float) -> float:
+    """FT probability using learned logistic classifier (with ln(PredDay) among features)."""
     A = st.session_state.ARTIFACTS or {}
     coef = A.get("ft_coef"); bias = float(A.get("ft_bias") or 0.0)
     ft_feats = A.get("ft_feats") or []
 
-    # PM%-derived day volume
-    p_pm, p_lo, p_hi = _pm_pct_predict(mc_m, gap_pct, atr_usd, float_m, rvol, catalyst)
-    pred_vol_m, _, _ = predict_day_volume_from_pm(pm_vol_m, p_pm, p_lo, p_hi)
+    # Use blended PredDay
+    pred_day, _, _, _, _ = predict_day_volume_blend(pm_vol_m, mc_m, gap_pct, atr_usd, float_m, rvol, catalyst)
 
     vals = []
     for name in ft_feats:
@@ -436,30 +499,12 @@ def predict_ft_prob(mc_m: float, gap_pct: float, atr_usd: float, float_m: float,
         elif name == "ln_fr":       vals.append(math.log(max(1e-6, _nz(pm_vol_m,0.0)/max(1e-6, _nz(float_m,0.0)))))
         elif name == "ln1p_pmmc":   vals.append(_safe_log(_nz(pm_dol_m,0.0)/max(1e-6, _nz(mc_m,0.0)) + 1.0))
         elif name == "catalyst":    vals.append(float(_nz(catalyst,0.0)))
-        elif name == "ln_pred_day": vals.append(_safe_log(pred_vol_m))
+        elif name == "ln_pred_day": vals.append(_safe_log(pred_day))
         else: vals.append(0.0)
 
     if coef is None or not vals:
-        p_cls = 0.50
-    else:
-        p_cls = float(logit_inv(bias + np.dot(vals, coef)))
-
-    # Optional MaxPush blend (if learned)
-    mpcoef = A.get("mpcoef"); mpbias = float(A.get("mpbias") or 0.0)
-    mpscale = float(A.get("mpscale") or 6.0); mp_med = float(A.get("mp_med_ft1") or 12.0)
-    p_blend = p_cls
-    if mpcoef is not None and (A.get("mp_feats") or []):
-        ln_mcap  = _safe_log(mc_m)
-        ln_gapf  = _safe_log(_nz(gap_pct,0.0)/100.0)
-        ln_atr   = _safe_log(atr_usd)
-        ln_fr    = math.log(max(1e-6, _nz(pm_vol_m,0.0)/max(1e-6, _nz(float_m,0.0))))
-        ca       = float(_nz(catalyst,0.0))
-        z_mp     = float(np.dot([ln_mcap, ln_gapf, ln_atr, ln_fr, ca], mpcoef) + mpbias)
-        mp_pct   = float(1.0/(1.0+math.exp(-z_mp)))*100.0
-        p_push   = 1.0/(1.0 + math.exp(-(mp_pct - mp_med)/max(2.0, mpscale*8.0)))
-        p_blend  = 0.80*p_cls + 0.20*p_push
-
-    return float(np.clip(p_blend, 1e-3, 1-1e-3))
+        return 0.50
+    return float(np.clip(logit_inv(bias + np.dot(vals, coef)), 1e-3, 1-1e-3))
 
 def _prob_to_odds(prob: float, cuts: Dict[str, float]) -> str:
     if prob >= cuts.get("very_high",0.85): return "Very High Odds"
@@ -475,20 +520,6 @@ def _prob_to_grade(prob: float, cuts: Dict[str, float]) -> str:
     if prob >= cuts.get("B",0.65):   return "B"
     if prob >= cuts.get("C",0.50):   return "C"
     return "D"
-
-# ============================== UI: Learn ==============================
-if learn_btn:
-    if not uploaded:
-        st.error("Upload a workbook first.")
-    else:
-        try:
-            xls = pd.ExcelFile(uploaded)
-            if sheet_name not in xls.sheet_names:
-                st.error(f"Sheet '{sheet_name}' not found. Available: {xls.sheet_names}")
-            else:
-                _load_and_learn(xls, sheet_name)
-        except Exception as e:
-            st.error(f"Learning failed: {e}")
 
 # ============================== Tabs ==============================
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -515,11 +546,13 @@ with tab_add:
 
     if submitted and ticker:
         cat = 1.0 if catalyst_flag=="Yes" else 0.0
-        # PM% → Predicted Day Volume (CI; PredVol ≥ PM)
-        p_pm, p_lo, p_hi = _pm_pct_predict(mc_m, gap_pct, atr_usd, float_m, rvol, cat)
-        pred_vol_m, ci68_l, ci68_u = predict_day_volume_from_pm(pm_vol_m, p_pm, p_lo, p_hi)
 
-        # FT probability
+        # Blended DayVol prediction (PredVol ≥ PMVol)
+        pred_vol_m, ci68_l, ci68_u, pmfrac_pct, w_dir = predict_day_volume_blend(
+            pm_vol_m, mc_m, gap_pct, atr_usd, float_m, rvol, cat
+        )
+
+        # FT probability (uses ln(PredDay))
         ft_prob = predict_ft_prob(mc_m, gap_pct, atr_usd, float_m, si_pct, rvol, pm_vol_m, pm_dol_m, cat)
         odds_cuts = st.session_state.get("ODDS_CUTS", {})
         grade_cuts = st.session_state.get("GRADE_CUTS", {})
@@ -534,7 +567,8 @@ with tab_add:
             "PredVol_M": round(pred_vol_m, 2),
             "PredVol_CI68_L": round(ci68_l, 2),
             "PredVol_CI68_U": round(ci68_u, 2),
-            "PM%_pred": round(p_pm*100.0, 1),
+            "PM%_implied": round(pmfrac_pct, 1),
+            "Blend_w_direct": round(w_dir, 2),
         }
         st.session_state.rows.append(row)
         st.session_state.last = row
@@ -551,7 +585,8 @@ with tab_add:
         d.metric("Odds", l.get('Odds','—'))
         e.metric("PredVol (M)", f"{l.get('PredVol_M',0):.2f}")
         st.caption(
-            f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · PM% (pred): {l.get('PM%_pred',0):.1f}%"
+            f"CI68: {l.get('PredVol_CI68_L',0):.2f} – {l.get('PredVol_CI68_U',0):.2f} M · "
+            f"PM% implied: {l.get('PM%_implied',0):.1f}% · Blend direct={l.get('Blend_w_direct',0):.2f}"
         )
 
 # ============================== Ranking ==============================
@@ -559,7 +594,10 @@ with tab_rank:
     st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows).sort_values("FinalScore", ascending=False).reset_index(drop=True)
-        cols_to_show = ["Ticker","Odds","Level","FinalScore","PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM%_pred"]
+        cols_to_show = [
+            "Ticker","Odds","Level","FinalScore",
+            "PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM%_implied","Blend_w_direct"
+        ]
         for c in cols_to_show:
             if c not in df.columns: df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
         st.dataframe(
@@ -572,7 +610,8 @@ with tab_rank:
                 "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
                 "PredVol_CI68_L": st.column_config.NumberColumn("PredVol CI68 Low (M)",  format="%.2f"),
                 "PredVol_CI68_U": st.column_config.NumberColumn("PredVol CI68 High (M)", format="%.2f"),
-                "PM%_pred": st.column_config.NumberColumn("Predicted PM% of Day", format="%.1f"),
+                "PM%_implied": st.column_config.NumberColumn("PM% implied", format="%.1f"),
+                "Blend_w_direct": st.column_config.NumberColumn("Blend weight (direct)", format="%.2f"),
             }
         )
         st.download_button(
