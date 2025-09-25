@@ -1,11 +1,11 @@
-# app.py — Premarket Ranking (Ground-up Minimal Core)
-# ---------------------------------------------------
+# app.py — Premarket Ranking (Minimal Core + ATR in FT)
+# -----------------------------------------------------
 # Core behaviors:
 # 1) Day Volume prediction: DIRECT log-linear model (fixed coefficients; millions out), clamped ≥ PM Vol.
-# 2) FT model: small logistic, trained from uploaded workbook on a minimal, safe feature set:
-#       ln1p_pmvol, ln_gapf, catalyst
-#    (You can enable extra features in the sidebar once stable: ln_atr, ln_mcap, ln_float, ln1p_rvol, ln1p_pmmc.)
-# 3) UI: Add/Score → Ranking table (download, delete, clear) → Markdown table (download).
+# 2) FT model: small logistic, trained from uploaded workbook on a stable feature set:
+#       ln1p_pmvol, ln_gapf, catalyst, ln_atr   ← (ATR added to core)
+#    (You can toggle in extra signals later if you want.)
+# 3) UI: Add/Score → Ranking table (download, delete, clear) → Markdown (download).
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -20,8 +20,8 @@ import pandas as pd
 import streamlit as st
 
 # ========== Page ==========
-st.set_page_config(page_title="Premarket Ranking — Minimal Core", layout="wide")
-st.title("Premarket Ranking — Minimal Core")
+st.set_page_config(page_title="Premarket Ranking — Minimal Core + ATR", layout="wide")
+st.title("Premarket Ranking — Minimal Core + ATR")
 
 st.markdown("""
 <style>
@@ -36,13 +36,6 @@ st.markdown("""
 # ========== Sidebar ==========
 st.sidebar.header("Confidence")
 sigma_ln = st.sidebar.slider("DayVol log-space σ (CI68)", 0.10, 1.50, 0.60, 0.01)
-
-st.sidebar.header("FT Features (incremental)")
-USE_ATR    = st.sidebar.checkbox("Add ln_atr", False)
-USE_MCAP   = st.sidebar.checkbox("Add ln_mcap", False)
-USE_FLOAT  = st.sidebar.checkbox("Add ln_float", False)
-USE_RVOL   = st.sidebar.checkbox("Add ln1p_rvol", False)
-USE_PMMC   = st.sidebar.checkbox("Add ln1p_pmmc (PM$ / MC)", False)
 
 SHOW_DIAG  = st.sidebar.checkbox("Show training diagnostics", True)
 SHOW_LAST  = st.sidebar.checkbox("Show last-ticker feature contributions", True)
@@ -165,7 +158,7 @@ def predict_dayvol_m(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     y = math.exp(ln_y)
     return float(max(0.0, y))
 
-# ========== FT logistic (tiny, balanced, L2, clipped) ==========
+# ========== FT logistic (balanced, L2, clipped) ==========
 def logit_fit_weighted(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
                        l2: float = 1.0, max_iter: int = 100, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
     n, k = X.shape
@@ -230,35 +223,20 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
     if "CAT" in col: df["catalyst"] = _parse_catalyst_col(raw[col["CAT"]])
     else: df["catalyst"] = 0.0
 
-    # quick unit sanity
+    # sanity peek
     with st.expander("Dataset checks"):
         meds = {c: float(np.nanmedian(df[c])) for c in ["mcap_m","float_m","pm_vol_m","gap_pct","atr_usd"] if c in df.columns}
         st.write(meds)
-        flags = []
-        if meds.get("mcap_m",0)>50000: flags.append("⚠️ Median MCap > $50B — units must be millions.")
-        if meds.get("float_m",0)>10000: flags.append("⚠️ Median Float > 10,000M — units?")
-        if meds.get("pm_vol_m",0)>1000: flags.append("⚠️ Median PM Vol > 1,000M — units?")
-        if 0 < meds.get("gap_pct",0) < 1: flags.append("⚠️ Gap looks like a fraction; use percent (e.g., 23).")
-        if meds.get("atr_usd",0)>20: flags.append("⚠️ ATR > $20 — check source.")
-        if flags: st.warning("\n".join(flags))
 
-    # ===== FT feature set (minimal core: ln1p_pmvol, ln_gapf, catalyst) =====
+    # ===== FT feature set: core + ATR =====
     feats: List[Tuple[str, callable]] = [
         ("ln1p_pmvol", lambda r: _safe_log(_nz(r.get("pm_vol_m"),0.0)+1.0)),
         ("ln_gapf",    lambda r: _safe_log(_nz(r.get("gap_pct"),0.0)/100.0)),
         ("catalyst",   lambda r: float(_nz(r.get("catalyst"),0.0))),
+        ("ln_atr",     lambda r: _safe_log(r.get("atr_usd"))),
     ]
-    # Optional extras (toggled)
-    if USE_ATR:   feats.append(("ln_atr",   lambda r: _safe_log(r.get("atr_usd"))))
-    if USE_MCAP:  feats.append(("ln_mcap",  lambda r: _safe_log(r.get("mcap_m"))))
-    if USE_FLOAT: feats.append(("ln_float", lambda r: _safe_log(r.get("float_m"))))
-    if USE_RVOL:  feats.append(("ln1p_rvol",lambda r: _safe_log(1.0 + _nz(r.get("rvol"),0.0))))
-    if USE_PMMC:  feats.append(("ln1p_pmmc",lambda r: _safe_log(_nz(r.get("pm_dol_m"),0.0)/max(1e-6,_nz(r.get("mcap_m"),0.0)) + 1.0)))
 
     # build design matrix
-    if not feats:
-        st.error("No FT features selected.")
-        return
     X = np.vstack([[f(df.iloc[i].to_dict()) for _, f in feats] for i in range(len(df))]).astype(float)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     y = df["FT"].to_numpy(dtype=float)
@@ -278,7 +256,7 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
     # train
     if Z.shape[0] >= 12 and np.unique(y).size == 2:
         coef_z, bias = logit_fit_weighted(Z, y, sample_w, l2=1.0, max_iter=120, tol=1e-6)
-        st.success(f"FT trained (n={Z.shape[0]}; base FT≈{p1:.2f}; feats: {', '.join([n for n,_ in feats])}).")
+        st.success(f"FT trained (n={Z.shape[0]}; base FT≈{p1:.2f}; feats: " + ", ".join([n for n,_ in feats]) + ").")
     else:
         coef_z, bias = np.zeros(Z.shape[1]), 0.0
         st.error("Unable to train FT (need ≥12 rows and both classes). Using neutral 50%.")
@@ -294,7 +272,6 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
     st.session_state.ODDS_CUTS = odds_cuts
     st.session_state.GRADE_CUTS = grade_cuts
 
-    # diagnostics
     if SHOW_DIAG:
         diag = pd.DataFrame({"feature":[n for n,_ in feats], "coef_z":coef_z}).sort_values("coef_z", key=np.abs, ascending=False)
         st.dataframe(diag, use_container_width=True, hide_index=True)
@@ -330,8 +307,8 @@ def _prob_to_grade(p: float, cuts: Dict[str,float]) -> str:
     return "D"
 
 # ========== Inference ==========
-def predict_ft_prob_minimal(gap_pct: float, pm_vol_m: float, catalyst: float,
-                            atr_usd: float, mcap_m: float, float_m: float, rvol: float, pm_dol_m: float) -> float:
+def predict_ft_prob_core(gap_pct: float, pm_vol_m: float, catalyst: float,
+                         atr_usd: float) -> float:
     A = st.session_state.ART or {}
     names = A.get("feat_names") or []; mu = A.get("mu"); sd = A.get("sd")
     coef = A.get("coef_z"); bias = float(A.get("bias", 0.0))
@@ -342,10 +319,6 @@ def predict_ft_prob_minimal(gap_pct: float, pm_vol_m: float, catalyst: float,
         "ln_gapf":    lambda: _safe_log(_nz(gap_pct,0.0)/100.0),
         "catalyst":   lambda: float(_nz(catalyst,0.0)),
         "ln_atr":     lambda: _safe_log(atr_usd),
-        "ln_mcap":    lambda: _safe_log(mcap_m),
-        "ln_float":   lambda: _safe_log(float_m),
-        "ln1p_rvol":  lambda: _safe_log(1.0 + _nz(rvol,0.0)),
-        "ln1p_pmmc":  lambda: _safe_log(_nz(pm_dol_m,0.0)/max(1e-6, _nz(mcap_m,0.0)) + 1.0),
     }
     vals = [float(feat_map[n]()) for n in names]
     Z = (np.array(vals) - mu) / sd
@@ -384,8 +357,8 @@ with tab_add:
 
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
 
-        # FT probability (minimal model)
-        ft_prob = predict_ft_prob_minimal(gap_pct, pm_vol_m, cat, atr_usd, mc_m, float_m, rvol, pm_dol_m)
+        # FT probability (core + ATR)
+        ft_prob = predict_ft_prob_core(gap_pct, pm_vol_m, cat, atr_usd)
 
         odds_cuts  = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
         grade_cuts = st.session_state.get("GRADE_CUTS", {"App":0.92,"Ap":0.85,"A":0.75,"B":0.65,"C":0.50})
@@ -428,19 +401,13 @@ with tab_add:
         if SHOW_LAST and st.session_state.ART.get("feat_names"):
             names = st.session_state.ART["feat_names"]; mu = st.session_state.ART["mu"]; sd = st.session_state.ART["sd"]; coef = st.session_state.ART["coef_z"]; bias = st.session_state.ART["bias"]
             # reconstruct feature values for last ticker
-            gap_pct  = last.get("_Gap_%",0.0); pm_vol_m = last.get("_PM_M",0.0); cat = last.get("_Catalyst",0.0)
-            atr_usd  = last.get("_ATR_$",0.0); mc_m = last.get("_MCap_M",0.0); fl_m = last.get("_Float_M",0.0)
-            rvol     = last.get("_RVOL",0.0);  pm_dol_m = last.get("_PM$_M",0.0)
+            gap_pct  = last.get("_Gap_%",0.0); pm_vol_m = last.get("_PM_M",0.0); cat = last.get("_Catalyst",0.0); atr_usd = last.get("_ATR_$",0.0)
 
             feat_map = {
                 "ln1p_pmvol": lambda: _safe_log(_nz(pm_vol_m,0.0)+1.0),
                 "ln_gapf":    lambda: _safe_log(_nz(gap_pct,0.0)/100.0),
                 "catalyst":   lambda: float(_nz(cat,0.0)),
                 "ln_atr":     lambda: _safe_log(atr_usd),
-                "ln_mcap":    lambda: _safe_log(mc_m),
-                "ln_float":   lambda: _safe_log(fl_m),
-                "ln1p_rvol":  lambda: _safe_log(1.0 + _nz(rvol,0.0)),
-                "ln1p_pmmc":  lambda: _safe_log(_nz(pm_dol_m,0.0)/max(1e-6, _nz(mc_m,0.0)) + 1.0),
             }
             vals = np.array([float(feat_map[n]()) for n in names])
             Z = np.clip((vals - st.session_state.ART["mu"]) / st.session_state.ART["sd"], -3.0, 3.0)
