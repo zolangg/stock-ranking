@@ -239,10 +239,10 @@ def make_odds_cuts() -> dict:
 # ========== Labels ==========
 def _prob_to_odds(p: float, cuts: Dict[str,float]) -> str:
     # Odds tiers (fixed cuts)
-    if p >= cuts.get("very_high",0.90): return "Very High Odds"
-    if p >= cuts.get("high",0.75):      return "High Odds"
-    if p >= cuts.get("moderate",0.60):  return "Moderate Odds"
-    if p >= cuts.get("low",0.45):       return "Low Odds"
+    if p >= cuts.get("very_high",0.97): return "Very High Odds"
+    if p >= cuts.get("high",0.90):      return "High Odds"
+    if p >= cuts.get("moderate",0.75):  return "Moderate Odds"
+    if p >= cuts.get("moderate",0.55):  return "Low Odds"
     return "Very Low Odds"
 
 def _prob_to_grade(p: float, cuts: Dict[str,float]) -> str:
