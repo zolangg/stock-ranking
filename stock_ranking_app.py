@@ -1,9 +1,10 @@
-# app.py — Premarket Ranking (Core FT + ATR + MCAP + RVOL + $Vol)
-# ----------------------------------------------------------------
-# DayVol: direct log-linear (fixed coeffs), clamped ≥ PM.
-# FT model (trained from workbook): standardized logistic on
-#   ln1p_pmvol, ln_gapf, catalyst, ln_atr, ln_mcap, **ln1p_rvol, ln1p_pmmc**
-# UI: Ranking + Markdown + delete rows + clear + downloads.
+# app.py — Premarket Ranking (Direct DayVol + FT with SI% and PM% of Pred)
+# ------------------------------------------------------------------------
+# • DayVol: your fixed direct log-linear model (millions), clamped ≥ PM Vol.
+# • FT model (trained from workbook): standardized logistic on
+#     ln1p_pmvol, ln_gapf, catalyst, ln_atr, ln_mcap, ln1p_rvol, ln1p_pmmc,
+#     **ln1p_si**, **ln1p_pmfrac**  (NEW)
+# • UI: Ranking + Markdown + delete rows + clear + downloads.
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -18,8 +19,8 @@ import pandas as pd
 import streamlit as st
 
 # ========== Page ==========
-st.set_page_config(page_title="Premarket Ranking — Core FT (+RVOL, $Vol)", layout="wide")
-st.title("Premarket Ranking — Core FT (+RVOL, $Vol)")
+st.set_page_config(page_title="Premarket Ranking — FT with SI% & PM%", layout="wide")
+st.title("Premarket Ranking — FT with SI% & PM% of Predicted Day")
 
 st.markdown("""
 <style>
@@ -32,10 +33,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ========== Sidebar ==========
-st.sidebar.header("Confidence")
+st.sidebar.header("Prediction Uncertainty")
 sigma_ln = st.sidebar.slider("DayVol log-space σ (CI68)", 0.10, 1.50, 0.60, 0.01)
 SHOW_DIAG = st.sidebar.checkbox("Show training diagnostics", True)
-SHOW_LAST = st.sidebar.checkbox("Show last-ticker feature contributions", True)
 
 # ========== Session ==========
 if "ART"   not in st.session_state: st.session_state.ART = {}
@@ -52,7 +52,7 @@ def _rerun():
 
 def _ft_is_trained() -> bool:
     A = st.session_state.get("ART", {})
-    return bool(A) and all(k in A for k in ("feat_names","mu","sd","coef_z","bias")) and len(A.get("feat_names") or [])>0
+    return bool(A) and all(k in A for k in ("feat_names","mu","sd","coef_z","bias"))
 
 # ========== Helpers ==========
 def _parse_local_float(s: str) -> Optional[float]:
@@ -67,7 +67,8 @@ def _parse_local_float(s: str) -> Optional[float]:
 def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
                 max_value: Optional[float] = None, decimals: int = 2,
                 key: Optional[str] = None, help: Optional[str] = None) -> float:
-    fmt = f"{{:.{decimals}f}}"; s = st.text_input(label, fmt.format(value), key=key, help=help)
+    fmt = f"{{:.{decimals}f}}"
+    s = st.text_input(label, fmt.format(value), key=key, help=help)
     v = _parse_local_float(s)
     if v is None: return float(value)
     v = max(min_value, v)
@@ -102,7 +103,7 @@ def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
-# ========== Legend mapping ==========
+# ========== Legend-driven mapping ==========
 _DEF = {
     "FT":     ["FT"],
     "GAP":    ["Gap %","Gap"],
@@ -113,7 +114,7 @@ _DEF = {
     "FLOAT":  ["Float M Shares","Public Float (M)","Float (M)","Float"],
     "MCAP":   ["MarketCap M","Market Cap (M)","MCap M"],
     "SI":     ["Short Interest %","Short Float %","Short Interest (Float) %"],
-    "DAILY":  ["Daily Vol (M)","Day Volume (M)","Volume (M)"],           # optional (diagnostics)
+    "DAILY":  ["Daily Vol (M)","Day Volume (M)","Volume (M)"],   # optional diagnostics
     "CAT":    ["Catalyst","News","PR"],
 }
 def _norm(s: str) -> str:
@@ -145,7 +146,7 @@ def _parse_catalyst_col(series: pd.Series) -> pd.Series:
             except: out.append(0.0)
     return pd.Series(out, dtype=float).clip(0,1)
 
-# ========== Direct log-linear DayVol (exact spec) ==========
+# ========== Direct log-linear DayVol (fixed) ==========
 def predict_dayvol_m(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """
     ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$)
@@ -223,15 +224,27 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
     if "CAT" in col: df["catalyst"] = _parse_catalyst_col(raw[col["CAT"]])
     else: df["catalyst"] = 0.0
 
-    # ===== FT feature set: core + ATR + MCAP + RVOL + PM$ vs MC =====
+    # Build PredDay from direct model and clamp ≥ PMVol (for PM%)
+    pred_day_direct = []
+    for i in range(len(df)):
+        r = df.iloc[i]
+        pred_m = predict_dayvol_m(_nz(r.get("mcap_m")), _nz(r.get("gap_pct")), _nz(r.get("atr_usd")))
+        pm_m   = _nz(r.get("pm_vol_m"), 0.0)
+        pred_day_direct.append(max(pm_m, pred_m))
+    df["pred_day_m"] = np.array(pred_day_direct, dtype=float)
+
+    # ===== FT feature set (includes SI% and PM% of Pred) =====
     feats: List[Tuple[str, callable]] = [
-        ("ln1p_pmvol", lambda r: _safe_log(_nz(r.get("pm_vol_m"),0.0) + 1.0)),
-        ("ln_gapf",    lambda r: _safe_log(_nz(r.get("gap_pct"),0.0) / 100.0)),
-        ("catalyst",   lambda r: float(_nz(r.get("catalyst"),0.0))),
-        ("ln_atr",     lambda r: _safe_log(r.get("atr_usd"))),
-        ("ln_mcap",    lambda r: _safe_log(r.get("mcap_m"))),
-        ("ln1p_rvol",  lambda r: _safe_log(_nz(r.get("rvol"),0.0) + 1.0)),
-        ("ln1p_pmmc",  lambda r: _safe_log(_nz(r.get("pm_dol_m"),0.0) / max(1e-6, _nz(r.get("mcap_m"),0.0)) + 1.0)),
+        ("ln1p_pmvol",  lambda r: _safe_log(_nz(r.get("pm_vol_m"),0.0) + 1.0)),
+        ("ln_gapf",     lambda r: _safe_log(_nz(r.get("gap_pct"),0.0) / 100.0)),
+        ("catalyst",    lambda r: float(_nz(r.get("catalyst"),0.0))),
+        ("ln_atr",      lambda r: _safe_log(r.get("atr_usd"))),
+        ("ln_mcap",     lambda r: _safe_log(r.get("mcap_m"))),
+        ("ln1p_rvol",   lambda r: _safe_log(_nz(r.get("rvol"),0.0) + 1.0)),
+        ("ln1p_pmmc",   lambda r: _safe_log(_nz(r.get("pm_dol_m"),0.0) / max(1e-6, _nz(r.get("mcap_m"),0.0)) + 1.0)),
+        # NEW:
+        ("ln1p_si",     lambda r: _safe_log(_nz(r.get("si_pct"),0.0) + 1.0)),  # SI% as percent, 0..100+
+        ("ln1p_pmfrac", lambda r: _safe_log(_nz(r.get("pm_vol_m"),0.0) / max(1e-6, _nz(r.get("pred_day_m"),0.0)) + 1.0)),
     ]
 
     # design matrix
@@ -245,7 +258,7 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
     Z = (X - mu) / sd
     Z = np.clip(Z, -3.0, 3.0)
 
-    # class balance
+    # class balance weights
     p1 = float(np.mean(y)) if y.size else 0.5
     w1 = 0.5 / max(1e-9, p1)
     w0 = 0.5 / max(1e-9, 1.0 - p1)
@@ -253,7 +266,7 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
 
     # train
     if Z.shape[0] >= 12 and np.unique(y).size == 2:
-        coef_z, bias = logit_fit_weighted(Z, y, sample_w, l2=1.0, max_iter=120, tol=1e-6)
+        coef_z, bias = logit_fit_weighted(Z, y, sample_w, l2=1.0, max_iter=140, tol=1e-6)
         st.success(
             "FT trained (n={}; base FT≈{:.2f}; feats: {})."
             .format(Z.shape[0], p1, ", ".join([n for n,_ in feats]))
@@ -268,14 +281,15 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
     odds_cuts = {"very_high": max(0.85,_q(0.98)),"high":max(0.70,_q(0.90)),"moderate":max(0.55,_q(0.65)),"low":max(0.40,_q(0.35))}
     grade_cuts= {"App":max(0.92,_q(0.995)),"Ap":max(0.85,_q(0.97)),"A":max(0.75,_q(0.90)),"B":max(0.65,_q(0.65)),"C":max(0.50,_q(0.35))}
 
-    # save artifacts
-    st.session_state.ART = {"feat_names":[n for n,_ in feats], "mu":mu, "sd":sd, "coef_z":coef_z, "bias":bias}
+    st.session_state.ART = {
+        "feat_names":[n for n,_ in feats], "mu":mu, "sd":sd, "coef_z":coef_z, "bias":bias
+    }
     st.session_state.ODDS_CUTS = odds_cuts
     st.session_state.GRADE_CUTS = grade_cuts
 
     if SHOW_DIAG:
         diag = pd.DataFrame({"feature":[n for n,_ in feats], "coef_z":coef_z}).sort_values("coef_z", key=np.abs, ascending=False)
-        st.dataframe(diag, use_container_width=True, hide_index=True)
+        st.dataframe(diac if False else diag, use_container_width=True, hide_index=True)
 
     st.success("Learning complete.")
 
@@ -308,21 +322,26 @@ def _prob_to_grade(p: float, cuts: Dict[str,float]) -> str:
     return "D"
 
 # ========== Inference ==========
-def predict_ft_prob_core(gap_pct: float, pm_vol_m: float, catalyst: float,
-                         atr_usd: float, mcap_m: float, rvol: float, pm_dol_m: float) -> float:
+def predict_ft_prob(gap_pct: float, pm_vol_m: float, catalyst: float,
+                    atr_usd: float, mcap_m: float, rvol: float, pm_dol_m: float,
+                    si_pct: float, pred_day_m: float) -> float:
     A = st.session_state.ART or {}
     names = A.get("feat_names") or []; mu = A.get("mu"); sd = A.get("sd")
     coef = A.get("coef_z"); bias = float(A.get("bias", 0.0))
     if not names or coef is None or mu is None or sd is None: return 0.50
 
+    pmfrac = _nz(pm_vol_m,0.0) / max(1e-6, _nz(pred_day_m,0.0))
+
     feat_map = {
-        "ln1p_pmvol": lambda: _safe_log(_nz(pm_vol_m,0.0)+1.0),
-        "ln_gapf":    lambda: _safe_log(_nz(gap_pct,0.0)/100.0),
-        "catalyst":   lambda: float(_nz(catalyst,0.0)),
-        "ln_atr":     lambda: _safe_log(atr_usd),
-        "ln_mcap":    lambda: _safe_log(mcap_m),
-        "ln1p_rvol":  lambda: _safe_log(_nz(rvol,0.0)+1.0),
-        "ln1p_pmmc":  lambda: _safe_log(_nz(pm_dol_m,0.0)/max(1e-6,_nz(mcap_m,0.0)) + 1.0),
+        "ln1p_pmvol":  lambda: _safe_log(_nz(pm_vol_m,0.0)+1.0),
+        "ln_gapf":     lambda: _safe_log(_nz(gap_pct,0.0)/100.0),
+        "catalyst":    lambda: float(_nz(catalyst,0.0)),
+        "ln_atr":      lambda: _safe_log(atr_usd),
+        "ln_mcap":     lambda: _safe_log(mcap_m),
+        "ln1p_rvol":   lambda: _safe_log(_nz(rvol,0.0) + 1.0),
+        "ln1p_pmmc":   lambda: _safe_log(_nz(pm_dol_m,0.0)/max(1e-6,_nz(mcap_m,0.0)) + 1.0),
+        "ln1p_si":     lambda: _safe_log(_nz(si_pct,0.0) + 1.0),
+        "ln1p_pmfrac": lambda: _safe_log(pmfrac + 1.0),
     }
     vals = [float(feat_map[n]()) for n in names]
     Z = (np.array(vals) - mu) / sd
@@ -334,14 +353,14 @@ tab_add, tab_rank = st.tabs(["➕ Add / Score", "📊 Ranking"])
 
 # ========== Add / Score ==========
 with tab_add:
-    _ft_ok = _ft_is_trained()
+    _ok = _ft_is_trained()
     st.markdown(
         f'<div style="margin:.25rem 0 1rem 0;">'
         f'  <span style="display:inline-block;padding:.18rem .55rem;border-radius:999px;'
-        f'         border:1px solid {_ft_ok and "#16a34a" or "#ef4444"};'
-        f'         background:{_ft_ok and "#ecfdf5" or "#fef2f2"};'
-        f'         color:{_ft_ok and "#166534" or "#991b1b"}; font-weight:600; font-size:.82rem;">'
-        f'    FT model: {_ft_ok and "trained" or "NOT trained"}'
+        f'         border:1px solid {_ok and "#16a34a" or "#ef4444"};'
+        f'         background:{_ok and "#ecfdf5" or "#fef2f2"};'
+        f'         color:{_ok and "#166534" or "#991b1b"}; font-weight:600; font-size:.82rem;">'
+        f'    FT model: {_ok and "trained" or "NOT trained"}'
         f'  </span>'
         f'</div>',
         unsafe_allow_html=True
@@ -376,26 +395,17 @@ with tab_add:
             pred_vol_m = max(pred_vol_m, _nz(pm_vol_m, 0.0))
             ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
 
-            # FT probability (core + ATR + MCAP + RVOL + $Vol/MC)
-            ft_prob = predict_ft_prob_core(gap_pct, pm_vol_m, cat, atr_usd, mc_m, rvol, pm_dol_m)
+            # FT probability with new features (SI% + PM% of Pred)
+            ft_prob = predict_ft_prob(
+                gap_pct=gap_pct, pm_vol_m=pm_vol_m, catalyst=cat,
+                atr_usd=atr_usd, mcap_m=mc_m, rvol=rvol, pm_dol_m=pm_dol_m,
+                si_pct=si_pct, pred_day_m=pred_vol_m
+            )
 
             odds_cuts  = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
             grade_cuts = st.session_state.get("GRADE_CUTS", {"App":0.92,"Ap":0.85,"A":0.75,"B":0.65,"C":0.50})
-            odds = (
-                "Very High Odds" if ft_prob >= odds_cuts.get("very_high",0.85) else
-                "High Odds"      if ft_prob >= odds_cuts.get("high",0.70)      else
-                "Moderate Odds"  if ft_prob >= odds_cuts.get("moderate",0.55)  else
-                "Low Odds"       if ft_prob >= odds_cuts.get("low",0.40)       else
-                "Very Low Odds"
-            )
-            grade= (
-                "A++" if ft_prob >= grade_cuts.get("App",0.92) else
-                "A+"  if ft_prob >= grade_cuts.get("Ap",0.85)  else
-                "A"   if ft_prob >= grade_cuts.get("A",0.75)   else
-                "B"   if ft_prob >= grade_cuts.get("B",0.65)   else
-                "C"   if ft_prob >= grade_cuts.get("C",0.50)   else
-                "D"
-            )
+            odds = _prob_to_odds(ft_prob, odds_cuts)
+            grade= _prob_to_grade(ft_prob, grade_cuts)
 
             row = {
                 "Ticker": ticker,
@@ -410,7 +420,7 @@ with tab_add:
                 "PM%_of_Pred": round(100.0 * _nz(pm_vol_m,0.0) / max(1e-6, pred_vol_m), 1),
                 "PM$ / MC_%": round(100.0 * _nz(pm_dol_m,0.0) / max(1e-6, _nz(mc_m,0.0)), 1),
 
-                # raw inputs for CSV/debug
+                # raw inputs for CSV/debug (kept)
                 "_MCap_M": mc_m, "_Gap_%": gap_pct, "_ATR_$": atr_usd, "_PM_M": pm_vol_m,
                 "_Float_M": float_m, "_SI_%": si_pct, "_RVOL": rvol, "_PM$_M": pm_dol_m, "_Catalyst": cat,
             }
@@ -419,45 +429,20 @@ with tab_add:
             st.session_state.flash = f"Saved {ticker} — Odds {row['Odds']} (Score {row['FinalScore']})"
             _rerun()
 
-    # Preview + contributions
-    last = st.session_state.last if isinstance(st.session_state.last, dict) else {}
-    if last:
+    # Preview card
+    l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
+    if l:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
         a,b,c,d,e = st.columns(5)
-        a.metric("Last Ticker", last.get("Ticker","—"))
-        b.metric("Final Score", f"{last.get('FinalScore',0):.2f}")
-        c.metric("Grade", last.get('Level','—'))
-        d.metric("Odds", last.get('Odds','—'))
-        e.metric("PredVol (M)", f"{last.get('PredVol_M',0):.2f}")
+        a.metric("Last Ticker", l.get("Ticker","—"))
+        b.metric("Final Score", f"{l.get('FinalScore',0):.2f}")
+        c.metric("Grade", l.get('Level','—'))
+        d.metric("Odds", l.get('Odds','—'))
+        e.metric("PredVol (M)", f"{l.get('PredVol_M',0):.2f}")
         st.caption(
-            f"CI68: {last.get('PredVol_CI68_L',0):.2f}–{last.get('PredVol_CI68_U',0):.2f} M · "
-            f"PM % of Pred: {last.get('PM%_of_Pred',0):.1f}% · PM $/MC: {last.get('PM$ / MC_%',0):.1f}%"
+            f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
+            f"PM % of Pred: {l.get('PM%_of_Pred',0):.1f}% · PM $/MC: {l.get('PM$ / MC_%',0):.1f}%"
         )
-
-        if SHOW_LAST and _ft_is_trained():
-            A = st.session_state.ART
-            names = A["feat_names"]; mu = A["mu"]; sd = A["sd"]; coef = A["coef_z"]; bias = A["bias"]
-            gap_pct  = last.get("_Gap_%",0.0); pm_vol_m = last.get("_PM_M",0.0)
-            cat      = last.get("_Catalyst",0.0); atr_usd = last.get("_ATR_$",0.0); mc_m = last.get("_MCap_M",0.0)
-            rvol     = last.get("_RVOL",0.0); pm_dol_m = last.get("_PM$_M",0.0)
-
-            feat_map = {
-                "ln1p_pmvol": lambda: _safe_log(_nz(pm_vol_m,0.0)+1.0),
-                "ln_gapf":    lambda: _safe_log(_nz(gap_pct,0.0)/100.0),
-                "catalyst":   lambda: float(_nz(cat,0.0)),
-                "ln_atr":     lambda: _safe_log(atr_usd),
-                "ln_mcap":    lambda: _safe_log(mc_m),
-                "ln1p_rvol":  lambda: _safe_log(_nz(rvol,0.0)+1.0),
-                "ln1p_pmmc":  lambda: _safe_log(_nz(pm_dol_m,0.0)/max(1e-6,_nz(mc_m,0.0)) + 1.0),
-            }
-            vals = np.array([float(feat_map[n]()) for n in names])
-            Z = np.clip((vals - mu) / sd, -3.0, 3.0)
-            contrib = Z * coef
-            dfc = pd.DataFrame({"feature": names, "value": vals, "z": Z, "coef_z": coef, "z*coef": contrib})
-            dfc["abs"] = np.abs(dfc["z*coef"])
-            dfc = dfc.sort_values("abs", ascending=False).drop(columns=["abs"])
-            st.markdown("**FT contribution breakdown (last ticker)**")
-            st.dataframe(dfc, use_container_width=True, hide_index=True)
 
 # ========== Ranking ==========
 with tab_rank:
