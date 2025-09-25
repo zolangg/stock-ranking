@@ -238,6 +238,7 @@ def make_odds_cuts() -> dict:
 
 # ========== Labels ==========
 def _prob_to_odds(p: float, cuts: Dict[str,float]) -> str:
+    # Odds tiers (fixed cuts)
     if p >= cuts.get("very_high",0.90): return "Very High Odds"
     if p >= cuts.get("high",0.75):      return "High Odds"
     if p >= cuts.get("moderate",0.60):  return "Moderate Odds"
@@ -245,12 +246,13 @@ def _prob_to_odds(p: float, cuts: Dict[str,float]) -> str:
     return "Very Low Odds"
 
 def _prob_to_grade(p: float, cuts: Dict[str,float]) -> str:
-    if p >= cuts.get("App",0.99): return "A++"
-    if p >= cuts.get("Ap",0.97):  return "A+"
-    if p >= cuts.get("A",0.90):   return "A"
-    if p >= cuts.get("B",0.75):   return "B"
-    if p >= cuts.get("C",0.55):   return "C"
-    return "D"
+    # Grades aligned with Odds
+    if p >= cuts.get("App",0.99): return "A++"   # Very High Odds
+    if p >= cuts.get("Ap",0.97):  return "A+"    # Very High Odds
+    if p >= cuts.get("A",0.90):   return "A"     # High Odds
+    if p >= cuts.get("B",0.75):   return "B"     # Moderate Odds
+    if p >= cuts.get("C",0.55):   return "C"     # Low Odds
+    return "D"                                   # Very Low Odds
 
 # ========== Upload & Learn ==========
 st.markdown('<div class="section-title">Upload workbook</div>', unsafe_allow_html=True)
