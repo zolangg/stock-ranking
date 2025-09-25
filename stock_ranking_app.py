@@ -228,13 +228,13 @@ def make_grade_cuts() -> dict:
 def make_odds_cuts() -> dict:
     """
     Fixed conservative odds bands:
-      • Very High Odds ≥ 0.90
-      • High Odds      ≥ 0.75
-      • Moderate Odds  ≥ 0.60
-      • Low Odds       ≥ 0.45
+      • Very High Odds ≥ 0.97
+      • High Odds      ≥ 0.90
+      • Moderate Odds  ≥ 0.75
+      • Low Odds       ≥ 0.60
       • else Very Low
     """
-    return {"very_high": 0.90, "high": 0.75, "moderate": 0.60, "low": 0.45}
+    return {"very_high": 0.97, "high": 0.9, "moderate": 0.75, "low": 0.60}
 
 # ========== Labels ==========
 def _prob_to_odds(p: float, cuts: Dict[str,float]) -> str:
