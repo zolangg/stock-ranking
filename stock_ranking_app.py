@@ -1,30 +1,34 @@
-# app.py — Premarket FT Ranking (FT-only; includes ln_float, excludes rotation/pm-fraction/dayvol)
-# ----------------------------------------------------------------------------------------------
-# • Trains a single FT classifier from your workbook.
-# • Uses features (if available): ln_gapf, ln_atr, ln_mcap, ln1p_rvol, ln1p_pmvol, ln1p_pmmc, ln1p_si, catalyst, ln_float.
-# • Class-weighted L2 logistic, standardized on training mean/std.
-# • Grades:
-#     A++ ≥ 0.99, A+ ≥ 0.97, A ≥ 0.90
-#     For p < 0.90 → B and C from exponential quantiles of training preds; remainder D.
-# • UI: Catalyst selector directly under Premarket $ Volume.
-# • Tables show only: Ticker, Grade, FT Probability %.
-# • Markdown export, CSV export, deletable rows (top 12), Clear.
+# app.py — Premarket FT Ranking with LASSO feature selection (no day-volume)
+# -----------------------------------------------------------------------------
+# Pipeline:
+#   1) Read workbook (Legend-aware).
+#   2) Build FT features: ln_gapf, ln_atr, ln_mcap, ln1p_rvol, ln1p_pmvol,
+#      ln1p_pmmc, ln1p_si, catalyst, ln_float  (float yes; no rotation; no pm-fraction).
+#   3) Standardize on train.
+#   4) Logistic LASSO (coordinate descent) with 5-fold CV to pick λ (and features).
+#   5) Refit weighted L2 logistic on the selected features for stability.
+#   6) Predict & grade: only Ticker, Grade, FT Probability % are displayed/exported.
+#
+# Notes:
+#   • No sklearn; custom L1 path with CV.
+#   • Catalyst input UI sits under Premarket $ Volume.
+#   • Deletable rows, CSV & Markdown export.
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
-import math, re
+import math, re, random
 from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ============================== Page & CSS ==============================
-st.set_page_config(page_title="Premarket FT Ranking", layout="wide")
-st.title("Premarket FT Ranking")
+# ============ Page ============
+st.set_page_config(page_title="Premarket FT Ranking — LASSO", layout="wide")
+st.title("Premarket FT Ranking — LASSO-selected Features")
 
 st.markdown("""
 <style>
@@ -36,8 +40,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ============================== Session ==============================
-if "FT" not in st.session_state: st.session_state.FT = {}      # classifier artifacts
+# ============ Session ============
+if "FT" not in st.session_state: st.session_state.FT = {}
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "flash" not in st.session_state: st.session_state.flash = None
@@ -51,7 +55,7 @@ def _rerun():
     if hasattr(st, "rerun"): st.rerun()
     elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
 
-# ============================== Helpers ==============================
+# ============ Helpers ============
 def _parse_local_float(s: str) -> Optional[float]:
     if s is None: return None
     s = str(s).strip().replace(" ", "").replace("’","").replace("'","")
@@ -97,7 +101,7 @@ def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
-# ============================== Legend-driven mapping ==============================
+# ============ Legend mapping ============
 _DEF = {
     "FT":     ["FT"],
     "GAP":    ["Gap %","Gap"],
@@ -138,34 +142,123 @@ def _parse_catalyst_col(series: pd.Series) -> pd.Series:
             except: out.append(0.0)
     return pd.Series(out, dtype=float).clip(0,1)
 
-# ============================== Logistic utils ==============================
-def logit_fit_weighted(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
-                       l2: float = 1.0, max_iter: int = 140, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
+# ============ Logistic helpers ============
+def _sigmoid(z: np.ndarray) -> np.ndarray:
+    z = np.clip(z, -35, 35)
+    return 1.0/(1.0 + np.exp(-z))
+
+def _logloss(y: np.ndarray, p: np.ndarray, w: Optional[np.ndarray] = None) -> float:
+    p = np.clip(p, 1e-9, 1-1e-9)
+    if w is None:
+        return float(-np.mean(y*np.log(p) + (1-y)*np.log(1-p)))
+    sw = float(np.sum(w)) if np.sum(w) > 0 else 1.0
+    return float(-np.sum(w*(y*np.log(p) + (1-y)*np.log(1-p))) / sw)
+
+def _soft(x: float, thr: float) -> float:
+    if x > thr:  return x - thr
+    if x < -thr: return x + thr
+    return 0.0
+
+def lasso_logistic_cd(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
+                      lam: float, l2: float = 1e-6, max_iter: int = 150, tol: float = 1e-6
+                     ) -> Tuple[np.ndarray, float]:
+    """
+    Coordinate descent for L1-penalized logistic:
+      minimize  -sum w_i [y_i log p_i + (1-y_i) log(1-p_i)] + lam * ||beta||_1 + (l2/2)||beta||^2
+    Returns (beta[k], intercept).
+    """
     n, k = X.shape
-    Xb = np.concatenate([np.ones((n,1)), X], axis=1)
-    w = np.zeros(k+1)
+    beta = np.zeros(k, dtype=float)
+    b = float(np.log((y.mean() + 1e-6) / (1 - y.mean() + 1e-6)))  # logit prior
+    for _ in range(max_iter):
+        z = b + X @ beta
+        p = _sigmoid(z)
+        W = p*(1-p)*sample_w
+        # intercept update (Newton)
+        g0 = np.sum(sample_w*(y - p))
+        h0 = np.sum(W) + 1e-9
+        b_new = b + g0 / h0
+        # coordinates
+        beta_new = beta.copy()
+        for j in range(k):
+            xj = X[:, j]
+            # gradient & hessian (diagonal) for j
+            gj = np.sum(sample_w * xj * (y - p)) - l2 * beta[j]
+            hj = np.sum(W * xj * xj) + l2 + 1e-9
+            zj = beta[j] + gj / hj
+            beta_new[j] = _soft(zj, lam / hj)
+        # check convergence
+        if np.linalg.norm(beta_new - beta) < tol and abs(b_new - b) < tol:
+            beta, b = beta_new, b_new
+            break
+        beta, b = beta_new, b_new
+    return beta, b
+
+def lasso_cv(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray, nfolds: int = 5
+            ) -> Tuple[float, np.ndarray, float]:
+    """
+    Pick λ by K-fold CV on logloss. Grid from λ_max → 0.01*λ_max (log-spaced).
+    Returns (lambda_best, beta, intercept) fitted on full data.
+    """
+    n, k = X.shape
+    # λ_max: max |grad| at beta=0 (with intercept only)
+    b0 = float(np.log((y.mean() + 1e-6) / (1 - y.mean() + 1e-6)))
+    p0 = _sigmoid(b0 + np.zeros(n))
+    grad = X.T @ (sample_w * (y - p0))
+    lam_max = float(np.max(np.abs(grad)) + 1e-9)
+    lam_grid = np.exp(np.linspace(np.log(lam_max), np.log(max(lam_max*0.01, 1e-6)), 30))
+
+    # build folds
+    idx = np.arange(n)
+    np.random.seed(42)
+    np.random.shuffle(idx)
+    folds = np.array_split(idx, nfolds)
+
+    best_lam, best_loss = None, float("inf")
+    for lam in lam_grid:
+        losses = []
+        for f in range(nfolds):
+            val_idx = folds[f]
+            tr_idx  = np.setdiff1d(idx, val_idx, assume_unique=True)
+            Xtr, ytr, wtr = X[tr_idx], y[tr_idx], sample_w[tr_idx]
+            Xvl, yvl, wvl = X[val_idx], y[val_idx], sample_w[val_idx]
+            beta, b = lasso_logistic_cd(Xtr, ytr, wtr, lam=lam, l2=1e-6, max_iter=160, tol=1e-6)
+            p_val = _sigmoid(b + Xvl @ beta)
+            losses.append(_logloss(yvl, p_val, wvl))
+        mean_loss = float(np.mean(losses))
+        if mean_loss < best_loss:
+            best_loss, best_lam = mean_loss, lam
+
+    beta_full, b_full = lasso_logistic_cd(X, y, sample_w, lam=best_lam, l2=1e-6, max_iter=200, tol=1e-6)
+    return best_lam, beta_full, b_full
+
+def logit_fit_weighted_L2(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
+                          l2: float = 1.0, max_iter: int = 160, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
+    """Stable final fit on selected features."""
+    n, k = X.shape
+    w = np.zeros(k+1)  # [intercept, beta...]
     R = np.eye(k+1); R[0,0] = 0.0; R *= l2
+    Xb = np.concatenate([np.ones((n,1)), X], axis=1)
     for _ in range(max_iter):
         z = Xb @ w
-        p = 1.0/(1.0 + np.exp(-np.clip(z, -35, 35)))
+        p = _sigmoid(z)
         W = p*(1-p)*sample_w
         if np.all(W < 1e-8): break
         WX = Xb * W[:, None]
-        H = Xb.T @ WX + R
-        g = Xb.T @ ((y - p) * sample_w)
+        H  = Xb.T @ WX + R
+        g  = Xb.T @ ((y - p) * sample_w)
         try:
             delta = np.linalg.solve(H, g)
         except np.linalg.LinAlgError:
             delta = np.linalg.lstsq(H, g, rcond=None)[0]
-        w = w + delta
-        if np.linalg.norm(delta) < tol: break
+        w_new = w + delta
+        if np.linalg.norm(delta) < tol:
+            w = w_new
+            break
+        w = w_new
     return w[1:].astype(float), float(w[0])
 
-def logit_inv(z: np.ndarray) -> np.ndarray:
-    z = np.clip(z, -35, 35)
-    return 1.0/(1.0 + np.exp(-z))
-
-# ============================== Grades (A tiers fixed; B/C from train) ==============================
+# ============ Grades ============
 def _inv_warp_p(sw: float, alpha: float = 2.6) -> float:
     sw = float(np.clip(sw, 0.0, 1.0))
     return float(1.0 - (1.0 - sw) ** (1.0 / max(1e-9, alpha)))
@@ -174,19 +267,19 @@ def make_grade_cuts() -> dict:
     A_cut, Ap_cut, App_cut = 0.90, 0.97, 0.99
     p_cal = st.session_state.get("TRAIN_PREDS", np.array([]))
     if p_cal.size == 0:
-        return {"App": App_cut, "Ap": Ap_cut, "A": A_cut, "B": 0.75, "C": 0.55}
+        return {"App": App_cut, "Ap": Ap_cut, "A": A_cut, "B": 0.80, "C": 0.60}
     sub = np.asarray(p_cal[(p_cal < A_cut) & np.isfinite(p_cal)])
     if sub.size == 0:
         return {"App": App_cut, "Ap": Ap_cut, "A": A_cut, "B": 0.80, "C": 0.60}
     sub.sort()
     alpha = 2.6
-    b_pos = _inv_warp_p(0.80, alpha)
-    c_pos = _inv_warp_p(0.50, alpha)
+    b_pos = _inv_warp_p(0.80, alpha)  # skewed higher
+    c_pos = _inv_warp_p(0.50, alpha)  # median-ish
     B_cut = float(np.quantile(sub, b_pos))
     C_cut = float(np.quantile(sub, c_pos))
     B_cut = min(B_cut, 0.89)
-    if not np.isfinite(B_cut): B_cut = 0.75
-    if not np.isfinite(C_cut): C_cut = 0.55
+    if not np.isfinite(B_cut): B_cut = 0.80
+    if not np.isfinite(C_cut): C_cut = 0.60
     if C_cut >= B_cut: C_cut = max(0.10, B_cut - 0.02)
     return {"App": App_cut, "Ap": Ap_cut, "A": A_cut, "B": B_cut, "C": C_cut}
 
@@ -194,20 +287,20 @@ def _prob_to_grade(p: float, cuts: Dict[str,float]) -> str:
     if p >= cuts.get("App",0.99): return "A++"
     if p >= cuts.get("Ap",0.97):  return "A+"
     if p >= cuts.get("A",0.90):   return "A"
-    if p >= cuts.get("B",0.75):   return "B"
-    if p >= cuts.get("C",0.55):   return "C"
+    if p >= cuts.get("B",0.80):   return "B"
+    if p >= cuts.get("C",0.60):   return "C"
     return "D"
 
-# ============================== Upload & Learn ==============================
+# ============ Upload & Learn ============
 st.markdown('<div class="section-title">Upload workbook</div>', unsafe_allow_html=True)
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], label_visibility="collapsed")
 sheet_name = st.text_input("Sheet name", "PMH BO Merged")
-learn_btn = st.button("Learn from uploaded sheet", use_container_width=True)
+learn_btn = st.button("Learn (LASSO select + final fit)", use_container_width=True)
 
 def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     raw = pd.read_excel(xls, sheet)
 
-    # Map columns
+    # Map columns (Legend)
     col = {}
     for key, cands in _DEF.items():
         pick = _pick(raw, cands)
@@ -216,10 +309,9 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         st.error("No 'FT' column found in sheet.")
         return
 
-    # Build training frame
     df = pd.DataFrame()
     ft_series = pd.to_numeric(raw[col["FT"]], errors="coerce")
-    df["FT"] = (ft_series.fillna(0.0) >= 0.5).astype(float)
+    y = (ft_series.fillna(0.0) >= 0.5).astype(float).to_numpy(dtype=float)
 
     def _add(colname: str, key: str):
         if key in col:
@@ -238,7 +330,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     else:
         df["catalyst"] = 0.0
 
-    # Feature transforms (robust)
+    # Build candidate features (your list)
     def _ln_gapf(r):   return _safe_log(_nz(r.get("gap_pct"),0.0)/100.0)
     def _ln_atr(r):    return _safe_log(r.get("atr_usd"))
     def _ln_mcap(r):   return _safe_log(r.get("mcap_m"))
@@ -260,12 +352,11 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         ("ln1p_pmmc",  _ln1p_pmmc,  ["pm_dol_m","mcap_m"]),
         ("ln1p_si",    _ln1p_si,    ["si_pct"]),
         ("catalyst",   _catalyst,   ["catalyst"]),
-        ("ln_float",   _ln_float,   ["float_m"]),   # include float, not rotation
+        ("ln_float",   _ln_float,   ["float_m"]),
     ]
     use_defs = [(n,f,req) for (n,f,req) in feat_defs if all(k in df.columns for k in req)]
-
     if not use_defs:
-        st.error("No usable features found to train FT classifier.")
+        st.error("No usable features found.")
         return
 
     X_list = []
@@ -273,35 +364,51 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         r = df.iloc[i].to_dict()
         X_list.append([f(r) for (n,f,_) in use_defs])
     X = np.array(X_list, dtype=float)
-    y = df["FT"].to_numpy(dtype=float)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Standardize on train
+    # Standardize
     mu = X.mean(axis=0)
     sd = X.std(axis=0, ddof=1); sd[sd==0] = 1.0
     Z = (X - mu) / sd
     Z = np.clip(Z, -6.0, 6.0)
 
-    # Class weights (inverse prevalence)
+    # Class weights
     pos = float(y.sum()); neg = float(len(y) - pos)
     w_pos = 0.5 / max(1e-9, pos) if pos > 0 else 0.0
     w_neg = 0.5 / max(1e-9, neg) if neg > 0 else 0.0
     sample_w = np.where(y >= 0.5, w_pos, w_neg).astype(float)
 
-    coef = None; bias = 0.0
-    if Z.shape[0] >= 12 and np.unique(y).size == 2:
-        coef, bias = logit_fit_weighted(Z, y, sample_w, l2=1.0, max_iter=160, tol=1e-6)
-        p_cal = logit_inv(bias + Z @ coef)
-        st.session_state.TRAIN_PREDS = p_cal.astype(float)
-        st.success(f"FT classifier trained (n={Z.shape[0]}; features: {', '.join([n for (n,_,_) in use_defs])}).")
-    else:
-        st.session_state.TRAIN_PREDS = np.array([])
-        st.error("Unable to train FT classifier (need ≥12 rows and both classes).")
+    # ===== LASSO selection by 5-fold CV =====
+    if Z.shape[0] < 12 or np.unique(y).size < 2:
+        st.error("Need ≥12 rows and both classes for training.")
+        return
+
+    lam_best, beta_l1, b_l1 = lasso_cv(Z, y, sample_w, nfolds=5)
+    sel_idx = np.where(np.abs(beta_l1) > 1e-8)[0]
+    sel_names = [use_defs[i][0] for i in sel_idx]
+
+    if len(sel_idx) == 0:
+        st.warning("LASSO selected no features; falling back to weak ridge on all.")
+        sel_idx = np.arange(Z.shape[1])
+        sel_names = [n for (n,_,_) in use_defs]
+
+    Zs = Z[:, sel_idx]
+
+    # Final stable weighted L2 logistic on selected features
+    coef, bias = logit_fit_weighted_L2(Zs, y, sample_w, l2=1.0, max_iter=200, tol=1e-6)
+    p_cal = _sigmoid(bias + Zs @ coef)
+    st.session_state.TRAIN_PREDS = p_cal.astype(float)
 
     st.session_state.FT = {
-        "feat_names": [n for (n,_,_) in use_defs],
-        "mu": mu, "sd": sd, "coef": coef, "bias": bias,
+        "feat_names_all": [n for (n,_,_) in use_defs],
+        "mu_all": mu, "sd_all": sd,
+        "sel_idx": sel_idx.astype(int),
+        "sel_names": sel_names,
+        "coef": coef.astype(float),
+        "bias": float(bias),
     }
+
+    st.success(f"LASSO CV chose λ≈{lam_best:.4g}; selected features: {', '.join(sel_names) if sel_names else '(none)'}")
     st.session_state.flash = "Learning complete."
     _rerun()
 
@@ -318,13 +425,14 @@ if learn_btn:
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
-# ============================== Inference ==============================
+# ============ Inference ============
 def _predict_ft_prob_live(inputs: Dict[str, float]) -> float:
     ART = st.session_state.get("FT", {})
-    feat_names = ART.get("feat_names", [])
-    mu = ART.get("mu", None); sd = ART.get("sd", None)
+    sel_idx = ART.get("sel_idx", None)
     coef = ART.get("coef", None); bias = ART.get("bias", 0.0)
-    if coef is None or mu is None or sd is None or not feat_names:
+    mu_all = ART.get("mu_all", None); sd_all = ART.get("sd_all", None)
+    feat_names_all = ART.get("feat_names_all", [])
+    if sel_idx is None or coef is None or mu_all is None or sd_all is None or not feat_names_all:
         return 0.50
 
     def _ln_gapf():   return _safe_log(_nz(inputs.get("gap_pct"),0.0)/100.0)
@@ -344,20 +452,19 @@ def _predict_ft_prob_live(inputs: Dict[str, float]) -> float:
         "ln1p_rvol": _ln1p_rvol, "ln1p_pmvol": _ln1p_pmvol, "ln1p_pmmc": _ln1p_pmmc,
         "ln1p_si": _ln1p_si, "catalyst": _catalyst, "ln_float": _ln_float,
     }
-    x = [maker[n]() for n in feat_names]
-    x = np.array(x, dtype=float)
-    z = (x - mu) / sd
-    z = np.clip(z, -6.0, 6.0)
-    p = float(logit_inv(bias + np.dot(z, coef)))
+    x_all = np.array([maker[n]() for n in feat_names_all], dtype=float)
+    z_all = (x_all - mu_all) / sd_all
+    z_all = np.clip(z_all, -6.0, 6.0)
+    zs = z_all[sel_idx]
+    p = float(_sigmoid(bias + np.dot(zs, coef)))
     return float(np.clip(p, 1e-4, 1-1e-4))
 
-# ============================== Grade cuts ==============================
 GRADE_CUTS = make_grade_cuts()
 
-# ============================== Tabs ==============================
+# ============ Tabs ============
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
-# ============================== Add Stock ==============================
+# ============ Add Stock ============
 with tab_add:
     st.markdown('<div class="section-title">Inputs</div>', unsafe_allow_html=True)
     with st.form("add_form", clear_on_submit=True):
@@ -401,7 +508,6 @@ with tab_add:
         st.session_state.flash = f"Saved {ticker} — Grade {row['Level']} (P={row['FT Probability %']:.2f}%)"
         _rerun()
 
-    # Preview card
     l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
     if l:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
@@ -410,7 +516,7 @@ with tab_add:
         b.metric("Grade", l.get("Level","—"))
         c.metric("FT Probability", f"{l.get('FT Probability %',0):.2f}%")
 
-# ============================== Ranking ==============================
+# ============ Ranking ============
 with tab_rank:
     st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
 
@@ -433,7 +539,6 @@ with tab_rank:
             }
         )
 
-        # Delete top rows (12)
         st.markdown("#### Delete rows")
         del_cols = st.columns(4)
         head12 = df.head(12).reset_index(drop=True)
@@ -445,14 +550,12 @@ with tab_rank:
                     st.session_state.rows = keep.to_dict(orient="records")
                     _rerun()
 
-        # CSV download
         st.download_button(
             "Download CSV",
             df[cols_to_show].to_csv(index=False).encode("utf-8"),
             "ranking.csv", "text/csv", use_container_width=True
         )
 
-        # Markdown below
         st.markdown("### 📋 Ranking (Markdown view)")
         md_text = df_to_markdown_table(df, cols_to_show)
         st.code(md_text, language="markdown")
@@ -462,7 +565,6 @@ with tab_rank:
             "ranking.md", "text/markdown", use_container_width=True
         )
 
-        # Clear all
         c1, _ = st.columns([0.25, 0.75])
         with c1:
             if st.button("Clear Ranking", use_container_width=True):
