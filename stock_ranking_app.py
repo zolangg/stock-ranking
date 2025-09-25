@@ -1,9 +1,10 @@
 # app.py — Premarket Ranking (Direct DayVol + FT with SI%, NO PM%)
 # ----------------------------------------------------------------
 # • DayVol: fixed direct log-linear model (millions), clamped ≥ PM Vol.
-# • FT model: standardized, weighted logistic using:
-#     ln1p_pmvol, ln_gapf, catalyst, ln_atr, ln_mcap, ln1p_rvol, ln1p_pmmc, ln1p_si
-#   (NO pmfrac / PM Vol % of Predicted Day)
+# • FT model (trained): ln1p_pmvol, ln_gapf, catalyst, ln_atr, ln_mcap, ln1p_rvol, ln1p_pmmc, ln1p_si
+#   (NO pmfrac / PM Vol % of Pred Day anywhere)
+# • Grades: A≥0.90, A+≥0.97, A++≥0.99 (fixed). Below 0.90 → B/C/D via exponential warp on train preds.
+# • Odds: Very High≥0.90, High≥0.75, Moderate≥0.60, Low≥0.45, else Very Low.
 # • UI: Ranking + Markdown + delete rows + clear + downloads.
 
 import os
@@ -19,8 +20,8 @@ import pandas as pd
 import streamlit as st
 
 # ========== Page ==========
-st.set_page_config(page_title="Premarket Ranking — FT (SI%, no PM%)", layout="wide")
-st.title("Premarket Ranking — FT with Short Interest (no PM%)")
+st.set_page_config(page_title="Premarket Ranking — Direct DayVol + FT (SI%, no PM%)", layout="wide")
+st.title("Premarket Ranking — Direct DayVol + FT (SI%, no PM%)")
 
 st.markdown("""
 <style>
@@ -37,10 +38,11 @@ st.sidebar.header("Prediction Uncertainty")
 sigma_ln = st.sidebar.slider("DayVol log-space σ (CI68)", 0.10, 1.50, 0.60, 0.01)
 
 # ========== Session ==========
-if "ART"   not in st.session_state: st.session_state.ART = {}
-if "rows"  not in st.session_state: st.session_state.rows = []
-if "last"  not in st.session_state: st.session_state.last = {}
+if "ART" not in st.session_state: st.session_state.ART = {}
+if "rows" not in st.session_state: st.session_state.rows = []
+if "last" not in st.session_state: st.session_state.last = {}
 if "flash" not in st.session_state: st.session_state.flash = None
+if "TRAIN_PREDS" not in st.session_state: st.session_state.TRAIN_PREDS = np.array([])
 if st.session_state.flash:
     st.success(st.session_state.flash)
     st.session_state.flash = None
@@ -160,7 +162,7 @@ def predict_dayvol_m(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
 
 # ========== Logistic utils ==========
 def logit_fit_weighted(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
-                       l2: float = 1.0, max_iter: int = 100, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
+                       l2: float = 1.0, max_iter: int = 120, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
     n, k = X.shape
     Xb = np.concatenate([np.ones((n,1)), X], axis=1)
     w = np.zeros(k+1)
@@ -184,6 +186,71 @@ def logit_fit_weighted(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
 def logit_inv(z: np.ndarray) -> np.ndarray:
     z = np.clip(z, -35, 35)
     return 1.0/(1.0 + np.exp(-z))
+
+# ========== Fixed cuts builders ==========
+def _inv_warp_p(sw: float, alpha: float = 2.6) -> float:
+    sw = float(np.clip(sw, 0.0, 1.0))
+    return float(1.0 - (1.0 - sw) ** (1.0 / max(1e-9, alpha)))
+
+def make_grade_cuts() -> dict:
+    """
+    Fixed A-zone thresholds (exact):
+      • A   ≥ 0.90
+      • A+  ≥ 0.97
+      • A++ ≥ 0.99
+    Below 0.90 → split B/C/D using exponential warp of training predictions.
+    """
+    A_cut, Ap_cut, App_cut = 0.90, 0.97, 0.99
+
+    p_cal = st.session_state.get("TRAIN_PREDS", np.array([]))
+    if p_cal.size == 0:
+        # conservative defaults for B/C
+        return {"App": App_cut, "Ap": Ap_cut, "A": A_cut, "B": 0.75, "C": 0.55}
+
+    sub = np.asarray(p_cal[(p_cal < A_cut) & np.isfinite(p_cal)])
+    if sub.size == 0:
+        return {"App": App_cut, "Ap": Ap_cut, "A": A_cut, "B": 0.80, "C": 0.60}
+
+    sub.sort()
+    alpha = 2.6
+    b_pos = _inv_warp_p(0.80, alpha)  # ~top of the sub-90 pool → B boundary
+    c_pos = _inv_warp_p(0.50, alpha)  # middle of the sub-90 pool → C boundary
+    B_cut = float(np.quantile(sub, b_pos))
+    C_cut = float(np.quantile(sub, c_pos))
+
+    B_cut = min(B_cut, 0.89)
+    if not np.isfinite(B_cut): B_cut = 0.75
+    if not np.isfinite(C_cut): C_cut = 0.55
+    if C_cut >= B_cut: C_cut = max(0.10, B_cut - 0.02)
+
+    return {"App": App_cut, "Ap": Ap_cut, "A": A_cut, "B": B_cut, "C": C_cut}
+
+def make_odds_cuts() -> dict:
+    """
+    Fixed conservative odds bands:
+      • Very High Odds ≥ 0.90
+      • High Odds      ≥ 0.75
+      • Moderate Odds  ≥ 0.60
+      • Low Odds       ≥ 0.45
+      • else Very Low
+    """
+    return {"very_high": 0.90, "high": 0.75, "moderate": 0.60, "low": 0.45}
+
+# ========== Labels ==========
+def _prob_to_odds(p: float, cuts: Dict[str,float]) -> str:
+    if p >= cuts.get("very_high",0.90): return "Very High Odds"
+    if p >= cuts.get("high",0.75):      return "High Odds"
+    if p >= cuts.get("moderate",0.60):  return "Moderate Odds"
+    if p >= cuts.get("low",0.45):       return "Low Odds"
+    return "Very Low Odds"
+
+def _prob_to_grade(p: float, cuts: Dict[str,float]) -> str:
+    if p >= cuts.get("App",0.99): return "A++"
+    if p >= cuts.get("Ap",0.97):  return "A+"
+    if p >= cuts.get("A",0.90):   return "A"
+    if p >= cuts.get("B",0.75):   return "B"
+    if p >= cuts.get("C",0.55):   return "C"
+    return "D"
 
 # ========== Upload & Learn ==========
 st.markdown('<div class="section-title">Upload workbook</div>', unsafe_allow_html=True)
@@ -254,26 +321,22 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
     # train
     if Z.shape[0] >= 12 and np.unique(y).size == 2:
         coef_z, bias = logit_fit_weighted(Z, y, sample_w, l2=1.0, max_iter=140, tol=1e-6)
-        st.success(
-            "FT trained (n={}; base FT≈{:.2f}; feats: {})."
-            .format(Z.shape[0], p1, ", ".join([n for n,_ in feats]))
-        )
+        st.success("FT trained (n={}; base FT≈{:.2f}; feats: {}).".format(Z.shape[0], p1, ", ".join([n for n,_ in feats])))
     else:
         coef_z, bias = np.zeros(Z.shape[1]), 0.0
         st.error("Unable to train FT (need ≥12 rows and both classes). Using neutral 50%.")
 
-    # cuts from train preds (with floors)
+    # store train predictions for grade split under 0.90
     p_cal = logit_inv(bias + Z @ coef_z)
-    def _q(q): return float(np.quantile(p_cal, q)) if p_cal.size else 0.5
-    odds_cuts = {"very_high": max(0.85,_q(0.98)),"high":max(0.70,_q(0.90)),"moderate":max(0.55,_q(0.65)),"low":max(0.40,_q(0.35))}
-    grade_cuts= {"App":max(0.92,_q(0.995)),"Ap":max(0.85,_q(0.97)),"A":max(0.75,_q(0.90)),"B":max(0.65,_q(0.65)),"C":max(0.50,_q(0.35))}
+    st.session_state.TRAIN_PREDS = p_cal
+
+    # cuts
+    st.session_state.GRADE_CUTS = make_grade_cuts()
+    st.session_state.ODDS_CUTS  = make_odds_cuts()
 
     st.session_state.ART = {
         "feat_names":[n for n,_ in feats], "mu":mu, "sd":sd, "coef_z":coef_z, "bias":bias
     }
-    st.session_state.ODDS_CUTS = odds_cuts
-    st.session_state.GRADE_CUTS = grade_cuts
-
     st.success("Learning complete.")
 
 if learn_btn:
@@ -288,21 +351,6 @@ if learn_btn:
                 _learn(xls, sheet_name)
         except Exception as e:
             st.error(f"Learning failed: {e}")
-
-# ========== Odds & Grade ==========
-def _prob_to_odds(p: float, cuts: Dict[str,float]) -> str:
-    if p >= cuts.get("very_high",0.85): return "Very High Odds"
-    if p >= cuts.get("high",0.70):      return "High Odds"
-    if p >= cuts.get("moderate",0.55):  return "Moderate Odds"
-    if p >= cuts.get("low",0.40):       return "Low Odds"
-    return "Very Low Odds"
-def _prob_to_grade(p: float, cuts: Dict[str,float]) -> str:
-    if p >= cuts.get("App",0.92): return "A++"
-    if p >= cuts.get("Ap",0.85):  return "A+"
-    if p >= cuts.get("A",0.75):   return "A"
-    if p >= cuts.get("B",0.65):   return "B"
-    if p >= cuts.get("C",0.50):   return "C"
-    return "D"
 
 # ========== Inference ==========
 def predict_ft_prob(gap_pct: float, pm_vol_m: float, catalyst: float,
@@ -327,6 +375,11 @@ def predict_ft_prob(gap_pct: float, pm_vol_m: float, catalyst: float,
     Z = (np.array(vals) - mu) / sd
     Z = np.clip(Z, -3.0, 3.0)
     return float(np.clip(logit_inv(bias + np.dot(Z, coef)), 1e-3, 1-1e-3))
+
+def _odds_and_grade(p: float) -> Tuple[str, str]:
+    odds_cuts  = st.session_state.get("ODDS_CUTS", make_odds_cuts())
+    grade_cuts = st.session_state.get("GRADE_CUTS", make_grade_cuts())
+    return _prob_to_odds(p, odds_cuts), _prob_to_grade(p, grade_cuts)
 
 # ========== Tabs ==========
 tab_add, tab_rank = st.tabs(["➕ Add / Score", "📊 Ranking"])
@@ -370,22 +423,18 @@ with tab_add:
         else:
             cat = 1.0 if catalyst_flag=="Yes" else 0.0
 
-            # DayVol via direct log model (and clamp to PM for sanity in the display & PM%-of-Pred metric)
+            # DayVol via direct log model (clamp to PM for PM% display)
             pred_vol_m = predict_dayvol_m(mc_m, gap_pct, atr_usd)
             pred_vol_m = max(pred_vol_m, _nz(pm_vol_m, 0.0))
             ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
 
-            # FT probability (NO pmfrac term)
+            # FT probability
             ft_prob = predict_ft_prob(
                 gap_pct=gap_pct, pm_vol_m=pm_vol_m, catalyst=cat,
                 atr_usd=atr_usd, mcap_m=mc_m, rvol=rvol, pm_dol_m=pm_dol_m,
                 si_pct=si_pct
             )
-
-            odds_cuts  = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
-            grade_cuts = st.session_state.get("GRADE_CUTS", {"App":0.92,"Ap":0.85,"A":0.75,"B":0.65,"C":0.50})
-            odds = _prob_to_odds(ft_prob, odds_cuts)
-            grade= _prob_to_grade(ft_prob, grade_cuts)
+            odds, grade = _odds_and_grade(ft_prob)
 
             row = {
                 "Ticker": ticker,
@@ -400,7 +449,7 @@ with tab_add:
                 "PM%_of_Pred": round(100.0 * _nz(pm_vol_m,0.0) / max(1e-6, pred_vol_m), 1),
                 "PM$ / MC_%": round(100.0 * _nz(pm_dol_m,0.0) / max(1e-6, _nz(mc_m,0.0)), 1),
 
-                # raw inputs for CSV/debug (kept)
+                # raw inputs for CSV/debug
                 "_MCap_M": mc_m, "_Gap_%": gap_pct, "_ATR_$": atr_usd, "_PM_M": pm_vol_m,
                 "_Float_M": float_m, "_SI_%": si_pct, "_RVOL": rvol, "_PM$_M": pm_dol_m, "_Catalyst": cat,
             }
@@ -433,7 +482,8 @@ with tab_rank:
         if "FinalScore" in df.columns:
             df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
-        cols = ["Ticker","Odds","Level","FinalScore","PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM%_of_Pred","PM$ / MC_%"]
+        cols = ["Ticker","Odds","Level","FinalScore",
+                "PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM%_of_Pred","PM$ / MC_%"]
         for c in cols:
             if c not in df.columns: df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
 
@@ -454,6 +504,7 @@ with tab_rank:
             }
         )
 
+        # Delete rows (top 12)
         st.markdown("#### Delete rows")
         del_cols = st.columns(4)
         head12 = df.head(12).reset_index(drop=True)
@@ -465,12 +516,14 @@ with tab_rank:
                     st.session_state.rows = keep.to_dict(orient="records")
                     _rerun()
 
+        # Downloads
         st.download_button(
             "Download CSV (Ranking)",
             df[cols].to_csv(index=False).encode("utf-8"),
             "ranking.csv", "text/csv", use_container_width=True
         )
 
+        # Markdown table
         st.markdown("### 📋 Ranking (Markdown view)")
         md_text = df_to_markdown_table(df, cols)
         st.code(md_text, language="markdown")
