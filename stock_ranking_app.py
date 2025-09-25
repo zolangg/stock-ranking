@@ -230,7 +230,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     _add("rvol", "RVOL")
     _add("pm_vol_m", "PMVOL")
     _add("pm_dol_m", "PM$")
-    _add("float_m", "FLOAT")     # <-- float YES
+    _add("float_m", "FLOAT")
     _add("mcap_m", "MCAP")
     _add("si_pct", "SI")
     if "CAT" in col:
@@ -238,15 +238,15 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     else:
         df["catalyst"] = 0.0
 
-    # Feature transforms (robust to missing)
+    # Feature transforms (robust)
     def _ln_gapf(r):   return _safe_log(_nz(r.get("gap_pct"),0.0)/100.0)
     def _ln_atr(r):    return _safe_log(r.get("atr_usd"))
     def _ln_mcap(r):   return _safe_log(r.get("mcap_m"))
     def _ln1p_rvol(r): return _safe_log(1.0 + _nz(r.get("rvol"),0.0))
     def _ln1p_pmvol(r):return _safe_log(_nz(r.get("pm_vol_m"),0.0) + 1.0)
     def _ln1p_pmmc(r):
-        pm$ = _nz(r.get("pm_dol_m"),0.0); mc = _nz(r.get("mcap_m"),0.0)
-        return _safe_log(pm$ / max(1e-6, mc) + 1.0)
+        pm_dol = _nz(r.get("pm_dol_m"),0.0); mc = _nz(r.get("mcap_m"),0.0)
+        return _safe_log(pm_dol / max(1e-6, mc) + 1.0)
     def _ln1p_si(r):   return _safe_log(1.0 + _nz(r.get("si_pct"),0.0))
     def _catalyst(r):  return float(_nz(r.get("catalyst"),0.0))
     def _ln_float(r):  return _safe_log(r.get("float_m"))
@@ -327,24 +327,24 @@ def _predict_ft_prob_live(inputs: Dict[str, float]) -> float:
     if coef is None or mu is None or sd is None or not feat_names:
         return 0.50
 
-    def _ln_gapf(v):   return _safe_log(_nz(inputs.get("gap_pct"),0.0)/100.0)
-    def _ln_atr(v):    return _safe_log(inputs.get("atr_usd"))
-    def _ln_mcap(v):   return _safe_log(inputs.get("mcap_m"))
-    def _ln1p_rvol(v): return _safe_log(1.0 + _nz(inputs.get("rvol"),0.0))
-    def _ln1p_pmvol(v):return _safe_log(_nz(inputs.get("pm_vol_m"),0.0) + 1.0)
-    def _ln1p_pmmc(v):
-        pm$ = _nz(inputs.get("pm_dol_m"),0.0); mc = _nz(inputs.get("mcap_m"),0.0)
-        return _safe_log(pm$ / max(1e-6, mc) + 1.0)
-    def _ln1p_si(v):   return _safe_log(1.0 + _nz(inputs.get("si_pct"),0.0))
-    def _catalyst(v):  return float(_nz(inputs.get("catalyst"),0.0))
-    def _ln_float(v):  return _safe_log(inputs.get("float_m"))
+    def _ln_gapf():   return _safe_log(_nz(inputs.get("gap_pct"),0.0)/100.0)
+    def _ln_atr():    return _safe_log(inputs.get("atr_usd"))
+    def _ln_mcap():   return _safe_log(inputs.get("mcap_m"))
+    def _ln1p_rvol(): return _safe_log(1.0 + _nz(inputs.get("rvol"),0.0))
+    def _ln1p_pmvol():return _safe_log(_nz(inputs.get("pm_vol_m"),0.0) + 1.0)
+    def _ln1p_pmmc():
+        pm_dol = _nz(inputs.get("pm_dol_m"),0.0); mc = _nz(inputs.get("mcap_m"),0.0)
+        return _safe_log(pm_dol / max(1e-6, mc) + 1.0)
+    def _ln1p_si():   return _safe_log(1.0 + _nz(inputs.get("si_pct"),0.0))
+    def _catalyst():  return float(_nz(inputs.get("catalyst"),0.0))
+    def _ln_float():  return _safe_log(inputs.get("float_m"))
 
     maker = {
         "ln_gapf": _ln_gapf, "ln_atr": _ln_atr, "ln_mcap": _ln_mcap,
         "ln1p_rvol": _ln1p_rvol, "ln1p_pmvol": _ln1p_pmvol, "ln1p_pmmc": _ln1p_pmmc,
         "ln1p_si": _ln1p_si, "catalyst": _catalyst, "ln_float": _ln_float,
     }
-    x = [maker[n](None) for n in feat_names]
+    x = [maker[n]() for n in feat_names]
     x = np.array(x, dtype=float)
     z = (x - mu) / sd
     z = np.clip(z, -6.0, 6.0)
@@ -373,7 +373,7 @@ with tab_add:
             rvol     = input_float("RVOL",    0.0, min_value=0.0, decimals=2)
             pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
             pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
-            catalyst_flag = st.selectbox("Catalyst?", ["No","Yes"], index=0)  # <-- directly under $Vol
+            catalyst_flag = st.selectbox("Catalyst?", ["No","Yes"], index=0)  # under $Vol
         with c3:
             st.markdown("&nbsp;")
             st.markdown("&nbsp;")
