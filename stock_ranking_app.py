@@ -1,9 +1,10 @@
-# app.py — Premarket Ranking (Direct DayVol + FT with SI%, NO PM%)
-# ----------------------------------------------------------------
-# • DayVol: fixed direct log-linear model (millions), clamped ≥ PM Vol.
-# • FT model (trained): ln1p_pmvol, ln_gapf, catalyst, ln_atr, ln_mcap, ln1p_rvol, ln1p_pmmc, ln1p_si
-#   (NO pmfrac / PM Vol % of Pred Day anywhere)
-# • Grades: A≥0.90, A+≥0.97, A++≥0.99 (fixed). Below 0.90 → B/C/D via exponential warp on train preds.
+# app.py — Premarket Ranking (Trained DayVol + FT; A/Ap/App fixed; Odds aligned)
+# ------------------------------------------------------------------------------
+# • DayVol predictor is TRAINED on your workbook (ridge on ln(Daily Vol M)), with learned σ.
+#   Fallback to your fixed direct model if training is unavailable. PredVol ≥ PM Vol clamp.
+# • FT classifier uses NO pmfrac; features:
+#   ln1p_pmvol, ln_gapf, catalyst, ln_atr, ln_mcap, ln1p_rvol, ln1p_pmmc, ln1p_si.
+# • Grades: A≥0.90, A+≥0.97, A++≥0.99 (fixed). Below 0.90 → B/C/D via exponential warp of train preds.
 # • Odds: Very High≥0.90, High≥0.75, Moderate≥0.60, Low≥0.45, else Very Low.
 # • UI: Ranking + Markdown + delete rows + clear + downloads.
 
@@ -19,9 +20,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ========== Page ==========
-st.set_page_config(page_title="Premarket Ranking", layout="wide")
-st.title("Premarket Ranking")
+# ============================== Page & CSS ==============================
+st.set_page_config(page_title="Premarket Ranking — Trained DayVol + FT", layout="wide")
+st.title("Premarket Ranking — Trained DayVol + FT")
 
 st.markdown("""
 <style>
@@ -33,16 +34,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ========== Sidebar ==========
-st.sidebar.header("Prediction Uncertainty")
-sigma_ln = st.sidebar.slider("DayVol log-space σ (CI68)", 0.10, 1.50, 0.60, 0.01)
-
-# ========== Session ==========
-if "ART" not in st.session_state: st.session_state.ART = {}
+# ============================== Session ==============================
+if "ART" not in st.session_state: st.session_state.ART = {}   # FT artifacts
+if "DVP" not in st.session_state: st.session_state.DVP = {}   # DayVol predictor artifacts
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "flash" not in st.session_state: st.session_state.flash = None
 if "TRAIN_PREDS" not in st.session_state: st.session_state.TRAIN_PREDS = np.array([])
+
 if st.session_state.flash:
     st.success(st.session_state.flash)
     st.session_state.flash = None
@@ -51,11 +50,7 @@ def _rerun():
     if hasattr(st, "rerun"): st.rerun()
     elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
 
-def _ft_is_trained() -> bool:
-    A = st.session_state.get("ART", {})
-    return bool(A) and all(k in A for k in ("feat_names","mu","sd","coef_z","bias"))
-
-# ========== Helpers ==========
+# ============================== Helpers ==============================
 def _parse_local_float(s: str) -> Optional[float]:
     if s is None: return None
     s = str(s).strip().replace(" ", "").replace("’","").replace("'","")
@@ -85,10 +80,6 @@ def _nz(x, fallback=0.0):
 def _safe_log(x: float, eps: float = 1e-8) -> float:
     return math.log(max(_nz(x, 0.0), eps))
 
-def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float) -> Tuple[float,float]:
-    if pred_m <= 0: return 0.0, 0.0
-    return float(pred_m * math.exp(-z*sigma_ln)), float(pred_m * math.exp(z*sigma_ln))
-
 def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
     keep = [c for c in cols if c in df.columns]
     if not keep: return "| (no data) |\n| --- |"
@@ -104,7 +95,7 @@ def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
-# ========== Legend-driven mapping ==========
+# ============================== Legend-driven mapping ==============================
 _DEF = {
     "FT":     ["FT"],
     "GAP":    ["Gap %","Gap"],
@@ -115,7 +106,7 @@ _DEF = {
     "FLOAT":  ["Float M Shares","Public Float (M)","Float (M)","Float"],
     "MCAP":   ["MarketCap M","Market Cap (M)","MCap M"],
     "SI":     ["Short Interest %","Short Float %","Short Interest (Float) %"],
-    "DAILY":  ["Daily Vol (M)","Day Volume (M)","Volume (M)"],   # optional diagnostics
+    "DAILY":  ["Daily Vol (M)","Day Volume (M)","Volume (M)"],   # target for DayVol train
     "CAT":    ["Catalyst","News","PR"],
 }
 def _norm(s: str) -> str:
@@ -146,8 +137,8 @@ def _parse_catalyst_col(series: pd.Series) -> pd.Series:
             except: out.append(0.0)
     return pd.Series(out, dtype=float).clip(0,1)
 
-# ========== Direct log-linear DayVol (fixed) ==========
-def predict_dayvol_m(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
+# ============================== Fixed direct DayVol (fallback) ==============================
+def predict_dayvol_m_fixed(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """
     ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$)
     Returns **millions of shares**.
@@ -160,11 +151,23 @@ def predict_dayvol_m(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     y = math.exp(ln_y)
     return float(max(0.0, y))
 
-# ========== Logistic utils ==========
-def logit_fit_weighted(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
+# ============================== Ridge & Logistic ==============================
+def ridge_fit(Z: np.ndarray, y: np.ndarray, l2: float = 1.0) -> Tuple[np.ndarray, float]:
+    """
+    Ridge regression with intercept on standardized Z (already z-scored).
+    Returns (coef_z, intercept).
+    """
+    n, k = Z.shape
+    # add intercept column
+    Xb = np.concatenate([np.ones((n,1)), Z], axis=1)
+    I = np.eye(k+1); I[0,0] = 0.0  # no penalty on intercept
+    w = np.linalg.solve(Xb.T @ Xb + l2*I, Xb.T @ y)
+    return w[1:].astype(float), float(w[0])
+
+def logit_fit_weighted(Z: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
                        l2: float = 1.0, max_iter: int = 120, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
-    n, k = X.shape
-    Xb = np.concatenate([np.ones((n,1)), X], axis=1)
+    n, k = Z.shape
+    Xb = np.concatenate([np.ones((n,1)), Z], axis=1)
     w = np.zeros(k+1)
     R = np.eye(k+1); R[0,0] = 0.0; R *= l2
     for _ in range(max_iter):
@@ -187,24 +190,23 @@ def logit_inv(z: np.ndarray) -> np.ndarray:
     z = np.clip(z, -35, 35)
     return 1.0/(1.0 + np.exp(-z))
 
-# ========== Fixed cuts builders ==========
+# ============================== Cuts & Labels ==============================
 def _inv_warp_p(sw: float, alpha: float = 2.6) -> float:
     sw = float(np.clip(sw, 0.0, 1.0))
     return float(1.0 - (1.0 - sw) ** (1.0 / max(1e-9, alpha)))
 
 def make_grade_cuts() -> dict:
     """
-    Fixed A-zone thresholds (exact):
+    Fixed A-zone thresholds:
       • A   ≥ 0.90
       • A+  ≥ 0.97
       • A++ ≥ 0.99
-    Below 0.90 → split B/C/D using exponential warp of training predictions.
+    Below 0.90 → B/C/D via exponential warp of training predictions.
     """
     A_cut, Ap_cut, App_cut = 0.90, 0.97, 0.99
 
     p_cal = st.session_state.get("TRAIN_PREDS", np.array([]))
     if p_cal.size == 0:
-        # conservative defaults for B/C
         return {"App": App_cut, "Ap": Ap_cut, "A": A_cut, "B": 0.75, "C": 0.55}
 
     sub = np.asarray(p_cal[(p_cal < A_cut) & np.isfinite(p_cal)])
@@ -213,8 +215,8 @@ def make_grade_cuts() -> dict:
 
     sub.sort()
     alpha = 2.6
-    b_pos = _inv_warp_p(0.80, alpha)  # ~top of the sub-90 pool → B boundary
-    c_pos = _inv_warp_p(0.50, alpha)  # middle of the sub-90 pool → C boundary
+    b_pos = _inv_warp_p(0.80, alpha)  # B/C boundary within sub-90 pool
+    c_pos = _inv_warp_p(0.50, alpha)  # C/D boundary
     B_cut = float(np.quantile(sub, b_pos))
     C_cut = float(np.quantile(sub, c_pos))
 
@@ -226,27 +228,16 @@ def make_grade_cuts() -> dict:
     return {"App": App_cut, "Ap": Ap_cut, "A": A_cut, "B": B_cut, "C": C_cut}
 
 def make_odds_cuts() -> dict:
-    """
-    Fixed conservative odds bands:
-      • Very High Odds ≥ 0.97
-      • High Odds      ≥ 0.90
-      • Moderate Odds  ≥ 0.75
-      • Low Odds       ≥ 0.60
-      • else Very Low
-    """
-    return {"very_high": 0.97, "high": 0.9, "moderate": 0.75, "low": 0.60}
+    return {"very_high": 0.90, "high": 0.75, "moderate": 0.60, "low": 0.45}
 
-# ========== Labels ==========
 def _prob_to_odds(p: float, cuts: Dict[str,float]) -> str:
-    # Odds tiers (fixed cuts)
-    if p >= cuts.get("very_high",0.97): return "Very High Odds"
-    if p >= cuts.get("high",0.90):      return "High Odds"
-    if p >= cuts.get("moderate",0.75):  return "Moderate Odds"
-    if p >= cuts.get("moderate",0.55):  return "Low Odds"
+    if p >= cuts.get("very_high",0.90): return "Very High Odds"
+    if p >= cuts.get("high",0.75):      return "High Odds"
+    if p >= cuts.get("moderate",0.60):  return "Moderate Odds"
+    if p >= cuts.get("low",0.45):       return "Low Odds"
     return "Very Low Odds"
 
 def _prob_to_grade(p: float, cuts: Dict[str,float]) -> str:
-    # Grades aligned with Odds
     if p >= cuts.get("App",0.99): return "A++"   # Very High Odds
     if p >= cuts.get("Ap",0.97):  return "A+"    # Very High Odds
     if p >= cuts.get("A",0.90):   return "A"     # High Odds
@@ -254,7 +245,7 @@ def _prob_to_grade(p: float, cuts: Dict[str,float]) -> str:
     if p >= cuts.get("C",0.55):   return "C"     # Low Odds
     return "D"                                   # Very Low Odds
 
-# ========== Upload & Learn ==========
+# ============================== Upload & Learn ==============================
 st.markdown('<div class="section-title">Upload workbook</div>', unsafe_allow_html=True)
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], label_visibility="collapsed")
 sheet_name = st.text_input("Sheet name", "PMH BO Merged")
@@ -291,8 +282,43 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
     if "CAT" in col: df["catalyst"] = _parse_catalyst_col(raw[col["CAT"]])
     else: df["catalyst"] = 0.0
 
-    # ===== FT feature set (NO pmfrac) =====
-    feats: List[Tuple[str, callable]] = [
+    # ---------------- DayVol TRAIN (ridge on ln(Daily Vol M)) ----------------
+    dv_feats: List[Tuple[str, callable]] = []
+    # features: ln_mcap, ln_gapf, ln_atr, catalyst, ln1p_rvol, ln_float (use what exists)
+    if "mcap_m" in df.columns:    dv_feats.append(("ln_mcap",   lambda r: _safe_log(r.get("mcap_m"))))
+    if "gap_pct" in df.columns:   dv_feats.append(("ln_gapf",   lambda r: _safe_log(_nz(r.get("gap_pct"),0.0)/100.0)))
+    if "atr_usd" in df.columns:   dv_feats.append(("ln_atr",    lambda r: _safe_log(r.get("atr_usd"))))
+    if "catalyst" in df.columns:  dv_feats.append(("catalyst",  lambda r: float(_nz(r.get("catalyst"),0.0))))
+    if "rvol" in df.columns:      dv_feats.append(("ln1p_rvol", lambda r: _safe_log(_nz(r.get("rvol"),0.0) + 1.0)))
+    if "float_m" in df.columns:   dv_feats.append(("ln_float",  lambda r: _safe_log(r.get("float_m"))))
+
+    DVP = {"trained": False, "sigma_ln": 0.60}  # default sigma
+    if "daily_vol_m" in df.columns and df["daily_vol_m"].notna().sum() >= 20 and len(dv_feats) >= 3:
+        y_ln = np.log(np.clip(df["daily_vol_m"].to_numpy(float), 1e-6, None))
+        X = np.vstack([[f(df.iloc[i].to_dict()) for _, f in dv_feats] for i in range(len(df))]).astype(float)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        mu = X.mean(axis=0); sd = X.std(axis=0, ddof=1); sd[sd==0] = 1.0
+        Z = (X - mu) / sd; Z = np.clip(Z, -4.0, 4.0)
+
+        coef_z, intercept = ridge_fit(Z, y_ln, l2=1.0)
+        yhat_ln = intercept + Z @ coef_z
+        resid = y_ln - yhat_ln
+        sigma_ln = float(np.std(resid, ddof=1)) if resid.size > 2 else 0.60
+
+        DVP = {
+            "trained": True,
+            "feat_names": [n for n,_ in dv_feats],
+            "mu": mu, "sd": sd,
+            "coef_z": coef_z, "intercept": float(intercept),
+            "sigma_ln": sigma_ln
+        }
+        st.success(f"DayVol model trained (n={len(y_ln)}; σ_ln≈{sigma_ln:.2f}; feats: {', '.join(DVP['feat_names'])}).")
+    else:
+        st.info("DayVol training unavailable — will use fixed direct model with generic σ_ln=0.60.")
+
+    # ---------------- FT TRAIN (no pmfrac) ----------------
+    ft_feats: List[Tuple[str, callable]] = [
         ("ln1p_pmvol",  lambda r: _safe_log(_nz(r.get("pm_vol_m"),0.0) + 1.0)),
         ("ln_gapf",     lambda r: _safe_log(_nz(r.get("gap_pct"),0.0) / 100.0)),
         ("catalyst",    lambda r: float(_nz(r.get("catalyst"),0.0))),
@@ -300,45 +326,37 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
         ("ln_mcap",     lambda r: _safe_log(r.get("mcap_m"))),
         ("ln1p_rvol",   lambda r: _safe_log(_nz(r.get("rvol"),0.0) + 1.0)),
         ("ln1p_pmmc",   lambda r: _safe_log(_nz(r.get("pm_dol_m"),0.0) / max(1e-6, _nz(r.get("mcap_m"),0.0)) + 1.0)),
-        ("ln1p_si",     lambda r: _safe_log(_nz(r.get("si_pct"),0.0) + 1.0)),  # SI% as percent; robust
+        ("ln1p_si",     lambda r: _safe_log(_nz(r.get("si_pct"),0.0) + 1.0)),
     ]
-
-    # design matrix
-    X = np.vstack([[f(df.iloc[i].to_dict()) for _, f in feats] for i in range(len(df))]).astype(float)
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    Xft = np.vstack([[f(df.iloc[i].to_dict()) for _, f in ft_feats] for i in range(len(df))]).astype(float)
+    Xft = np.nan_to_num(Xft, nan=0.0, posinf=0.0, neginf=0.0)
     y = df["FT"].to_numpy(dtype=float)
 
-    # standardize + clip
-    mu = X.mean(axis=0)
-    sd = X.std(axis=0, ddof=1); sd[sd==0] = 1.0
-    Z = (X - mu) / sd
-    Z = np.clip(Z, -3.0, 3.0)
+    mu = Xft.mean(axis=0); sd = Xft.std(axis=0, ddof=1); sd[sd==0] = 1.0
+    Z = (Xft - mu) / sd; Z = np.clip(Z, -3.0, 3.0)
 
-    # class balance weights
+    # balance weights
     p1 = float(np.mean(y)) if y.size else 0.5
     w1 = 0.5 / max(1e-9, p1)
     w0 = 0.5 / max(1e-9, 1.0 - p1)
     sample_w = np.where(y>0.5, w1, w0).astype(float)
 
-    # train
     if Z.shape[0] >= 12 and np.unique(y).size == 2:
         coef_z, bias = logit_fit_weighted(Z, y, sample_w, l2=1.0, max_iter=140, tol=1e-6)
-        st.success("FT trained (n={}; base FT≈{:.2f}; feats: {}).".format(Z.shape[0], p1, ", ".join([n for n,_ in feats])))
+        st.success("FT model trained (n={}; base FT≈{:.2f}).".format(Z.shape[0], p1))
     else:
         coef_z, bias = np.zeros(Z.shape[1]), 0.0
         st.error("Unable to train FT (need ≥12 rows and both classes). Using neutral 50%.")
 
-    # store train predictions for grade split under 0.90
     p_cal = logit_inv(bias + Z @ coef_z)
     st.session_state.TRAIN_PREDS = p_cal
-
-    # cuts
     st.session_state.GRADE_CUTS = make_grade_cuts()
     st.session_state.ODDS_CUTS  = make_odds_cuts()
 
     st.session_state.ART = {
-        "feat_names":[n for n,_ in feats], "mu":mu, "sd":sd, "coef_z":coef_z, "bias":bias
+        "feat_names":[n for n,_ in ft_feats], "mu":mu, "sd":sd, "coef_z":coef_z, "bias":bias
     }
+    st.session_state.DVP = DVP
     st.success("Learning complete.")
 
 if learn_btn:
@@ -354,7 +372,47 @@ if learn_btn:
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
-# ========== Inference ==========
+# ============================== Inference ==============================
+def predict_dayvol_trained(mcap_m: float, gap_pct: float, atr_usd: float,
+                           rvol: float, float_m: float, catalyst: float) -> Tuple[float,float,float,bool]:
+    """
+    Returns (pred_M, CI68_low, CI68_high, used_trained_model)
+    Uses trained ridge model if available; otherwise falls back to fixed direct model with σ=0.60.
+    """
+    DVP = st.session_state.get("DVP", {}) or {}
+    used_trained = False
+
+    if DVP.get("trained"):
+        names = DVP.get("feat_names", [])
+        mu = DVP.get("mu"); sd = DVP.get("sd")
+        coef = DVP.get("coef_z"); intercept = float(DVP.get("intercept", 0.0))
+        sigma_ln = float(DVP.get("sigma_ln", 0.60))
+        if names and mu is not None and sd is not None and coef is not None:
+            fmap = {
+                "ln_mcap":   lambda: _safe_log(mcap_m),
+                "ln_gapf":   lambda: _safe_log(_nz(gap_pct,0.0) / 100.0),
+                "ln_atr":    lambda: _safe_log(atr_usd),
+                "catalyst":  lambda: float(_nz(catalyst,0.0)),
+                "ln1p_rvol": lambda: _safe_log(_nz(rvol,0.0) + 1.0),
+                "ln_float":  lambda: _safe_log(float_m),
+            }
+            vals = [float(fmap[n]()) for n in names]
+            Z = (np.array(vals) - mu) / sd
+            Z = np.clip(Z, -4.0, 4.0)
+            ln_pred = float(intercept + np.dot(Z, coef))
+            pred = float(max(0.0, math.exp(ln_pred)))
+            lo = float(pred * math.exp(-1.0 * sigma_ln))
+            hi = float(pred * math.exp(+1.0 * sigma_ln))
+            used_trained = True
+            return pred, lo, hi, used_trained
+
+    # Fallback to fixed model
+    pred = predict_dayvol_m_fixed(mcap_m, gap_pct, atr_usd)
+    sigma_ln = 0.60
+    lo = float(pred * math.exp(-1.0 * sigma_ln))
+    hi = float(pred * math.exp(+1.0 * sigma_ln))
+    return pred, lo, hi, used_trained
+
 def predict_ft_prob(gap_pct: float, pm_vol_m: float, catalyst: float,
                     atr_usd: float, mcap_m: float, rvol: float, pm_dol_m: float,
                     si_pct: float) -> float:
@@ -383,19 +441,27 @@ def _odds_and_grade(p: float) -> Tuple[str, str]:
     grade_cuts = st.session_state.get("GRADE_CUTS", make_grade_cuts())
     return _prob_to_odds(p, odds_cuts), _prob_to_grade(p, grade_cuts)
 
-# ========== Tabs ==========
+# ============================== Tabs ==============================
 tab_add, tab_rank = st.tabs(["➕ Add / Score", "📊 Ranking"])
 
-# ========== Add / Score ==========
+# ============================== Add / Score ==============================
 with tab_add:
-    _ok = _ft_is_trained()
+    # Training status badges
+    _ft_ok  = bool(st.session_state.ART)
+    _dvp_ok = bool(st.session_state.DVP.get("trained", False))
     st.markdown(
         f'<div style="margin:.25rem 0 1rem 0;">'
         f'  <span style="display:inline-block;padding:.18rem .55rem;border-radius:999px;'
-        f'         border:1px solid {_ok and "#16a34a" or "#ef4444"};'
-        f'         background:{_ok and "#ecfdf5" or "#fef2f2"};'
-        f'         color:{_ok and "#166534" or "#991b1b"}; font-weight:600; font-size:.82rem;">'
-        f'    FT model: {_ok and "trained" or "NOT trained"}'
+        f'         border:1px solid {_ft_ok and "#16a34a" or "#ef4444"};'
+        f'         background:{_ft_ok and "#ecfdf5" or "#fef2f2"};'
+        f'         color:{_ft_ok and "#166534" or "#991b1b"}; font-weight:600; font-size:.82rem; margin-right:.4rem;">'
+        f'    FT model: {_ft_ok and "trained" or "NOT trained"}'
+        f'  </span>'
+        f'  <span style="display:inline-block;padding:.18rem .55rem;border-radius:999px;'
+        f'         border:1px solid {_dvp_ok and "#16a34a" or "#94a3b8"};'
+        f'         background:{_dvp_ok and "#ecfdf5" or "#f1f5f9"};'
+        f'         color:{_dvp_ok and "#166534" or "#334155"}; font-weight:600; font-size:.82rem;">'
+        f'    DayVol model: {_dvp_ok and "trained" or "fixed fallback"}'
         f'  </span>'
         f'</div>',
         unsafe_allow_html=True
@@ -420,15 +486,18 @@ with tab_add:
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
     if submitted and ticker:
-        if not _ft_is_trained():
+        if not _ft_ok:
             st.error("Train the FT model first (Upload → Learn).")
         else:
             cat = 1.0 if catalyst_flag=="Yes" else 0.0
 
-            # DayVol via direct log model (clamp to PM for PM% display)
-            pred_vol_m = predict_dayvol_m(mc_m, gap_pct, atr_usd)
+            # DayVol (trained if available; else fixed); clamp to PM
+            pred_vol_m, ci68_l, ci68_u, used_trained = predict_dayvol_trained(
+                mcap_m=mc_m, gap_pct=gap_pct, atr_usd=atr_usd,
+                rvol=rvol, float_m=float_m, catalyst=cat
+            )
             pred_vol_m = max(pred_vol_m, _nz(pm_vol_m, 0.0))
-            ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
+            # when clamped, CI can be below pred; that's fine for display—keep as model CI
 
             # FT probability
             ft_prob = predict_ft_prob(
@@ -450,6 +519,7 @@ with tab_add:
 
                 "PM%_of_Pred": round(100.0 * _nz(pm_vol_m,0.0) / max(1e-6, pred_vol_m), 1),
                 "PM$ / MC_%": round(100.0 * _nz(pm_dol_m,0.0) / max(1e-6, _nz(mc_m,0.0)), 1),
+                "DayVolModel": ("Trained" if used_trained else "Fixed"),
 
                 # raw inputs for CSV/debug
                 "_MCap_M": mc_m, "_Gap_%": gap_pct, "_ATR_$": atr_usd, "_PM_M": pm_vol_m,
@@ -472,10 +542,11 @@ with tab_add:
         e.metric("PredVol (M)", f"{l.get('PredVol_M',0):.2f}")
         st.caption(
             f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
-            f"PM % of Pred: {l.get('PM%_of_Pred',0):.1f}% · PM $/MC: {l.get('PM$ / MC_%',0):.1f}%"
+            f"PM % of Pred: {l.get('PM%_of_Pred',0):.1f}% · PM $/MC: {l.get('PM$ / MC_%',0):.1f}% · "
+            f"DayVol model: {l.get('DayVolModel','—')}"
         )
 
-# ========== Ranking ==========
+# ============================== Ranking ==============================
 with tab_rank:
     st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
 
@@ -485,9 +556,9 @@ with tab_rank:
             df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
         cols = ["Ticker","Odds","Level","FinalScore",
-                "PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM%_of_Pred","PM$ / MC_%"]
+                "PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM%_of_Pred","PM$ / MC_%","DayVolModel"]
         for c in cols:
-            if c not in df.columns: df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
+            if c not in df.columns: df[c] = "" if c in ("Ticker","Odds","Level","DayVolModel") else 0.0
 
         st.dataframe(
             df[cols],
@@ -503,6 +574,7 @@ with tab_rank:
                 "PredVol_CI68_U": st.column_config.NumberColumn("PredVol CI68 High (M)", format="%.2f"),
                 "PM%_of_Pred": st.column_config.NumberColumn("PM % of Pred", format="%.1f"),
                 "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
+                "DayVolModel": st.column_config.TextColumn("DayVol Model"),
             }
         )
 
