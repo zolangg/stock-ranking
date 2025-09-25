@@ -20,8 +20,8 @@ import pandas as pd
 import streamlit as st
 
 # ========== Page ==========
-st.set_page_config(page_title="Premarket Ranking — Direct DayVol + FT (SI%, no PM%)", layout="wide")
-st.title("Premarket Ranking — Direct DayVol + FT (SI%, no PM%)")
+st.set_page_config(page_title="Premarket Ranking", layout="wide")
+st.title("Premarket Ranking")
 
 st.markdown("""
 <style>
