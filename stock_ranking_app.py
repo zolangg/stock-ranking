@@ -1,6 +1,5 @@
 # app.py — Premarket Ranking (Prediction-only; learns from uploaded workbook)
 # -----------------------------------------------------------------------------
-# Robust training that handles NaNs and odd encodings:
 # • PM% of Day model (logit ridge) → invert to Predicted Day Volume (+ CI68), PredVol ≥ PM Vol.
 # • FT classifier (logistic IRLS) on dataset vars + ln(PredDay).
 # • Optional Max Push Daily % regression (light blend) if present.
@@ -292,8 +291,8 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         pm = _nz(r.get("pm_vol_m"),0.0); fl = _nz(r.get("float_m"),0.0)
         return math.log(max(1e-6, pm / max(1e-6, fl)))
     def _ln1p_pmmc(r):
-        pm$ = _nz(r.get("pm_dol_m"),0.0); mc = _nz(r.get("mcap_m"),0.0)
-        return _safe_log(pm$ / max(1e-6, mc) + 1.0)
+        pm_dol = _nz(r.get("pm_dol_m"),0.0); mc = _nz(r.get("mcap_m"),0.0)
+        return _safe_log(pm_dol / max(1e-6, mc) + 1.0)
 
     ft_candidates = [
         ("ln_mcap",      lambda r: _safe_log(r.get("mcap_m")),                               ["mcap_m"]),
