@@ -1,10 +1,11 @@
-# app.py — Premarket FT Ranking (no DayVol, no Float)
-# ---------------------------------------------------
+# app.py — Premarket FT Ranking (two full-width columns, Catalyst under PM $Vol)
+# -----------------------------------------------------------------------------
 # • Trains a single FT classifier (weighted L2 logistic) from your workbook.
-# • Features used (if columns present): ln1p_pmvol, ln_gapf, catalyst,
-#   ln_atr, ln_mcap, ln1p_rvol, ln1p_pmmc, ln1p_si
+# • Features used (if present): ln1p_pmvol, ln_gapf, catalyst, ln_atr,
+#   ln_mcap, ln1p_rvol, ln1p_pmmc, ln1p_si
 # • Grades only: A≥0.90, A+≥0.97, A++≥0.99. Below 0.90, B/C/D via warped quantiles.
-# • UI: full-width inputs, catalyst directly under PM $Vol; trained / NOT trained badge.
+# • UI: two side-by-side columns spanning full width; Catalyst sits right under PM $ Volume.
+# • Status badge: “FT model: trained / NOT trained”.
 # • Table: Ticker, Grade, FT Probability %. Delete top-12, CSV/Markdown download, Clear.
 
 import os
@@ -175,7 +176,7 @@ def make_grade_cuts() -> dict:
         return {"App": App_cut, "Ap": Ap_cut, "A": A_cut, "B": 0.80, "C": 0.60}
     sub.sort()
     alpha = 2.6
-    b_pos = _inv_warp_p(0.80, alpha)  # skew towards higher
+    b_pos = _inv_warp_p(0.80, alpha)
     c_pos = _inv_warp_p(0.50, alpha)
     B_cut = float(np.quantile(sub, b_pos))
     C_cut = float(np.quantile(sub, c_pos))
@@ -354,16 +355,21 @@ with tab_add:
 
     st.markdown('<div class="section-title">Inputs</div>', unsafe_allow_html=True)
     with st.form("add_form", clear_on_submit=True):
-        # Full-width single-column inputs, catalyst directly under PM $Vol
-        ticker   = st.text_input("Ticker", "").strip().upper()
-        mcap_m   = input_float("Market Cap (Millions $)", 0.0, min_value=0.0, decimals=2)
-        si_pct   = input_float("Short Interest (%)",       0.0, min_value=0.0, decimals=2)
-        gap_pct  = input_float("Gap %",                    0.0, min_value=0.0, decimals=1)
-        atr_usd  = input_float("ATR ($)",                  0.0, min_value=0.0, decimals=2)
-        rvol     = input_float("RVOL",                     0.0, min_value=0.0, decimals=2)
-        pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
-        pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
-        catalyst_flag = st.selectbox("Catalyst?", ["No","Yes"], index=0)
+        # Two columns that span the full page width
+        c1, c2 = st.columns(2)
+
+        with c1:
+            ticker   = st.text_input("Ticker", "").strip().upper()
+            mcap_m   = input_float("Market Cap (Millions $)", 0.0, min_value=0.0, decimals=2)
+            si_pct   = input_float("Short Interest (%)",       0.0, min_value=0.0, decimals=2)
+            gap_pct  = input_float("Gap %",                    0.0, min_value=0.0, decimals=1)
+
+        with c2:
+            atr_usd  = input_float("ATR ($)",                  0.0, min_value=0.0, decimals=2)
+            rvol     = input_float("RVOL",                     0.0, min_value=0.0, decimals=2)
+            pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
+            pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
+            catalyst_flag = st.selectbox("Catalyst?", ["No","Yes"], index=0)
 
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
