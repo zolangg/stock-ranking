@@ -1,9 +1,9 @@
-# app.py — Premarket Ranking (Predictive‑Only, trains from uploaded workbook)
+# app.py — Premarket Ranking (Predictive-Only, trains from uploaded workbook)
 # ---------------------------------------------------------------------------------
-# • Learns BOTH: (A) PM%‑of‑Day model (logit ridge) to derive Predicted Day Volume and CI.
-# • (B) FT classifier (logistic IRLS) using dataset vars + predicted day volume.
-# • (C) Optional Max Push Daily % regression blended (small weight) into FT.
-# • Robust column auto‑detection (uses the Legend naming), no scikit‑learn required.
+# • Learns: (A) PM%-of-Day model (logit ridge) → Predicted Day Volume + CI (and never below PM).
+# • (B) FT classifier (logistic IRLS) using dataset vars + ln(PredDay).
+# • (C) Optional Max Push Daily % regression; blended (20%) into FT.
+# • Robust column auto-detection matching the Legend.
 # • Numeric inputs accept commas (e.g., "5,05").
 # • Minimal UI: Upload → Learn → Add/Score → Ranking.
 
@@ -48,7 +48,6 @@ if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 
 # ============================== Helpers ==============================
-
 def _parse_local_float(s: str) -> Optional[float]:
     if s is None: return None
     s = str(s).strip().replace(" ", "").replace("’","").replace("'","")
@@ -76,12 +75,12 @@ def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
 # smart column picker (aligned with Legend)
 _DEF = {
     "FT": ["FT"],
-    "MAXPCT": ["Max Push Daily %", "Max Push %"],
+    "MAXPCT": ["Max Push Daily %", "Max Push Daily (%)", "Max Push %"],
     "GAP": ["Gap %", "Gap"],
-    "ATR": ["ATR $", "ATR"],
-    "RVOL": ["RVOL @ BO", "RVOL"],
+    "ATR": ["ATR $", "ATR", "Daily ATR"],  # include "Daily ATR" used in Legend
+    "RVOL": ["RVOL @ BO", "RVOL", "Relative Volume"],
     "PMVOL": ["PM Vol (M)", "Premarket Vol (M)"],
-    "PM$": ["PM $Vol (M)", "PM Dollar Vol (M)"],
+    "PM$": ["PM $Vol (M)", "PM Dollar Vol (M)"],  # optional, handled gracefully
     "FLOAT": ["Float M Shares", "Public Float (M)", "Float (M)"],
     "MCAP": ["MarketCap M", "Market Cap (M)"],
     "SI": ["Short Interest %"],
@@ -106,7 +105,6 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 # ---------- math & models ----------
-
 def _safe_log(x: float, eps: float = 1e-8) -> float:
     x = float(x) if x is not None else 0.0
     return math.log(max(x, eps))
@@ -154,7 +152,6 @@ with col2:
     local_path = st.text_input("Or read local path (server)", "")
     learn_local_btn = st.button("Learn from local path", use_container_width=True)
 
-
 def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     raw = pd.read_excel(xls, sheet)
 
@@ -174,6 +171,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     def _add(colname: str, key: str):
         if key in col:
             df[colname] = pd.to_numeric(raw[col[key]], errors="coerce")
+
     _add("gap_pct", "GAP")
     _add("atr_usd", "ATR")
     _add("rvol", "RVOL")
@@ -189,18 +187,19 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
 
     # derived
     if {"pm_vol_m","daily_vol_m"}.issubset(df.columns):
-        df["pm_pct_daily"] = 100.0 * df["pm_vol_m"] / df["daily_vol_m"]
+        df["pm_pct_daily"] = 100.0 * df["pm_vol_m"] / df["daily_vol_m"].replace(0, np.nan)
     if {"pm_vol_m","float_m"}.issubset(df.columns):
         df["fr_x"] = df["pm_vol_m"] / df["float_m"]
     if {"pm_dol_m","mcap_m"}.issubset(df.columns):
         df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
 
-    # ---------- (A) Learn PM%‑of‑Day model (logit of pm_pct_daily/100) ----------
-    pmcoef = None; pmbias = 0.0; pmsigma = 0.60; pm_base = 0.139  # base from dataset median
+    # ---------- (A) Learn PM%-of-Day model (logit of pm_pct_daily/100) ----------
+    pmcoef = None; pmbias = 0.0; pmsigma = 0.60; pm_base = 0.139  # base ≈ dataset median 13.9%
     if "pm_pct_daily" in df.columns and df["pm_pct_daily"].notna().any():
         y_raw = pd.to_numeric(df["pm_pct_daily"], errors="coerce").astype(float)
-        y_frac = np.clip(y_raw/100.0, 0.005, 0.95)  # keep realistic band
+        y_frac = np.clip(y_raw/100.0, 0.005, 0.95)   # realistic band
         y = np.log(y_frac/(1.0 - y_frac))           # logit
+
         # features: ln mcap, ln gap_frac, ln atr, ln float, ln(1+rvol), catalyst
         def _feat_pm(r):
             mc = _safe_log(r.get("mcap_m", np.nan))
@@ -210,6 +209,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
             rv = _safe_log(1.0 + (r.get("rvol", np.nan) or 0.0))
             ca = float(r.get("catalyst", 0.0) or 0.0)
             return [mc,gp,at,fl,rv,ca]
+
         X = df.apply(_feat_pm, axis=1, result_type="expand").to_numpy(dtype=float)
         mask = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
         Xf, yf = X[mask], y[mask]
@@ -219,11 +219,11 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
             pmbias = float(np.mean(resid))
             pmsigma = float(np.std(resid, ddof=1)) if resid.size > 2 else 0.60
             pm_base = float(np.median(y_raw[mask]))/100.0
-            st.success(f"PM% model trained on n={len(yf)} rows (median={pm_base*100:.1f}%).")
+            st.success(f"PM% model trained on n={len(yf)} rows (median≈{pm_base*100:.1f}%).")
         else:
-            st.warning("Insufficient rows to fit PM% model — will fall back to heuristic.")
+            st.warning("Insufficient rows to fit PM% model — will fall back to median baseline.")
     else:
-        st.warning("No 'PM Vol % of Daily' available — fall back to heuristic.")
+        st.warning("No 'PM Vol % of Daily' available — fall back to median baseline.")
 
     # ---------- (B1) Max Push Daily % regression (optional) ----------
     mpcoef = None; mpbias = 0.0; mpscale = 1.0; mp_med_ft1 = 12.0
@@ -252,7 +252,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
                     if mp_ft.size: mp_med_ft1 = float(np.median(mp_ft))
                 except Exception:
                     pass
-                st.success(f"MaxPush% model trained on n={len(yf)} rows (median FT=1 ~ {mp_med_ft1:.1f}%).")
+                st.success(f"MaxPush% model trained on n={len(yf)} rows (median FT=1 ≈ {mp_med_ft1:.1f}%).")
             else:
                 st.warning("Insufficient rows to fit MaxPush% model — FT will rely on classifier only.")
         else:
@@ -261,10 +261,9 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         st.info("No 'Max Push Daily %' column.")
 
     # ---------- (B2) FT classifier ----------
-    # features include catalyst and predicted ln(day volume) from PM% model
     def _pm_pct_predict_row(r) -> float:
         if pmcoef is None:
-            return 0.139  # heuristic baseline (13.9%)
+            return float(np.clip(0.139, 0.02, 0.95))  # median baseline (~13.9%)
         mc = _safe_log(r.get("mcap_m", np.nan))
         gp = _safe_log((r.get("gap_pct", np.nan) or 0.0)/100.0)
         at = _safe_log(r.get("atr_usd", np.nan))
@@ -276,6 +275,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         return float(np.clip(p, 0.02, 0.95))
 
     y_ft = df["FT"].to_numpy(dtype=float)
+
     def _ft_feats(r):
         mc = _safe_log(r.get("mcap_m", np.nan))
         gp = _safe_log((r.get("gap_pct", np.nan) or 0.0)/100.0)
@@ -287,9 +287,9 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         fr = math.log(max(1e-6, (r.get("pm_vol_m", np.nan) or 0.0)/max(1e-6, r.get("float_m", np.nan) or 0.0)))
         pmmc = _safe_log((r.get("pm_dol_m", np.nan) or 0.0) / max(1e-6, r.get("mcap_m", np.nan) or 0.0) + 1.0)
         ca = float(r.get("catalyst", 0.0) or 0.0)
-        p_pct = _pm_pct_predict_row(r)
-        # implied day volume (>= PM volume automatically by construction)
-        pred_day = max(1e-6, (r.get("pm_vol_m", 0.0) or 0.0) / max(1e-6, p_pct))
+        p_pct = _pm_pct_predict_row(r)                # fraction
+        pred_day = max(1e-6, (r.get("pm_vol_m", 0.0) or 0.0) / max(1e-6, p_pct))  # ensure >= PM
+        pred_day = max(pred_day, float(r.get("pm_vol_m", 0.0) or 0.0))
         ln_pred_day = _safe_log(pred_day)
         return [mc,gp,at,fl,si,rv,pm,fr,pmmc,ca,ln_pred_day]
 
@@ -307,8 +307,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     # Calibration for grade/odds
     if ft_coef is not None:
         p_cal = logit_inv(ft_bias + Xf @ ft_coef)
-        def _q(p):
-            return float(np.quantile(p_cal, p)) if p_cal.size else 0.5
+        def _q(p): return float(np.quantile(p_cal, p)) if p_cal.size else 0.5
         odds_cuts = {
             "very_high": max(0.85, _q(0.98)),
             "high":      max(0.70, _q(0.90)),
@@ -373,11 +372,9 @@ if learn_local_btn:
         st.error(f"Learning failed: {e}")
 
 # ============================== Inference helpers ==============================
-
 def _pm_pct_predict(mc_m: float, gap_pct: float, atr_usd: float, float_m: float, rvol: float, catalyst: float) -> Tuple[float,float,float]:
-    """Predict PM% of day (as fraction) with CI68 using learned model or heuristic baseline.
-       Returns (p, lo, hi) in FRAC (0..1).
-    """
+    """Predict PM% of day (as fraction) with CI68 using learned model or baseline.
+       Returns (p, lo, hi) in FRAC (0..1)."""
     A = st.session_state.ARTIFACTS or {}
     pmcoef = A.get("pmcoef")
     pmbias = float(A.get("pmbias") or 0.0)
@@ -395,20 +392,22 @@ def _pm_pct_predict(mc_m: float, gap_pct: float, atr_usd: float, float_m: float,
         z = float(np.dot([mc,gp,at,fl,rv,ca], pmcoef) + pmbias)
         p = 1.0/(1.0 + math.exp(-z))
     p = float(np.clip(p, 0.02, 0.95))
-    lo = float(np.clip(1.0/(1.0+math.exp(-(math.log(p/(1-p)) - pmsigma))), 0.01, 0.98))
-    hi = float(np.clip(1.0/(1.0+math.exp(-(math.log(p/(1-p)) + pmsigma))), 0.01, 0.98))
+    # CI68 in logit space
+    logit = math.log(p/(1.0-p))
+    lo = 1.0/(1.0+math.exp(-(logit - pmsigma)))
+    hi = 1.0/(1.0+math.exp(-(logit + pmsigma)))
+    lo = float(np.clip(lo, 0.01, 0.98))
+    hi = float(np.clip(hi, 0.01, 0.98))
     return p, lo, hi
-
 
 def predict_day_volume_from_pm(pm_vol_m: float, p_pm: float, lo: float, hi: float) -> Tuple[float,float,float]:
     """Invert PM% to get day volume. Guarantees PredVol ≥ PM volume. Returns (pred, ci68_lo, ci68_hi)."""
     p = max(1e-6, min(0.95, p_pm))
-    pred = pm_vol_m / p if p>0 else float("nan")
+    pred = pm_vol_m / p if p > 0 else float("nan")
     pred = max(pred, pm_vol_m)  # never below PM volume
     lo_v = max(pm_vol_m, pm_vol_m / max(1e-6, hi))
     hi_v = max(pm_vol_m, pm_vol_m / max(1e-6, lo))
     return float(pred), float(lo_v), float(hi_v)
-
 
 def predict_ft_prob(mc_m: float, gap_pct: float, atr_usd: float, float_m: float, si_pct: float,
                     rvol: float, pm_vol_m: float, pm_dol_m: float, catalyst: float) -> float:
@@ -416,7 +415,7 @@ def predict_ft_prob(mc_m: float, gap_pct: float, atr_usd: float, float_m: float,
     coef = A.get("ft_coef")
     bias = float(A.get("ft_bias") or 0.0)
 
-    # PM%‑derived day volume
+    # PM%-derived day volume
     p_pm, p_lo, p_hi = _pm_pct_predict(mc_m, gap_pct, atr_usd, float_m, rvol, catalyst)
     pred_vol_m, _, _ = predict_day_volume_from_pm(pm_vol_m, p_pm, p_lo, p_hi)
 
@@ -453,7 +452,6 @@ def predict_ft_prob(mc_m: float, gap_pct: float, atr_usd: float, float_m: float,
 
     return float(np.clip(p_blend, 1e-3, 1-1e-3))
 
-
 def _prob_to_odds(prob: float, cuts: Dict[str, float]) -> str:
     if prob >= cuts.get("very_high",0.85): return "Very High Odds"
     if prob >= cuts.get("high",0.70):      return "High Odds"
@@ -470,7 +468,7 @@ def _prob_to_grade(prob: float, cuts: Dict[str, float]) -> str:
     return "D"
 
 # ============================== Tabs ==============================
-tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"]) 
+tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 # ============================== Add Stock ==============================
 with tab_add:
@@ -495,7 +493,7 @@ with tab_add:
 
     if submitted and ticker:
         cat = 1.0 if catalyst_flag=="Yes" else 0.0
-        # PM% → Predicted Day Volume (with CI)
+        # PM% → Predicted Day Volume (with CI; PredVol >= PM)
         p_pm, p_lo, p_hi = _pm_pct_predict(mc_m, gap_pct, atr_usd, float_m, rvol, cat)
         pred_vol_m, ci68_l, ci68_u = predict_day_volume_from_pm(pm_vol_m, p_pm, p_lo, p_hi)
 
