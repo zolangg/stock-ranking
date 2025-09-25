@@ -1,9 +1,9 @@
-# app.py — Premarket Ranking (Direct DayVol + FT with SI% and PM% of Pred)
-# ------------------------------------------------------------------------
-# • DayVol: your fixed direct log-linear model (millions), clamped ≥ PM Vol.
-# • FT model (trained from workbook): standardized logistic on
-#     ln1p_pmvol, ln_gapf, catalyst, ln_atr, ln_mcap, ln1p_rvol, ln1p_pmmc,
-#     **ln1p_si**, **ln1p_pmfrac**  (NEW)
+# app.py — Premarket Ranking (Direct DayVol + FT with SI%, NO PM%)
+# ----------------------------------------------------------------
+# • DayVol: fixed direct log-linear model (millions), clamped ≥ PM Vol.
+# • FT model: standardized, weighted logistic using:
+#     ln1p_pmvol, ln_gapf, catalyst, ln_atr, ln_mcap, ln1p_rvol, ln1p_pmmc, ln1p_si
+#   (NO pmfrac / PM Vol % of Predicted Day)
 # • UI: Ranking + Markdown + delete rows + clear + downloads.
 
 import os
@@ -19,8 +19,8 @@ import pandas as pd
 import streamlit as st
 
 # ========== Page ==========
-st.set_page_config(page_title="Premarket Ranking — FT with SI% & PM%", layout="wide")
-st.title("Premarket Ranking — FT with SI% & PM% of Predicted Day")
+st.set_page_config(page_title="Premarket Ranking — FT (SI%, no PM%)", layout="wide")
+st.title("Premarket Ranking — FT with Short Interest (no PM%)")
 
 st.markdown("""
 <style>
@@ -35,7 +35,6 @@ st.markdown("""
 # ========== Sidebar ==========
 st.sidebar.header("Prediction Uncertainty")
 sigma_ln = st.sidebar.slider("DayVol log-space σ (CI68)", 0.10, 1.50, 0.60, 0.01)
-SHOW_DIAG = st.sidebar.checkbox("Show training diagnostics", True)
 
 # ========== Session ==========
 if "ART"   not in st.session_state: st.session_state.ART = {}
@@ -131,7 +130,6 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
         for c in cols:
             if n in nm[c]: return c
     return None
-
 def _parse_catalyst_col(series: pd.Series) -> pd.Series:
     s = series.astype("string").str.strip().str.lower()
     pos = {"1","true","yes","y","t"}
@@ -224,16 +222,7 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
     if "CAT" in col: df["catalyst"] = _parse_catalyst_col(raw[col["CAT"]])
     else: df["catalyst"] = 0.0
 
-    # Build PredDay from direct model and clamp ≥ PMVol (for PM%)
-    pred_day_direct = []
-    for i in range(len(df)):
-        r = df.iloc[i]
-        pred_m = predict_dayvol_m(_nz(r.get("mcap_m")), _nz(r.get("gap_pct")), _nz(r.get("atr_usd")))
-        pm_m   = _nz(r.get("pm_vol_m"), 0.0)
-        pred_day_direct.append(max(pm_m, pred_m))
-    df["pred_day_m"] = np.array(pred_day_direct, dtype=float)
-
-    # ===== FT feature set (includes SI% and PM% of Pred) =====
+    # ===== FT feature set (NO pmfrac) =====
     feats: List[Tuple[str, callable]] = [
         ("ln1p_pmvol",  lambda r: _safe_log(_nz(r.get("pm_vol_m"),0.0) + 1.0)),
         ("ln_gapf",     lambda r: _safe_log(_nz(r.get("gap_pct"),0.0) / 100.0)),
@@ -242,9 +231,7 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
         ("ln_mcap",     lambda r: _safe_log(r.get("mcap_m"))),
         ("ln1p_rvol",   lambda r: _safe_log(_nz(r.get("rvol"),0.0) + 1.0)),
         ("ln1p_pmmc",   lambda r: _safe_log(_nz(r.get("pm_dol_m"),0.0) / max(1e-6, _nz(r.get("mcap_m"),0.0)) + 1.0)),
-        # NEW:
-        ("ln1p_si",     lambda r: _safe_log(_nz(r.get("si_pct"),0.0) + 1.0)),  # SI% as percent, 0..100+
-        ("ln1p_pmfrac", lambda r: _safe_log(_nz(r.get("pm_vol_m"),0.0) / max(1e-6, _nz(r.get("pred_day_m"),0.0)) + 1.0)),
+        ("ln1p_si",     lambda r: _safe_log(_nz(r.get("si_pct"),0.0) + 1.0)),  # SI% as percent; robust
     ]
 
     # design matrix
@@ -287,10 +274,6 @@ def _learn(xls: pd.ExcelFile, sheet: str) -> None:
     st.session_state.ODDS_CUTS = odds_cuts
     st.session_state.GRADE_CUTS = grade_cuts
 
-    if SHOW_DIAG:
-        diag = pd.DataFrame({"feature":[n for n,_ in feats], "coef_z":coef_z}).sort_values("coef_z", key=np.abs, ascending=False)
-        st.dataframe(diac if False else diag, use_container_width=True, hide_index=True)
-
     st.success("Learning complete.")
 
 if learn_btn:
@@ -306,7 +289,7 @@ if learn_btn:
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
-# ========== Odds/Grade ==========
+# ========== Odds & Grade ==========
 def _prob_to_odds(p: float, cuts: Dict[str,float]) -> str:
     if p >= cuts.get("very_high",0.85): return "Very High Odds"
     if p >= cuts.get("high",0.70):      return "High Odds"
@@ -324,16 +307,14 @@ def _prob_to_grade(p: float, cuts: Dict[str,float]) -> str:
 # ========== Inference ==========
 def predict_ft_prob(gap_pct: float, pm_vol_m: float, catalyst: float,
                     atr_usd: float, mcap_m: float, rvol: float, pm_dol_m: float,
-                    si_pct: float, pred_day_m: float) -> float:
+                    si_pct: float) -> float:
     A = st.session_state.ART or {}
     names = A.get("feat_names") or []; mu = A.get("mu"); sd = A.get("sd")
     coef = A.get("coef_z"); bias = float(A.get("bias", 0.0))
     if not names or coef is None or mu is None or sd is None: return 0.50
 
-    pmfrac = _nz(pm_vol_m,0.0) / max(1e-6, _nz(pred_day_m,0.0))
-
     feat_map = {
-        "ln1p_pmvol":  lambda: _safe_log(_nz(pm_vol_m,0.0)+1.0),
+        "ln1p_pmvol":  lambda: _safe_log(_nz(pm_vol_m,0.0) + 1.0),
         "ln_gapf":     lambda: _safe_log(_nz(gap_pct,0.0)/100.0),
         "catalyst":    lambda: float(_nz(catalyst,0.0)),
         "ln_atr":      lambda: _safe_log(atr_usd),
@@ -341,7 +322,6 @@ def predict_ft_prob(gap_pct: float, pm_vol_m: float, catalyst: float,
         "ln1p_rvol":   lambda: _safe_log(_nz(rvol,0.0) + 1.0),
         "ln1p_pmmc":   lambda: _safe_log(_nz(pm_dol_m,0.0)/max(1e-6,_nz(mcap_m,0.0)) + 1.0),
         "ln1p_si":     lambda: _safe_log(_nz(si_pct,0.0) + 1.0),
-        "ln1p_pmfrac": lambda: _safe_log(pmfrac + 1.0),
     }
     vals = [float(feat_map[n]()) for n in names]
     Z = (np.array(vals) - mu) / sd
@@ -390,16 +370,16 @@ with tab_add:
         else:
             cat = 1.0 if catalyst_flag=="Yes" else 0.0
 
-            # DayVol via direct log model, clamp to PM
+            # DayVol via direct log model (and clamp to PM for sanity in the display & PM%-of-Pred metric)
             pred_vol_m = predict_dayvol_m(mc_m, gap_pct, atr_usd)
             pred_vol_m = max(pred_vol_m, _nz(pm_vol_m, 0.0))
             ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
 
-            # FT probability with new features (SI% + PM% of Pred)
+            # FT probability (NO pmfrac term)
             ft_prob = predict_ft_prob(
                 gap_pct=gap_pct, pm_vol_m=pm_vol_m, catalyst=cat,
                 atr_usd=atr_usd, mcap_m=mc_m, rvol=rvol, pm_dol_m=pm_dol_m,
-                si_pct=si_pct, pred_day_m=pred_vol_m
+                si_pct=si_pct
             )
 
             odds_cuts  = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
