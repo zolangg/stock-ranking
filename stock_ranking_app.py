@@ -1,12 +1,10 @@
-# app.py — Premarket Ranking (Direct Log Vol + FT WITHOUT pmfrac & fr)
-# -------------------------------------------------------------------
-# • Day Volume: your direct log-linear model (millions), clamped to ≥ 0; CI via sidebar σ.
-# • FT Classifier: logistic (L2), class-balanced, standardized (z-scores), clipped ±3σ,
-#   **NO pmfrac features** and **NO ln_fr**. Flow signal = ln1p_pmvol only.
-#   Features (if available): ln_gapf, ln_mcap, ln_atr, ln_float, ln1p_rvol, ln1p_pmvol, catalyst, optional maxpush_s.
-# • Intercept calibration to match training prevalence.
-# • UI: Add ➜ Ranking (+ Markdown view), Download, Delete rows (top 12), Clear.
-# • Catalyst yes/no supported. PredVol shown but NOT used by FT.
+# app.py — Premarket Stock Ranking — Direct Log Model (with robust catalyst + unit diagnostics)
+# ---------------------------------------------------------------------------------------------
+# • Day Volume prediction uses ONLY your direct log-linear model (millions), clamped: PredVol ≥ PM Vol.
+# • FT classifier learned from the workbook; features include ln(PredDay) + context. Optional non-neg on ln1p_pmvol.
+# • Robust catalyst parsing (Yes/No/True/False/1/0/"pr"/"news").
+# • Dataset unit diagnostics right after learning (quick sanity flags).
+# • UI: Ranking + Markdown (both downloadable), delete rows (top 12), Clear. No local paths, no notes.
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -21,8 +19,8 @@ import pandas as pd
 import streamlit as st
 
 # ============================== Page & CSS ==============================
-st.set_page_config(page_title="Premarket Stock Ranking — FT (no pmfrac / no fr)", layout="wide")
-st.title("Premarket Stock Ranking — FT (no pmfrac / no fr)")
+st.set_page_config(page_title="Premarket Stock Ranking — Direct Log Model", layout="wide")
+st.title("Premarket Stock Ranking — Direct Log Model")
 
 st.markdown("""
 <style>
@@ -34,15 +32,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ============================== Sidebar ==============================
-st.sidebar.header("Predicted Day Volume — CI (display only)")
-sigma_ln = st.sidebar.slider("Log-space σ for PredVol CI68", 0.10, 1.50, 0.60, 0.01,
-                             help="Std dev of residuals in ln(DayVol). 0.60 ≈ typical.")
+# ============================== Sidebar (confidence only) ==============================
+st.sidebar.header("Prediction Uncertainty")
+sigma_ln = st.sidebar.slider("Log-space σ (CI68)", 0.10, 1.50, 0.60, 0.01,
+                             help="Std dev of residuals in ln(DayVol). 0.60 is a sensible default.")
 
-st.sidebar.header("FT Flow Sensitivity")
-flow_sens = st.sidebar.slider("Flow sensitivity (ln1p_pmvol)", 0.5, 1.5, 1.00, 0.05,
-                              help="Scales the ln1p_pmvol feature after z-scoring.")
-st.session_state["FLOW_SENS"] = float(flow_sens)
+# Optional: do not allow negative weight on ln1p_pmvol in FT (prevents 'more PM flow -> lower FT').
+ENFORCE_NONNEG_FLOW = st.sidebar.checkbox("FT: enforce non-negative coef on ln1p_pmvol", True)
 
 # ============================== Session State ==============================
 if "ARTIFACTS" not in st.session_state: st.session_state.ARTIFACTS = {}
@@ -61,16 +57,15 @@ def _parse_local_float(s: str) -> Optional[float]:
     if "," in s and "." not in s: s = s.replace(",", ".")
     else: s = s.replace(",", "")
     try: return float(s)
-    except: return None
+    except Exception: return None
 
 def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
                 max_value: Optional[float] = None, decimals: int = 2,
                 key: Optional[str] = None, help: Optional[str] = None) -> float:
-    fmt = f"{{:.{decimals}f}}"
-    s = st.text_input(label, fmt.format(value), key=key, help=help)
+    fmt = f"{{:.{decimals}f}}"; s = st.text_input(label, fmt.format(value), key=key, help=help)
     v = _parse_local_float(s)
     if v is None: return float(value)
-    v = max(min_value, v)
+    v = max(min_value, v); 
     if max_value is not None: v = min(max_value, v)
     return float(v)
 
@@ -95,8 +90,7 @@ def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
         cells = []
         for c in keep:
             v = row[c]
-            if isinstance(v, float): cells.append(f"{v:.2f}")
-            else: cells.append(str(v))
+            cells.append(f"{v:.2f}" if isinstance(v, float) else str(v))
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -108,22 +102,20 @@ def do_rerun():
 _DEF = {
     "FT": ["FT"],
     "MAXPCT": ["Max Push Daily %", "Max Push Daily (%)", "Max Push %"],  # optional
-    "GAP": ["Gap %", "Gap", "Premarket Gap"],
+    "GAP": ["Gap %", "Gap"],
     "ATR": ["Daily ATR", "ATR $", "ATR", "ATR (USD)", "ATR$"],
     "RVOL": ["RVOL @ BO", "RVOL", "Relative Volume"],
-    "PMVOL": ["PM Vol (M)", "Premarket Vol (M)", "PM Volume (M)", "PM Shares (M)"],
-    "PM$": ["PM $Vol (M)", "PM Dollar Vol (M)", "PM $ Volume (M)", "PM $Vol"],  # optional
+    "PMVOL": ["PM Vol (M)", "Premarket Vol (M)", "PM Volume (M)"],
+    "PM$": ["PM $Vol (M)", "PM Dollar Vol (M)", "PM $ Volume (M)"],      # optional
     "FLOAT": ["Float M Shares", "Public Float (M)", "Float (M)", "Float"],
-    "MCAP": ["MarketCap M", "Market Cap (M)", "MCap M", "MCap"],
-    "SI": ["Short Interest %", "Short Float %", "Short Interest (Float) %", "SI"],
-    "DAILY": ["Daily Vol (M)", "Day Volume (M)", "Volume (M)"],  # optional (diagnostics only)
+    "MCAP": ["MarketCap M", "Market Cap (M)", "MCap M"],
+    "SI": ["Short Interest %", "Short Float %", "Short Interest (Float) %"],
+    "DAILY": ["Daily Vol (M)", "Day Volume (M)", "Volume (M)"],          # optional (diagnostics)
     "CAT": ["Catalyst", "News", "PR"],
 }
-
 def _norm(s: str) -> str:
     s = re.sub(r"\s+", " ", str(s).strip().lower())
     return s.replace("$","").replace("%","").replace("’","").replace("'","")
-
 def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = list(df.columns); nm = {c:_norm(c) for c in cols}
     for cand in candidates:
@@ -136,11 +128,26 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             if n in nm[c]: return c
     return None
 
-# ============================== Day Volume — Direct log-linear (display only) ==============================
+# ============================== Catalyst parsing (robust) ==============================
+def _parse_catalyst_col(series: pd.Series) -> pd.Series:
+    s = series.astype("string").str.strip().str.lower()
+    positives = {"1","true","yes","y","t"}
+    negatives = {"0","false","no","n","f",""}
+    out = []
+    for v in s.fillna(""):
+        if v in positives: out.append(1.0)
+        elif v in negatives: out.append(0.0)
+        elif "pr" in v or "news" in v or "catalyst" in v: out.append(1.0)
+        else:
+            try: out.append(float(v))
+            except: out.append(0.0)
+    return pd.Series(out, dtype=float).clip(0,1)
+
+# ============================== Direct log-linear DayVol (ONLY) ==============================
 def predict_day_volume_m_direct(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """
     ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$)
-    Returns Y in **millions of shares**
+    Returns Y in **millions of shares**.
     """
     e = 1e-6
     mc  = max(float(mcap_m or 0.0), 0.0)
@@ -152,22 +159,21 @@ def predict_day_volume_m_direct(mcap_m: float, gap_pct: float, atr_usd: float) -
 
 def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float) -> Tuple[float,float]:
     if pred_m <= 0: return 0.0, 0.0
-    low  = pred_m * math.exp(-z * sigma_ln)
-    high = pred_m * math.exp( z * sigma_ln)
-    return float(low), float(high)
+    return float(pred_m * math.exp(-z*sigma_ln)), float(pred_m * math.exp(z*sigma_ln))
 
-# ============================== Logistic with L2 + class weights ==============================
-def logit_fit_l2_weighted(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
-                          l2: float = 1.2, max_iter: int = 120, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
-    """Logistic regression via IRLS with L2 on weights (not intercept) and sample weights."""
+# ============================== Logistic with L2 + class balance (+ optional nonneg) ==============================
+def logit_fit_weighted(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
+                       l2: float = 1.0, max_iter: int = 100, tol: float = 1e-6,
+                       nonneg_idx: Optional[List[int]] = None) -> Tuple[np.ndarray, float]:
+    """IRLS with L2 and sample weights; optionally projects selected coef to ≥0 each step."""
     n, k = X.shape
     Xb = np.concatenate([np.ones((n,1)), X], axis=1)
     w = np.zeros(k+1)
-    R = np.eye(k+1); R[0,0] = 0.0; R *= float(l2)
+    R = np.eye(k+1); R[0,0] = 0.0; R *= l2
     for _ in range(max_iter):
         z = Xb @ w
         p = 1.0/(1.0 + np.exp(-np.clip(z, -35, 35)))
-        W = p*(1-p) * sample_w
+        W = p*(1-p)*sample_w
         if np.all(W < 1e-8): break
         WX = Xb * W[:, None]
         H = Xb.T @ WX + R
@@ -176,17 +182,17 @@ def logit_fit_l2_weighted(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
             delta = np.linalg.solve(H, g)
         except np.linalg.LinAlgError:
             delta = np.linalg.lstsq(H, g, rcond=None)[0]
-        w_new = w + delta
-        if np.linalg.norm(delta) < tol: w = w_new; break
-        w = w_new
+        w = w + delta
+        if nonneg_idx:
+            for j in nonneg_idx:
+                jj = j + 1  # skip intercept
+                if w[jj] < 0: w[jj] = 0.0
+        if np.linalg.norm(delta) < tol: break
     return w[1:].astype(float), float(w[0])
 
-def logit_inv(z: np.ndarray) -> np.ndarray:
-    z = np.clip(z, -35, 35)
-    return 1.0/(1.0 + np.exp(-z))
-
-def _clip_z(z: np.ndarray, lim: float = 3.0) -> np.ndarray:
-    return np.clip(z, -abs(lim), abs(lim))
+def logit_inv(z: float) -> float:
+    z = float(np.clip(z, -35, 35))
+    return 1.0/(1.0 + math.exp(-z))
 
 # ============================== Upload & Learn ==============================
 st.markdown('<div class="section-title">Upload workbook</div>', unsafe_allow_html=True)
@@ -202,133 +208,143 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     for key, cands in _DEF.items():
         pick = _pick(raw, cands)
         if pick: col[key] = pick
-
     if "FT" not in col:
         st.error("No 'FT' column found in sheet.")
         return
 
     df = pd.DataFrame()
-    # Force-binary FT
     ft_series = pd.to_numeric(raw[col["FT"]], errors="coerce")
     df["FT"] = (ft_series.fillna(0.0) >= 0.5).astype(float)
 
-    def _add(colname: str, key: str):
-        if key in col:
-            df[colname] = pd.to_numeric(raw[col[key]], errors="coerce")
+    def _add(colname: str, key: str): 
+        if key in col: df[colname] = pd.to_numeric(raw[col[key]], errors="coerce")
 
-    _add("gap_pct", "GAP")
-    _add("atr_usd", "ATR")
-    _add("rvol", "RVOL")
-    _add("pm_vol_m", "PMVOL")
-    _add("pm_dol_m", "PM$")
-    _add("float_m", "FLOAT")
-    _add("mcap_m", "MCAP")
-    _add("si_pct", "SI")
-    _add("daily_vol_m", "DAILY")  # optional (not used by FT)
-    if "CAT" in col:
-        df["catalyst"] = pd.to_numeric(raw[col["CAT"]], errors="coerce").clip(0,1).fillna(0.0)
-    else:
-        df["catalyst"] = 0.0
+    _add("gap_pct", "GAP"); _add("atr_usd", "ATR"); _add("rvol", "RVOL")
+    _add("pm_vol_m", "PMVOL"); _add("pm_dol_m", "PM$")
+    _add("float_m", "FLOAT"); _add("mcap_m", "MCAP"); _add("si_pct", "SI")
+    _add("daily_vol_m", "DAILY")
+
+    if "CAT" in col: df["catalyst"] = _parse_catalyst_col(raw[col["CAT"]])
+    else: df["catalyst"] = 0.0
+
     if "MAXPCT" in col:
         df["max_push_pct"] = pd.to_numeric(raw[col["MAXPCT"]], errors="coerce")
 
-    # ================= FT CLASSIFIER (NO pmfrac / NO fr) =================
-    # Feature builders
-    def _ln_gapf(r):    return _safe_log(_nz(r.get("gap_pct"),0.0)/100.0)
-    def _ln_mcap(r):    return _safe_log(r.get("mcap_m"))
-    def _ln_atr(r):     return _safe_log(r.get("atr_usd"))
-    def _ln_float(r):   return _safe_log(r.get("float_m"))
-    def _ln1p_rvol(r):  return _safe_log(1.0 + _nz(r.get("rvol"),0.0))
+    # Derived diagnostics
+    if {"pm_vol_m","float_m"}.issubset(df.columns):
+        df["fr_x"] = df["pm_vol_m"] / df["float_m"]
+    if {"pm_dol_m","mcap_m"}.issubset(df.columns):
+        df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
+
+    # ---------- Dataset unit diagnostics ----------
+    with st.expander("Dataset checks (medians & sanity flags)"):
+        med = {c: float(np.nanmedian(df[c])) for c in ["mcap_m","float_m","pm_vol_m","gap_pct","atr_usd"] if c in df.columns}
+        st.write("Medians (from uploaded):", med)
+        flags = []
+        if med.get("mcap_m", 0) > 50000: flags.append("⚠️ Median MCap > $50B — ensure units are **millions**.")
+        if med.get("float_m", 0) > 10000: flags.append("⚠️ Median Float > 10,000M — check units.")
+        if med.get("pm_vol_m", 0) > 1000: flags.append("⚠️ Median PM Vol > 1,000M — check units.")
+        if med.get("gap_pct", 0) < 1 and med.get("gap_pct", 0) > 0: flags.append("⚠️ Gap % looks like a fraction (e.g., 0.23). Enter as percent (23).")
+        if med.get("atr_usd", 0) > 20: flags.append("⚠️ ATR > $20 — double-check source/units.")
+        if flags: st.warning("\n".join(flags))
+        else: st.info("No obvious unit issues detected.")
+
+    # ---------- Build ln(PredDay) using DIRECT model (clamp to PMVol) ----------
+    pred_day_direct = []
+    for i in range(len(df)):
+        r = df.iloc[i]
+        pred_m = predict_day_volume_m_direct(_nz(r.get("mcap_m")), _nz(r.get("gap_pct")), _nz(r.get("atr_usd")))
+        pm_m   = _nz(r.get("pm_vol_m"), 0.0)
+        pred_day_direct.append(max(pm_m, pred_m))
+    df["pred_day_m"] = np.array(pred_day_direct, dtype=float)
+
+    # ===== Train FT classifier =====
     def _ln1p_pmvol(r): return _safe_log(_nz(r.get("pm_vol_m"),0.0) + 1.0)
-    def _catalyst(r):   return float(_nz(r.get("catalyst"),0.0))
-    def _maxpush_s(r):
+    def _ln_fr(r):
+        pm = _nz(r.get("pm_vol_m"),0.0); fl = _nz(r.get("float_m"),0.0)
+        return math.log(max(1e-6, pm / max(1e-6, fl)))
+    def _ln1p_pmmc(r):
+        pm_dol = _nz(r.get("pm_dol_m"),0.0); mc = _nz(r.get("mcap_m"),0.0)
+        return _safe_log(pm_dol / max(1e-6, mc) + 1.0)
+    def _scaled_maxpush(r):
         v = _nz(r.get("max_push_pct"), np.nan)
         return (v/100.0) if np.isfinite(v) else 0.0
 
-    # Select features (no ln_pmvol_f, no ln_fr)
-    F_LIST = [
-        ("ln_gapf", _ln_gapf, ["gap_pct"]),
-        ("ln_mcap", _ln_mcap, ["mcap_m"]),
-        ("ln_atr", _ln_atr, ["atr_usd"]),
-        ("ln_float", _ln_float, ["float_m"]),
-        ("ln1p_rvol", _ln1p_rvol, ["rvol"]),
-        ("ln1p_pmvol", _ln1p_pmvol, ["pm_vol_m"]),  # the ONLY flow signal
-        ("catalyst", _catalyst, ["catalyst"]),
-        ("maxpush_s", _maxpush_s, []),              # optional
+    ft_candidates = [
+        ("ln_mcap",      lambda r: _safe_log(r.get("mcap_m")),                         ["mcap_m"]),
+        ("ln_gapf",      lambda r: _safe_log(_nz(r.get("gap_pct"),0.0)/100.0),         ["gap_pct"]),
+        ("ln_atr",       lambda r: _safe_log(r.get("atr_usd")),                        ["atr_usd"]),
+        ("ln_float",     lambda r: _safe_log(r.get("float_m")),                        ["float_m"]),
+        ("ln1p_rvol",    lambda r: _safe_log(1.0 + _nz(r.get("rvol"),0.0)),            ["rvol"]),
+        ("ln1p_pmvol",   _ln1p_pmvol,                                                  ["pm_vol_m"]),
+        ("ln_fr",        _ln_fr,                                                       ["pm_vol_m","float_m"]),
+        ("ln1p_pmmc",    _ln1p_pmmc,                                                   ["pm_dol_m","mcap_m"]),
+        ("catalyst",     lambda r: float(_nz(r.get("catalyst"),0.0)),                  ["catalyst"]),
+        ("ln_pred_day",  lambda r: _safe_log(r.get("pred_day_m")),                     ["pred_day_m"]),
+        ("maxpush_s",    _scaled_maxpush,                                              []),  # optional, 0 if missing
     ]
-    use_feats = [(n,f,req) for (n,f,req) in F_LIST if all(k in df.columns for k in req) or n=="maxpush_s"]
-    if not use_feats:
+    ft_use = [(n,f,req) for (n,f,req) in ft_candidates if all(k in df.columns for k in req) or n=="maxpush_s"]
+
+    if not ft_use:
         st.error("No usable FT features found.")
         return
 
-    # Design matrix
-    X_raw = np.vstack([[f(df.iloc[i].to_dict()) for (n,f,_) in use_feats] for i in range(len(df))]).astype(float)
-    X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    Xft = np.vstack([[f(df.iloc[i].to_dict()) for (n,f,_) in ft_use] for i in range(len(df))]).astype(float)
+    Xft = np.nan_to_num(Xft, nan=0.0, posinf=0.0, neginf=0.0)
     y_ft = (np.nan_to_num(df["FT"].to_numpy(dtype=float), nan=0.0) >= 0.5).astype(float)
-    feat_names = [n for (n,_,_) in use_feats]
+    feat_names = [n for (n,_,_) in ft_use]
 
-    # Standardize
-    mu = X_raw.mean(axis=0)
-    sd = X_raw.std(axis=0, ddof=1); sd[sd == 0] = 1.0
-    X = (X_raw - mu) / sd
+    # Standardize + clip (stabilize fit)
+    mu = Xft.mean(axis=0)
+    sd = Xft.std(axis=0, ddof=1); sd[sd == 0] = 1.0
+    Z = (Xft - mu) / sd
+    Z = np.clip(Z, -3.0, 3.0)
 
-    # Clip z-scores
-    X = _clip_z(X, 3.0)
-    # Flow sensitivity on ln1p_pmvol only
-    for j, name in enumerate(feat_names):
-        if name == "ln1p_pmvol":
-            X[:, j] = _clip_z(X[:, j], 2.5) * st.session_state.get("FLOW_SENS", flow_sens)
-
-    # Class weights (prevalence balancing)
+    # Class weights (balance prevalence)
     p1 = float(np.mean(y_ft)) if y_ft.size else 0.5
     w1 = 0.5 / max(1e-9, p1); w0 = 0.5 / max(1e-9, 1.0 - p1)
     sample_w = np.where(y_ft > 0.5, w1, w0).astype(float)
 
-    # Fit
-    ft_coef = None; ft_bias = 0.0
-    if X.shape[0] >= 12 and np.unique(y_ft).size == 2 and X.shape[1] > 0:
-        ft_coef, ft_bias = logit_fit_l2_weighted(X, y_ft, sample_w, l2=1.2, max_iter=140, tol=1e-6)
+    # Optional non-negative constraint on ln1p_pmvol
+    nonneg_idx = []
+    if ENFORCE_NONNEG_FLOW and "ln1p_pmvol" in feat_names:
+        nonneg_idx.append(feat_names.index("ln1p_pmvol"))
 
-        # Intercept calibration (match base rate)
-        p_hat = logit_inv(ft_bias + X @ ft_coef)
-        p_hat = np.clip(p_hat, 1e-4, 1-1e-4)
-        p_bar = float(np.mean(y_ft)) if y_ft.size else 0.5
-        p_bar = float(np.clip(p_bar, 1e-4, 1-1e-4))
-        corr = math.log(p_bar/(1.0 - p_bar)) - math.log(np.mean(p_hat)/(1.0 - np.mean(p_hat)))
-        ft_bias = float(ft_bias + corr)
-
-        st.success(f"FT classifier trained (n={X.shape[0]}; feats: {', '.join(feat_names)}; base rate≈{p_bar:.2f}).")
-    else:
-        st.error("Unable to train FT classifier (need ≥12 rows, both classes, and valid features).")
-
-    # Cuts (quantile-based with floors)
-    if ft_coef is not None:
-        p_cal = logit_inv(ft_bias + X @ ft_coef)
-        def _q(p): return float(np.quantile(p_cal, p)) if p_cal.size else 0.5
-        odds_cuts = {
-            "very_high": max(0.85, _q(0.98)),
-            "high":      max(0.70, _q(0.90)),
-            "moderate":  max(0.55, _q(0.65)),
-            "low":       max(0.40, _q(0.35)),
-        }
-        grade_cuts = {
-            "App": max(0.92, _q(0.995)),
-            "Ap":  max(0.85, _q(0.97)),
-            "A":   max(0.75, _q(0.90)),
-            "B":   max(0.65, _q(0.65)),
-            "C":   max(0.50, _q(0.35)),
-        }
-    else:
-        odds_cuts = {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40}
-        grade_cuts = {"App":0.92,"Ap":0.85,"A":0.75,"B":0.65,"C":0.50}
+    ft_coef_z, ft_bias = logit_fit_weighted(Z, y_ft, sample_w, l2=1.0, max_iter=140, tol=1e-6, nonneg_idx=nonneg_idx)
 
     # Save artifacts
     st.session_state.ARTIFACTS = {
-        "ft_coef": ft_coef, "ft_bias": ft_bias,
         "feat_names": feat_names, "mu": mu, "sd": sd,
+        "ft_coef_z": ft_coef_z, "ft_bias": ft_bias,
+    }
+
+    # Calibration thresholds from train preds (with floors)
+    p_cal = 1.0/(1.0 + np.exp(-(ft_bias + Z @ ft_coef_z)))
+    def _q(p): return float(np.quantile(p_cal, p)) if p_cal.size else 0.5
+    odds_cuts = {
+        "very_high": max(0.85, _q(0.98)),
+        "high":      max(0.70, _q(0.90)),
+        "moderate":  max(0.55, _q(0.65)),
+        "low":       max(0.40, _q(0.35)),
+    }
+    grade_cuts = {
+        "App": max(0.92, _q(0.995)),
+        "Ap":  max(0.85, _q(0.97)),
+        "A":   max(0.75, _q(0.90)),
+        "B":   max(0.65, _q(0.65)),
+        "C":   max(0.50, _q(0.35)),
     }
     st.session_state.ODDS_CUTS = odds_cuts
     st.session_state.GRADE_CUTS = grade_cuts
+
+    # Quick coefficients table
+    coefs_tbl = pd.DataFrame({
+        "feature": feat_names,
+        "coef_z":  ft_coef_z
+    }).sort_values("coef_z", ascending=False, key=np.abs)
+    st.dataframe(coefs_tbl, use_container_width=True, hide_index=True)
+
+    st.success(f"FT classifier trained (n={Z.shape[0]}; feats: {', '.join(feat_names)}; base FT≈{p1:.2f}).")
     st.success("Learning complete.")
 
 if learn_btn:
@@ -344,47 +360,47 @@ if learn_btn:
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
-# ============================== Inference (FT with ln1p_pmvol only for flow) ==============================
-def predict_ft_prob_no_pmfrac(mc_m: float, gap_pct: float, atr_usd: float, float_m: float, si_pct: float,
-                              rvol: float, pm_vol_m: float, pm_dol_m: float, catalyst: float) -> float:
+# ============================== Inference ==============================
+def predict_ft_prob_direct(mc_m: float, gap_pct: float, atr_usd: float, float_m: float, si_pct: float,
+                           rvol: float, pm_vol_m: float, pm_dol_m: float, catalyst: float,
+                           maxpush_pct_live: Optional[float] = None) -> float:
     A = st.session_state.ARTIFACTS or {}
-    coef = A.get("ft_coef"); bias = float(A.get("ft_bias") or 0.0)
-    names = A.get("feat_names") or []
-    mu = A.get("mu"); sd = A.get("sd")
-    if coef is None or mu is None or sd is None or not names:
-        return 0.50
+    names = A.get("feat_names") or []; mu = A.get("mu"); sd = A.get("sd")
+    coef_z = A.get("ft_coef_z"); bias = float(A.get("ft_bias") or 0.0)
+    if not names or coef_z is None or mu is None or sd is None: return 0.50
 
-    # Feature builders — mirror training exactly
-    def _ln_gapf():    return _safe_log(_nz(gap_pct,0.0)/100.0)
-    def _ln_mcap():    return _safe_log(mc_m)
-    def _ln_atr():     return _safe_log(atr_usd)
-    def _ln_float():   return _safe_log(float_m)
-    def _ln1p_rvol():  return _safe_log(1.0 + _nz(rvol,0.0))
+    # Predicted Day Vol from DIRECT model (clamped to PMVol)
+    pred_day_m = max(_nz(pm_vol_m,0.0), predict_day_volume_m_direct(mc_m, gap_pct, atr_usd))
+
     def _ln1p_pmvol(): return _safe_log(_nz(pm_vol_m,0.0) + 1.0)
-    def _catalyst():   return float(_nz(catalyst,0.0))
-    def _maxpush_s():  return 0.0  # no live value; safe default
+    def _ln_fr():
+        pm = _nz(pm_vol_m,0.0); fl = _nz(float_m,0.0)
+        return math.log(max(1e-6, pm / max(1e-6, fl)))
+    def _ln1p_pmmc():
+        pm_dol = _nz(pm_dol_m,0.0); mc = _nz(mc_m,0.0)
+        return _safe_log(pm_dol / max(1e-6, mc) + 1.0)
+    def _maxpush_s():
+        v = _nz(maxpush_pct_live, np.nan)
+        return (v/100.0) if np.isfinite(v) else 0.0
 
-    feat_lookup = {
-        "ln_gapf": _ln_gapf,
-        "ln_mcap": _ln_mcap,
-        "ln_atr": _ln_atr,
-        "ln_float": _ln_float,
-        "ln1p_rvol": _ln1p_rvol,
-        "ln1p_pmvol": _ln1p_pmvol,
-        "catalyst": _catalyst,
-        "maxpush_s": _maxpush_s,
+    feat_map = {
+        "ln_mcap":     lambda: _safe_log(mc_m),
+        "ln_gapf":     lambda: _safe_log(_nz(gap_pct,0.0)/100.0),
+        "ln_atr":      lambda: _safe_log(atr_usd),
+        "ln_float":    lambda: _safe_log(float_m),
+        "ln1p_rvol":   lambda: _safe_log(1.0 + _nz(rvol,0.0)),
+        "ln1p_pmvol":  _ln1p_pmvol,
+        "ln_fr":       _ln_fr,
+        "ln1p_pmmc":   _ln1p_pmmc,
+        "catalyst":    lambda: float(_nz(catalyst,0.0)),
+        "ln_pred_day": lambda: _safe_log(pred_day_m),
+        "maxpush_s":   _maxpush_s,
     }
-    vals_raw = [float(feat_lookup[n]()) for n in names]
-    X = (np.array(vals_raw, dtype=float) - mu) / sd
+    vals_raw = [float(feat_map[n]()) for n in names]
+    Z = (np.array(vals_raw) - mu) / sd
+    Z = np.clip(Z, -3.0, 3.0)
 
-    # Same clipping and flow scaling
-    X = _clip_z(X, 3.0)
-    for j, name in enumerate(names):
-        if name == "ln1p_pmvol":
-            X[j] = np.clip(X[j], -2.5, 2.5) * st.session_state.get("FLOW_SENS", flow_sens)
-
-    p = float(logit_inv(bias + np.dot(X, coef)))
-    return float(np.clip(p, 1e-3, 1-1e-3))
+    return float(np.clip(1.0/(1.0 + np.exp(-(bias + np.dot(Z, coef_z)))), 1e-3, 1-1e-3))
 
 def _prob_to_odds(prob: float, cuts: Dict[str, float]) -> str:
     if prob >= cuts.get("very_high",0.85): return "Very High Odds"
@@ -400,6 +416,9 @@ def _prob_to_grade(prob: float, cuts: Dict[str, float]) -> str:
     if prob >= cuts.get("B",0.65):   return "B"
     if prob >= cuts.get("C",0.50):   return "C"
     return "D"
+
+def _odds_and_grade(p: float) -> Tuple[str,str]:
+    return _prob_to_odds(p, st.session_state.get("ODDS_CUTS", {})), _prob_to_grade(p, st.session_state.get("GRADE_CUTS", {}))
 
 # ============================== Tabs ==============================
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -427,17 +446,16 @@ with tab_add:
     if submitted and ticker:
         cat = 1.0 if catalyst_flag=="Yes" else 0.0
 
-        # Predicted day volume (display only)
+        # Direct model → Predicted Day Volume (millions), clamp to PM
         pred_vol_m = predict_day_volume_m_direct(mc_m, gap_pct, atr_usd)
+        pred_vol_m = max(pred_vol_m, _nz(pm_vol_m, 0.0))
+
+        # Confidence bands (68%)
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
 
-        # FT probability (NO pmfrac, NO fr)
-        ft_prob = predict_ft_prob_no_pmfrac(mc_m, gap_pct, atr_usd, float_m, si_pct, rvol, pm_vol_m, pm_dol_m, cat)
-
-        odds_cuts = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
-        grade_cuts = st.session_state.get("GRADE_CUTS", {"App":0.92,"Ap":0.85,"A":0.75,"B":0.65,"C":0.50})
-        odds_name = _prob_to_odds(ft_prob, odds_cuts)
-        level     = _prob_to_grade(ft_prob, grade_cuts)
+        # FT probability
+        ft_prob = predict_ft_prob_direct(mc_m, gap_pct, atr_usd, float_m, si_pct, rvol, pm_vol_m, pm_dol_m, cat)
+        odds_name, level = _odds_and_grade(ft_prob)
 
         row = {
             "Ticker": ticker,
@@ -449,11 +467,11 @@ with tab_add:
             "PredVol_CI68_L": round(ci68_l, 2),
             "PredVol_CI68_U": round(ci68_u, 2),
 
-            # Diagnostics (display-only fields)
+            # Display helpers
             "PM%_of_Pred": round(100.0 * _nz(pm_vol_m,0.0) / max(1e-6, pred_vol_m), 1),
             "PM$ / MC_%": round(100.0 * _nz(pm_dol_m,0.0) / max(1e-6, _nz(mc_m,0.0)), 1),
 
-            # raw inputs for CSV
+            # raw inputs for CSV (kept hidden in UI)
             "_MCap_M": mc_m, "_Gap_%": gap_pct, "_ATR_$": atr_usd, "_PM_M": pm_vol_m,
             "_Float_M": float_m, "_SI_%": si_pct, "_RVOL": rvol, "_PM$_M": pm_dol_m, "_Catalyst": cat,
         }
@@ -525,14 +543,14 @@ with tab_rank:
                     st.session_state.rows = keep.to_dict(orient="records")
                     do_rerun()
 
-        # Download CSV
+        # Download CSV (Ranking view)
         st.download_button(
             "Download CSV (Ranking)",
             df[cols_to_show].to_csv(index=False).encode("utf-8"),
             "ranking.csv", "text/csv", use_container_width=True
         )
 
-        # Markdown table view + download
+        # Markdown table (below ranking) + download + clear
         st.markdown("### 📋 Ranking (Markdown view)")
         md_text = df_to_markdown_table(df, cols_to_show)
         st.code(md_text, language="markdown")
@@ -542,7 +560,6 @@ with tab_rank:
             "ranking.md", "text/markdown", use_container_width=True
         )
 
-        # Clear Ranking
         c1, _ = st.columns([0.25, 0.75])
         with c1:
             if st.button("Clear Ranking", use_container_width=True):
