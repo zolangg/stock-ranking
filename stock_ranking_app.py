@@ -1,10 +1,10 @@
-# app.py — Premarket Ranking (Direct Log Model + FT with ln_fr & ln1p_pmvol, no ln_pmvol_f)
+# app.py — Premarket Ranking (Direct Log Model + FT with ln_pmvol_f & ln1p_pmvol, no ln_fr)
 # ----------------------------------------------------------------------------------------
 # • Day Volume: ONLY your direct log model (clamped to ≥ PM Vol), CI from sidebar σ.
-# • FT Classifier: logistic, standardized (mean/std), z-scores clipped to ±3, with intercept calibration.
-#   Features used (if present): ln_gapf, ln_mcap, ln_atr, ln_float, ln1p_rvol, ln1p_pmvol, ln_fr, catalyst, optional maxpush_s.
-#   IMPORTANT: No ln_pmvol_f anywhere.
-# • UI: Ranking table + Markdown table, Download, Delete rows, Clear.
+# • FT Classifier: logistic, standardized (mean/std), z-scores clipped (±3; flow ±2), mild L2, intercept calibration.
+#   Features (if present): ln_gapf, ln_mcap, ln_atr, ln_float, ln1p_rvol, ln1p_pmvol, ln_pmvol_f (winsorized), catalyst, optional maxpush_s.
+#   IMPORTANT: No ln_fr anywhere. pmfrac = PMVol/PredDay is capped at 0.80 before ln(1+pmfrac).
+# • UI: Ranking table + Markdown table, Download, Delete rows (top 12), Clear.
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -19,8 +19,8 @@ import pandas as pd
 import streamlit as st
 
 # ============================== Page & CSS ==============================
-st.set_page_config(page_title="Premarket Stock Ranking — Flow FT (ln_fr + ln1p_pmvol)", layout="wide")
-st.title("Premarket Stock Ranking — Flow FT (ln_fr + ln1p_pmvol)")
+st.set_page_config(page_title="Premarket Stock Ranking — PM% FT (safe)", layout="wide")
+st.title("Premarket Stock Ranking — PM% FT (safe)")
 
 st.markdown(
     """
@@ -35,10 +35,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ============================== Sidebar (uncertainty) ==============================
-st.sidebar.header("Prediction Uncertainty")
+# ============================== Sidebar ==============================
+st.sidebar.header("PredVol CI")
 sigma_ln = st.sidebar.slider("Log-space σ for PredVol CI68", 0.10, 1.50, 0.60, 0.01,
                              help="Std dev of residuals in ln(DayVol). 0.60 ≈ typical.")
+
+st.sidebar.header("FT Flow Sensitivity")
+flow_sens = st.sidebar.slider("Flow sensitivity (ln_pmvol_f & ln1p_pmvol)", 0.5, 1.2, 0.85, 0.05,
+                              help="Scales the two flow features to reduce 'waves' without losing direction.")
+st.session_state["FLOW_SENS"] = flow_sens
 
 # ============================== Session State ==============================
 if "ARTIFACTS" not in st.session_state: st.session_state.ARTIFACTS = {}
@@ -120,7 +125,7 @@ _DEF = {
     "FLOAT": ["Float M Shares", "Public Float (M)", "Float (M)", "Float"],
     "MCAP": ["MarketCap M", "Market Cap (M)", "MCap M", "MCap"],
     "SI": ["Short Interest %", "Short Float %", "Short Interest (Float) %", "SI"],
-    "DAILY": ["Daily Vol (M)", "Day Volume (M)", "Volume (M)"],  # optional (for diagnostics only)
+    "DAILY": ["Daily Vol (M)", "Day Volume (M)", "Volume (M)"],  # optional (diagnostics only)
     "CAT": ["Catalyst", "News", "PR"],
 }
 
@@ -190,14 +195,14 @@ def logit_inv(z: np.ndarray) -> np.ndarray:
     z = np.clip(z, -35, 35)
     return 1.0/(1.0 + np.exp(-z))
 
+def _clip_z(z: np.ndarray, lim: float = 3.0) -> np.ndarray:
+    return np.clip(z, -abs(lim), abs(lim))
+
 # ============================== Upload & Learn ==============================
 st.markdown('<div class="section-title">Upload workbook</div>', unsafe_allow_html=True)
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], label_visibility="collapsed")
 sheet_name = st.text_input("Sheet name", "PMH BO Merged")
 learn_btn = st.button("Learn from uploaded sheet", use_container_width=True)
-
-def _clip_z(z: np.ndarray, lim: float = 3.0) -> np.ndarray:
-    return np.clip(z, -abs(lim), abs(lim))
 
 def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     raw = pd.read_excel(xls, sheet)
@@ -229,7 +234,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     _add("float_m", "FLOAT")
     _add("mcap_m", "MCAP")
     _add("si_pct", "SI")
-    _add("daily_vol_m", "DAILY")  # optional, not required for FT
+    _add("daily_vol_m", "DAILY")  # optional; not used by FT
     if "CAT" in col:
         df["catalyst"] = pd.to_numeric(raw[col["CAT"]], errors="coerce").clip(0,1).fillna(0.0)
     else:
@@ -237,29 +242,33 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     if "MAXPCT" in col:
         df["max_push_pct"] = pd.to_numeric(raw[col["MAXPCT"]], errors="coerce")
 
-    # Derived for diagnostics (not required)
-    if {"pm_vol_m","float_m"}.issubset(df.columns):
-        df["fr_x"] = df["pm_vol_m"] / df["float_m"]
-    if {"pm_dol_m","mcap_m"}.issubset(df.columns):
-        df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
+    # ---- Predicted Day (DIRECT model) per row; clamp to PM for stability of pmfrac ----
+    pred_day_direct = []
+    for i in range(len(df)):
+        r = df.iloc[i]
+        pred_m = predict_day_volume_m_direct(_nz(r.get("mcap_m")), _nz(r.get("gap_pct")), _nz(r.get("atr_usd")))
+        pm_m   = _nz(r.get("pm_vol_m"), 0.0)
+        pred_day_direct.append(max(pm_m, pred_m))
+    df["pred_day_m"] = np.array(pred_day_direct, dtype=float)
 
-    # ================= FT CLASSIFIER (no PredDay/pmvol_f) =================
-    # Feature builders
+    # ================= FT CLASSIFIER (PM% core, safe) =================
     def _ln_gapf(r):    return _safe_log(_nz(r.get("gap_pct"),0.0)/100.0)
     def _ln_mcap(r):    return _safe_log(r.get("mcap_m"))
     def _ln_atr(r):     return _safe_log(r.get("atr_usd"))
     def _ln_float(r):   return _safe_log(r.get("float_m"))
     def _ln1p_rvol(r):  return _safe_log(1.0 + _nz(r.get("rvol"),0.0))
     def _ln1p_pmvol(r): return _safe_log(_nz(r.get("pm_vol_m"),0.0) + 1.0)
-    def _ln_fr(r):
-        pm = _nz(r.get("pm_vol_m"),0.0); fl = _nz(r.get("float_m"),0.0)
-        return math.log(max(1e-6, pm / max(1e-6, fl)))
+    def _ln_pmvol_f(r):
+        pm = _nz(r.get("pm_vol_m"),0.0); pred = _nz(r.get("pred_day_m"),0.0)
+        pmfrac = 0.0 if pred <= 0 else pm / pred
+        pmfrac = float(np.clip(pmfrac, 0.0, 0.80))  # winsorize to stop “downer”
+        return _safe_log(1.0 + pmfrac)
     def _catalyst(r):   return float(_nz(r.get("catalyst"),0.0))
     def _maxpush_s(r):
         v = _nz(r.get("max_push_pct"), np.nan)
         return (v/100.0) if np.isfinite(v) else 0.0  # safe optional
 
-    # Select available features (enforce flow block = ln_fr + ln1p_pmvol; no ln_pmvol_f)
+    # Features (NO ln_fr; keep PM% core + level)
     F_LIST = [
         ("ln_gapf", _ln_gapf, ["gap_pct"]),
         ("ln_mcap", _ln_mcap, ["mcap_m"]),
@@ -267,31 +276,36 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         ("ln_float", _ln_float, ["float_m"]),
         ("ln1p_rvol", _ln1p_rvol, ["rvol"]),
         ("ln1p_pmvol", _ln1p_pmvol, ["pm_vol_m"]),
-        ("ln_fr", _ln_fr, ["pm_vol_m","float_m"]),
+        ("ln_pmvol_f", _ln_pmvol_f, ["pm_vol_m","pred_day_m"]),
         ("catalyst", _catalyst, ["catalyst"]),
-        ("maxpush_s", _maxpush_s, []),  # optional: 0 if missing
+        ("maxpush_s", _maxpush_s, []),  # optional
     ]
     use_feats = [(n,f,req) for (n,f,req) in F_LIST if all(k in df.columns for k in req) or n=="maxpush_s"]
-
     if not use_feats:
         st.error("No usable FT features found.")
         return
 
-    # Build design matrix
+    # Design matrix
     X_raw = np.vstack([[f(df.iloc[i].to_dict()) for (n,f,_) in use_feats] for i in range(len(df))]).astype(float)
     X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
     y_ft = (np.nan_to_num(df["FT"].to_numpy(dtype=float), nan=0.0) >= 0.5).astype(float)
+    feat_names = [n for (n,_,_) in use_feats]
 
-    # Standardize features (mean/std on training) + clip z to ±3
+    # Standardize (mean/std on training)
     mu = X_raw.mean(axis=0)
     sd = X_raw.std(axis=0, ddof=1)
     sd[sd == 0] = 1.0
     X = (X_raw - mu) / sd
+
+    # Global clip ±3
     X = _clip_z(X, 3.0)
+    # Flow features tighter clip ±2 and scaled by flow_sens
+    for j, name in enumerate(feat_names):
+        if name in ("ln_pmvol_f", "ln1p_pmvol"):
+            X[:, j] = _clip_z(X[:, j], 2.0) * st.session_state.get("FLOW_SENS", flow_sens)
 
     # Fit with mild L2
     ft_coef = None; ft_bias = 0.0
-    feat_names = [n for (n,_,_) in use_feats]
     if X.shape[0] >= 12 and np.unique(y_ft).size == 2 and X.shape[1] > 0:
         ft_coef, ft_bias = logit_fit_l2(X, y_ft, l2=1.2, max_iter=120, tol=1e-6)
 
@@ -307,7 +321,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     else:
         st.error("Unable to train FT classifier (need ≥12 rows, both classes, and valid features).")
 
-    # Calibrated cuts from train predictions (with floors)
+    # Calibrated cuts (with sensible floors)
     if ft_coef is not None:
         p_cal = logit_inv(ft_bias + X @ ft_coef)
         def _q(p): return float(np.quantile(p_cal, p)) if p_cal.size else 0.5
@@ -350,9 +364,9 @@ if learn_btn:
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
-# ============================== Inference (FT with ln_fr & ln1p_pmvol only) ==============================
-def predict_ft_prob_flow(mc_m: float, gap_pct: float, atr_usd: float, float_m: float, si_pct: float,
-                         rvol: float, pm_vol_m: float, pm_dol_m: float, catalyst: float) -> float:
+# ============================== Inference (FT with ln_pmvol_f + ln1p_pmvol; no ln_fr) ==============================
+def predict_ft_prob_pmfrac(mc_m: float, gap_pct: float, atr_usd: float, float_m: float, si_pct: float,
+                           rvol: float, pm_vol_m: float, pm_dol_m: float, catalyst: float) -> float:
     A = st.session_state.ARTIFACTS or {}
     coef = A.get("ft_coef"); bias = float(A.get("ft_bias") or 0.0)
     names = A.get("feat_names") or []
@@ -360,18 +374,23 @@ def predict_ft_prob_flow(mc_m: float, gap_pct: float, atr_usd: float, float_m: f
     if coef is None or mu is None or sd is None or not names:
         return 0.50
 
-    # Feature builders (mirror training; NO PredDay/pmvol_f here)
+    # Build PredDay from DIRECT model (clamp to PM for stability)
+    pred_day_m = max(_nz(pm_vol_m,0.0), predict_day_volume_m_direct(mc_m, gap_pct, atr_usd))
+
+    # Feature builders
     def _ln_gapf():    return _safe_log(_nz(gap_pct,0.0)/100.0)
     def _ln_mcap():    return _safe_log(mc_m)
     def _ln_atr():     return _safe_log(atr_usd)
     def _ln_float():   return _safe_log(float_m)
     def _ln1p_rvol():  return _safe_log(1.0 + _nz(rvol,0.0))
     def _ln1p_pmvol(): return _safe_log(_nz(pm_vol_m,0.0) + 1.0)
-    def _ln_fr():
-        pm = _nz(pm_vol_m,0.0); fl = _nz(float_m,0.0)
-        return math.log(max(1e-6, pm / max(1e-6, fl)))
+    def _ln_pmvol_f():
+        pm = _nz(pm_vol_m,0.0); pred = _nz(pred_day_m,0.0)
+        pmfrac = 0.0 if pred <= 0 else pm / pred
+        pmfrac = float(np.clip(pmfrac, 0.0, 0.80))  # same winsorization as training
+        return _safe_log(1.0 + pmfrac)
     def _catalyst():   return float(_nz(catalyst,0.0))
-    def _maxpush_s():  return 0.0  # no live input; safe default
+    def _maxpush_s():  return 0.0  # safe default (no live input)
 
     feat_lookup = {
         "ln_gapf": _ln_gapf,
@@ -380,13 +399,18 @@ def predict_ft_prob_flow(mc_m: float, gap_pct: float, atr_usd: float, float_m: f
         "ln_float": _ln_float,
         "ln1p_rvol": _ln1p_rvol,
         "ln1p_pmvol": _ln1p_pmvol,
-        "ln_fr": _ln_fr,
+        "ln_pmvol_f": _ln_pmvol_f,
         "catalyst": _catalyst,
         "maxpush_s": _maxpush_s,
     }
     vals_raw = [float(feat_lookup[n]()) for n in names]
     X = (np.array(vals_raw, dtype=float) - mu) / sd
+
+    # Same clipping and flow scaling as training
     X = _clip_z(X, 3.0)
+    for j, name in enumerate(names):
+        if name in ("ln_pmvol_f", "ln1p_pmvol"):
+            X[j] = np.clip(X[j], -2.0, 2.0) * st.session_state.get("FLOW_SENS", flow_sens)
 
     p = float(logit_inv(bias + np.dot(X, coef)))
     return float(np.clip(p, 1e-3, 1-1e-3))
@@ -439,8 +463,8 @@ with tab_add:
         # Confidence bands (68%)
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
 
-        # FT probability (flow model)
-        ft_prob = predict_ft_prob_flow(mc_m, gap_pct, atr_usd, float_m, si_pct, rvol, pm_vol_m, pm_dol_m, cat)
+        # FT probability (PM% core; safe)
+        ft_prob = predict_ft_prob_pmfrac(mc_m, gap_pct, atr_usd, float_m, si_pct, rvol, pm_vol_m, pm_dol_m, cat)
         odds_cuts = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
         grade_cuts = st.session_state.get("GRADE_CUTS", {"App":0.92,"Ap":0.85,"A":0.75,"B":0.65,"C":0.50})
         odds_name = _prob_to_odds(ft_prob, odds_cuts)
