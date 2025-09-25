@@ -163,33 +163,28 @@ def grade(score_pct: float) -> str:
             "B"   if score_pct >= 60 else
             "C"   if score_pct >= 45 else "D")
 
-# ---------- Prediction model (fixed; SI as fraction; FR = PM/Float) ----------
+# ---------- New premarket day-volume model (millions out) ----------
 def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """
-    Premarket day-volume model (pooled log–log OLS).
-    Inputs:
-      mcap_m  = market cap in millions of $
-      gap_pct = gap as PERCENT (e.g., 10 for 10%)
-      atr_usd = ATR in $
-    Returns:
-      predicted daily volume in **millions of shares**
+    ln(Y) = 3.1435
+            + 0.1608*ln(MCap_M)
+            + 0.6704*ln(Gap_frac)        # Gap_frac = Gap_% / 100
+            - 0.3878*ln(ATR_$)
+    Returns Y in **millions of shares**
     """
-    import math
-    # convert % -> fraction (CRITICAL)
-    gp = max(float(gap_pct) if gap_pct is not None else 0.0, 0.0) / 100.0
-
-    # tiny eps for logs
-    e1 = e2 = e3 = 1e-6
+    e = 1e-6
+    mc = max(float(mcap_m or 0.0), 0.0)
+    gp = max(float(gap_pct or 0.0), 0.0) / 100.0
+    atr = max(float(atr_usd or 0.0), 0.0)
 
     ln_y = (
         3.1435
-        + 0.1608 * math.log(max(float(mcap_m) if mcap_m is not None else 0.0, 0.0) + e1)
-        + 0.6704 * math.log(gp + e2)
-        - 0.3878 * math.log(max(float(atr_usd) if atr_usd is not None else 0.0, 0.0) + e3)
+        + 0.1608 * math.log(mc + e)
+        + 0.6704 * math.log(gp + e)
+        - 0.3878 * math.log(atr + e)
     )
-    # model outputs **millions** already
-    return math.exp(ln_y)
-    
+    return math.exp(ln_y)  # already in millions
+
 def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
     flags = []
     # Unit sanity
@@ -202,7 +197,6 @@ def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
     # Adaptive FR threshold by float size
     fr = (pm_vol_m / max(float_m, 1e-12)) if float_m > 0 else 0.0
     if float_m <= 1.0:
-        # micro-float: allow much higher rotations
         if fr > 60: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× is extreme even for micro-float.")
     elif float_m <= 5.0:
         if fr > 20: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× is unusually high.")
@@ -212,43 +206,20 @@ def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
         if fr > 3.0: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× may indicate unit mismatch.")
     return flags
 
-def ln_terms_for_display(mc_m, si_pct, atr_usd, pm_vol_m, float_m, catalyst):
-    eps = 1e-12
-    mc = max(mc_m, eps)
-    si_fr = max(si_pct, 0.0) / 100.0
-    atr = max(atr_usd, 0.0)
-    pm  = max(pm_vol_m, 0.0)
-    flt = max(float_m, eps)
-    fr  = pm / flt
-
-    t0 = 5.307
-    t1 = -0.015481 * math.log(mc)
-    t2 =  1.007036 * math.log1p(si_fr)
-    t3 = -1.267843 * math.log1p(atr)
-    t4 =  0.114066 * math.log1p(fr)
-    t5 =  0.074    * float(catalyst)
-    lnY = t0 + t1 + t2 + t3 + t4 + t5
+def ln_terms_for_display(mcap_m, gap_pct, atr_usd):
+    e = 1e-6
+    t0 = 3.1435
+    t1 = 0.1608 * math.log(max(float(mcap_m or 0.0), 0.0) + e)
+    t2 = 0.6704 * math.log(max(float(gap_pct or 0.0), 0.0) / 100.0 + e)
+    t3 = -0.3878 * math.log(max(float(atr_usd or 0.0), 0.0) + e)
+    lnY = t0 + t1 + t2 + t3
     Y   = math.exp(lnY)
-
     return {
-        "inputs_expected_units": {
-            "MCap (millions $)": mc_m,
-            "SI (%)": si_pct,
-            "ATR ($)": atr_usd,
-            "PM Volume (millions shares)": pm_vol_m,
-            "Float (millions shares)": float_m,
-            "Catalyst (-1..+1)": catalyst,
-        },
-        "derived": {
-            "FR = PM/Float (×)": fr
-        },
         "ln_components": {
             "base": t0,
-            "−0.015481 ln(MCap)": t1,
-            "+1.007036 ln(1+SI_frac)": t2,
-            "−1.267843 ln(1+ATR)": t3,
-            "+0.114066 ln(1+FR)": t4,
-            "+0.074 Catalyst": t5,
+            "+0.1608 ln(MCap M)": t1,
+            "+0.6704 ln(Gap frac)": t2,
+            "−0.3878 ln(ATR $)": t3,
             "lnY total": lnY
         },
         "Predicted Y (millions shares)": Y
@@ -264,6 +235,82 @@ def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
     low  = pred_m * math.exp(-z * sigma_ln)
     high = pred_m * math.exp( z * sigma_ln)
     return low, high
+
+# ---------- FT model params (REPLACE with your trained values) ----------
+# If you paste your trained params, delete the placeholder block below.
+_FT_INTERCEPT = -0.20     # TODO: paste trained intercept
+_FT_COEF = {              # TODO: paste trained coefficients for selected features
+    # keys must be in this set: {'ln_float','ln_mcap','ln_atr','ln_gapf','ln_pmvol_f','ln_pmvol_m','ln_fr','catalyst'}
+    'ln_gapf':    1.20,
+    'ln_pmvol_f': 0.80,
+    'ln_fr':      0.30,
+    'ln_pmvol_m': 0.10,
+    'ln_mcap':   -0.40,
+    'ln_atr':    -0.30,
+    'ln_float':  -0.20,
+    'catalyst':   0.40,
+}
+# Standardization used at train time: z = (x - mean)/scale
+_FT_MEAN = {k: 0.0 for k in _FT_COEF.keys()}   # TODO: paste trained feature means
+_FT_SCALE= {k: 1.0 for k in _FT_COEF.keys()}   # TODO: paste trained feature scales (std dev)
+
+def _std(x, m, s):
+    s = float(s) if s not in (None, 0.0) else 1.0
+    return (x - float(m)) / s
+
+# ===== FT probability model (uses ONLY Predicted Day Volume as denominator) =====
+def predict_ft_prob_premarket(float_m: float, mcap_m: float, atr_usd: float,
+                              gap_pct: float, pm_vol_m: float,
+                              pred_vol_m: float,
+                              catalyst_flag: int = 0) -> float:
+    """
+    FT probability model (premarket).
+    PM % of day = PM Vol (M) / Predicted Day Volume (M)
+    """
+    e = 1e-6
+
+    # Base transforms
+    ln_float   = math.log(max(float_m, e))
+    ln_mcap    = math.log(max(mcap_m, e))
+    ln_atr     = math.log(max(atr_usd, e))
+    ln_gapf    = math.log(max(gap_pct, 0.0)/100.0 + e)
+
+    # PM volume levels + float rotation (kept)
+    ln_pmvol_m = math.log(max(pm_vol_m, 0.0) + 1.0)
+    fr         = (pm_vol_m / max(float_m, e)) if float_m > 0 else 0.0
+    ln_fr      = math.log(fr + 1.0)
+
+    # PM fraction of predicted day volume
+    denom  = max(float(pred_vol_m or 0.0), 0.0)
+    pm_frac = (pm_vol_m / denom) if denom > 0 else 0.0
+    # light clipping (avoids extreme early-PM tails)
+    pm_frac = max(0.0, min(pm_frac, 5.0))
+    ln_pmvol_f = math.log(pm_frac + 1.0)
+
+    # Linear predictor with standardization
+    lp = _FT_INTERCEPT
+    features = {
+        'ln_float': ln_float,
+        'ln_mcap': ln_mcap,
+        'ln_atr': ln_atr,
+        'ln_gapf': ln_gapf,
+        'ln_pmvol_f': ln_pmvol_f,   # PM % of predicted day volume
+        'ln_pmvol_m': ln_pmvol_m,   # level
+        'ln_fr': ln_fr,             # float rotation
+        'catalyst': float(catalyst_flag),
+    }
+    for name, val in features.items():
+        if name in _FT_COEF:
+            z = _std(val, _FT_MEAN.get(name, 0.0), _FT_SCALE.get(name, 1.0))
+            lp += _FT_COEF[name] * z
+
+    # numerically stable logistic
+    if lp >= 0:
+        p = 1.0 / (1.0 + math.exp(-lp))
+    else:
+        elp = math.exp(lp)
+        p = elp / (1.0 + elp)
+    return max(0.0, min(1.0, p))
 
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
@@ -288,7 +335,7 @@ with tab_add:
             mc_m     = st.number_input("Market Cap (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             si_pct   = st.number_input("Short Interest (% of float)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.0001, format="%.4f")  # finer step
+            pm_vwap  = st.number_input("PM VWAP ($)", min_value=0.0, value=0.0, step=0.0001, format="%.4f")
 
         # Cap & Modifiers
         with c_top[2]:
@@ -299,10 +346,9 @@ with tab_add:
         st.subheader("Qualitative Context")
 
         q_cols = st.columns(3)
-        # store chosen level 1..7 for each criterion in session_state via radio
         for i, crit in enumerate(QUAL_CRITERIA):
             with q_cols[i % 3]:
-                choice = st.radio(
+                st.radio(
                     crit["question"],
                     options=list(enumerate(crit["options"], 1)),
                     format_func=lambda x: x[1],
@@ -314,7 +360,7 @@ with tab_add:
 
     # After submit
     if submitted and ticker:
-        # === Prediction ===
+        # === Day volume prediction (M) ===
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
 
         # Confidence bands (millions)
@@ -333,7 +379,6 @@ with tab_add:
         # === Qualitative points (weighted 1..7) ===
         qual_0_7 = 0.0
         for crit in QUAL_CRITERIA:
-            # stored as (idx, text) in radio; we saved only key, so read index:
             sel = st.session_state.get(f"qual_{crit['name']}", (1,))[0] if isinstance(st.session_state.get(f"qual_{crit['name']}"), tuple) else st.session_state.get(f"qual_{crit['name']}", 1)
             qual_0_7 += q_weights[crit["name"]] * float(sel)
         qual_pct = (qual_0_7/7.0)*100.0
@@ -346,7 +391,23 @@ with tab_add:
         # === Diagnostics to save ===
         pm_pct_of_pred   = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
         pm_float_rot_x   = pm_vol_m / float_m if float_m > 0 else 0.0
-        pm_dollar_vs_mc  = 100.0 * (pm_vol_m * pm_vwap) / mc_m if mc_m > 0 else 0.0  # keep in display
+        pm_dollar_vs_mc  = 100.0 * (pm_vol_m * pm_vwap) / mc_m if mc_m > 0 else 0.0
+
+        # === FT Probability (uses PredVol_M as denominator) ===
+        ft_prob = predict_ft_prob_premarket(
+            float_m=float_m, mcap_m=mc_m, atr_usd=atr_usd,
+            gap_pct=gap_pct, pm_vol_m=pm_vol_m,
+            pred_vol_m=pred_vol_m,
+            catalyst_flag=1 if catalyst_points != 0 else 0
+        )
+        ft_pct = round(100.0 * ft_prob, 1)
+        ft_label = ("High FT" if ft_pct >= 70 else
+                    "Moderate FT" if ft_pct >= 55 else
+                    "Low FT" if ft_pct >= 40 else
+                    "Very Low FT")
+        
+        # NEW: fused display string
+        ft_display = f"{ft_pct:.1f}% ({ft_label})"
 
         row = {
             "Ticker": ticker,
@@ -356,32 +417,32 @@ with tab_add:
             "Numeric_%": round(num_pct, 2),
             "Qual_%": round(qual_pct, 2),
             "FinalScore": final_score,
-            # Prediction fields
-            "PredVol_M": round(pred_vol_m, 2),
-            "PM_%_of_Pred": round(pm_pct_of_pred, 1),
-            "PM_FloatRot_x": round(pm_float_rot_x, 3),
-            # Keep $Vol/MC (you said it's good)
-            "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
-      
-            # ... your existing fields ...
-            "PredVol_M": round(pred_vol_m, 2),
-            "PM_%_of_Pred": round(pm_pct_of_pred, 1),
-            "PM_FloatRot_x": round(pm_float_rot_x, 3),
-            "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
         
-            # store raw inputs for debug / sanity
-            "_MCap_M": mc_m,
-            "_SI_%": si_pct,
-            "_ATR_$": atr_usd,
-            "_PM_M": pm_vol_m,
-            "_Float_M": float_m,
-            "_Catalyst": float(catalyst_points),
-
+            # Prediction fields
             "PredVol_M": round(pred_vol_m, 2),
             "PredVol_CI68_L": round(ci68_l, 2),
             "PredVol_CI68_U": round(ci68_u, 2),
             "PredVol_CI95_L": round(ci95_l, 2),
             "PredVol_CI95_U": round(ci95_u, 2),
+            "PM_%_of_Pred": round(pm_pct_of_pred, 1),
+        
+            # Keep $Vol/MC; hide Float Rotation from UI
+            "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
+            "PM_FloatRot_x": round(pm_float_rot_x, 3),   # kept for CSV/sanity, not shown
+        
+            # FT fields
+            "FT": ft_display,                # <— fused display
+            "FT_Prob_%": ft_pct,             # keep for sorting/export
+            "FT_Label": ft_label,            # keep for export
+        
+            # raw inputs for debug / sanity
+            "_MCap_M": mc_m,
+            "_Gap_%": gap_pct,
+            "_SI_%": si_pct,
+            "_ATR_$": atr_usd,
+            "_PM_M": pm_vol_m,
+            "_Float_M": float_m,
+            "_Catalyst": float(catalyst_points),
         }
 
         st.session_state.rows.append(row)
@@ -393,45 +454,33 @@ with tab_add:
     l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
     if l:
         st.markdown("---")
-        cA, cB, cC, cD = st.columns(4)
+        cA, cB, cC, cD, cE = st.columns(5)
+    
         cA.metric("Last Ticker", l.get("Ticker","—"))
         cB.metric("Numeric Block", f"{l.get('Numeric_%',0):.2f}%")
         cC.metric("Qual Block",    f"{l.get('Qual_%',0):.2f}%")
         cD.metric("Final Score",   f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
-
-        d1, d2, d3, d4 = st.columns(4)
+        cE.metric("Odds", l.get("Odds","—"))
+    
+        d1, d2, d3, d4, d5 = st.columns(5)
         d1.metric("PM Float Rotation", f"{l.get('PM_FloatRot_x',0):.3f}×")
         d1.caption("Premarket volume ÷ float.")
-        d2.metric("PM $Vol / MC",      f"{l.get('PM$ / MC_%',0):.1f}%")
+    
+        d2.metric("PM $Vol / MC", f"{l.get('PM$ / MC_%',0):.1f}%")
         d2.caption("PM dollar volume ÷ market cap × 100.")
+    
         d3.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
         d3.caption(
             f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
             f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
         )
+    
         d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
         d4.caption("PM volume ÷ predicted day volume × 100.")
-
-    # --- Sanity sniff test ---
-    with st.expander("🔎 Sanity sniff test (units & term contributions)"):
-        mc_m_dbg  = l.get("_MCap_M", 0.0)
-        si_pct_dbg= l.get("_SI_%", 0.0)
-        atr_dbg   = l.get("_ATR_$", 0.0)
-        pm_m_dbg  = l.get("_PM_M", 0.0)
-        flt_m_dbg = l.get("_Float_M", 0.0)
-        cat_dbg   = l.get("_Catalyst", 0.0)
-
-        # Flags
-        flags = sanity_flags(mc_m_dbg, si_pct_dbg, atr_dbg, pm_m_dbg, flt_m_dbg)
-        if flags:
-            for f in flags:
-                st.warning(f)
-        else:
-            st.success("Inputs look plausible at a glance.")
-
-        # Term-by-term breakdown
-        details = ln_terms_for_display(mc_m_dbg, si_pct_dbg, atr_dbg, pm_m_dbg, flt_m_dbg, cat_dbg)
-        st.write(details)
+    
+        d5.metric("FT Probability", f"{l.get('FT_Prob_%',0):.1f}%")
+        d5.caption(f"FT Label: {l.get('FT_Label','—')}")
+        
 
 # ---------- Ranking tab ----------
 with tab_rank:
@@ -448,14 +497,15 @@ with tab_rank:
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
-            "PM_FloatRot_x","PM$ / MC_%",
-            "PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM_%_of_Pred"
+            "PM$ / MC_%",
+            "PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM_%_of_Pred",
+            "FT"   # <— fused
         ]
         for c in cols_to_show:
             if c not in df.columns:
-                df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
+                df[c] = "" if c in ("Ticker","Odds","Level","FT") else 0.0
         df = df[cols_to_show]
-
+        
         st.dataframe(
             df,
             use_container_width=True,
@@ -467,12 +517,12 @@ with tab_rank:
                 "Numeric_%": st.column_config.NumberColumn("Numeric_%", format="%.2f"),
                 "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
-                "PM_FloatRot_x": st.column_config.NumberColumn("PM Float Rotation (×)", format="%.3f"),
                 "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
                 "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
                 "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
                 "PredVol_CI68_U": st.column_config.NumberColumn("Pred Vol CI68 High (M)", format="%.2f"),
                 "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
+                "FT": st.column_config.TextColumn("FT (p/label)"),  # <— fused
             }
         )
 
