@@ -1,10 +1,12 @@
-# app.py — Premarket Ranking (Direct Log Model + FT with ln_pmvol_f & ln1p_pmvol, no ln_fr)
-# ----------------------------------------------------------------------------------------
-# • Day Volume: ONLY your direct log model (clamped to ≥ PM Vol), CI from sidebar σ.
-# • FT Classifier: logistic, standardized (mean/std), z-scores clipped (±3; flow ±2), mild L2, intercept calibration.
-#   Features (if present): ln_gapf, ln_mcap, ln_atr, ln_float, ln1p_rvol, ln1p_pmvol, ln_pmvol_f (winsorized), catalyst, optional maxpush_s.
-#   IMPORTANT: No ln_fr anywhere. pmfrac = PMVol/PredDay is capped at 0.80 before ln(1+pmfrac).
-# • UI: Ranking table + Markdown table, Download, Delete rows (top 12), Clear.
+# app.py — Premarket Ranking (Direct Log Vol + FT WITHOUT pmfrac & fr)
+# -------------------------------------------------------------------
+# • Day Volume: your direct log-linear model (millions), clamped to ≥ 0; CI via sidebar σ.
+# • FT Classifier: logistic (L2), class-balanced, standardized (z-scores), clipped ±3σ,
+#   **NO pmfrac features** and **NO ln_fr**. Flow signal = ln1p_pmvol only.
+#   Features (if available): ln_gapf, ln_mcap, ln_atr, ln_float, ln1p_rvol, ln1p_pmvol, catalyst, optional maxpush_s.
+# • Intercept calibration to match training prevalence.
+# • UI: Add ➜ Ranking (+ Markdown view), Download, Delete rows (top 12), Clear.
+# • Catalyst yes/no supported. PredVol shown but NOT used by FT.
 
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -19,31 +21,28 @@ import pandas as pd
 import streamlit as st
 
 # ============================== Page & CSS ==============================
-st.set_page_config(page_title="Premarket Stock Ranking — PM% FT (safe)", layout="wide")
-st.title("Premarket Stock Ranking — PM% FT (safe)")
+st.set_page_config(page_title="Premarket Stock Ranking — FT (no pmfrac / no fr)", layout="wide")
+st.title("Premarket Stock Ranking — FT (no pmfrac / no fr)")
 
-st.markdown(
-    """
-    <style>
-      html, body, [class*="css"] { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; font-size:14.25px; }
-      .section-title { font-weight: 700; font-size: 1.02rem; letter-spacing:.12px; margin: 4px 0 8px 0; }
-      .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 14px 0; }
-      [data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.12rem; }
-      [data-testid="stMetric"] label { font-size: 0.82rem; color:#374151; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<style>
+  html, body, [class*="css"] { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; font-size:14.25px; }
+  .section-title { font-weight: 700; font-size: 1.02rem; letter-spacing:.12px; margin: 4px 0 8px 0; }
+  .block-divider { border-bottom: 1px solid #e5e7eb; margin: 12px 0 14px 0; }
+  [data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.12rem; }
+  [data-testid="stMetric"] label { font-size: 0.82rem; color:#374151; }
+</style>
+""", unsafe_allow_html=True)
 
 # ============================== Sidebar ==============================
-st.sidebar.header("PredVol CI")
+st.sidebar.header("Predicted Day Volume — CI (display only)")
 sigma_ln = st.sidebar.slider("Log-space σ for PredVol CI68", 0.10, 1.50, 0.60, 0.01,
                              help="Std dev of residuals in ln(DayVol). 0.60 ≈ typical.")
 
 st.sidebar.header("FT Flow Sensitivity")
-flow_sens = st.sidebar.slider("Flow sensitivity (ln_pmvol_f & ln1p_pmvol)", 0.5, 1.2, 0.85, 0.05,
-                              help="Scales the two flow features to reduce 'waves' without losing direction.")
-st.session_state["FLOW_SENS"] = flow_sens
+flow_sens = st.sidebar.slider("Flow sensitivity (ln1p_pmvol)", 0.5, 1.5, 1.00, 0.05,
+                              help="Scales the ln1p_pmvol feature after z-scoring.")
+st.session_state["FLOW_SENS"] = float(flow_sens)
 
 # ============================== Session State ==============================
 if "ARTIFACTS" not in st.session_state: st.session_state.ARTIFACTS = {}
@@ -59,14 +58,10 @@ def _parse_local_float(s: str) -> Optional[float]:
     if s is None: return None
     s = str(s).strip().replace(" ", "").replace("’","").replace("'","")
     if s == "": return None
-    if "," in s and "." not in s:
-        s = s.replace(",", ".")
-    else:
-        s = s.replace(",", "")
-    try:
-        return float(s)
-    except Exception:
-        return None
+    if "," in s and "." not in s: s = s.replace(",", ".")
+    else: s = s.replace(",", "")
+    try: return float(s)
+    except: return None
 
 def input_float(label: str, value: float = 0.0, min_value: float = 0.0,
                 max_value: Optional[float] = None, decimals: int = 2,
@@ -100,18 +95,14 @@ def df_to_markdown_table(df: pd.DataFrame, cols: List[str]) -> str:
         cells = []
         for c in keep:
             v = row[c]
-            if isinstance(v, float):
-                cells.append(f"{v:.2f}")
-            else:
-                cells.append(str(v))
+            if isinstance(v, float): cells.append(f"{v:.2f}")
+            else: cells.append(str(v))
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 def do_rerun():
-    if hasattr(st, "rerun"):
-        st.rerun()
-    elif hasattr(st, "experimental_rerun"):
-        st.experimental_rerun()
+    if hasattr(st, "rerun"): st.rerun()
+    elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
 
 # ============================== Legend-driven column mapping ==============================
 _DEF = {
@@ -145,10 +136,9 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             if n in nm[c]: return c
     return None
 
-# ============================== Direct log-linear DayVol (ONLY) ==============================
+# ============================== Day Volume — Direct log-linear (display only) ==============================
 def predict_day_volume_m_direct(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     """
-    Your original model exactly (millions of shares out):
     ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$)
     Returns Y in **millions of shares**
     """
@@ -161,15 +151,15 @@ def predict_day_volume_m_direct(mcap_m: float, gap_pct: float, atr_usd: float) -
     return float(max(0.0, y))
 
 def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float) -> Tuple[float,float]:
-    if pred_m <= 0:
-        return 0.0, 0.0
+    if pred_m <= 0: return 0.0, 0.0
     low  = pred_m * math.exp(-z * sigma_ln)
     high = pred_m * math.exp( z * sigma_ln)
     return float(low), float(high)
 
-# ============================== Logistic with L2 (calm) ==============================
-def logit_fit_l2(X: np.ndarray, y: np.ndarray, l2: float = 1.2, max_iter: int = 120, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
-    """Logistic regression via IRLS; L2 on weights (not intercept)."""
+# ============================== Logistic with L2 + class weights ==============================
+def logit_fit_l2_weighted(X: np.ndarray, y: np.ndarray, sample_w: np.ndarray,
+                          l2: float = 1.2, max_iter: int = 120, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
+    """Logistic regression via IRLS with L2 on weights (not intercept) and sample weights."""
     n, k = X.shape
     Xb = np.concatenate([np.ones((n,1)), X], axis=1)
     w = np.zeros(k+1)
@@ -177,11 +167,11 @@ def logit_fit_l2(X: np.ndarray, y: np.ndarray, l2: float = 1.2, max_iter: int = 
     for _ in range(max_iter):
         z = Xb @ w
         p = 1.0/(1.0 + np.exp(-np.clip(z, -35, 35)))
-        W = p*(1-p)
+        W = p*(1-p) * sample_w
         if np.all(W < 1e-8): break
         WX = Xb * W[:, None]
         H = Xb.T @ WX + R
-        g = Xb.T @ (y - p)
+        g = Xb.T @ ((y - p) * sample_w)
         try:
             delta = np.linalg.solve(H, g)
         except np.linalg.LinAlgError:
@@ -218,7 +208,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
         return
 
     df = pd.DataFrame()
-    # Force-binary FT: >=0.5 → 1.0 else 0.0
+    # Force-binary FT
     ft_series = pd.to_numeric(raw[col["FT"]], errors="coerce")
     df["FT"] = (ft_series.fillna(0.0) >= 0.5).astype(float)
 
@@ -234,7 +224,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     _add("float_m", "FLOAT")
     _add("mcap_m", "MCAP")
     _add("si_pct", "SI")
-    _add("daily_vol_m", "DAILY")  # optional; not used by FT
+    _add("daily_vol_m", "DAILY")  # optional (not used by FT)
     if "CAT" in col:
         df["catalyst"] = pd.to_numeric(raw[col["CAT"]], errors="coerce").clip(0,1).fillna(0.0)
     else:
@@ -242,43 +232,29 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     if "MAXPCT" in col:
         df["max_push_pct"] = pd.to_numeric(raw[col["MAXPCT"]], errors="coerce")
 
-    # ---- Predicted Day (DIRECT model) per row; clamp to PM for stability of pmfrac ----
-    pred_day_direct = []
-    for i in range(len(df)):
-        r = df.iloc[i]
-        pred_m = predict_day_volume_m_direct(_nz(r.get("mcap_m")), _nz(r.get("gap_pct")), _nz(r.get("atr_usd")))
-        pm_m   = _nz(r.get("pm_vol_m"), 0.0)
-        pred_day_direct.append(max(pm_m, pred_m))
-    df["pred_day_m"] = np.array(pred_day_direct, dtype=float)
-
-    # ================= FT CLASSIFIER (PM% core, safe) =================
+    # ================= FT CLASSIFIER (NO pmfrac / NO fr) =================
+    # Feature builders
     def _ln_gapf(r):    return _safe_log(_nz(r.get("gap_pct"),0.0)/100.0)
     def _ln_mcap(r):    return _safe_log(r.get("mcap_m"))
     def _ln_atr(r):     return _safe_log(r.get("atr_usd"))
     def _ln_float(r):   return _safe_log(r.get("float_m"))
     def _ln1p_rvol(r):  return _safe_log(1.0 + _nz(r.get("rvol"),0.0))
     def _ln1p_pmvol(r): return _safe_log(_nz(r.get("pm_vol_m"),0.0) + 1.0)
-    def _ln_pmvol_f(r):
-        pm = _nz(r.get("pm_vol_m"),0.0); pred = _nz(r.get("pred_day_m"),0.0)
-        pmfrac = 0.0 if pred <= 0 else pm / pred
-        pmfrac = float(np.clip(pmfrac, 0.0, 0.80))  # winsorize to stop “downer”
-        return _safe_log(1.0 + pmfrac)
     def _catalyst(r):   return float(_nz(r.get("catalyst"),0.0))
     def _maxpush_s(r):
         v = _nz(r.get("max_push_pct"), np.nan)
-        return (v/100.0) if np.isfinite(v) else 0.0  # safe optional
+        return (v/100.0) if np.isfinite(v) else 0.0
 
-    # Features (NO ln_fr; keep PM% core + level)
+    # Select features (no ln_pmvol_f, no ln_fr)
     F_LIST = [
         ("ln_gapf", _ln_gapf, ["gap_pct"]),
         ("ln_mcap", _ln_mcap, ["mcap_m"]),
         ("ln_atr", _ln_atr, ["atr_usd"]),
         ("ln_float", _ln_float, ["float_m"]),
         ("ln1p_rvol", _ln1p_rvol, ["rvol"]),
-        ("ln1p_pmvol", _ln1p_pmvol, ["pm_vol_m"]),
-        ("ln_pmvol_f", _ln_pmvol_f, ["pm_vol_m","pred_day_m"]),
+        ("ln1p_pmvol", _ln1p_pmvol, ["pm_vol_m"]),  # the ONLY flow signal
         ("catalyst", _catalyst, ["catalyst"]),
-        ("maxpush_s", _maxpush_s, []),  # optional
+        ("maxpush_s", _maxpush_s, []),              # optional
     ]
     use_feats = [(n,f,req) for (n,f,req) in F_LIST if all(k in df.columns for k in req) or n=="maxpush_s"]
     if not use_feats:
@@ -291,25 +267,29 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     y_ft = (np.nan_to_num(df["FT"].to_numpy(dtype=float), nan=0.0) >= 0.5).astype(float)
     feat_names = [n for (n,_,_) in use_feats]
 
-    # Standardize (mean/std on training)
+    # Standardize
     mu = X_raw.mean(axis=0)
-    sd = X_raw.std(axis=0, ddof=1)
-    sd[sd == 0] = 1.0
+    sd = X_raw.std(axis=0, ddof=1); sd[sd == 0] = 1.0
     X = (X_raw - mu) / sd
 
-    # Global clip ±3
+    # Clip z-scores
     X = _clip_z(X, 3.0)
-    # Flow features tighter clip ±2 and scaled by flow_sens
+    # Flow sensitivity on ln1p_pmvol only
     for j, name in enumerate(feat_names):
-        if name in ("ln_pmvol_f", "ln1p_pmvol"):
-            X[:, j] = _clip_z(X[:, j], 2.0) * st.session_state.get("FLOW_SENS", flow_sens)
+        if name == "ln1p_pmvol":
+            X[:, j] = _clip_z(X[:, j], 2.5) * st.session_state.get("FLOW_SENS", flow_sens)
 
-    # Fit with mild L2
+    # Class weights (prevalence balancing)
+    p1 = float(np.mean(y_ft)) if y_ft.size else 0.5
+    w1 = 0.5 / max(1e-9, p1); w0 = 0.5 / max(1e-9, 1.0 - p1)
+    sample_w = np.where(y_ft > 0.5, w1, w0).astype(float)
+
+    # Fit
     ft_coef = None; ft_bias = 0.0
     if X.shape[0] >= 12 and np.unique(y_ft).size == 2 and X.shape[1] > 0:
-        ft_coef, ft_bias = logit_fit_l2(X, y_ft, l2=1.2, max_iter=120, tol=1e-6)
+        ft_coef, ft_bias = logit_fit_l2_weighted(X, y_ft, sample_w, l2=1.2, max_iter=140, tol=1e-6)
 
-        # Intercept calibration to match training prevalence
+        # Intercept calibration (match base rate)
         p_hat = logit_inv(ft_bias + X @ ft_coef)
         p_hat = np.clip(p_hat, 1e-4, 1-1e-4)
         p_bar = float(np.mean(y_ft)) if y_ft.size else 0.5
@@ -321,7 +301,7 @@ def _load_and_learn(xls: pd.ExcelFile, sheet: str) -> None:
     else:
         st.error("Unable to train FT classifier (need ≥12 rows, both classes, and valid features).")
 
-    # Calibrated cuts (with sensible floors)
+    # Cuts (quantile-based with floors)
     if ft_coef is not None:
         p_cal = logit_inv(ft_bias + X @ ft_coef)
         def _q(p): return float(np.quantile(p_cal, p)) if p_cal.size else 0.5
@@ -364,9 +344,9 @@ if learn_btn:
         except Exception as e:
             st.error(f"Learning failed: {e}")
 
-# ============================== Inference (FT with ln_pmvol_f + ln1p_pmvol; no ln_fr) ==============================
-def predict_ft_prob_pmfrac(mc_m: float, gap_pct: float, atr_usd: float, float_m: float, si_pct: float,
-                           rvol: float, pm_vol_m: float, pm_dol_m: float, catalyst: float) -> float:
+# ============================== Inference (FT with ln1p_pmvol only for flow) ==============================
+def predict_ft_prob_no_pmfrac(mc_m: float, gap_pct: float, atr_usd: float, float_m: float, si_pct: float,
+                              rvol: float, pm_vol_m: float, pm_dol_m: float, catalyst: float) -> float:
     A = st.session_state.ARTIFACTS or {}
     coef = A.get("ft_coef"); bias = float(A.get("ft_bias") or 0.0)
     names = A.get("feat_names") or []
@@ -374,23 +354,15 @@ def predict_ft_prob_pmfrac(mc_m: float, gap_pct: float, atr_usd: float, float_m:
     if coef is None or mu is None or sd is None or not names:
         return 0.50
 
-    # Build PredDay from DIRECT model (clamp to PM for stability)
-    pred_day_m = max(_nz(pm_vol_m,0.0), predict_day_volume_m_direct(mc_m, gap_pct, atr_usd))
-
-    # Feature builders
+    # Feature builders — mirror training exactly
     def _ln_gapf():    return _safe_log(_nz(gap_pct,0.0)/100.0)
     def _ln_mcap():    return _safe_log(mc_m)
     def _ln_atr():     return _safe_log(atr_usd)
     def _ln_float():   return _safe_log(float_m)
     def _ln1p_rvol():  return _safe_log(1.0 + _nz(rvol,0.0))
     def _ln1p_pmvol(): return _safe_log(_nz(pm_vol_m,0.0) + 1.0)
-    def _ln_pmvol_f():
-        pm = _nz(pm_vol_m,0.0); pred = _nz(pred_day_m,0.0)
-        pmfrac = 0.0 if pred <= 0 else pm / pred
-        pmfrac = float(np.clip(pmfrac, 0.0, 0.80))  # same winsorization as training
-        return _safe_log(1.0 + pmfrac)
     def _catalyst():   return float(_nz(catalyst,0.0))
-    def _maxpush_s():  return 0.0  # safe default (no live input)
+    def _maxpush_s():  return 0.0  # no live value; safe default
 
     feat_lookup = {
         "ln_gapf": _ln_gapf,
@@ -399,18 +371,17 @@ def predict_ft_prob_pmfrac(mc_m: float, gap_pct: float, atr_usd: float, float_m:
         "ln_float": _ln_float,
         "ln1p_rvol": _ln1p_rvol,
         "ln1p_pmvol": _ln1p_pmvol,
-        "ln_pmvol_f": _ln_pmvol_f,
         "catalyst": _catalyst,
         "maxpush_s": _maxpush_s,
     }
     vals_raw = [float(feat_lookup[n]()) for n in names]
     X = (np.array(vals_raw, dtype=float) - mu) / sd
 
-    # Same clipping and flow scaling as training
+    # Same clipping and flow scaling
     X = _clip_z(X, 3.0)
     for j, name in enumerate(names):
-        if name in ("ln_pmvol_f", "ln1p_pmvol"):
-            X[j] = np.clip(X[j], -2.0, 2.0) * st.session_state.get("FLOW_SENS", flow_sens)
+        if name == "ln1p_pmvol":
+            X[j] = np.clip(X[j], -2.5, 2.5) * st.session_state.get("FLOW_SENS", flow_sens)
 
     p = float(logit_inv(bias + np.dot(X, coef)))
     return float(np.clip(p, 1e-3, 1-1e-3))
@@ -456,15 +427,13 @@ with tab_add:
     if submitted and ticker:
         cat = 1.0 if catalyst_flag=="Yes" else 0.0
 
-        # Direct model → Predicted Day Volume (millions), clamp to PM
+        # Predicted day volume (display only)
         pred_vol_m = predict_day_volume_m_direct(mc_m, gap_pct, atr_usd)
-        pred_vol_m = max(pred_vol_m, _nz(pm_vol_m, 0.0))
-
-        # Confidence bands (68%)
         ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)
 
-        # FT probability (PM% core; safe)
-        ft_prob = predict_ft_prob_pmfrac(mc_m, gap_pct, atr_usd, float_m, si_pct, rvol, pm_vol_m, pm_dol_m, cat)
+        # FT probability (NO pmfrac, NO fr)
+        ft_prob = predict_ft_prob_no_pmfrac(mc_m, gap_pct, atr_usd, float_m, si_pct, rvol, pm_vol_m, pm_dol_m, cat)
+
         odds_cuts = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
         grade_cuts = st.session_state.get("GRADE_CUTS", {"App":0.92,"Ap":0.85,"A":0.75,"B":0.65,"C":0.50})
         odds_name = _prob_to_odds(ft_prob, odds_cuts)
@@ -480,11 +449,11 @@ with tab_add:
             "PredVol_CI68_L": round(ci68_l, 2),
             "PredVol_CI68_U": round(ci68_u, 2),
 
-            # Diagnostics
+            # Diagnostics (display-only fields)
             "PM%_of_Pred": round(100.0 * _nz(pm_vol_m,0.0) / max(1e-6, pred_vol_m), 1),
             "PM$ / MC_%": round(100.0 * _nz(pm_dol_m,0.0) / max(1e-6, _nz(mc_m,0.0)), 1),
 
-            # raw inputs (kept for CSV)
+            # raw inputs for CSV
             "_MCap_M": mc_m, "_Gap_%": gap_pct, "_ATR_$": atr_usd, "_PM_M": pm_vol_m,
             "_Float_M": float_m, "_SI_%": si_pct, "_RVOL": rvol, "_PM$_M": pm_dol_m, "_Catalyst": cat,
         }
@@ -544,7 +513,7 @@ with tab_rank:
             }
         )
 
-        # Delete rows (top 12)
+        # Delete rows (top 12 quick buttons)
         st.markdown("#### Delete rows")
         del_cols = st.columns(4)
         head12 = df.head(12).reset_index(drop=True)
@@ -556,19 +525,17 @@ with tab_rank:
                     st.session_state.rows = keep.to_dict(orient="records")
                     do_rerun()
 
-        # Download CSV (Ranking)
+        # Download CSV
         st.download_button(
             "Download CSV (Ranking)",
             df[cols_to_show].to_csv(index=False).encode("utf-8"),
             "ranking.csv", "text/csv", use_container_width=True
         )
 
-        # Markdown table below
+        # Markdown table view + download
         st.markdown("### 📋 Ranking (Markdown view)")
-        md_cols = cols_to_show
-        md_text = df_to_markdown_table(df, md_cols)
+        md_text = df_to_markdown_table(df, cols_to_show)
         st.code(md_text, language="markdown")
-
         st.download_button(
             "Download Markdown",
             md_text.encode("utf-8"),
