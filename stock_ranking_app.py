@@ -126,41 +126,30 @@ with st.form("add_form", clear_on_submit=True):
     st.markdown("---")
     st.subheader("Qualitative Context")
     q_cols = st.columns(3)
-    qual_levels = {}
-    qual_short  = {}
+    qual_tags = {}
     for i, crit in enumerate(QUAL_CRITERIA):
         with q_cols[i % 3]:
             choice = st.radio(
                 crit["question"],
-                options=list(enumerate(crit["options"], 1)),   # (1..7, long text)
+                options=list(enumerate(crit["options"], 1)),  # (1..7, long text)
                 format_func=lambda x: f"{x[0]}. {x[1]}",
                 key=f"qual_{crit['name']}"
             )
             level = int(choice[0])
-            # shortest, still-clear label
             short_label = crit["short"][level-1]
-            qual_levels[crit["name"]] = float(level)
-            qual_short[crit["name"]]  = short_label
+            qual_tags[crit["name"]] = f"{level}-{short_label}"
 
     submitted = st.form_submit_button("Add", use_container_width=True)
 
 # ---------- Add Row ----------
 if submitted and ticker:
     # Derived metrics
-    fr_x = (pm_vol/float_m) if float_m > 0 else 0.0                    # PM Float Rotation ×
-    pmmc_pct = (pm_dol/mc_m*100.0) if mc_m > 0 else 0.0                # PM $Vol / MC %
-
-    # Simple qualitative % (equal-weight mean of 3 levels; 1..7 → 0..100)
-    levels = list(qual_levels.values())
-    qual_pct = (sum(levels)/len(levels)/7.0*100.0) if levels else 0.0
-
-    # Concise strings: "<level>-<short>"
-    gap_tag    = f"{int(qual_levels.get('GapStruct',0))}-{qual_short.get('GapStruct','')}" if 'GapStruct' in qual_levels else ""
-    level_tag  = f"{int(qual_levels.get('LevelStruct',0))}-{qual_short.get('LevelStruct','')}" if 'LevelStruct' in qual_levels else ""
-    month_tag  = f"{int(qual_levels.get('Monthly',0))}-{qual_short.get('Monthly','')}" if 'Monthly' in qual_levels else ""
+    fr_x = (pm_vol/float_m) if float_m > 0 else 0.0         # PM Float Rotation ×
+    pmmc_pct = (pm_dol/mc_m*100.0) if mc_m > 0 else 0.0     # PM $Vol / MC %
 
     row = {
         "Ticker": ticker,
+        # Inputs
         "MarketCap_M$": mc_m,
         "Float_M": float_m,
         "ShortInt_%": si_pct,
@@ -175,10 +164,9 @@ if submitted and ticker:
         "FR_x": fr_x,
         "PM$Vol/MC_%": pmmc_pct,
         # Qualitative (concise)
-        "GapStruct": gap_tag,
-        "LevelStruct": level_tag,
-        "Monthly": month_tag,
-        "Qualitative_%": qual_pct,
+        "GapStruct": qual_tags.get("GapStruct", ""),
+        "LevelStruct": qual_tags.get("LevelStruct", ""),
+        "Monthly": qual_tags.get("Monthly", ""),
     }
     st.session_state.rows.append(row)
     do_rerun()
@@ -209,7 +197,6 @@ if st.session_state.rows:
             "GapStruct": st.column_config.TextColumn("GapStruct (lvl-tag)"),
             "LevelStruct": st.column_config.TextColumn("LevelStruct (lvl-tag)"),
             "Monthly": st.column_config.TextColumn("Monthly (lvl-tag)"),
-            "Qualitative_%": st.column_config.NumberColumn("Qualitative %", format="%.2f"),
         }
     )
 
@@ -233,7 +220,7 @@ if st.session_state.rows:
     cols_order = [
         "Ticker","MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
         "PM_Vol_M","PM_$Vol_M$","Catalyst","Dilution","FR_x","PM$Vol/MC_%",
-        "GapStruct","LevelStruct","Monthly","Qualitative_%"
+        "GapStruct","LevelStruct","Monthly"
     ]
     st.code(df_to_markdown_table(df, cols_order), language="markdown")
 else:
