@@ -36,48 +36,33 @@ if "last" not in st.session_state: st.session_state.last = {}
 
 # ---------- Qualitative criteria ----------
 QUAL_CRITERIA = [
-    {
-        "name": "GapStruct",
-        "question": "Gap & Trend Development:",
-        "options": [
-            "Gap fully reversed: price loses >80% of gap.",
-            "Choppy reversal: price loses 50–80% of gap.",
-            "Partial retracement: price loses 25–50% of gap.",
-            "Sideways consolidation: gap holds, price within top 25% of gap.",
-            "Uptrend with deep pullbacks (>30% retrace).",
-            "Uptrend with moderate pullbacks (10–30% retrace).",
-            "Clean uptrend, only minor pullbacks (<10%).",
-        ],
-        "weight": 0.15,
-    },
-    {
-        "name": "LevelStruct",
-        "question": "Key Price Levels:",
-        "options": [
-            "Fails at all major support/resistance; cannot hold any key level.",
-            "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
-            "Holds one support but unable to break resistance; capped below a key level.",
-            "Breaks above resistance but cannot stay; dips below reclaimed level.",
-            "Breaks and holds one major level; most resistance remains above.",
-            "Breaks and holds several major levels; clears most overhead resistance.",
-            "Breaks and holds above all resistance; blue sky.",
-        ],
-        "weight": 0.15,
-    },
-    {
-        "name": "Monthly",
-        "question": "Monthly/Weekly Context:",
-        "options": [
-            "Sharp, accelerating downtrend; new lows repeatedly.",
-            "Persistent downtrend; still lower lows.",
-            "Downtrend losing momentum; flattening.",
-            "Clear base; sideways consolidation.",
-            "Bottom confirmed; higher low after base.",
-            "Uptrend begins; breaks out of base.",
-            "Sustained uptrend; higher highs, blue sky.",
-        ],
-        "weight": 0.10,
-    },
+    {"name": "GapStruct", "question": "Gap & Trend Development:", "options": [
+        "Gap fully reversed: price loses >80% of gap.",
+        "Choppy reversal: price loses 50–80% of gap.",
+        "Partial retracement: price loses 25–50% of gap.",
+        "Sideways consolidation: gap holds, price within top 25% of gap.",
+        "Uptrend with deep pullbacks (>30% retrace).",
+        "Uptrend with moderate pullbacks (10–30% retrace).",
+        "Clean uptrend, only minor pullbacks (<10%).",
+    ], "weight": 0.15},
+    {"name": "LevelStruct", "question": "Key Price Levels:", "options": [
+        "Fails at all major support/resistance; cannot hold any key level.",
+        "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
+        "Holds one support but unable to break resistance; capped below a key level.",
+        "Breaks above resistance but cannot stay; dips below reclaimed level.",
+        "Breaks and holds one major level; most resistance remains above.",
+        "Breaks and holds several major levels; clears most overhead resistance.",
+        "Breaks and holds above all resistance; blue sky.",
+    ], "weight": 0.15},
+    {"name": "Monthly", "question": "Monthly/Weekly Context:", "options": [
+        "Sharp, accelerating downtrend; new lows repeatedly.",
+        "Persistent downtrend; still lower lows.",
+        "Downtrend losing momentum; flattening.",
+        "Clear base; sideways consolidation.",
+        "Bottom confirmed; higher low after base.",
+        "Uptrend begins; breaks out of base.",
+        "Sustained uptrend; higher highs, blue sky.",
+    ], "weight": 0.10},
 ]
 
 # ---------- Sidebar: weights ----------
@@ -89,13 +74,17 @@ w_gap    = st.sidebar.slider("Gap %",                0.0, 1.0, 0.15, 0.01)
 w_atr    = st.sidebar.slider("ATR ($)",              0.0, 1.0, 0.10, 0.01)
 w_rvol   = st.sidebar.slider("RVOL",                 0.0, 1.0, 0.20, 0.01)
 w_pmvol  = st.sidebar.slider("Premarket Volume (M)", 0.0, 1.0, 0.15, 0.01)
+w_cat    = st.sidebar.slider("Catalyst",             0.0, 1.0, 0.05, 0.01)
+w_dil    = st.sidebar.slider("Dilution",             0.0, 1.0, 0.05, 0.01)
 
 st.sidebar.header("Qualitative Weights")
 q_weights = {crit["name"]: st.sidebar.slider(crit["name"], 0.0, 1.0, crit["weight"], 0.01) for crit in QUAL_CRITERIA}
 
 # normalize weights
-num_sum = max(1e-9, w_mc+w_float+w_si+w_gap+w_atr+w_rvol+w_pmvol)
-w_mc, w_float, w_si, w_gap, w_atr, w_rvol, w_pmvol = [w/num_sum for w in (w_mc, w_float, w_si, w_gap, w_atr, w_rvol, w_pmvol)]
+num_sum = max(1e-9, w_mc+w_float+w_si+w_gap+w_atr+w_rvol+w_pmvol+w_cat+w_dil)
+w_mc, w_float, w_si, w_gap, w_atr, w_rvol, w_pmvol, w_cat, w_dil = [
+    w/num_sum for w in (w_mc, w_float, w_si, w_gap, w_atr, w_rvol, w_pmvol, w_cat, w_dil)
+]
 qual_sum = max(1e-9, sum(q_weights.values()))
 for k in q_weights: q_weights[k] /= qual_sum
 
@@ -116,7 +105,7 @@ with tab_add:
     st.subheader("Numeric Context")
 
     with st.form("add_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
 
         with c1:
             ticker   = st.text_input("Ticker", "").strip().upper()
@@ -129,6 +118,10 @@ with tab_add:
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01)
             rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.01)
             pm_vol_m = st.number_input("Premarket Volume (M)", min_value=0.0, value=0.0, step=0.01)
+
+        with c3:
+            catalyst = st.number_input("Catalyst (0=no, 1=yes)", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
+            dilution = st.number_input("Dilution (0=no, 1=yes)", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
 
         st.markdown("---")
         st.subheader("Qualitative Context")
@@ -144,7 +137,11 @@ with tab_add:
 
     if submitted and ticker:
         # numeric score
-        num_score = w_mc*mc_m + w_float*float_m + w_si*si_pct + w_gap*gap_pct + w_atr*atr_usd + w_rvol*rvol + w_pmvol*pm_vol_m
+        num_score = (
+            w_mc*mc_m + w_float*float_m + w_si*si_pct + w_gap*gap_pct +
+            w_atr*atr_usd + w_rvol*rvol + w_pmvol*pm_vol_m +
+            w_cat*catalyst + w_dil*dilution
+        )
         num_pct = 100.0 * num_score / (num_score+1e-9)
 
         # qualitative score
