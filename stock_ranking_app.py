@@ -31,7 +31,7 @@ def do_rerun():
 # ---------- Session state ----------
 if "rows" not in st.session_state: st.session_state.rows = []
 
-# ---------- Qualitative criteria ----------
+# ---------- Qualitative criteria (short labels) ----------
 QUAL_CRITERIA = [
     {
         "name": "GapStruct",
@@ -44,6 +44,15 @@ QUAL_CRITERIA = [
             "Uptrend with deep pullbacks (>30% retrace).",
             "Uptrend with moderate pullbacks (10–30% retrace).",
             "Clean uptrend, only minor pullbacks (<10%).",
+        ],
+        "short": [
+            "Full reversal",
+            "Choppy reversal",
+            "25–50% retrace",
+            "Sideways (top 25%)",
+            "Uptrend (deep PBs)",
+            "Uptrend (mod PBs)",
+            "Clean uptrend",
         ],
     },
     {
@@ -58,6 +67,15 @@ QUAL_CRITERIA = [
             "Breaks and holds several major levels; clears most overhead resistance.",
             "Breaks and holds above all resistance; blue sky.",
         ],
+        "short": [
+            "Fails levels",
+            "Brief hold; loses",
+            "Holds support; capped",
+            "Breaks then loses",
+            "Holds 1 major",
+            "Holds several",
+            "Above all",
+        ],
     },
     {
         "name": "Monthly",
@@ -70,6 +88,15 @@ QUAL_CRITERIA = [
             "Bottom confirmed; higher low after base.",
             "Uptrend begins; breaks out of base.",
             "Sustained uptrend; higher highs, blue sky.",
+        ],
+        "short": [
+            "Accel downtrend",
+            "Downtrend",
+            "Flattening",
+            "Base",
+            "Higher low",
+            "BO from base",
+            "Sustained uptrend",
         ],
     },
 ]
@@ -100,18 +127,20 @@ with st.form("add_form", clear_on_submit=True):
     st.subheader("Qualitative Context")
     q_cols = st.columns(3)
     qual_levels = {}
-    qual_texts  = {}
+    qual_short  = {}
     for i, crit in enumerate(QUAL_CRITERIA):
         with q_cols[i % 3]:
             choice = st.radio(
                 crit["question"],
-                options=list(enumerate(crit["options"], 1)),   # (1..7, text)
+                options=list(enumerate(crit["options"], 1)),   # (1..7, long text)
                 format_func=lambda x: f"{x[0]}. {x[1]}",
                 key=f"qual_{crit['name']}"
             )
-            level, text = choice
+            level = int(choice[0])
+            # shortest, still-clear label
+            short_label = crit["short"][level-1]
             qual_levels[crit["name"]] = float(level)
-            qual_texts[crit["name"]]  = text
+            qual_short[crit["name"]]  = short_label
 
     submitted = st.form_submit_button("Add", use_container_width=True)
 
@@ -124,6 +153,11 @@ if submitted and ticker:
     # Simple qualitative % (equal-weight mean of 3 levels; 1..7 → 0..100)
     levels = list(qual_levels.values())
     qual_pct = (sum(levels)/len(levels)/7.0*100.0) if levels else 0.0
+
+    # Concise strings: "<level>-<short>"
+    gap_tag    = f"{int(qual_levels.get('GapStruct',0))}-{qual_short.get('GapStruct','')}" if 'GapStruct' in qual_levels else ""
+    level_tag  = f"{int(qual_levels.get('LevelStruct',0))}-{qual_short.get('LevelStruct','')}" if 'LevelStruct' in qual_levels else ""
+    month_tag  = f"{int(qual_levels.get('Monthly',0))}-{qual_short.get('Monthly','')}" if 'Monthly' in qual_levels else ""
 
     row = {
         "Ticker": ticker,
@@ -140,13 +174,10 @@ if submitted and ticker:
         # Derived
         "FR_x": fr_x,
         "PM$Vol/MC_%": pmmc_pct,
-        # Qualitative
-        "GapStruct_Level": qual_levels.get("GapStruct", 0.0),
-        "GapStruct_Text":  qual_texts.get("GapStruct", ""),
-        "LevelStruct_Level": qual_levels.get("LevelStruct", 0.0),
-        "LevelStruct_Text":  qual_texts.get("LevelStruct", ""),
-        "Monthly_Level": qual_levels.get("Monthly", 0.0),
-        "Monthly_Text":  qual_texts.get("Monthly", ""),
+        # Qualitative (concise)
+        "GapStruct": gap_tag,
+        "LevelStruct": level_tag,
+        "Monthly": month_tag,
         "Qualitative_%": qual_pct,
     }
     st.session_state.rows.append(row)
@@ -157,7 +188,6 @@ st.subheader("Table")
 if st.session_state.rows:
     df = pd.DataFrame(st.session_state.rows)
 
-    # Display
     st.dataframe(
         df,
         use_container_width=True,
@@ -176,9 +206,9 @@ if st.session_state.rows:
             "Dilution": st.column_config.NumberColumn("Dilution", format="%.2f"),
             "FR_x": st.column_config.NumberColumn("PM Float Rotation (×)", format="%.2f"),
             "PM$Vol/MC_%": st.column_config.NumberColumn("PM $Vol / MC (%)", format="%.2f"),
-            "GapStruct_Level": st.column_config.NumberColumn("GapStruct (1–7)", format="%.2f"),
-            "LevelStruct_Level": st.column_config.NumberColumn("LevelStruct (1–7)", format="%.2f"),
-            "Monthly_Level": st.column_config.NumberColumn("Monthly (1–7)", format="%.2f"),
+            "GapStruct": st.column_config.TextColumn("GapStruct (lvl-tag)"),
+            "LevelStruct": st.column_config.TextColumn("LevelStruct (lvl-tag)"),
+            "Monthly": st.column_config.TextColumn("Monthly (lvl-tag)"),
             "Qualitative_%": st.column_config.NumberColumn("Qualitative %", format="%.2f"),
         }
     )
@@ -202,8 +232,8 @@ if st.session_state.rows:
     st.markdown("### 📋 Table (Markdown)")
     cols_order = [
         "Ticker","MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-        "PM_Vol_M","PM_$Vol_M$","Catalyst","Dilution","FR_x","PM$Vol/MC_%","Qualitative_%",
-        "GapStruct_Level","LevelStruct_Level","Monthly_Level"
+        "PM_Vol_M","PM_$Vol_M$","Catalyst","Dilution","FR_x","PM$Vol/MC_%",
+        "GapStruct","LevelStruct","Monthly","Qualitative_%"
     ]
     st.code(df_to_markdown_table(df, cols_order), language="markdown")
 else:
