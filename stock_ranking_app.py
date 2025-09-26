@@ -227,7 +227,7 @@ with tab_manual:
         st.info("Add a stock above to populate the table.")
 
 # =============================================================================
-# TAB 2 — Upload & Model Stocks (medians + Catalyst %Yes; unit normalization)
+# TAB 2 — Upload & Model Stocks (medians + Catalyst %Yes; robust percent parsing)
 # =============================================================================
 with tab_models:
     st.subheader("Upload workbook")
@@ -269,36 +269,63 @@ with tab_models:
         true_vals = {"y","yes","true","t","1","✓","✔","x"}
         return sm.apply(lambda x: 1.0 if x in true_vals else 0.0)
 
+    # ---------- robust percent parser ----------
+    def _to_float_strip_percent(val):
+        if pd.isna(val):
+            return np.nan
+        s = str(val).strip().replace(",", "")
+        if "%" in s:
+            try:
+                return float(s.replace("%", "").strip())
+            except:
+                return np.nan
+        try:
+            return float(s)
+        except:
+            return np.nan
+
+    def parse_percent_series(series: pd.Series) -> pd.Series:
+        """
+        Handles:
+        - Strings like '90%' -> 90
+        - Fractions like 0.9 -> 90 (if column distribution suggests fraction)
+        - Keeps sign; robust to mixed entries
+        Heuristic: if the 90th percentile of |values| <= 3, treat as fraction -> multiply <=3 by 100.
+        """
+        s = series.apply(_to_float_strip_percent)
+        if not s.notna().any():
+            return s
+
+        abs_vals = s.abs()
+        q90 = np.nanquantile(abs_vals, 0.90)
+        # If the vast majority look like fractions, promote to percent
+        if q90 <= 3.0:
+            # multiply only those that are safely in fraction range (<=3 abs)
+            s = s.where(abs_vals > 3.0, s * 100.0)
+        return s
+
     def normalize_units(df: pd.DataFrame) -> pd.DataFrame:
-        """Heuristically normalize units to:
+        """Normalize units to:
            - MarketCap_M$: millions of dollars
            - Float_M: millions of shares
-           - ShortInt_%: percent (0..100)
-           - Gap_%: percent (0..100)
+           - ShortInt_%: percent (0..100) with robust parser
+           - Gap_%: percent (0..100) with robust parser
            - ATR_$: dollars (as-is)
            - RVOL: unitless
            - PM_Vol_M: millions of shares
            - PM_$Vol_M$: millions of dollars
         """
         out = df.copy()
-        def _med(name): 
+
+        # Robust percent parsing for Gap and SI
+        if "Gap_%" in out.columns:
+            out["Gap_%"] = parse_percent_series(out["Gap_%"])
+        if "ShortInt_%" in out.columns:
+            out["ShortInt_%"] = parse_percent_series(out["ShortInt_%"])
+
+        def _med(name):
             s = pd.to_numeric(out[name], errors="coerce")
             return float(s.median()) if s.notna().any() else np.nan
-        def _max(name):
-            s = pd.to_numeric(out[name], errors="coerce")
-            return float(s.max()) if s.notna().any() else np.nan
-
-        # Gap % (0..1 -> ×100)
-        if "Gap_%" in out.columns:
-            gmax = _max("Gap_%")
-            if pd.notna(gmax) and gmax <= 3.0:
-                out["Gap_%"] = pd.to_numeric(out["Gap_%"], errors="coerce") * 100.0
-
-        # Short Interest % (0..1 -> ×100)
-        if "ShortInt_%" in out.columns:
-            simax = _max("ShortInt_%")
-            if pd.notna(simax) and simax <= 1.5:
-                out["ShortInt_%"] = pd.to_numeric(out["ShortInt_%"], errors="coerce") * 100.0
 
         # Market Cap (to M$)
         if "MarketCap_M$" in out.columns:
@@ -354,11 +381,12 @@ with tab_models:
             st.error("Missing required columns: " + ", ".join(missing))
             return out
 
+        # Build raw mapped DataFrame
         base = pd.DataFrame({
             "MarketCap_M$": pd.to_numeric(df[col_mc], errors="coerce"),
             "Float_M":      pd.to_numeric(df[col_float], errors="coerce"),
-            "ShortInt_%":   pd.to_numeric(df[col_si], errors="coerce"),
-            "Gap_%":        pd.to_numeric(df[col_gap], errors="coerce"),
+            "ShortInt_%":   df[col_si],         # keep raw for robust percent parsing
+            "Gap_%":        df[col_gap],        # keep raw for robust percent parsing
             "ATR_$":        pd.to_numeric(df[col_atr], errors="coerce"),
             "RVOL":         pd.to_numeric(df[col_rvol], errors="coerce"),
             "PM_Vol_M":     pd.to_numeric(df[col_pmvol], errors="coerce"),
@@ -366,7 +394,7 @@ with tab_models:
         })
         base["Catalyst01"] = parse_catalyst_series(df[col_cat]) if col_cat else 0.0
 
-        # -------- Normalize units heuristically --------
+        # -------- Normalize units robustly --------
         base = normalize_units(base)
 
         # FT masks
