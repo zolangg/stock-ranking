@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import re
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -9,6 +10,7 @@ st.title("Premarket Stock Ranking")
 
 # ============================== Helpers ==============================
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
+    """Convert dataframe to markdown with 2 decimals for numerics."""
     keep = [c for c in cols if c in df.columns]
     if not keep:
         return "| (no data) |\n| --- |"
@@ -33,7 +35,8 @@ def do_rerun():
         st.experimental_rerun()
 
 def _norm(s: str) -> str:
-    return str(s).strip().lower().replace("%","").replace("$","").replace("(","").replace(")","").replace("  "," ").replace("’","").replace("'","")
+    s = re.sub(r"\s+", " ", str(s).strip().lower())
+    return s.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
 
 def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     if df is None or df.empty:
@@ -54,7 +57,19 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
                 return c
     return None
 
-# Qualitative config (original options) + short labels
+def _to_float(s):
+    if pd.isna(s): return np.nan
+    try:
+        ss = str(s).strip().replace(" ", "")
+        if "," in ss and "." not in ss:  # EU decimals
+            ss = ss.replace(",", ".")
+        else:
+            ss = ss.replace(",", "")
+        return float(ss)
+    except Exception:
+        return np.nan
+
+# Qualitative config (full text + short labels for table)
 QUAL_CRITERIA = [
     {
         "name": "GapStruct",
@@ -132,10 +147,10 @@ def _short_qual(name: str, idx1_based: int) -> str:
     return "—"
 
 # ============================== Session State ==============================
-if "rows" not in st.session_state: st.session_state.rows = []      # manual input rows
-if "last" not in st.session_state: st.session_state.last = {}      # last added row
+if "rows" not in st.session_state: st.session_state.rows = []      # manual + uploaded rows for table
+if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "var_list": [...]}
-if "groups" not in st.session_state: st.session_state.groups = {}  # group -> df
+if "groups" not in st.session_state: st.session_state.groups = {}  # group -> df (uploaded)
 
 # ============================== Tabs ==============================
 tab_input, tab_tables = st.tabs(["➕ Manual Input", "📊 Tables & Models"])
@@ -145,20 +160,24 @@ with tab_input:
     st.markdown("### Add Stock")
     with st.form("add_form", clear_on_submit=True):
         c1, c2, c3 = st.columns([1.2, 1.2, 1.0])
+
         with c1:
             ticker  = st.text_input("Ticker", "").strip().upper()
             mc_m    = st.number_input("Market Cap (M$)", 0.0, step=0.01, format="%.2f")
             float_m = st.number_input("Public Float (M)", 0.0, step=0.01, format="%.2f")
             si_pct  = st.number_input("Short Interest (%)", 0.0, step=0.01, format="%.2f")
-            gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")  # real percent (e.g., 45 = +45)
+            gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")  # real percent e.g. 100 = +100%
+
         with c2:
             atr_usd = st.number_input("ATR ($)", 0.0, step=0.01, format="%.2f")
             rvol    = st.number_input("RVOL", 0.0, step=0.01, format="%.2f")
             pm_vol  = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
             pm_dol  = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
+
         with c3:
-            catalyst = st.selectbox("Catalyst?", ["No","Yes"])
-            dilution = st.selectbox("Dilution?", ["No","Yes"])
+            # Sliders per your request
+            catalyst = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.1)
+            dilution = st.slider("Dilution (0.0 … 1.0)", 0.0, 1.0, 0.0, 0.1)
 
         st.markdown("---")
         st.subheader("Qualitative Context")
@@ -173,16 +192,17 @@ with tab_input:
                     key=f"qual_{crit['name']}"
                 )
                 # store 1-based index
-                qual_selected[crit["name"]] = choice[0] if isinstance(choice, tuple) else int(choice)
+                q_idx = choice[0] if isinstance(choice, tuple) else int(choice)
+                qual_selected[crit["name"]] = q_idx
 
         submitted = st.form_submit_button("Add to Table", use_container_width=True)
 
     if submitted and ticker:
-        # Derived
+        # Derived metrics
         fr = (pm_vol / float_m) if float_m > 0 else 0.0
         pmmc = (pm_dol / mc_m * 100.0) if mc_m > 0 else 0.0
 
-        # Short qualitative labels
+        # Short qualitative labels for table
         q_gap   = _short_qual("GapStruct",   qual_selected.get("GapStruct", 1))
         q_level = _short_qual("LevelStruct", qual_selected.get("LevelStruct", 1))
         q_mtf   = _short_qual("Monthly",     qual_selected.get("Monthly", 1))
@@ -200,24 +220,24 @@ with tab_input:
             "PM_$Vol_M$": pm_dol,
             "FR_x": fr,
             "PM$Vol/MC_%": pmmc,
-            # Qualitative (short labels)
+            # Sliders
+            "Catalyst": catalyst,
+            "Dilution": dilution,
+            # Qualitative (short)
             "Q_GapStruct": q_gap,
             "Q_LevelStruct": q_level,
             "Q_Monthly": q_mtf,
-            # Convenience (raw selections 1..7 if needed later)
+            # Qual raw selections (1..7) if needed later
             "_Q_GapStruct_idx": qual_selected.get("GapStruct", 1),
             "_Q_LevelStruct_idx": qual_selected.get("LevelStruct", 1),
             "_Q_Monthly_idx": qual_selected.get("Monthly", 1),
-            # Flags
-            "Catalyst": catalyst,
-            "Dilution": dilution,
         }
         st.session_state.rows.append(row)
         st.session_state.last = row
         st.success(f"Saved {ticker}.")
         do_rerun()
 
-    # Quick preview of last added
+    # Minimal preview of last added (no ranking)
     l = st.session_state.last
     if l:
         st.markdown("---")
@@ -240,53 +260,68 @@ with tab_tables:
         else:
             try:
                 xls = pd.ExcelFile(uploaded)
+                # Pick first non-legend sheet if present
                 sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
                 sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
                 raw = pd.read_excel(xls, sheet)
 
-                # Map columns
-                col_mc   = _pick(raw, ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
-                col_float= _pick(raw, ["float m","public float (m)","float_m","float (m)","float m shares"])
-                col_si   = _pick(raw, ["shortint %","short interest %","short float %","si","short interest (float) %"])
-                col_gap  = _pick(raw, ["gap %","gap%","premarket gap","gap"])
-                col_atr  = _pick(raw, ["atr $","atr$","atr (usd)","atr"])
-                col_rvol = _pick(raw, ["rvol","relative volume","rvol @ bo"])
-                col_pm   = _pick(raw, ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)"])
-                col_pmd  = _pick(raw, ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol"])
-                col_cat  = _pick(raw, ["catalyst","news","pr"])
-                col_group= _pick(raw, [group_field])
+                # ------- Map columns from DB -------
+                col_ticker= _pick(raw, ["ticker","symbol"])
+                col_group = _pick(raw, [group_field])
+
+                col_mc    = _pick(raw, ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
+                col_float = _pick(raw, ["float m","public float (m)","float_m","float (m)","float m shares"])
+                col_si    = _pick(raw, ["shortint %","short interest %","short float %","si","short interest (float) %"])
+                col_gap   = _pick(raw, ["gap %","gap%","premarket gap","gap"])
+                col_atr   = _pick(raw, ["atr $","atr$","atr (usd)","atr"])
+                col_rvol  = _pick(raw, ["rvol","relative volume","rvol @ bo"])
+                col_pm    = _pick(raw, ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
+                col_pmd   = _pick(raw, ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
+                col_cat   = _pick(raw, ["catalyst","news","pr"])
 
                 if col_group is None:
                     st.error(f"Group field '{group_field}' not found in sheet '{sheet}'.")
                 else:
                     df = pd.DataFrame()
-                    df["Group"] = raw[col_group]
+                    df["Group"] = raw[col_group].astype(str)
 
-                    if col_mc:    df["MarketCap_M$"] = pd.to_numeric(raw[col_mc], errors="coerce")
-                    if col_float: df["Float_M"]      = pd.to_numeric(raw[col_float], errors="coerce")
-                    if col_si:    df["ShortInt_%"]   = pd.to_numeric(raw[col_si], errors="coerce")
-                    if col_gap:   df["Gap_%"]        = pd.to_numeric(raw[col_gap], errors="coerce")  # real percent (45=+45%)
-                    if col_atr:   df["ATR_$"]        = pd.to_numeric(raw[col_atr], errors="coerce")
-                    if col_rvol:  df["RVOL"]         = pd.to_numeric(raw[col_rvol], errors="coerce")
-                    if col_pm:    df["PM_Vol_M"]     = pd.to_numeric(raw[col_pm], errors="coerce")
-                    if col_pmd:   df["PM_$Vol_M$"]   = pd.to_numeric(raw[col_pmd], errors="coerce")
+                    if col_ticker: df["Ticker"] = raw[col_ticker].astype(str).str.upper()
 
+                    def add_num(name, src):
+                        if src:
+                            df[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
+
+                    add_num("MarketCap_M$", col_mc)
+                    add_num("Float_M",      col_float)
+                    add_num("ShortInt_%",   col_si)
+                    add_num("Gap_%",        col_gap)     # real % (e.g., 100 = +100)
+                    add_num("ATR_$",        col_atr)
+                    add_num("RVOL",         col_rvol)
+                    add_num("PM_Vol_M",     col_pm)
+                    add_num("PM_$Vol_M$",   col_pmd)
+
+                    # Catalyst in DB is Yes/No or 1/0 → map to 0/1 for models if present
                     if col_cat:
-                        cat_series = raw[col_cat].astype(str).str.strip().str.lower()
-                        df["Catalyst01"] = cat_series.isin(["1","true","yes","y","t"]).astype(int)
+                        s = raw[col_cat].astype(str).str.strip().str.lower()
+                        df["Catalyst01"] = s.map({
+                            "yes":1,"y":1,"true":1,"1":1,
+                            "no":0,"n":0,"false":0,"0":0
+                        })
+                        # if numeric strings:
+                        df["Catalyst01"] = df["Catalyst01"].fillna(pd.to_numeric(s, errors="coerce")).fillna(0).astype(int)
 
-                    # Derived (DB)
+                    # Derived
                     if {"PM_Vol_M","Float_M"}.issubset(df.columns):
                         df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
                     if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
                         df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-                    # Split groups & medians
+                    # Split groups & build medians table
                     groups = {}
                     for gname, gdf in df.groupby("Group"):
                         groups[str(gname)] = gdf.drop(columns=["Group"]).copy()
 
-                    var_list = [c for c in df.columns if c != "Group"]
+                    var_list = [c for c in df.columns if c not in ["Group","Ticker"]]
                     medians = []
                     for gname, gdf in groups.items():
                         meds = gdf[var_list].median(numeric_only=True)
@@ -297,16 +332,21 @@ with tab_tables:
                     st.session_state.groups = groups
                     st.session_state.models = {"models_tbl": models_tbl, "var_list": var_list}
 
+                    # Also append uploaded rows to main table (display)
+                    st.session_state.rows.extend(df.to_dict(orient="records"))
+
                     st.success(f"Built model stocks from sheet '{sheet}' with groups: {list(groups.keys())}")
+                    do_rerun()
 
             except Exception as e:
                 st.error("Loading/processing failed.")
                 st.exception(e)
 
-    # ---------- Current Manual Table ----------
-    st.markdown("### Current Manual Table")
+    # ---------- Current Manual + Uploaded Table ----------
+    st.markdown("### Current Table (Manual + Uploaded)")
     if st.session_state.rows:
         df_rows = pd.DataFrame(st.session_state.rows)
+
         show_cols = [
             "Ticker",
             "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
@@ -316,18 +356,21 @@ with tab_tables:
         ]
         for c in show_cols:
             if c not in df_rows.columns:
-                df_rows[c] = ""
+                df_rows[c] = ""  # pad missing
+
         num_cols_cfg = {c: st.column_config.NumberColumn(c, format="%.2f")
-                        for c in show_cols if c not in ["Ticker","Catalyst","Dilution","Q_GapStruct","Q_LevelStruct","Q_Monthly"]}
+                        for c in show_cols if c not in ["Ticker","Q_GapStruct","Q_LevelStruct","Q_Monthly"]}
         st.dataframe(df_rows[show_cols], use_container_width=True, hide_index=True,
                      column_config={**num_cols_cfg})
-        st.download_button("Download Manual Table CSV",
+
+        st.download_button("Download Table CSV",
                            df_rows[show_cols].to_csv(index=False).encode("utf-8"),
-                           "manual_table.csv","text/csv",use_container_width=True)
+                           "stocks_table.csv","text/csv",use_container_width=True)
+
         st.markdown("**Markdown**")
         st.code(df_to_markdown_table(df_rows, show_cols), language="markdown")
     else:
-        st.info("No manual rows yet. Add a stock in the first tab.")
+        st.info("No rows yet. Add a stock in **Manual Input** or upload a DB above.")
 
     # ---------- Divergence across Model Stocks ----------
     st.markdown("### Divergence across Model Stocks (Top-K by median differences)")
@@ -344,6 +387,7 @@ with tab_tables:
         ordered_groups = preferred + rest
         models_tbl_disp = models_tbl.reindex(columns=ordered_groups)
 
+        # Compute max absolute pairwise median difference per variable
         diffs = []
         for v in models_tbl_disp.index:
             vals = models_tbl_disp.loc[v].astype(float)
@@ -380,8 +424,59 @@ with tab_tables:
     else:
         st.info("Upload the DB and build model stocks to see divergences.")
 
-    # ---------- Alignment Summary (per manual stock) ----------
-    st.markdown("### Alignment Summary (how many variables look like each group)")
+    # ---------- Pairwise Differences (select two uploaded tickers if present) ----------
+    st.markdown("### Pairwise Differences (select two tickers)")
+    # Use uploaded rows (those with 'Ticker') for pairwise compare
+    if st.session_state.rows:
+        base = pd.DataFrame(st.session_state.rows)
+        if "Ticker" in base.columns and base["Ticker"].notna().any():
+            tickers = base["Ticker"].dropna().astype(str).unique().tolist()
+            tickers = [t for t in tickers if t != ""]
+            if len(tickers) >= 2:
+                c1, c2 = st.columns(2)
+                with c1:
+                    tA = st.selectbox("Ticker A", tickers, index=0, key="pair_A")
+                with c2:
+                    tB = st.selectbox("Ticker B", [t for t in tickers if t != tA], index=0, key="pair_B")
+
+                # Pick most recent rows for each
+                a = base[base["Ticker"] == tA].iloc[-1]
+                b = base[base["Ticker"] == tB].iloc[-1]
+
+                num_vars = [
+                    "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+                    "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"
+                ]
+                rows = []
+                for v in num_vars:
+                    va = pd.to_numeric(a.get(v), errors="coerce")
+                    vb = pd.to_numeric(b.get(v), errors="coerce")
+                    if pd.notna(va) and pd.notna(vb):
+                        diff = float(va - vb)
+                        rows.append({"Variable": v, f"{tA}": va, f"{tB}": vb, "Δ(A−B)": diff, "|Δ|": abs(diff)})
+                if rows:
+                    dd = pd.DataFrame(rows).sort_values("|Δ|", ascending=False)
+                    cfg = {
+                        "Variable": st.column_config.TextColumn("Variable"),
+                        f"{tA}": st.column_config.NumberColumn(f"{tA}", format="%.2f"),
+                        f"{tB}": st.column_config.NumberColumn(f"{tB}", format="%.2f"),
+                        "Δ(A−B)": st.column_config.NumberColumn("Δ(A−B)", format="%.2f"),
+                        "|Δ|": st.column_config.NumberColumn("|Δ|", format="%.2f"),
+                    }
+                    st.dataframe(dd, use_container_width=True, hide_index=True, column_config=cfg)
+                    st.markdown("**Markdown**")
+                    st.code(df_to_markdown_table(dd, list(dd.columns)), language="markdown")
+                else:
+                    st.info("No overlapping numeric variables between the selected tickers.")
+            else:
+                st.info("Need at least two distinct tickers for pairwise comparison.")
+        else:
+            st.info("No tickers available for pairwise comparison.")
+    else:
+        st.info("No data available for pairwise comparison.")
+
+    # ---------- Alignment Summary (manual rows vs model medians) ----------
+    st.markdown("### Alignment Summary (how many variables look like each model group)")
     def compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
         if models_tbl is None or models_tbl.empty:
             return {}
@@ -408,8 +503,8 @@ with tab_tables:
         counts["N_Vars_Used"] = used
         return counts
 
-    if st.session_state.rows and models_data:
-        models_tbl: pd.DataFrame = models_data["models_tbl"]
+    if st.session_state.rows and st.session_state.models:
+        models_tbl: pd.DataFrame = st.session_state.models["models_tbl"]
         group_cols = list(models_tbl.columns)
 
         summary_rows = []
@@ -420,11 +515,11 @@ with tab_tables:
             out = {"Ticker": row.get("Ticker","—"), "N_Vars_Used": counts.pop("N_Vars_Used", 0)}
             for g in group_cols:
                 out[f"Like_{g}"] = counts.get(g, 0)
-            grp_count_pairs = [(g, out.get(f"Like_{g}", 0)) for g in group_cols]
-            if grp_count_pairs:
-                maxc = max(c for _, c in grp_count_pairs)
-                top_groups = [g for g, c in grp_count_pairs if c == maxc and maxc > 0]
-                out["Lean"] = ", ".join(top_groups) if top_groups else "—"
+            pairs = [(g, out.get(f"Like_{g}", 0)) for g in group_cols]
+            if pairs:
+                m = max(c for _, c in pairs)
+                top = [g for g, c in pairs if c == m and m > 0]
+                out["Lean"] = ", ".join(top) if top else "—"
             else:
                 out["Lean"] = "—"
             summary_rows.append(out)
@@ -448,3 +543,11 @@ with tab_tables:
             st.info("Add at least one stock and build model stocks to compute alignment.")
     else:
         st.info("To compute alignment, add stocks and build model stocks first.")
+
+    # Clear all
+    st.markdown("---")
+    if st.button("Clear All Rows", use_container_width=True):
+        st.session_state.rows = []
+        st.session_state.models = {}
+        st.session_state.groups = {}
+        do_rerun()
