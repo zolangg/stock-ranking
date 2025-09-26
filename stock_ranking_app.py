@@ -88,7 +88,7 @@ QUAL_CRITERIA = [
     },
 ]
 
-# ---------- Sidebar: weights & modifiers (YOUR original + expanded numeric weights) ----------
+# ---------- Sidebar: weights & modifiers ----------
 st.sidebar.header("Numeric Weights")
 w_mc      = st.sidebar.slider("Market Cap (Millions $)", 0.0, 1.0, 0.05, 0.01, key="w_mc")
 w_float   = st.sidebar.slider("Public Float (Millions)",  0.0, 1.0, 0.06, 0.01, key="w_float")
@@ -186,20 +186,7 @@ def grade(score_pct: float) -> str:
             "B"   if score_pct >= 60 else
             "C"   if score_pct >= 45 else "D")
 
-# ---------- Predicted day-volume (kept; used for PM% and FT calc) ----------
-def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
-    e = 1e-6
-    mc = max(float(mcap_m or 0.0), 0.0)
-    gp = max(float(gap_pct or 0.0), 0.0) / 100.0
-    atr = max(float(atr_usd or 0.0), 0.0)
-    ln_y = (
-        3.1435
-        + 0.1608 * math.log(mc + e)
-        + 0.6704 * math.log(gp + e)
-        - 0.3878 * math.log(atr + e)
-    )
-    return math.exp(ln_y)
-
+# ---------- Sanity checks ----------
 def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
     flags = []
     if mc_m > 50000: flags.append("⚠️ Market Cap looks > $50B — is it in *millions*?")
@@ -218,89 +205,13 @@ def sanity_flags(mc_m, si_pct, atr_usd, pm_vol_m, float_m):
         if fr > 3.0: flags.append(f"⚠️ FR=PM/Float = {fr:.2f}× may indicate unit mismatch.")
     return flags
 
-def ln_terms_for_display(mcap_m, gap_pct, atr_usd):
-    e = 1e-6
-    t0 = 3.1435
-    t1 = 0.1608 * math.log(max(float(mcap_m or 0.0), 0.0) + e)
-    t2 = 0.6704 * math.log(max(float(gap_pct or 0.0), 0.0) / 100.0 + e)
-    t3 = -0.3878 * math.log(max(float(atr_usd or 0.0), 0.0) + e)
-    lnY = t0 + t1 + t2 + t3
-    Y   = math.exp(lnY)
-    return {
-        "ln_components": {
-            "base": t0,
-            "+0.1608 ln(MCap M)": t1,
-            "+0.6704 ln(Gap frac)": t2,
-            "−0.3878 ln(ATR $)": t3,
-            "lnY total": lnY
-        },
-        "Predicted Y (millions shares)": Y
-    }
-
-# ---------- FT probability (kept) ----------
-_FT_INTERCEPT = -0.20
-_FT_COEF = {
-    'ln_gapf':    1.20,
-    'ln_pmvol_f': 0.80,
-    'ln_fr':      0.30,
-    'ln_pmvol_m': 0.10,
-    'ln_mcap':   -0.40,
-    'ln_atr':    -0.30,
-    'ln_float':  -0.20,
-    'catalyst':   0.40,
-}
-_FT_MEAN = {k: 0.0 for k in _FT_COEF.keys()}
-_FT_SCALE= {k: 1.0 for k in _FT_COEF.keys()}
-
-def _std(x, m, s):
-    s = float(s) if s not in (None, 0.0) else 1.0
-    return (x - float(m)) / s
-
-def predict_ft_prob_premarket(float_m: float, mcap_m: float, atr_usd: float,
-                              gap_pct: float, pm_vol_m: float,
-                              pred_vol_m: float,
-                              catalyst_flag: int = 0) -> float:
-    e = 1e-6
-    ln_float   = math.log(max(float_m, e))
-    ln_mcap    = math.log(max(mcap_m, e))
-    ln_atr     = math.log(max(atr_usd, e))
-    ln_gapf    = math.log(max(gap_pct, 0.0)/100.0 + e)
-    ln_pmvol_m = math.log(max(pm_vol_m, 0.0) + 1.0)
-    fr         = (pm_vol_m / max(float_m, e)) if float_m > 0 else 0.0
-    ln_fr      = math.log(fr + 1.0)
-    denom  = max(float(pred_vol_m or 0.0), 0.0)
-    pm_frac = (pm_vol_m / denom) if denom > 0 else 0.0
-    pm_frac = max(0.0, min(pm_frac, 5.0))
-    ln_pmvol_f = math.log(pm_frac + 1.0)
-    lp = _FT_INTERCEPT
-    features = {
-        'ln_float': ln_float,
-        'ln_mcap': ln_mcap,
-        'ln_atr': ln_atr,
-        'ln_gapf': ln_gapf,
-        'ln_pmvol_f': ln_pmvol_f,
-        'ln_pmvol_m': ln_pmvol_m,
-        'ln_fr': ln_fr,
-        'catalyst': float(catalyst_flag),
-    }
-    for name, val in features.items():
-        if name in _FT_COEF:
-            z = _std(val, _FT_MEAN.get(name, 0.0), _FT_SCALE.get(name, 1.0))
-            lp += _FT_COEF[name] * z
-    if lp >= 0:
-        p = 1.0 / (1.0 + math.exp(-lp))
-    else:
-        elp = math.exp(lp)
-        p = elp / (1.0 + elp)
-    return max(0.0, min(1.0, p))
-
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
 with tab_add:
     st.subheader("Numeric Context")
 
-    # Form that clears on submit (order & $Vol kept)
+    # Form that clears on submit (keeps your order & $ volume)
     with st.form("add_form", clear_on_submit=True):
         c_top = st.columns([1.2, 1.2, 1.0])
 
@@ -342,9 +253,6 @@ with tab_add:
 
     # After submit
     if submitted and ticker:
-        # Predicted day volume (M)
-        pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
-
         # === Numeric points ===
         p_mc     = pts_mcap(mc_m)
         p_float  = pts_float(float_m)
@@ -377,48 +285,20 @@ with tab_add:
         final_score = round(combo_pct + news_weight*catalyst_points*10 + dilution_weight*dilution_points*10, 2)
         final_score = max(0.0, min(100.0, final_score))
 
-        # === Diagnostics to save ===
-        pm_pct_of_pred   = 100.0 * pm_vol_m / pred_vol_m if pred_vol_m > 0 else 0.0
-        pm_float_rot_x   = pm_vol_m / float_m if float_m > 0 else 0.0
-        pm_dollar_vs_mc  = 100.0 * pm_dol_m / mc_m if mc_m > 0 else 0.0
-
-        # === FT Probability (kept)
-        ft_prob = predict_ft_prob_premarket(
-            float_m=float_m, mcap_m=mc_m, atr_usd=atr_usd,
-            gap_pct=gap_pct, pm_vol_m=pm_vol_m,
-            pred_vol_m=pred_vol_m,
-            catalyst_flag=1 if catalyst_points != 0 else 0
-        )
-        ft_pct = round(100.0 * ft_prob, 1)
-        ft_label = ("High FT" if ft_pct >= 70 else
-                    "Moderate FT" if ft_pct >= 55 else
-                    "Low FT" if ft_pct >= 40 else
-                    "Very Low FT")
-        ft_display = f"{ft_pct:.1f}% ({ft_label})"
+        # === Display/diagnostics we keep ===
+        pm_float_rot_x  = pm_vol_m / float_m if float_m > 0 else 0.0
+        pm_dollar_vs_mc = 100.0 * pm_dol_m / mc_m if mc_m > 0 else 0.0
 
         row = {
             "Ticker": ticker,
             "Odds": odds_label(final_score),
             "Level": grade(final_score),
-            "OddsScore": final_score,
             "Numeric_%": round(num_pct, 2),
             "Qual_%": round(qual_pct, 2),
             "FinalScore": final_score,
-
-            # Prediction fields (no CI fields anymore)
-            "PredVol_M": round(pred_vol_m, 2),
-            "PM_%_of_Pred": round(pm_pct_of_pred, 1),
-
-            # Diagnostics
             "PM$ / MC_%": round(pm_dollar_vs_mc, 1),
             "PM_FloatRot_x": round(pm_float_rot_x, 3),
-
-            # FT fields
-            "FT": ft_display,
-            "FT_Prob_%": ft_pct,
-            "FT_Label": ft_label,
-
-            # raw inputs
+            # raw inputs (for export)
             "_MCap_M": mc_m,
             "_Gap_%": gap_pct,
             "_SI_%": si_pct,
@@ -427,6 +307,7 @@ with tab_add:
             "_PM_$M": pm_dol_m,
             "_Float_M": float_m,
             "_Catalyst": float(catalyst_points),
+            "_Dilution": float(dilution_points),
         }
 
         st.session_state.rows.append(row)
@@ -434,29 +315,16 @@ with tab_add:
         st.session_state.flash = f"Saved {ticker} – Odds {row['Odds']} (Score {row['FinalScore']})"
         do_rerun()
 
-    # ---------- Preview card ----------
+    # ---------- Preview card (only the three you asked for, plus basics) ----------
     l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
     if l:
         st.markdown("---")
-        cA, cB, cC, cD, cE = st.columns(5)
-
-        cA.metric("Last Ticker", l.get("Ticker","—"))
-        cB.metric("Numeric Block", f"{l.get('Numeric_%',0):.2f}%")
-        cC.metric("Qual Block",    f"{l.get('Qual_%',0):.2f}%")
-        cD.metric("Final Score",   f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
-        cE.metric("Odds", l.get("Odds","—"))
-
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("PM Float Rotation", f"{l.get('PM_FloatRot_x',0):.3f}×")
-        d1.caption("Premarket volume ÷ float.")
-        d2.metric("PM $Vol / MC", f"{l.get('PM$ / MC_%',0):.1f}%")
-        d2.caption("PM dollar volume ÷ market cap × 100.")
-        d3.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
-        d3.caption("Model-based estimate of total day shares.")
-        d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
-        d4.caption("PM volume ÷ predicted day volume × 100.")
-        d5.metric("FT Probability", f"{l.get('FT_Prob_%',0):.1f}%")
-        d5.caption(f"FT Label: {l.get('FT_Label','—')}")
+        a, b, c, d, e = st.columns(5)
+        a.metric("Last Ticker", l.get("Ticker","—"))
+        b.metric("Final Score", f"{l.get('FinalScore',0):.2f} ({l.get('Level','—')})")
+        c.metric("Odds", l.get("Odds","—"))
+        d.metric("PM Float Rotation", f"{l.get('PM_FloatRot_x',0):.3f}×")
+        e.metric("PM $Vol / MC", f"{l.get('PM$ / MC_%',0):.1f}%")
 
 # ---------- Ranking tab ----------
 with tab_rank:
@@ -466,19 +334,18 @@ with tab_rank:
         df = pd.DataFrame(st.session_state.rows)
         df = df.loc[:, ~df.columns.duplicated(keep="first")]
 
+        # sort by FinalScore highest first
         if "FinalScore" in df.columns:
             df = df.sort_values("FinalScore", ascending=False).reset_index(drop=True)
 
         cols_to_show = [
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
-            "PM$ / MC_%",
-            "PredVol_M","PM_%_of_Pred",
-            "FT"
+            "PM$ / MC_%","PM_FloatRot_x"
         ]
         for c in cols_to_show:
             if c not in df.columns:
-                df[c] = "" if c in ("Ticker","Odds","Level","FT") else 0.0
+                df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
         df = df[cols_to_show]
 
         st.dataframe(
@@ -493,22 +360,9 @@ with tab_rank:
                 "Qual_%": st.column_config.NumberColumn("Qual_%", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
                 "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
-                "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
-                "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
-                "FT": st.column_config.TextColumn("FT (p/label)"),
+                "PM_FloatRot_x": st.column_config.NumberColumn("PM Float Rotation ×", format="%.3f"),
             }
         )
-
-        st.markdown("#### Delete rows")
-        del_cols = st.columns(4)
-        head12 = df.head(12).reset_index(drop=True)
-        for i, r in head12.iterrows():
-            with del_cols[i % 4]:
-                label = r.get("Ticker", f"Row {i+1}")
-                if st.button(f"🗑️ {label}", key=f"del_{i}", use_container_width=True):
-                    keep = df.drop(index=i).reset_index(drop=True)
-                    st.session_state.rows = keep.to_dict(orient="records")
-                    do_rerun()
 
         st.download_button(
             "Download CSV",
