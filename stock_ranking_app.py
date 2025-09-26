@@ -34,7 +34,7 @@ def do_rerun():
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 
-# ---------- Qualitative criteria (full 7-step texts) ----------
+# ---------- Qualitative criteria ----------
 QUAL_CRITERIA = [
     {
         "name": "GapStruct",
@@ -99,6 +99,16 @@ w_mc, w_float, w_si, w_gap, w_atr, w_rvol, w_pmvol = [w/num_sum for w in (w_mc, 
 qual_sum = max(1e-9, sum(q_weights.values()))
 for k in q_weights: q_weights[k] /= qual_sum
 
+# ---------- Grading helper ----------
+def grade(score: float) -> str:
+    return (
+        "A++" if score >= 90 else
+        "A+"  if score >= 85 else
+        "A"   if score >= 75 else
+        "B"   if score >= 65 else
+        "C"   if score >= 50 else "D"
+    )
+
 # ---------- Tabs ----------
 tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
@@ -133,11 +143,11 @@ with tab_add:
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
     if submitted and ticker:
-        # numeric score (just normalized weighted sum)
+        # numeric score
         num_score = w_mc*mc_m + w_float*float_m + w_si*si_pct + w_gap*gap_pct + w_atr*atr_usd + w_rvol*rvol + w_pmvol*pm_vol_m
         num_pct = 100.0 * num_score / (num_score+1e-9)
 
-        # qualitative score (average of chosen options weighted)
+        # qualitative score
         qual_score = 0
         for crit in QUAL_CRITERIA:
             sel = st.session_state.get(f"qual_{crit['name']}")[0]
@@ -145,8 +155,15 @@ with tab_add:
         qual_pct = (qual_score/7.0)*100.0
 
         final_score = round(0.5*num_pct + 0.5*qual_pct, 2)
+        grade_label = grade(final_score)
 
-        row = {"Ticker": ticker, "Numeric_%": round(num_pct,2), "Qual_%": round(qual_pct,2), "FinalScore": final_score}
+        row = {
+            "Ticker": ticker,
+            "Numeric_%": round(num_pct,2),
+            "Qual_%": round(qual_pct,2),
+            "FinalScore": final_score,
+            "Grade": grade_label,
+        }
         st.session_state.rows.append(row)
         st.session_state.last = row
         do_rerun()
@@ -155,11 +172,12 @@ with tab_add:
     l = st.session_state.last
     if l:
         st.markdown("---")
-        a, b, c, d = st.columns(4)
+        a, b, c, d, e = st.columns(5)
         a.metric("Last Ticker", l.get("Ticker","—"))
         b.metric("Numeric Score", f"{l.get('Numeric_%',0):.2f}%")
         c.metric("Qualitative Score", f"{l.get('Qual_%',0):.2f}%")
         d.metric("Final Score", f"{l.get('FinalScore',0):.2f}")
+        e.metric("Grade", l.get("Grade","—"))
 
 with tab_rank:
     st.subheader("Current Ranking")
@@ -167,6 +185,6 @@ with tab_rank:
         df = pd.DataFrame(st.session_state.rows).sort_values("FinalScore", ascending=False).reset_index(drop=True)
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), "ranking.csv")
-        st.code(df_to_markdown_table(df, ["Ticker","Numeric_%","Qual_%","FinalScore"]), language="markdown")
+        st.code(df_to_markdown_table(df, ["Ticker","Numeric_%","Qual_%","FinalScore","Grade"]), language="markdown")
     else:
         st.info("No rows yet. Add a stock in the **Add Stock** tab.")
