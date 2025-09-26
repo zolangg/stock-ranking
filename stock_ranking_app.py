@@ -88,20 +88,18 @@ QUAL_CRITERIA = [
     },
 ]
 
-# ---------- Sidebar: weights & modifiers ----------
-st.sidebar.header("Numeric Weights (suggested)")
-# Suggestions: emphasize RVOL/FR/$Vol-MC; keep others smaller but present
-w_mc      = st.sidebar.slider("Market Cap (M$)",           0.0, 1.0, 0.05, 0.01, key="w_mc")
-w_float   = st.sidebar.slider("Public Float (M)",          0.0, 1.0, 0.06, 0.01, key="w_float")
-w_si      = st.sidebar.slider("Short Interest (%)",        0.0, 1.0, 0.12, 0.01, key="w_si")
-w_gap     = st.sidebar.slider("Gap %",                     0.0, 1.0, 0.10, 0.01, key="w_gap")
-w_atr     = st.sidebar.slider("ATR ($)",                   0.0, 1.0, 0.10, 0.01, key="w_atr")
-w_rvol    = st.sidebar.slider("RVOL",                      0.0, 1.0, 0.22, 0.01, key="w_rvol")
-w_pmvol   = st.sidebar.slider("Premarket Volume (M)",      0.0, 1.0, 0.05, 0.01, key="w_pmvol")
-w_pmmc    = st.sidebar.slider("PM $Vol / MC (%)",          0.0, 1.0, 0.10, 0.01, key="w_pmmc")
-w_fr      = st.sidebar.slider("PM Float Rotation (×)",     0.0, 1.0, 0.20, 0.01, key="w_fr")
+# ---------- Sidebar: weights & modifiers (YOUR original + expanded numeric weights) ----------
+st.sidebar.header("Numeric Weights")
+w_mc      = st.sidebar.slider("Market Cap (Millions $)", 0.0, 1.0, 0.05, 0.01, key="w_mc")
+w_float   = st.sidebar.slider("Public Float (Millions)",  0.0, 1.0, 0.06, 0.01, key="w_float")
+w_si      = st.sidebar.slider("Short Interest (%)",       0.0, 1.0, 0.12, 0.01, key="w_si")
+w_gap     = st.sidebar.slider("Gap %",                    0.0, 1.0, 0.10, 0.01, key="w_gap")
+w_atr     = st.sidebar.slider("ATR ($)",                  0.0, 1.0, 0.10, 0.01, key="w_atr")
+w_rvol    = st.sidebar.slider("RVOL",                     0.0, 1.0, 0.22, 0.01, key="w_rvol")
+w_pmvol   = st.sidebar.slider("Premarket Volume (M)",     0.0, 1.0, 0.05, 0.01, key="w_pmvol")
+w_pmmc    = st.sidebar.slider("PM $Vol / MC (%)",         0.0, 1.0, 0.10, 0.01, key="w_pmmc")
+w_fr      = st.sidebar.slider("PM Float Rotation (×)",    0.0, 1.0, 0.20, 0.01, key="w_fr")
 
-# Qualitative weights (unchanged)
 st.sidebar.header("Qualitative Weights")
 q_weights = {}
 for crit in QUAL_CRITERIA:
@@ -113,11 +111,6 @@ st.sidebar.header("Modifiers")
 news_weight     = st.sidebar.slider("Catalyst (× on value)", 0.0, 2.0, 1.0, 0.05, key="news_weight")
 dilution_weight = st.sidebar.slider("Dilution (× on value)", 0.0, 2.0, 1.0, 0.05, key="dil_weight")
 
-# --- Confidence (log-space) ---
-st.sidebar.header("Prediction Uncertainty")
-sigma_ln = st.sidebar.slider("Log-space σ (residual std dev)", 0.10, 1.50, 0.60, 0.01,
-                             help="Estimated std dev of residuals in ln(volume). 0.60 ≈ typical for your sheet.")
-
 # Normalize numeric & qualitative blocks separately
 num_sum = max(1e-9, w_mc + w_float + w_si + w_gap + w_atr + w_rvol + w_pmvol + w_pmmc + w_fr)
 w_mc, w_float, w_si, w_gap, w_atr, w_rvol, w_pmvol, w_pmmc, w_fr = [
@@ -127,7 +120,7 @@ qual_sum = max(1e-9, sum(q_weights.values()))
 for k in q_weights:
     q_weights[k] = q_weights[k] / qual_sum
 
-# ---------- Numeric bucket scorers (YOUR original style + new ones) ----------
+# ---------- Numeric bucket scorers ----------
 def pts_rvol(x: float) -> int:
     for th, p in [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]:
         if x < th: return p
@@ -149,7 +142,6 @@ def pts_gap(x: float) -> int:
     return 7
 
 def pts_mcap(mcap_m: float) -> int:
-    # Prefer smaller caps for momentum (more points for smaller)
     if mcap_m <= 100: return 7
     for th, p in [(20000,1),(10000,2),(5000,3),(2000,4),(1000,5),(500,6)]:
         if mcap_m > th: return p
@@ -174,7 +166,6 @@ def pts_float(float_m: float) -> int:
     return 7
 
 def pts_pmmc(pm_dol_m: float, mcap_m: float) -> int:
-    # PM $Vol / MC % — larger is stronger
     if mcap_m <= 0: return 1
     pct = 100.0 * pm_dol_m / mcap_m
     for th, p in [(0.10,1),(0.30,2),(0.80,3),(2.00,4),(5.00,5),(10.00,6)]:
@@ -195,7 +186,7 @@ def grade(score_pct: float) -> str:
             "B"   if score_pct >= 60 else
             "C"   if score_pct >= 45 else "D")
 
-# ---------- New premarket day-volume model (millions out) ----------
+# ---------- Predicted day-volume (kept; used for PM% and FT calc) ----------
 def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
     e = 1e-6
     mc = max(float(mcap_m or 0.0), 0.0)
@@ -246,14 +237,7 @@ def ln_terms_for_display(mcap_m, gap_pct, atr_usd):
         "Predicted Y (millions shares)": Y
     }
 
-def ci_from_logsigma(pred_m: float, sigma_ln: float, z: float):
-    if pred_m <= 0:
-        return 0.0, 0.0
-    low  = pred_m * math.exp(-z * sigma_ln)
-    high = pred_m * math.exp( z * sigma_ln)
-    return low, high
-
-# ---------- FT placeholder (unchanged) ----------
+# ---------- FT probability (kept) ----------
 _FT_INTERCEPT = -0.20
 _FT_COEF = {
     'ln_gapf':    1.20,
@@ -316,7 +300,7 @@ tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 with tab_add:
     st.subheader("Numeric Context")
 
-    # Form that clears on submit (order & $Vol kept from last change)
+    # Form that clears on submit (order & $Vol kept)
     with st.form("add_form", clear_on_submit=True):
         c_top = st.columns([1.2, 1.2, 1.0])
 
@@ -335,7 +319,7 @@ with tab_add:
             pm_vol_m = st.number_input("Premarket Volume (Millions)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
             pm_dol_m = st.number_input("Premarket Dollar Volume (Millions $)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
 
-        # Column 3 (unchanged)
+        # Column 3
         with c_top[2]:
             catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
             dilution_points = st.slider("Dilution (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05)
@@ -358,12 +342,8 @@ with tab_add:
 
     # After submit
     if submitted and ticker:
-        # Day volume prediction (M)
+        # Predicted day volume (M)
         pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
-
-        # Confidence bands (millions)
-        ci68_l, ci68_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.0)    # ~68%
-        ci95_l, ci95_u = ci_from_logsigma(pred_vol_m, sigma_ln, 1.96)   # ~95%
 
         # === Numeric points ===
         p_mc     = pts_mcap(mc_m)
@@ -402,7 +382,7 @@ with tab_add:
         pm_float_rot_x   = pm_vol_m / float_m if float_m > 0 else 0.0
         pm_dollar_vs_mc  = 100.0 * pm_dol_m / mc_m if mc_m > 0 else 0.0
 
-        # === FT Probability (unchanged)
+        # === FT Probability (kept)
         ft_prob = predict_ft_prob_premarket(
             float_m=float_m, mcap_m=mc_m, atr_usd=atr_usd,
             gap_pct=gap_pct, pm_vol_m=pm_vol_m,
@@ -425,12 +405,8 @@ with tab_add:
             "Qual_%": round(qual_pct, 2),
             "FinalScore": final_score,
 
-            # Prediction fields
+            # Prediction fields (no CI fields anymore)
             "PredVol_M": round(pred_vol_m, 2),
-            "PredVol_CI68_L": round(ci68_l, 2),
-            "PredVol_CI68_U": round(ci68_u, 2),
-            "PredVol_CI95_L": round(ci95_l, 2),
-            "PredVol_CI95_U": round(ci95_u, 2),
             "PM_%_of_Pred": round(pm_pct_of_pred, 1),
 
             # Diagnostics
@@ -476,10 +452,7 @@ with tab_add:
         d2.metric("PM $Vol / MC", f"{l.get('PM$ / MC_%',0):.1f}%")
         d2.caption("PM dollar volume ÷ market cap × 100.")
         d3.metric("Predicted Day Vol (M)", f"{l.get('PredVol_M',0):.2f}")
-        d3.caption(
-            f"CI68: {l.get('PredVol_CI68_L',0):.2f}–{l.get('PredVol_CI68_U',0):.2f} M · "
-            f"CI95: {l.get('PredVol_CI95_L',0):.2f}–{l.get('PredVol_CI95_U',0):.2f} M"
-        )
+        d3.caption("Model-based estimate of total day shares.")
         d4.metric("PM % of Predicted", f"{l.get('PM_%_of_Pred',0):.1f}%")
         d4.caption("PM volume ÷ predicted day volume × 100.")
         d5.metric("FT Probability", f"{l.get('FT_Prob_%',0):.1f}%")
@@ -500,7 +473,7 @@ with tab_rank:
             "Ticker","Odds","Level",
             "Numeric_%","Qual_%","FinalScore",
             "PM$ / MC_%",
-            "PredVol_M","PredVol_CI68_L","PredVol_CI68_U","PM_%_of_Pred",
+            "PredVol_M","PM_%_of_Pred",
             "FT"
         ]
         for c in cols_to_show:
@@ -521,8 +494,6 @@ with tab_rank:
                 "FinalScore": st.column_config.NumberColumn("FinalScore", format="%.2f"),
                 "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
                 "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
-                "PredVol_CI68_L": st.column_config.NumberColumn("Pred Vol CI68 Low (M)",  format="%.2f"),
-                "PredVol_CI68_U": st.column_config.NumberColumn("Pred Vol CI68 High (M)", format="%.2f"),
                 "PM_%_of_Pred": st.column_config.NumberColumn("PM % of Prediction", format="%.1f"),
                 "FT": st.column_config.TextColumn("FT (p/label)"),
             }
