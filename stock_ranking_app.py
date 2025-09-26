@@ -235,16 +235,6 @@ with tab_input:
         st.success(f"Saved {ticker}.")
         do_rerun()
 
-    # Minimal preview of last added
-    l = st.session_state.last
-    if l:
-        st.markdown("---")
-        cA, cB, cC, cD = st.columns(4)
-        cA.metric("Last Ticker", l.get("Ticker","—"))
-        cB.metric("FR ×", f"{l.get('FR_x',0):.2f}")
-        cC.metric("PM $Vol / MC %", f"{l.get('PM$Vol/MC_%',0):.2f}")
-        cD.metric("Gap %", f"{l.get('Gap_%',0):.2f}")
-
 # ============================== 📊 Tables & Models ==============================
 with tab_tables:
     st.markdown("### Upload Database (Excel) → Build Model Stocks (FT=1 & FT=0 medians only)")
