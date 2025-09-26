@@ -34,11 +34,50 @@ def do_rerun():
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 
-# ---------- Qualitative criteria ----------
+# ---------- Qualitative criteria (full 7-step texts) ----------
 QUAL_CRITERIA = [
-    {"name": "GapStruct", "question": "Gap & Trend Development:", "options": [1,2,3,4,5,6,7], "weight": 0.15},
-    {"name": "LevelStruct", "question": "Key Price Levels:", "options": [1,2,3,4,5,6,7], "weight": 0.15},
-    {"name": "Monthly", "question": "Monthly/Weekly Context:", "options": [1,2,3,4,5,6,7], "weight": 0.10},
+    {
+        "name": "GapStruct",
+        "question": "Gap & Trend Development:",
+        "options": [
+            "Gap fully reversed: price loses >80% of gap.",
+            "Choppy reversal: price loses 50–80% of gap.",
+            "Partial retracement: price loses 25–50% of gap.",
+            "Sideways consolidation: gap holds, price within top 25% of gap.",
+            "Uptrend with deep pullbacks (>30% retrace).",
+            "Uptrend with moderate pullbacks (10–30% retrace).",
+            "Clean uptrend, only minor pullbacks (<10%).",
+        ],
+        "weight": 0.15,
+    },
+    {
+        "name": "LevelStruct",
+        "question": "Key Price Levels:",
+        "options": [
+            "Fails at all major support/resistance; cannot hold any key level.",
+            "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
+            "Holds one support but unable to break resistance; capped below a key level.",
+            "Breaks above resistance but cannot stay; dips below reclaimed level.",
+            "Breaks and holds one major level; most resistance remains above.",
+            "Breaks and holds several major levels; clears most overhead resistance.",
+            "Breaks and holds above all resistance; blue sky.",
+        ],
+        "weight": 0.15,
+    },
+    {
+        "name": "Monthly",
+        "question": "Monthly/Weekly Context:",
+        "options": [
+            "Sharp, accelerating downtrend; new lows repeatedly.",
+            "Persistent downtrend; still lower lows.",
+            "Downtrend losing momentum; flattening.",
+            "Clear base; sideways consolidation.",
+            "Bottom confirmed; higher low after base.",
+            "Uptrend begins; breaks out of base.",
+            "Sustained uptrend; higher highs, blue sky.",
+        ],
+        "weight": 0.10,
+    },
 ]
 
 # ---------- Sidebar: weights ----------
@@ -84,34 +123,30 @@ with tab_add:
         st.markdown("---")
         st.subheader("Qualitative Context")
         for crit in QUAL_CRITERIA:
-            st.radio(crit["question"], options=list(enumerate(crit["options"], 1)),
-                     format_func=lambda x: f"Option {x[1]}", key=f"qual_{crit['name']}")
+            st.radio(
+                crit["question"],
+                options=list(enumerate(crit["options"], start=1)),
+                format_func=lambda x: f"{x[0]}. {x[1]}",
+                key=f"qual_{crit['name']}"
+            )
 
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
     if submitted and ticker:
-        # numeric block (raw normalization is enough, no fancy buckets now)
-        num_score = (
-            w_mc*mc_m + w_float*float_m + w_si*si_pct +
-            w_gap*gap_pct + w_atr*atr_usd + w_rvol*rvol + w_pmvol*pm_vol_m
-        )
+        # numeric score (just normalized weighted sum)
+        num_score = w_mc*mc_m + w_float*float_m + w_si*si_pct + w_gap*gap_pct + w_atr*atr_usd + w_rvol*rvol + w_pmvol*pm_vol_m
         num_pct = 100.0 * num_score / (num_score+1e-9)
 
-        # qualitative block
+        # qualitative score (average of chosen options weighted)
         qual_score = 0
         for crit in QUAL_CRITERIA:
-            sel = st.session_state.get(f"qual_{crit['name']}", (1,))[0]
+            sel = st.session_state.get(f"qual_{crit['name']}")[0]
             qual_score += q_weights[crit["name"]] * float(sel)
         qual_pct = (qual_score/7.0)*100.0
 
         final_score = round(0.5*num_pct + 0.5*qual_pct, 2)
 
-        row = {
-            "Ticker": ticker,
-            "Numeric_%": round(num_pct,2),
-            "Qual_%": round(qual_pct,2),
-            "FinalScore": final_score,
-        }
+        row = {"Ticker": ticker, "Numeric_%": round(num_pct,2), "Qual_%": round(qual_pct,2), "FinalScore": final_score}
         st.session_state.rows.append(row)
         st.session_state.last = row
         do_rerun()
