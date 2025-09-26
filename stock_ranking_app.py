@@ -314,66 +314,66 @@ with tab_input:
 
 # ============================== 📊 Tables & Models ==============================
 with tab_tables:
-# ---------- Manual Table (editable; ONLY manual rows) ----------
-st.markdown("### Manual Table (editable)")
-
-if st.session_state.rows:
-    df_rows = pd.DataFrame(st.session_state.rows)
-    show_cols = [
-        "Ticker",
-        "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-        "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%",
-        "Catalyst","Dilution",
-        "Q_GapStruct","Q_LevelStruct","Q_Monthly",
-    ]
-    # pad missing columns so editor stays stable
-    for c in show_cols:
-        if c not in df_rows.columns:
-            df_rows[c] = ""
-
-    # column configs
-    num_cols_cfg = {
-        c: st.column_config.NumberColumn(c, format="%.2f")
-        for c in show_cols
-        if c not in ["Ticker","Q_GapStruct","Q_LevelStruct","Q_Monthly"]
-    }
-    text_cols_cfg = {
-        "Ticker": st.column_config.TextColumn("Ticker"),
-        "Q_GapStruct": st.column_config.TextColumn("Q_GapStruct"),
-        "Q_LevelStruct": st.column_config.TextColumn("Q_LevelStruct"),
-        "Q_Monthly": st.column_config.TextColumn("Q_Monthly"),
-    }
-
-    edited_df = st.data_editor(
-        df_rows[show_cols],
-        use_container_width=True,
-        hide_index=True,
-        column_config={**num_cols_cfg, **text_cols_cfg},
-        num_rows="dynamic",  # allows adding/removing rows
-        key="manual_editor",
-    )
-
-    c_save, c_dl = st.columns([1,1])
-    with c_save:
-        if st.button("Save Changes", use_container_width=True, key="save_manual_changes"):
-            st.session_state.rows = edited_df.to_dict(orient="records")
-            st.success("Manual table updated.")
-            do_rerun()
-
-    with c_dl:
-        st.download_button(
-            "Download Manual Table CSV",
-            edited_df.to_csv(index=False).encode("utf-8"),
-            "manual_table.csv",
-            "text/csv",
+    # ---------- Manual Table (editable; ONLY manual rows) ----------
+    st.markdown("### Manual Table (editable)")
+    
+    if st.session_state.rows:
+        df_rows = pd.DataFrame(st.session_state.rows)
+        show_cols = [
+            "Ticker",
+            "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+            "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%",
+            "Catalyst","Dilution",
+            "Q_GapStruct","Q_LevelStruct","Q_Monthly",
+        ]
+        # pad missing columns so editor stays stable
+        for c in show_cols:
+            if c not in df_rows.columns:
+                df_rows[c] = ""
+    
+        # column configs
+        num_cols_cfg = {
+            c: st.column_config.NumberColumn(c, format="%.2f")
+            for c in show_cols
+            if c not in ["Ticker","Q_GapStruct","Q_LevelStruct","Q_Monthly"]
+        }
+        text_cols_cfg = {
+            "Ticker": st.column_config.TextColumn("Ticker"),
+            "Q_GapStruct": st.column_config.TextColumn("Q_GapStruct"),
+            "Q_LevelStruct": st.column_config.TextColumn("Q_LevelStruct"),
+            "Q_Monthly": st.column_config.TextColumn("Q_Monthly"),
+        }
+    
+        edited_df = st.data_editor(
+            df_rows[show_cols],
             use_container_width=True,
+            hide_index=True,
+            column_config={**num_cols_cfg, **text_cols_cfg},
+            num_rows="dynamic",  # allows adding/removing rows
+            key="manual_editor",
         )
-
-    st.markdown("**Markdown**")
-    st.code(df_to_markdown_table(edited_df, show_cols), language="markdown")
-
-else:
-    st.info("No manual rows yet. Add a stock in **Manual Input**.")
+    
+        c_save, c_dl = st.columns([1,1])
+        with c_save:
+            if st.button("Save Changes", use_container_width=True, key="save_manual_changes"):
+                st.session_state.rows = edited_df.to_dict(orient="records")
+                st.success("Manual table updated.")
+                do_rerun()
+    
+        with c_dl:
+            st.download_button(
+                "Download Manual Table CSV",
+                edited_df.to_csv(index=False).encode("utf-8"),
+                "manual_table.csv",
+                "text/csv",
+                use_container_width=True,
+            )
+    
+        st.markdown("**Markdown**")
+        st.code(df_to_markdown_table(edited_df, show_cols), language="markdown")
+    
+    else:
+        st.info("No manual rows yet. Add a stock in **Manual Input**.")
 
     # ---------- Divergence (FT=1 vs FT=0 only) ----------
     with st.expander("Divergence (FT=1 vs FT=0 medians)", expanded=False):
