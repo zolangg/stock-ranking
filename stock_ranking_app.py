@@ -54,7 +54,7 @@ QUAL_CRITERIA = [
         "Breaks and holds several major levels; clears most overhead resistance.",
         "Breaks and holds above all resistance; blue sky.",
     ], "weight": 0.15},
-    {"name": "Monthly", "question": "Monthly/Weekly Context:", "options": [
+    {"name": "Monthly", "question": "Monthly/Weekly Chart Context:", "options": [
         "Sharp, accelerating downtrend; new lows repeatedly.",
         "Persistent downtrend; still lower lows.",
         "Downtrend losing momentum; flattening.",
@@ -67,28 +67,31 @@ QUAL_CRITERIA = [
 
 # ---------- Sidebar: weights ----------
 st.sidebar.header("Numeric Weights")
-w_mc     = st.sidebar.slider("Market Cap",           0.0, 1.0, 0.10, 0.01)
-w_float  = st.sidebar.slider("Public Float",         0.0, 1.0, 0.05, 0.01)
-w_si     = st.sidebar.slider("Short Interest",       0.0, 1.0, 0.15, 0.01)
+w_mc     = st.sidebar.slider("Market Cap (M$)",      0.0, 1.0, 0.10, 0.01)
+w_float  = st.sidebar.slider("Public Float (M)",     0.0, 1.0, 0.05, 0.01)
+w_si     = st.sidebar.slider("Short Interest (%)",   0.0, 1.0, 0.15, 0.01)
 w_gap    = st.sidebar.slider("Gap %",                0.0, 1.0, 0.15, 0.01)
 w_atr    = st.sidebar.slider("ATR ($)",              0.0, 1.0, 0.10, 0.01)
 w_rvol   = st.sidebar.slider("RVOL",                 0.0, 1.0, 0.20, 0.01)
-w_pmvol  = st.sidebar.slider("Premarket Volume (M)", 0.0, 1.0, 0.15, 0.01)
-w_cat    = st.sidebar.slider("Catalyst",             0.0, 1.0, 0.05, 0.01)
-w_dil    = st.sidebar.slider("Dilution",             0.0, 1.0, 0.05, 0.01)
+w_pmvol  = st.sidebar.slider("Premarket Vol (M)",    0.0, 1.0, 0.15, 0.01)
+w_pmdol  = st.sidebar.slider("Premarket $Vol (M$)",  0.0, 1.0, 0.05, 0.01)
+w_cat    = st.sidebar.slider("Catalyst",             0.0, 1.0, 0.03, 0.01)
+w_dil    = st.sidebar.slider("Dilution",             0.0, 1.0, 0.02, 0.01)
 
 st.sidebar.header("Qualitative Weights")
-q_weights = {crit["name"]: st.sidebar.slider(crit["name"], 0.0, 1.0, crit["weight"], 0.01) for crit in QUAL_CRITERIA}
+q_weights = {crit["name"]: st.sidebar.slider(
+    crit["name"], 0.0, 1.0, crit["weight"], 0.01
+) for crit in QUAL_CRITERIA}
 
 # normalize weights
-num_sum = max(1e-9, w_mc+w_float+w_si+w_gap+w_atr+w_rvol+w_pmvol+w_cat+w_dil)
-w_mc, w_float, w_si, w_gap, w_atr, w_rvol, w_pmvol, w_cat, w_dil = [
-    w/num_sum for w in (w_mc, w_float, w_si, w_gap, w_atr, w_rvol, w_pmvol, w_cat, w_dil)
+num_sum = max(1e-9, w_mc+w_float+w_si+w_gap+w_atr+w_rvol+w_pmvol+w_pmdol+w_cat+w_dil)
+w_mc, w_float, w_si, w_gap, w_atr, w_rvol, w_pmvol, w_pmdol, w_cat, w_dil = [
+    w/num_sum for w in (w_mc,w_float,w_si,w_gap,w_atr,w_rvol,w_pmvol,w_pmdol,w_cat,w_dil)
 ]
 qual_sum = max(1e-9, sum(q_weights.values()))
 for k in q_weights: q_weights[k] /= qual_sum
 
-# ---------- Grading helper ----------
+# ---------- Grading ----------
 def grade(score: float) -> str:
     return (
         "A++" if score >= 90 else
@@ -109,19 +112,20 @@ with tab_add:
 
         with c1:
             ticker   = st.text_input("Ticker", "").strip().upper()
-            mc_m     = st.number_input("Market Cap (M $)", min_value=0.0, value=0.0, step=0.01)
+            mc_m     = st.number_input("Market Cap (M$)", min_value=0.0, value=0.0, step=0.01)
             float_m  = st.number_input("Public Float (M)", min_value=0.0, value=0.0, step=0.01)
             si_pct   = st.number_input("Short Interest (%)", min_value=0.0, value=0.0, step=0.01)
+            gap_pct  = st.number_input("Gap %", min_value=0.0, value=0.0, step=0.1)
 
         with c2:
-            gap_pct  = st.number_input("Gap %", min_value=0.0, value=0.0, step=0.1)
             atr_usd  = st.number_input("ATR ($)", min_value=0.0, value=0.0, step=0.01)
             rvol     = st.number_input("RVOL", min_value=0.0, value=0.0, step=0.01)
             pm_vol_m = st.number_input("Premarket Volume (M)", min_value=0.0, value=0.0, step=0.01)
+            pm_dol_m = st.number_input("Premarket Dollar Volume (M$)", min_value=0.0, value=0.0, step=0.01)
 
         with c3:
-            catalyst = st.number_input("Catalyst (0=no, 1=yes)", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
-            dilution = st.number_input("Dilution (0=no, 1=yes)", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
+            catalyst = st.number_input("Catalyst (−1 … +1)", min_value=-1.0, max_value=1.0, value=0.0, step=0.1)
+            dilution = st.number_input("Dilution (−1 … +1)", min_value=-1.0, max_value=1.0, value=0.0, step=0.1)
 
         st.markdown("---")
         st.subheader("Qualitative Context")
@@ -136,13 +140,13 @@ with tab_add:
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
     if submitted and ticker:
-        # numeric score
+        # numeric score (weighted average of raw inputs, normalized)
         num_score = (
             w_mc*mc_m + w_float*float_m + w_si*si_pct + w_gap*gap_pct +
-            w_atr*atr_usd + w_rvol*rvol + w_pmvol*pm_vol_m +
+            w_atr*atr_usd + w_rvol*rvol + w_pmvol*pm_vol_m + w_pmdol*pm_dol_m +
             w_cat*catalyst + w_dil*dilution
         )
-        num_pct = 100.0 * num_score / (num_score+1e-9)
+        num_pct = min(100.0, max(0.0, num_score))  # clamp
 
         # qualitative score
         qual_score = 0
