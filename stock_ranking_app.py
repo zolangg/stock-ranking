@@ -361,7 +361,7 @@ with tab_tables:
             st.warning("Need both FT=1 and FT=0 medians from DB to show divergence.")
         else:
             diffs = models_tbl.copy()
-            diffs["Δ |FT=1 − FT=0|"] = (models_tbl["FT=1"] - models_tbl["FT=0"]).abs()
+            diffs["Δ |FT=1 − FT=0|"] = (models_tbl["FT=1"] - models_tbl["FT=0"])
             dfd = diffs.sort_values("Δ |FT=1 − FT=0|", ascending=False)
             TOP_K = st.slider("Top-K divergent variables", 3, min(12, len(dfd)), min(8, len(dfd)), 1, key="topk_div")
             show_df = dfd.head(TOP_K).reset_index().rename(columns={"index":"Variable"})
