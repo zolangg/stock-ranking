@@ -147,10 +147,9 @@ def _short_qual(name: str, idx1_based: int) -> str:
     return "—"
 
 # ============================== Session State ==============================
-if "rows" not in st.session_state: st.session_state.rows = []      # manual + uploaded rows for table
+if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "var_list": [...]}
-if "groups" not in st.session_state: st.session_state.groups = {}  # group -> df (uploaded)
 
 # ============================== Tabs ==============================
 tab_input, tab_tables = st.tabs(["➕ Manual Input", "📊 Tables & Models"])
@@ -175,7 +174,7 @@ with tab_input:
             pm_dol  = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
 
         with c3:
-            # Sliders per your request
+            # Probability sliders (as requested)
             catalyst = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.1)
             dilution = st.slider("Dilution (0.0 … 1.0)", 0.0, 1.0, 0.0, 0.1)
 
@@ -191,7 +190,6 @@ with tab_input:
                     format_func=lambda x: x[1],
                     key=f"qual_{crit['name']}"
                 )
-                # store 1-based index
                 q_idx = choice[0] if isinstance(choice, tuple) else int(choice)
                 qual_selected[crit["name"]] = q_idx
 
@@ -227,7 +225,7 @@ with tab_input:
             "Q_GapStruct": q_gap,
             "Q_LevelStruct": q_level,
             "Q_Monthly": q_mtf,
-            # Qual raw selections (1..7) if needed later
+            # raw idx (optional)
             "_Q_GapStruct_idx": qual_selected.get("GapStruct", 1),
             "_Q_LevelStruct_idx": qual_selected.get("LevelStruct", 1),
             "_Q_Monthly_idx": qual_selected.get("Monthly", 1),
@@ -237,7 +235,7 @@ with tab_input:
         st.success(f"Saved {ticker}.")
         do_rerun()
 
-    # Minimal preview of last added (no ranking)
+    # Minimal preview of last added
     l = st.session_state.last
     if l:
         st.markdown("---")
@@ -249,104 +247,85 @@ with tab_input:
 
 # ============================== 📊 Tables & Models ==============================
 with tab_tables:
-    st.markdown("### Upload Database (Excel) → Build Model Stocks")
+    st.markdown("### Upload Database (Excel) → Build Model Stocks (FT=1 & FT=0 medians only)")
     uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl", label_visibility="collapsed")
-    group_field = st.text_input("Group field (e.g., 'FT')", value="FT", key="db_group")
-    build_btn = st.button("Build model stocks (medians per group)", use_container_width=True, key="db_build_btn")
+    group_field = st.text_input("Group field (must have 0/1 values, e.g., 'FT')", value="FT", key="db_group")
+    build_btn = st.button("Build model stocks (medians for FT=1 and FT=0)", use_container_width=True, key="db_build_btn")
 
+    # ---- Build model stocks: only store medians by group; DO NOT mix uploaded rows into manual table ----
     if build_btn:
         if not uploaded:
             st.error("Please upload an Excel workbook first.")
         else:
             try:
                 xls = pd.ExcelFile(uploaded)
-                # Pick first non-legend sheet if present
+                # choose first non-legend sheet
                 sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
                 sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
                 raw = pd.read_excel(xls, sheet)
 
-                # ------- Map columns from DB -------
-                col_ticker= _pick(raw, ["ticker","symbol"])
+                # map columns
                 col_group = _pick(raw, [group_field])
-
-                col_mc    = _pick(raw, ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
-                col_float = _pick(raw, ["float m","public float (m)","float_m","float (m)","float m shares"])
-                col_si    = _pick(raw, ["shortint %","short interest %","short float %","si","short interest (float) %"])
-                col_gap   = _pick(raw, ["gap %","gap%","premarket gap","gap"])
-                col_atr   = _pick(raw, ["atr $","atr$","atr (usd)","atr"])
-                col_rvol  = _pick(raw, ["rvol","relative volume","rvol @ bo"])
-                col_pm    = _pick(raw, ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
-                col_pmd   = _pick(raw, ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
-                col_cat   = _pick(raw, ["catalyst","news","pr"])
-
                 if col_group is None:
                     st.error(f"Group field '{group_field}' not found in sheet '{sheet}'.")
                 else:
                     df = pd.DataFrame()
-                    df["Group"] = raw[col_group].astype(str)
+                    df["GroupRaw"] = raw[col_group]
 
-                    if col_ticker: df["Ticker"] = raw[col_ticker].astype(str).str.upper()
-
-                    def add_num(name, src):
+                    def add_num(df, name, src_candidates):
+                        src = _pick(raw, src_candidates)
                         if src:
                             df[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-                    add_num("MarketCap_M$", col_mc)
-                    add_num("Float_M",      col_float)
-                    add_num("ShortInt_%",   col_si)
-                    add_num("Gap_%",        col_gap)     # real % (e.g., 100 = +100)
-                    add_num("ATR_$",        col_atr)
-                    add_num("RVOL",         col_rvol)
-                    add_num("PM_Vol_M",     col_pm)
-                    add_num("PM_$Vol_M$",   col_pmd)
+                    add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
+                    add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
+                    add_num(df, "ShortInt_%",   ["shortint %","short interest %","short float %","si","short interest (float) %"])
+                    add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
+                    add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
+                    add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
+                    add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
+                    add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
 
-                    # Catalyst in DB is Yes/No or 1/0 → map to 0/1 for models if present
-                    if col_cat:
-                        s = raw[col_cat].astype(str).str.strip().str.lower()
-                        df["Catalyst01"] = s.map({
-                            "yes":1,"y":1,"true":1,"1":1,
-                            "no":0,"n":0,"false":0,"0":0
-                        })
-                        # if numeric strings:
-                        df["Catalyst01"] = df["Catalyst01"].fillna(pd.to_numeric(s, errors="coerce")).fillna(0).astype(int)
-
-                    # Derived
+                    # derived
                     if {"PM_Vol_M","Float_M"}.issubset(df.columns):
                         df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
                     if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
                         df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-                    # Split groups & build medians table
-                    groups = {}
-                    for gname, gdf in df.groupby("Group"):
-                        groups[str(gname)] = gdf.drop(columns=["Group"]).copy()
+                    # reduce to binary groups FT=1 vs FT=0 (or general 1 vs 0)
+                    def _to_binary(v):
+                        sv = str(v).strip().lower()
+                        if sv in {"1","true","yes","y","t"}: return 1
+                        if sv in {"0","false","no","n","f"}: return 0
+                        try:
+                            fv = float(sv)
+                            return 1 if fv >= 0.5 else 0
+                        except:
+                            return np.nan
 
-                    var_list = [c for c in df.columns if c not in ["Group","Ticker"]]
-                    medians = []
-                    for gname, gdf in groups.items():
-                        meds = gdf[var_list].median(numeric_only=True)
-                        meds["Group"] = gname
-                        medians.append(meds)
-                    models_tbl = pd.DataFrame(medians).set_index("Group").T  # variables as rows
+                    df["FT01"] = df["GroupRaw"].map(_to_binary)
+                    df = df[df["FT01"].isin([0,1])]
+                    if df.empty or df["FT01"].nunique() < 2:
+                        st.error("Could not find both FT=1 and FT=0 rows in the DB. Please check the group column.")
+                    else:
+                        df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-                    st.session_state.groups = groups
-                    st.session_state.models = {"models_tbl": models_tbl, "var_list": var_list}
+                        # medians per group
+                        var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
+                        gmed = df.groupby("Group")[var_list].median(numeric_only=True).T  # variables as rows, columns FT=0/FT=1
 
-                    # Also append uploaded rows to main table (display)
-                    st.session_state.rows.extend(df.to_dict(orient="records"))
-
-                    st.success(f"Built model stocks from sheet '{sheet}' with groups: {list(groups.keys())}")
-                    do_rerun()
+                        st.session_state.models = {"models_tbl": gmed, "var_list": var_list}
+                        st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
+                        do_rerun()
 
             except Exception as e:
                 st.error("Loading/processing failed.")
                 st.exception(e)
 
-    # ---------- Current Manual + Uploaded Table ----------
-    st.markdown("### Current Table (Manual + Uploaded)")
+    # ---------- Manual Table (ONLY manual rows) ----------
+    st.markdown("### Manual Table")
     if st.session_state.rows:
         df_rows = pd.DataFrame(st.session_state.rows)
-
         show_cols = [
             "Ticker",
             "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
@@ -363,125 +342,104 @@ with tab_tables:
         st.dataframe(df_rows[show_cols], use_container_width=True, hide_index=True,
                      column_config={**num_cols_cfg})
 
-        st.download_button("Download Table CSV",
+        st.download_button("Download Manual Table CSV",
                            df_rows[show_cols].to_csv(index=False).encode("utf-8"),
-                           "stocks_table.csv","text/csv",use_container_width=True)
+                           "manual_table.csv","text/csv",use_container_width=True)
 
         st.markdown("**Markdown**")
         st.code(df_to_markdown_table(df_rows, show_cols), language="markdown")
     else:
-        st.info("No rows yet. Add a stock in **Manual Input** or upload a DB above.")
+        st.info("No manual rows yet. Add a stock in **Manual Input**.")
 
-    # ---------- Divergence across Model Stocks ----------
-    st.markdown("### Divergence across Model Stocks (Top-K by median differences)")
-    TOP_K = st.slider("Top-K divergent variables", 3, 12, 8, 1, key="topk_div")
+    # ---------- Divergence (FT=1 vs FT=0 only) ----------
+    st.markdown("### Divergence (FT=1 vs FT=0 medians)")
     models_data = st.session_state.models
-    groups = st.session_state.groups
+    if models_data:
+        models_tbl: pd.DataFrame = models_data["models_tbl"]  # rows=variables, cols=FT=0/FT=1
+        needed = {"FT=1","FT=0"}.issubset(models_tbl.columns)
+        if not needed:
+            st.warning("Need both FT=1 and FT=0 medians from DB to show divergence.")
+        else:
+            diffs = models_tbl.copy()
+            diffs["Δ |FT=1 − FT=0|"] = (models_tbl["FT=1"] - models_tbl["FT=0"]).abs()
+            dfd = diffs.sort_values("Δ |FT=1 − FT=0|", ascending=False)
+            TOP_K = st.slider("Top-K divergent variables", 3, min(12, len(dfd)), min(8, len(dfd)), 1, key="topk_div")
+            show_df = dfd.head(TOP_K).reset_index().rename(columns={"index":"Variable"})
 
-    if models_data and groups:
-        models_tbl: pd.DataFrame = models_data["models_tbl"]
+            cfg = {
+                "Variable": st.column_config.TextColumn("Variable"),
+                "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
+                "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
+                "Δ |FT=1 − FT=0|": st.column_config.NumberColumn("Δ |FT=1 − FT=0|", format="%.2f"),
+            }
+            st.dataframe(show_df, use_container_width=True, hide_index=True, column_config=cfg)
 
-        group_names = list(models_tbl.columns)
-        preferred = [g for g in ["FT=1","1","True","Yes","MaxPush","FT=0","0","False","No"] if g in group_names]
-        rest = [g for g in group_names if g not in preferred]
-        ordered_groups = preferred + rest
-        models_tbl_disp = models_tbl.reindex(columns=ordered_groups)
-
-        # Compute max absolute pairwise median difference per variable
-        diffs = []
-        for v in models_tbl_disp.index:
-            vals = models_tbl_disp.loc[v].astype(float)
-            if vals.notna().sum() < 2:
-                continue
-            mat = vals.dropna()
-            arr = mat.values
-            cols = list(mat.index)
-            max_diff = 0.0
-            best_pair = ("","")
-            for i in range(len(arr)):
-                for j in range(i+1, len(arr)):
-                    d = abs(arr[i] - arr[j])
-                    if d > max_diff:
-                        max_diff = d
-                        best_pair = (cols[i], cols[j])
-            diffs.append({"Variable": v, "MaxΔMedian": max_diff, "Pair": f"{best_pair[0]} vs {best_pair[1]}"})
-
-        if diffs:
-            dfd = pd.DataFrame(diffs).sort_values("MaxΔMedian", ascending=False).head(TOP_K)
-            med_view = models_tbl_disp.loc[dfd["Variable"]].reset_index().rename(columns={"index":"Variable"})
-            show_df = pd.merge(dfd, med_view, on="Variable", how="left")
-
-            num_cfg = {c: st.column_config.NumberColumn(c, format="%.2f")
-                       for c in show_df.columns if c not in ["Variable","Pair"]}
-            col_cfg = {"Variable": st.column_config.TextColumn("Variable"),
-                       "Pair": st.column_config.TextColumn("Strongest Pair"), **num_cfg}
-            st.dataframe(show_df, use_container_width=True, hide_index=True, column_config=col_cfg)
-            st.caption("Top-K variables with the largest absolute median differences across model groups.")
             st.markdown("**Markdown**")
             st.code(df_to_markdown_table(show_df, list(show_df.columns)), language="markdown")
-        else:
-            st.info("Not enough overlap across groups to compute divergences.")
     else:
-        st.info("Upload the DB and build model stocks to see divergences.")
+        st.info("Upload DB and build FT=1/FT=0 medians to see divergence.")
 
-    # ---------- Pairwise Differences (select two uploaded tickers if present) ----------
-    st.markdown("### Pairwise Differences (select two tickers)")
-    # Use uploaded rows (those with 'Ticker') for pairwise compare
-    if st.session_state.rows:
+    # ---------- Pairwise Differences: Manual vs Model Stocks ----------
+    st.markdown("### Pairwise Differences (Manual Ticker vs FT=1 & FT=0 medians)")
+    if st.session_state.rows and st.session_state.models and {"FT=1","FT=0"}.issubset(st.session_state.models["models_tbl"].columns):
         base = pd.DataFrame(st.session_state.rows)
-        if "Ticker" in base.columns and base["Ticker"].notna().any():
-            tickers = base["Ticker"].dropna().astype(str).unique().tolist()
-            tickers = [t for t in tickers if t != ""]
-            if len(tickers) >= 2:
-                c1, c2 = st.columns(2)
-                with c1:
-                    tA = st.selectbox("Ticker A", tickers, index=0, key="pair_A")
-                with c2:
-                    tB = st.selectbox("Ticker B", [t for t in tickers if t != tA], index=0, key="pair_B")
+        tickers = base["Ticker"].dropna().astype(str).unique().tolist() if "Ticker" in base.columns else []
+        tickers = [t for t in tickers if t != ""]
+        if tickers:
+            tA = st.selectbox("Manual Ticker", tickers, index=0, key="pair_manual_vs_models")
+            a = base[base["Ticker"] == tA].iloc[-1]
 
-                # Pick most recent rows for each
-                a = base[base["Ticker"] == tA].iloc[-1]
-                b = base[base["Ticker"] == tB].iloc[-1]
+            models_tbl = st.session_state.models["models_tbl"]  # rows=variables
+            num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
 
-                num_vars = [
-                    "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-                    "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"
-                ]
-                rows = []
-                for v in num_vars:
-                    va = pd.to_numeric(a.get(v), errors="coerce")
-                    vb = pd.to_numeric(b.get(v), errors="coerce")
-                    if pd.notna(va) and pd.notna(vb):
-                        diff = float(va - vb)
-                        rows.append({"Variable": v, f"{tA}": va, f"{tB}": vb, "Δ(A−B)": diff, "|Δ|": abs(diff)})
-                if rows:
-                    dd = pd.DataFrame(rows).sort_values("|Δ|", ascending=False)
-                    cfg = {
-                        "Variable": st.column_config.TextColumn("Variable"),
-                        f"{tA}": st.column_config.NumberColumn(f"{tA}", format="%.2f"),
-                        f"{tB}": st.column_config.NumberColumn(f"{tB}", format="%.2f"),
-                        "Δ(A−B)": st.column_config.NumberColumn("Δ(A−B)", format="%.2f"),
-                        "|Δ|": st.column_config.NumberColumn("|Δ|", format="%.2f"),
-                    }
-                    st.dataframe(dd, use_container_width=True, hide_index=True, column_config=cfg)
-                    st.markdown("**Markdown**")
-                    st.code(df_to_markdown_table(dd, list(dd.columns)), language="markdown")
-                else:
-                    st.info("No overlapping numeric variables between the selected tickers.")
+            rows = []
+            for v in num_vars:
+                va = pd.to_numeric(a.get(v), errors="coerce")
+                v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) and ("FT=1" in models_tbl.columns) else np.nan
+                v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) and ("FT=0" in models_tbl.columns) else np.nan
+                if pd.notna(va) and (pd.notna(v1) or pd.notna(v0)):
+                    rows.append({
+                        "Variable": v,
+                        f"{tA}": va,
+                        "FT=1": v1 if pd.notna(v1) else np.nan,
+                        "FT=0": v0 if pd.notna(v0) else np.nan,
+                        "Δ vs FT=1": (va - v1) if pd.notna(v1) else np.nan,
+                        "Δ vs FT=0": (va - v0) if pd.notna(v0) else np.nan,
+                    })
+            if rows:
+                dd = pd.DataFrame(rows)
+                # Order by whichever absolute delta is larger per row
+                dd["_max_abs"] = np.nanmax(np.vstack([
+                    dd["Δ vs FT=1"].abs().fillna(-np.inf).to_numpy(),
+                    dd["Δ vs FT=0"].abs().fillna(-np.inf).to_numpy()
+                ]), axis=0)
+                dd = dd.sort_values("_max_abs", ascending=False).drop(columns=["_max_abs"])
+
+                cfg = {
+                    "Variable": st.column_config.TextColumn("Variable"),
+                    f"{tA}":   st.column_config.NumberColumn(f"{tA}",   format="%.2f"),
+                    "FT=1":    st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
+                    "FT=0":    st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
+                    "Δ vs FT=1": st.column_config.NumberColumn("Δ vs FT=1", format="%.2f"),
+                    "Δ vs FT=0": st.column_config.NumberColumn("Δ vs FT=0", format="%.2f"),
+                }
+                st.dataframe(dd, use_container_width=True, hide_index=True, column_config=cfg)
+                st.markdown("**Markdown**")
+                st.code(df_to_markdown_table(dd, list(dd.columns)), language="markdown")
             else:
-                st.info("Need at least two distinct tickers for pairwise comparison.")
+                st.info("No overlapping variables between manual ticker and model medians.")
         else:
-            st.info("No tickers available for pairwise comparison.")
+            st.info("Add at least one manual ticker to compare.")
     else:
-        st.info("No data available for pairwise comparison.")
+        st.info("Need manual rows and built FT=1/FT=0 medians to run this comparison.")
 
-    # ---------- Alignment Summary (manual rows vs model medians) ----------
-    st.markdown("### Alignment Summary (how many variables look like each model group)")
-    def compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
-        if models_tbl is None or models_tbl.empty:
+    # ---------- Alignment Summary (Manual vs FT=1 & FT=0) ----------
+    st.markdown("### Alignment Summary (manual stocks closest to FT=1 vs FT=0)")
+    def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
+        if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
             return {}
-        groups_cols = list(models_tbl.columns)
-        cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
+        groups_cols = ["FT=1","FT=0"]
+        cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
         common_vars = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
         counts = {g: 0 for g in groups_cols}
         used = 0
@@ -493,7 +451,7 @@ with tab_tables:
                 xv = np.nan
             if not np.isfinite(xv):
                 continue
-            med = models_tbl.loc[v].astype(float).dropna()
+            med = models_tbl.loc[v, groups_cols].astype(float).dropna()
             if med.empty:
                 continue
             diffs = (med - xv).abs()
@@ -503,34 +461,34 @@ with tab_tables:
         counts["N_Vars_Used"] = used
         return counts
 
-    if st.session_state.rows and st.session_state.models:
-        models_tbl: pd.DataFrame = st.session_state.models["models_tbl"]
-        group_cols = list(models_tbl.columns)
-
+    if st.session_state.rows and st.session_state.models and {"FT=1","FT=0"}.issubset(st.session_state.models["models_tbl"].columns):
+        models_tbl = st.session_state.models["models_tbl"]
         summary_rows = []
         for row in st.session_state.rows:
-            counts = compute_alignment_counts(row, models_tbl)
+            counts = compute_alignment_counts_vs_binary(row, models_tbl)
             if not counts:
                 continue
             out = {"Ticker": row.get("Ticker","—"), "N_Vars_Used": counts.pop("N_Vars_Used", 0)}
-            for g in group_cols:
-                out[f"Like_{g}"] = counts.get(g, 0)
-            pairs = [(g, out.get(f"Like_{g}", 0)) for g in group_cols]
-            if pairs:
-                m = max(c for _, c in pairs)
-                top = [g for g, c in pairs if c == m and m > 0]
-                out["Lean"] = ", ".join(top) if top else "—"
+            out["Like_FT=1"] = counts.get("FT=1", 0)
+            out["Like_FT=0"] = counts.get("FT=0", 0)
+            if out["Like_FT=1"] > out["Like_FT=0"]:
+                out["Lean"] = "FT=1"
+            elif out["Like_FT=0"] > out["Like_FT=1"]:
+                out["Lean"] = "FT=0"
             else:
-                out["Lean"] = "—"
+                out["Lean"] = "Tie"
             summary_rows.append(out)
 
         if summary_rows:
             sum_df = pd.DataFrame(summary_rows)
-            num_cfg = {c: st.column_config.NumberColumn(c, format="%.2f")
-                       for c in sum_df.columns if c not in ["Ticker","Lean"]}
-            col_cfg = {"Ticker": st.column_config.TextColumn("Ticker"),
-                       "Lean": st.column_config.TextColumn("Lean"), **num_cfg}
-            st.dataframe(sum_df, use_container_width=True, hide_index=True, column_config=col_cfg)
+            cfg = {
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "N_Vars_Used": st.column_config.NumberColumn("N Vars Used", format="%.2f"),
+                "Like_FT=1": st.column_config.NumberColumn("Like FT=1", format="%.2f"),
+                "Like_FT=0": st.column_config.NumberColumn("Like FT=0", format="%.2f"),
+                "Lean": st.column_config.TextColumn("Lean"),
+            }
+            st.dataframe(sum_df, use_container_width=True, hide_index=True, column_config=cfg)
 
             st.markdown("**Markdown**")
             st.code(df_to_markdown_table(sum_df, list(sum_df.columns)), language="markdown")
@@ -540,14 +498,18 @@ with tab_tables:
                                "alignment_summary.csv", "text/csv",
                                use_container_width=True)
         else:
-            st.info("Add at least one stock and build model stocks to compute alignment.")
+            st.info("Add at least one manual stock to compute alignment.")
     else:
-        st.info("To compute alignment, add stocks and build model stocks first.")
+        st.info("Upload DB (to build FT=1/FT=0 medians) and add manual stocks to see alignment.")
 
-    # Clear all
+    # Clear
     st.markdown("---")
-    if st.button("Clear All Rows", use_container_width=True):
-        st.session_state.rows = []
-        st.session_state.models = {}
-        st.session_state.groups = {}
-        do_rerun()
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Clear Manual Rows", use_container_width=True):
+            st.session_state.rows = []
+            do_rerun()
+    with c2:
+        if st.button("Clear Model Medians (FT=1/FT=0)", use_container_width=True):
+            st.session_state.models = {}
+            do_rerun()
