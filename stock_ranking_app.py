@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+import math
+from itertools import combinations
 
 # =========================== Page ===========================
 st.set_page_config(page_title="Premarket Table + Model Stocks", layout="wide")
@@ -35,6 +37,8 @@ def do_rerun():
 # ======================= Session state ======================
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last_warnings" not in st.session_state: st.session_state.last_warnings = []
+if "model_groups" not in st.session_state: st.session_state.model_groups = {}  # for divergence tests
+if "models" not in st.session_state: st.session_state.models = {}
 
 # ================= Qualitative (short labels) ================
 QUAL_CRITERIA = [
@@ -203,14 +207,15 @@ def normalize_units(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
-def build_model_rows(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+# ================= Build models + store raw groups =================
+def build_models_and_groups(df: pd.DataFrame):
     """
-    Build 1-row model tables for:
-      - FT=1
-      - FT=0 (if present)
-      - Max Push (top decile; fallback top quartile if very small)
+    Returns:
+      models: dict[name] -> 1-row DataFrame (medians + FR_x + PM$Vol/MC_% + Catalyst_%Yes)
+      groups: dict[name] -> normalized full DataFrame with raw rows for that subgroup
     """
-    out: dict[str, pd.DataFrame] = {}
+    models: dict[str, pd.DataFrame] = {}
+    groups: dict[str, pd.DataFrame]  = {}
 
     col_ft    = pick_col(df, ["ft"])
     col_mc    = pick_col(df, ["market cap (m)","mcap m","mcap","marketcap m"])
@@ -229,7 +234,7 @@ def build_model_rows(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     if not all(c is not None for c in need_cols):
         missing = [n for n, c in zip(need_names, need_cols) if c is None]
         st.error("Missing required columns: " + ", ".join(missing))
-        return out
+        return models, groups
 
     base = pd.DataFrame({
         "MarketCap_M$": pd.to_numeric(df[col_mc], errors="coerce"),
@@ -242,7 +247,6 @@ def build_model_rows(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         "PM_$Vol_M$":   pd.to_numeric(df[col_pmdol], errors="coerce"),
     })
     base["Catalyst01"] = parse_catalyst_series(df[col_cat]) if col_cat else 0.0
-
     base = normalize_units(base)
 
     # FT masks
@@ -254,7 +258,29 @@ def build_model_rows(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         mask_ft1 = pd.Series([False]*len(df))
         mask_ft0 = pd.Series([False]*len(df))
 
-    def model_from_subset(sub: pd.DataFrame, label: str) -> pd.DataFrame | None:
+    # group DataFrames (retain rows)
+    sub_ft1 = base[mask_ft1].copy() if mask_ft1.any() else pd.DataFrame(columns=base.columns)
+    sub_ft0 = base[mask_ft0].copy() if mask_ft0.any() else pd.DataFrame(columns=base.columns)
+
+    # Max Push group
+    if col_push:
+        push_vals = pd.to_numeric(df[col_push], errors="coerce")
+        if push_vals.notna().any():
+            pctl = 0.90 if push_vals.notna().sum() >= 40 else 0.75
+            thr = push_vals.quantile(pctl)
+            mask_push = (push_vals >= thr)
+            sub_push = base[mask_push.fillna(False)].copy()
+        else:
+            sub_push = pd.DataFrame(columns=base.columns)
+    else:
+        sub_push = pd.DataFrame(columns=base.columns)
+
+    # save raw groups for divergence
+    if not sub_ft1.empty: groups["FT=1"] = sub_ft1
+    if not sub_ft0.empty: groups["FT=0"] = sub_ft0
+    if not sub_push.empty: groups["Max Push"] = sub_push
+
+    def one_row_model(sub: pd.DataFrame, label: str) -> pd.DataFrame | None:
         sub_num = sub.dropna(how="all")
         if sub_num.empty:
             return None
@@ -281,136 +307,216 @@ def build_model_rows(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             "Catalyst_%Yes": float(cat_pct_yes),
         }])
 
-    # FT=1 model
-    sub_ft1 = base[mask_ft1] if mask_ft1.any() else pd.DataFrame(columns=base.columns)
-    m_ft1 = model_from_subset(sub_ft1, "FT1")
-    # FT=0 model
-    sub_ft0 = base[mask_ft0] if mask_ft0.any() else pd.DataFrame(columns=base.columns)
-    m_ft0 = model_from_subset(sub_ft0, "FT0")
-    # Max Push model
-    if col_push:
-        push_vals = pd.to_numeric(df[col_push], errors="coerce")
-        if push_vals.notna().any():
-            pctl = 0.90 if push_vals.notna().sum() >= 40 else 0.75
-            thr = push_vals.quantile(pctl)
-            mask_push = (push_vals >= thr)
-            sub_push = base[mask_push.fillna(False)]
-            m_push = model_from_subset(sub_push, "MaxPush")
-        else:
-            m_push = None
-    else:
-        m_push = None
+    m_ft1  = one_row_model(sub_ft1, "FT1")
+    m_ft0  = one_row_model(sub_ft0, "FT0")
+    m_push = one_row_model(sub_push, "MaxPush")
 
-    if m_ft1 is not None: out["FT=1"] = m_ft1
-    if m_ft0 is not None: out["FT=0"] = m_ft0
-    if m_push is not None: out["Max Push"] = m_push
-    return out
+    if m_ft1 is not None:  models["FT=1"] = m_ft1
+    if m_ft0 is not None:  models["FT=0"] = m_ft0
+    if m_push is not None: models["Max Push"] = m_push
 
-# =================== Robust divergence renderer ===================
-def render_divergence_tables(models: dict):
-    """Robust divergence view with full error surfacing."""
+    return models, groups
+
+# =================== Stats: KW (permutation) & Cliff's δ ===================
+def rankdata_average_ties(x: np.ndarray) -> np.ndarray:
+    """Average ranks for ties (1-based)."""
+    order = np.argsort(x)
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(1, len(x) + 1, dtype=float)
+    # tie groups
+    i = 0
+    while i < len(x):
+        j = i
+        while j + 1 < len(x) and x[order[j + 1]] == x[order[i]]:
+            j += 1
+        if j > i:
+            avg = (i + j + 2) / 2.0  # average of ranks i+1..j+1
+            ranks[order[i:j+1]] = avg
+        i = j + 1
+    return ranks
+
+def kruskal_wallis_H_permutation(groups_list, perms: int = 1999, random_state: int = 42):
+    """
+    Compute Kruskal–Wallis H and a permutation p-value by shuffling group labels.
+    groups_list: list of 1D numeric arrays (k groups)
+    """
+    rng = np.random.default_rng(random_state)
+    # Filter valid groups
+    clean = [np.asarray(g, dtype=float) for g in groups_list if len(pd.Series(g).dropna()) >= 2]
+    clean = [pd.Series(g).dropna().to_numpy(dtype=float) for g in clean]
+    k = len(clean)
+    if k < 2:
+        return np.nan, np.nan
+
+    # Observed H
+    all_vals = np.concatenate(clean, axis=0)
+    ranks = rankdata_average_ties(all_vals)
+    sizes = [len(g) for g in clean]
+    idx_start = np.cumsum([0] + sizes[:-1])
+    Ri_bar = []
+    for i, n in enumerate(sizes):
+        r = ranks[idx_start[i]: idx_start[i] + n]
+        Ri_bar.append(r.mean())
+    N = len(all_vals)
+    H_obs = (12.0 / (N * (N + 1))) * sum(n * (Ri**2) for n, Ri in zip(sizes, Ri_bar)) - 3.0 * (N + 1)
+
+    # Permutation p-value
+    p_count = 1  # add-one smoothing
+    for _ in range(perms):
+        perm = rng.permutation(N)
+        ranks_perm = ranks[perm]  # ranks are fixed; shuffling group labels equivalent
+        Ri_bar_perm = []
+        start = 0
+        for n in sizes:
+            r = ranks_perm[start:start+n]
+            Ri_bar_perm.append(r.mean())
+            start += n
+        H_perm = (12.0 / (N * (N + 1))) * sum(n * (Ri**2) for n, Ri in zip(sizes, Ri_bar_perm)) - 3.0 * (N + 1)
+        if H_perm >= H_obs - 1e-12:
+            p_count += 1
+    p_perm = p_count / (perms + 1)
+    return float(H_obs), float(p_perm)
+
+def cliffs_delta(a: np.ndarray, b: np.ndarray) -> float:
+    """Cliff's delta (a vs b). Range [-1,1]."""
+    a = pd.Series(a).dropna().to_numpy(dtype=float)
+    b = pd.Series(b).dropna().to_numpy(dtype=float)
+    if len(a) == 0 or len(b) == 0:
+        return np.nan
+    # Efficient pairwise compare using broadcasting (may be fine for small samples)
+    A = a[:, None]
+    comp = (A > b).sum() - (A < b).sum()
+    return float(comp) / float(len(a) * len(b))
+
+# =================== Robust divergence renderer (statistical) ===================
+def render_divergence_tables_stat(models: dict, groups: dict, perms: int = 1999):
+    """
+    Shows ONLY significant rows using:
+      - Kruskal–Wallis H with permutation p-value (no SciPy)
+      - Max pairwise |Cliff’s δ| across available groups
+    Significance rule: p_perm < 0.10 OR max|δ| >= 0.50
+    """
     try:
         if not isinstance(models, dict) or not models:
             return
 
-        st.markdown("### 🔎 Divergence across Model Stocks")
+        st.markdown("### 🔎 Divergence across Model Stocks (statistical)")
 
-        # only keep valid, non-empty model dataframes
-        model_names = [
-            name for name, dfm in models.items()
-            if isinstance(dfm, pd.DataFrame) and not dfm.empty
-        ]
+        # model names present in both models and groups (need raw distributions)
+        model_names = [name for name in models.keys() if name in groups and not groups[name].empty]
         if len(model_names) < 2:
-            st.info("Need at least two model tables (e.g., FT=1 and Max Push) to compare.")
+            st.info("Need at least two model groups with data (e.g., FT=1 and Max Push) to compare.")
             return
 
         var_list = [
             "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-            "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst_%Yes"
+            "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst01"
         ]
 
-        def _to_float(x):
-            try:
-                return float(pd.to_numeric(x, errors="coerce"))
-            except Exception:
-                return np.nan
-
-        comp_rows = []
+        rows = []
         for var in var_list:
-            row = {"Variable": var}
-            vals = []
-            for mname in model_names:
-                v = np.nan
-                dfm = models.get(mname)
-                if isinstance(dfm, pd.DataFrame) and not dfm.empty and (var in dfm.columns):
-                    v = _to_float(dfm[var].iloc[0])
-                row[mname] = v
-                vals.append(v)
-
-            s = pd.Series(vals, index=model_names, dtype="float64").replace([np.inf, -np.inf], np.nan)
-            valid = s.dropna()
-
-            if len(valid) >= 2:
-                vmin = float(valid.min())
-                vmax = float(valid.max())
-                frng = float(vmax - vmin)
-                fold = float(vmax / vmin) if vmin > 0 else np.nan  # avoid inf
-
-                pct_vars = {"ShortInt_%","Gap_%","PM$Vol/MC_%","Catalyst_%Yes"}
-                if var in pct_vars:
-                    significant = (abs(frng) >= 15.0) or (pd.notna(fold) and fold >= 1.5)
-                elif var in {"FR_x","RVOL"}:
-                    significant = pd.notna(fold) and (fold >= 1.5)
+            # collect per-group arrays
+            data_by_group = {}
+            medians_by_group = {}
+            for name in model_names:
+                gdf = groups[name]
+                if var in gdf.columns:
+                    s = pd.to_numeric(gdf[var], errors="coerce")
+                    data = s.dropna().to_numpy(dtype=float)
+                    if len(data) > 0:
+                        data_by_group[name] = data
+                        medians_by_group[name] = float(np.median(data))
                 else:
-                    significant = pd.notna(fold) and (fold >= 2.0)
+                    # derive FR_x and PM$Vol/MC_% if needed
+                    if var == "FR_x" and {"PM_Vol_M","Float_M"}.issubset(gdf.columns):
+                        a = pd.to_numeric(gdf["PM_Vol_M"], errors="coerce")
+                        b = pd.to_numeric(gdf["Float_M"], errors="coerce")
+                        arr = (a / b.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna().to_numpy(float)
+                        if len(arr) > 0:
+                            data_by_group[name] = arr
+                            medians_by_group[name] = float(np.median(arr))
+                    elif var == "PM$Vol/MC_%" and {"PM_$Vol_M$","MarketCap_M$"}.issubset(gdf.columns):
+                        a = pd.to_numeric(gdf["PM_$Vol_M$"], errors="coerce")
+                        b = pd.to_numeric(gdf["MarketCap_M$"], errors="coerce")
+                        arr = (a / b.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).dropna().to_numpy(float)
+                        if len(arr) > 0:
+                            data_by_group[name] = arr
+                            medians_by_group[name] = float(np.median(arr))
+                    elif var == "Catalyst01" and "Catalyst01" in gdf.columns:
+                        s = pd.to_numeric(gdf["Catalyst01"], errors="coerce").clip(0,1)
+                        data = s.dropna().to_numpy(dtype=float)
+                        if len(data) > 0:
+                            data_by_group[name] = data
+                            medians_by_group[name] = float(np.median(data) * 100.0)  # display as %
+            if len(data_by_group) < 2:
+                continue
 
-                row.update({
-                    "Min": vmin, "Max": vmax, "Range": frng,
-                    "Fold": fold, "Significant": "Yes" if significant else ""
-                })
+            # KW (permutation) on available groups
+            groups_list = [data_by_group[n] for n in data_by_group.keys()]
+            H, p_perm = kruskal_wallis_H_permutation(groups_list, perms=perms)
+
+            # Pairwise Cliff's delta -> max absolute
+            deltas = []
+            pairs = list(combinations(list(data_by_group.keys()), 2))
+            for a_name, b_name in pairs:
+                d = cliffs_delta(data_by_group[a_name], data_by_group[b_name])
+                deltas.append((a_name, b_name, d))
+            if deltas:
+                pair, max_abs_delta = None, np.nan
+                best = max(deltas, key=lambda t: abs(t[2]) if pd.notna(t[2]) else -1)
+                pair = f"{best[0]} vs {best[1]}"
+                max_abs_delta = abs(best[2]) if pd.notna(best[2]) else np.nan
             else:
-                row.update({"Min": np.nan, "Max": np.nan, "Range": np.nan, "Fold": np.nan, "Significant": ""})
+                pair, max_abs_delta = "", np.nan
 
-            comp_rows.append(row)
+            # simple practical metrics too
+            meds = list(medians_by_group.values())
+            vmin = float(np.nanmin(meds))
+            vmax = float(np.nanmax(meds))
+            rng  = float(vmax - vmin)
+            fold = float(vmax / vmin) if vmin > 0 else np.nan
 
-        comp_df = pd.DataFrame(comp_rows).replace([np.inf, -np.inf], np.nan)
+            # significance rule
+            significant = (pd.notna(p_perm) and p_perm < 0.10) or (pd.notna(max_abs_delta) and max_abs_delta >= 0.50)
+            if not significant:
+                continue  # show only significant rows
 
-        # ensure metric columns exist (even if all NaN)
-        for col in ["Min","Max","Range","Fold","Significant"]:
-            if col not in comp_df.columns:
-                comp_df[col] = np.nan
+            # assemble row
+            row = {"Variable": var, "H": H, "p_perm": p_perm, "Max|Cliffδ|": max_abs_delta, "Pair": pair,
+                   "Min": vmin, "Max": vmax, "Range": rng, "Fold": fold}
+            # add medians per model present
+            for name in model_names:
+                if name in medians_by_group:
+                    row[name] = medians_by_group[name]
+            rows.append(row)
 
-        # UI toggle (unique key)
-        show_all = st.checkbox("Show all variables (not only significant)", value=False, key="show_all_divergence")
-        view_df = comp_df if show_all else comp_df[comp_df["Significant"] == "Yes"]
-
-        if view_df.empty:
-            st.info("No significant divergences based on current thresholds.")
+        if not rows:
+            st.info("No variables met the statistical significance rule (p<0.10 or |δ|≥0.50).")
             return
 
-        # Build display columns strictly from what's present
-        display_cols = ["Variable"] + model_names + ["Min","Max","Range","Fold","Significant"]
-        display_cols = [c for c in display_cols if c in view_df.columns]
+        comp_df = pd.DataFrame(rows).replace([np.inf, -np.inf], np.nan)
 
-        # Column config only for actually present columns
+        # Display order
+        display_cols = ["Variable"] + model_names + ["Min","Max","Range","Fold","H","p_perm","Max|Cliffδ|","Pair"]
+        display_cols = [c for c in display_cols if c in comp_df.columns]
+
+        # Column config
         col_cfg = {"Variable": st.column_config.TextColumn("Variable")}
         for mname in model_names:
-            if mname in view_df.columns:
+            if mname in comp_df.columns:
                 col_cfg[mname] = st.column_config.NumberColumn(mname, format="%.2f")
-        if "Min" in view_df.columns:   col_cfg["Min"]   = st.column_config.NumberColumn("Min", format="%.2f")
-        if "Max" in view_df.columns:   col_cfg["Max"]   = st.column_config.NumberColumn("Max", format="%.2f")
-        if "Range" in view_df.columns: col_cfg["Range"] = st.column_config.NumberColumn("Range", format="%.2f")
-        if "Fold" in view_df.columns:  col_cfg["Fold"]  = st.column_config.NumberColumn("Fold (×)", format="%.2f")
-        if "Significant" in view_df.columns:
-            col_cfg["Significant"] = st.column_config.TextColumn("Flag")
+        for col, label in [("Min","Min"),("Max","Max"),("Range","Range"),("Fold","Fold (×)"),
+                           ("H","KW H"),("p_perm","p (perm)"),("Max|Cliffδ|","Max |Cliff's δ|"),
+                           ("Pair","Strongest Pair")]:
+            if col in comp_df.columns:
+                if col in {"Pair","Variable"}:
+                    col_cfg[col] = st.column_config.TextColumn(label)
+                else:
+                    col_cfg[col] = st.column_config.NumberColumn(label, format="%.2f")
 
-        st.dataframe(view_df[display_cols], use_container_width=True, hide_index=True, column_config=col_cfg)
-
+        st.dataframe(comp_df[display_cols], use_container_width=True, hide_index=True, column_config=col_cfg)
         st.markdown("**Markdown**")
-        st.code(df_to_markdown_table(view_df, display_cols), language="markdown")
-
-        with st.expander("Debug: raw divergence table", expanded=False):
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+        st.code(df_to_markdown_table(comp_df, display_cols), language="markdown")
 
     except Exception as e:
         st.error("Divergence view failed. See details below.")
@@ -551,7 +657,7 @@ with tab_manual:
         st.info("Add a stock above to populate the table.")
 
 # =============================================================================
-# TAB 2 — Upload & Model Stocks (medians + Catalyst %Yes; robust percent parsing)
+# TAB 2 — Upload & Model Stocks + Statistical Divergence
 # =============================================================================
 with tab_models:
     st.subheader("Upload workbook")
@@ -559,7 +665,6 @@ with tab_models:
     sheet_main = st.text_input("Data sheet name", "PMH BO Merged")
     build_btn = st.button("Build Model Stocks", use_container_width=True)
 
-    models = {}
     if build_btn:
         if not uploaded:
             st.error("Upload a workbook first.")
@@ -570,7 +675,10 @@ with tab_models:
                     st.error(f"Sheet '{sheet_main}' not found. Available: {xls.sheet_names}")
                 else:
                     raw = pd.read_excel(xls, sheet_main)
-                    models = build_model_rows(raw)
+                    models, groups = build_models_and_groups(raw)
+                    st.session_state.models = models
+                    st.session_state.model_groups = groups
+
                     if not models:
                         st.warning("No model tables could be built. Check required columns and FT/Max Push presence.")
                     else:
@@ -610,8 +718,8 @@ with tab_models:
                                 st.markdown("**Markdown**")
                                 st.code(df_to_markdown_table(dfm, cols_order), language="markdown")
 
-                        # Robust divergence view
-                        render_divergence_tables(models)
+                        # Statistical divergence (only significant rows)
+                        render_divergence_tables_stat(st.session_state.models, st.session_state.model_groups, perms=1999)
 
             except Exception as e:
                 st.error(f"Failed to build models: {e}")
