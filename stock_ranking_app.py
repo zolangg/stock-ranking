@@ -18,7 +18,7 @@ def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
         for c in keep:
             v = row[c]
             if isinstance(v, float):
-                cells.append(f"{v:.2f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v))}")
+                cells.append(f"{v:.2f}")   # always 2 decimals
             else:
                 cells.append(str(v))
         lines.append("| " + " | ".join(cells) + " |")
@@ -181,7 +181,7 @@ with tab_add:
 
         final_score = round(0.5*num_pct + 0.5*qual_pct,2)
 
-        row = {"Ticker": ticker, "Numeric_%": num_pct, "Qual_%": qual_pct,
+        row = {"Ticker": ticker, "Numeric_%": round(num_pct,2), "Qual_%": round(qual_pct,2),
                "FinalScore": final_score, "Grade": grade(final_score)}
         st.session_state.rows.append(row)
         st.session_state.last = row
@@ -207,13 +207,11 @@ with tab_rank:
         st.dataframe(df,use_container_width=True,hide_index=True)
         st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
                            "ranking.csv","text/csv",use_container_width=True)
+        st.markdown("### 📋 Ranking (Markdown view)")
+        cols_to_show = ["Ticker","Numeric_%","Qual_%","FinalScore","Grade"]
+        st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
         if st.button("Clear Ranking", use_container_width=True):
             st.session_state.rows,st.session_state.last=[],{}
             do_rerun()
-
-            st.markdown("### 📋 Ranking (Markdown view)")
-        cols_to_show = ["Ticker","Numeric_%","Qual_%","FinalScore","Grade"]
-        st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
-
     else:
         st.info("No rows yet. Add a stock in the **Add Stock** tab.")
