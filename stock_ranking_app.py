@@ -1,11 +1,16 @@
-# app.py
+# app.py — Premarket Stock Ranking (Weight-only; DB-derived weights; $Vol inputs)
+# ------------------------------------------------------------------------------
+# • Upload workbook -> evaluates AUC-based weights for numeric metrics (no models).
+# • Inputs organized in two numeric columns + a third column for Catalyst & Dilution.
+# • Scoring = weighted numeric buckets (1..7 → %), + catalyst bonus, − dilution penalty.
+# • Uses $ Premarket Dollar Volume (M) instead of VWAP anywhere.
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import math
 import re
-import matplotlib.pyplot as plt
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 # ============================== Page & CSS ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -20,7 +25,7 @@ st.markdown("""
   .pill-good { background:#e7f5e9; color:#166534; border:1px solid #bbf7d0; }
   .pill-warn { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; }
   .pill-bad  { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 11.5px; color:#374151; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 11.5px; color:#374151; }
   ul { margin: 4px 0 0 0; padding-left: 16px; }
   li { margin-bottom: 2px; }
   [data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.12rem; }
@@ -28,26 +33,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ============================== Sidebar (Curves only) ==============================
-st.sidebar.header("Curves")
-BINS = st.sidebar.slider("Curve bins (histogram)", min_value=2, max_value=10, value=2, step=1)
-show_baseline = st.sidebar.checkbox("Curves: show baseline", True)
-plot_all_curves = st.sidebar.checkbox("Curves: plot ALL variables", False)
-sel_curve_var = st.sidebar.selectbox(
-    "Or plot one variable",
-    ["gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m","fr_x",
-     "pmmc_pct","pm_pct_daily","pm_pct_pred","catalyst"]
-)
-
 # ============================== Session State ==============================
-if "MODELS" not in st.session_state: st.session_state.MODELS = {}   # var -> model dict
-if "rows"   not in st.session_state: st.session_state.rows = []
-if "last"   not in st.session_state: st.session_state.last = {}
-if "ODDS_CUTS" not in st.session_state: st.session_state.ODDS_CUTS = {}
-if "GRADE_CUTS" not in st.session_state: st.session_state.GRADE_CUTS = {}
-if "STACK_KEYS" not in st.session_state: st.session_state.STACK_KEYS = []
-if "STACK_COEF" not in st.session_state: st.session_state.STACK_COEF = None
-if "STACK_BIAS" not in st.session_state: st.session_state.STACK_BIAS = 0.0
+if "rows" not in st.session_state: st.session_state.rows = []
+if "last" not in st.session_state: st.session_state.last = {}
+if "WEIGHTS" not in st.session_state: st.session_state.WEIGHTS = {}  # evaluated from DB
 
 # ============================== Helpers ==============================
 def _parse_local_float(s: str) -> Optional[float]:
@@ -108,324 +97,86 @@ def _pick(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             if n in nm[c]: return c
     return None
 
-# ================= Predicted Day Volume (for PM% fallback) =================
-def predict_day_volume_m_premarket(mcap_m: float, gap_pct: float, atr_usd: float) -> float:
-    """ ln(Y) = 3.1435 + 0.1608*ln(MCap_M) + 0.6704*ln(Gap_%/100) − 0.3878*ln(ATR_$) """
-    e = 1e-6
-    mc  = max(float(mcap_m or 0.0), 0.0)
-    gp  = max(float(gap_pct or 0.0), 0.0) / 100.0
-    atr = max(float(atr_usd or 0.0), 0.0)
-    ln_y = 3.1435 + 0.1608*math.log(mc + e) + 0.6704*math.log(gp + e) - 0.3878*math.log(atr + e)
-    return math.exp(ln_y)
+# ============================== Numeric bucket scorers (1..7) ==============================
+def pts_rvol(x: float) -> int:
+    for th, p in [(3,1),(4,2),(5,3),(7,4),(10,5),(15,6)]:
+        if x < th: return p
+    return 7
 
-# ================= Rank-hist learning (DB-derived) =================
-STRETCH_EPS = 0.10
-CLASS_LIFT = 0.08  # checklist Good/Risk offset vs local baseline
+def pts_atr(x: float) -> int:
+    for th, p in [(0.05,1),(0.10,2),(0.20,3),(0.35,4),(0.60,5),(1.00,6)]:
+        if x < th: return p
+    return 7
 
-def moving_average(y: np.ndarray, w: int = 3) -> np.ndarray:
-    if w <= 1: return y
-    pad = w//2
-    ypad = np.pad(y, (pad,pad), mode='edge')
-    kernel = np.ones(w) / w
-    return np.convolve(ypad, kernel, mode='valid')
+def pts_si(x: float) -> int:
+    for th, p in [(2,1),(5,2),(10,3),(15,4),(20,5),(30,6)]:
+        if x < th: return p
+    return 7
 
-def stretch_curve_to_unit(p: np.ndarray, base_p: float) -> np.ndarray:
-    eps = STRETCH_EPS
-    p = np.asarray(p, dtype=float)
-    pmin, pmax = float(np.nanmin(p)), float(np.nanmax(p))
-    if not np.isfinite(pmin) or not np.isfinite(pmax) or pmax <= pmin:
-        return np.full_like(p, base_p)
-    scale = max(1e-9, (pmax - pmin))
-    p_stretched = eps + (1.0 - 2.0*eps) * (p - pmin) / scale
-    return np.clip(p_stretched, 1e-6, 1.0 - 1.0e-6)
+def pts_fr(pm_vol_m: float, float_m: float) -> int:
+    if float_m <= 0: return 1
+    rot = pm_vol_m / float_m
+    for th, p in [(0.01,1),(0.03,2),(0.10,3),(0.25,4),(0.50,5),(1.00,6)]:
+        if rot < th: return p
+    return 7
 
-def _smooth_local_baseline(centers: np.ndarray, p_curve: np.ndarray, support: np.ndarray, bandwidth: float = 0.22) -> np.ndarray:
-    c = centers.astype(float)
-    p = p_curve.astype(float)
-    n = (support.astype(float) + 1e-9)
-    diffs = (c[:, None] - c[None, :]) / max(1e-6, bandwidth)
-    w = np.exp(-0.5 * diffs**2) * n[None, :]
-    num = (w * p[None, :]).sum(axis=1)
-    den = w.sum(axis=1)
-    pb = np.where(den > 0, num / den, np.nan)
-    pb = pd.Series(pb).interpolate(limit_direction="both").fillna(np.nanmean(pb)).to_numpy()
-    return pb
+def pts_float(float_m: float) -> int:
+    if float_m <= 3: return 7
+    for th, p in [(200,2),(100,3),(50,4),(35,5),(10,6)]:
+        if float_m > th: return p
+    return 7
 
-def rank_hist_model(x: pd.Series, y: pd.Series, bins: int) -> Optional[Dict[str,Any]]:
-    x = pd.to_numeric(x, errors="coerce")
-    y = pd.to_numeric(y, errors="coerce")
-    mask = x.notna() & y.notna()
-    x = x[mask]; y = y[mask]
-    if len(x) < 40 or y.nunique() != 2:
-        return None
+def odds_label(score: float) -> str:
+    if score >= 85: return "Very High Odds"
+    elif score >= 70: return "High Odds"
+    elif score >= 55: return "Moderate Odds"
+    elif score >= 40: return "Low Odds"
+    else: return "Very Low Odds"
 
-    ranks = x.rank(pct=True)
-    B = int(bins)
-    edges = np.linspace(0, 1, B + 1)
-    idx = np.clip(np.searchsorted(edges, ranks, side="right")-1, 0, B-1)
+def grade(score_pct: float) -> str:
+    return ("A++" if score_pct >= 92 else
+            "A+"  if score_pct >= 85 else
+            "A"   if score_pct >= 75 else
+            "B"   if score_pct >= 65 else
+            "C"   if score_pct >= 50 else "D")
 
-    total = np.bincount(idx, minlength=B)
-    ft    = np.bincount(idx[y==1], minlength=B)
-    p0_global = float(y.mean())
+# ============================== Sidebar: Show/Adjust Weights ==============================
+st.sidebar.header("Weights")
+st.sidebar.caption("Upload your workbook below to evaluate data-driven weights. You can still tweak them here.")
 
-    kappa = max(6.0, 0.1 * len(x) / max(1, B))
-    with np.errstate(divide='ignore', invalid='ignore'):
-        p_bin = (ft + kappa * p0_global) / (total + kappa)
+# Default fallback weights (from prior analysis on your sheet): RVOL 0.56, FR 0.25, SI 0.19
+DEFAULT_W = {"RVOL":0.56, "PM Float Rotation (×)":0.25, "Short Interest (%)":0.19, "ATR ($)":0.0, "Float (M)":0.0}
 
-    if B > 2:
-        p_series = pd.Series(p_bin).interpolate(limit_direction="both")
-        p_fill   = p_series.fillna(p_series.mean()).to_numpy()
-        p_smooth = moving_average(p_fill, w=3)
-    else:
-        p_smooth = p_bin
+# Start with evaluated weights if present, else defaults
+currW = st.session_state.WEIGHTS.copy() if st.session_state.WEIGHTS else DEFAULT_W.copy()
 
-    centers = (edges[:-1] + edges[1:]) / 2.0
-    p_base_var = float(np.average(p_smooth, weights=(total + 1e-9)))
+# Manual fine-tune sliders
+w_rvol  = st.sidebar.slider("RVOL", 0.0, 1.0, float(currW.get("RVOL", DEFAULT_W["RVOL"])), 0.01)
+w_fr    = st.sidebar.slider("PM Float Rotation (×)", 0.0, 1.0, float(currW.get("PM Float Rotation (×)", DEFAULT_W["PM Float Rotation (×)"])), 0.01)
+w_si    = st.sidebar.slider("Short Interest (%)", 0.0, 1.0, float(currW.get("Short Interest (%)", DEFAULT_W["Short Interest (%)"])), 0.01)
+w_atr   = st.sidebar.slider("ATR ($)", 0.0, 1.0, float(currW.get("ATR ($)", DEFAULT_W["ATR ($)"])), 0.01)
+w_float = st.sidebar.slider("Float (M) (penalty/bonus)", 0.0, 1.0, float(currW.get("Float (M)", DEFAULT_W["Float (M)"])), 0.01)
 
-    if B == 2:
-        p_low, p_high = float(p_smooth[0]), float(p_smooth[1])
-        p_line = p_base_var + (p_high - p_low) * (centers - 0.5)
-        p_line = np.clip(p_line, 0.05, 0.95)
-        p_ready = p_line
-    else:
-        p_ready = p_smooth
-
-    eps_use = 0.08 if B == 2 else STRETCH_EPS
-    pmin, pmax = float(np.min(p_ready)), float(np.max(p_ready))
-    if np.isfinite(pmin) and np.isfinite(pmax) and pmax > pmin:
-        scale = (pmax - pmin)
-        p_use = eps_use + (1.0 - 2.0*eps_use) * (p_ready - pmin) / scale
-    else:
-        p_use = np.full_like(p_ready, p_base_var)
-    p_use = np.clip(p_use, 1e-6, 1 - 1e-6)
-
-    pb_curve = _smooth_local_baseline(centers, p_use, total, bandwidth=0.30 if B==2 else 0.22)
-
-    pr = np.linspace(0,1,41)
-    vals = np.quantile(x, pr)
-
-    return {
-        "edges": edges,
-        "centers": centers,
-        "support": total,
-        "p_raw": p_use,
-        "p0_global": p0_global,
-        "p_base_var": p_base_var,
-        "pb_curve": pb_curve,
-        "quantiles": {"pr": pr, "vals": vals},
-        "n": int(len(x))
-    }
-
-def value_to_prob(var_key: str, model: Dict[str,Any], x_val: float) -> float:
-    if model is None or not np.isfinite(x_val): return 0.5
-    pr, vals = model["quantiles"]["pr"], model["quantiles"]["vals"]
-    if x_val <= vals.min(): r = 0.0
-    elif x_val >= vals.max(): r = 1.0
-    else:
-        idx = np.searchsorted(vals, x_val)
-        i0 = max(1, min(idx, len(vals)-1))
-        x0, x1 = vals[i0-1], vals[i0]
-        p0, p1 = pr[i0-1], pr[i0]
-        t = (x_val - x0) / (x1 - x0) if x1 != x0 else 0.0
-        r = float(p0 + t*(p1 - p0))
-    centers = model["centers"]; p = model["p"]
-    j = int(np.clip(np.searchsorted(centers, r), 0, len(centers)-1))
-    p_local = float(p[j])
-    return float(np.clip(p_local, 1e-6, 1-1e-6))
-
-# ---------- Prior & simple anchors ----------
-def si_directional_prior(x: float) -> Optional[float]:
-    if not np.isfinite(x): return None
-    k = 0.25; x0 = 10.0
-    base = 0.25 + 0.65 / (1 + math.exp(-k * (x - x0)))
-    return float(np.clip(base, 0.20, 0.90))
-
-def blend_with_prior(var_key: str, x: float, p_learned: float) -> float:
-    if var_key == "si_pct":
-        prior = si_directional_prior(x)
-        if prior is not None:
-            p_learned = 0.40*prior + 0.60*p_learned
-    return float(np.clip(p_learned, 1e-6, 1e0-1e-6))
-
-ANCHORS = {
-    "pm_pct_daily": (8.0, 25.0),
-    "pm_pct_pred":  (8.0, 25.0),
+# Normalize to sum 1
+w_sum = max(1e-9, w_rvol + w_fr + w_si + w_atr + w_float)
+W = {
+    "RVOL": w_rvol / w_sum,
+    "PM Float Rotation (×)": w_fr / w_sum,
+    "Short Interest (%)": w_si / w_sum,
+    "ATR ($)": w_atr / w_sum,
+    "Float (M)": w_float / w_sum,
 }
 
-def anchor_pm_percent(var_key: str, p: float, x_val: float, pb: float) -> float:
-    band = ANCHORS.get(var_key)
-    if not band or not np.isfinite(x_val): 
-        return p
-    lo, hi = band
-    if lo <= x_val <= hi:
-        return float(max(p, min(0.95, pb + 0.10)))
-    return p
+# Modifiers for catalyst/dilution impact on final score (kept simple & transparent)
+st.sidebar.header("Modifiers")
+cat_mult = st.sidebar.slider("Catalyst weight (score pts per 1.0)", 0.0, 20.0, 10.0, 0.5)
+dil_mult = st.sidebar.slider("Dilution penalty (score pts at 1.0)", 0.0, 30.0, 12.0, 0.5)
 
-def anchor_atr(p: float, x: float, pb: float) -> float:
-    if not np.isfinite(x): return p
-    if 0.15 <= x <= 0.40:
-        return max(p, min(0.92, pb + 0.10))
-    if x < 0.10:
-        return min(p, 0.50)
-    return p
-
-def _rank_from_value(model: dict, x: float) -> Optional[float]:
-    if not np.isfinite(x): return None
-    pr, vals = model["quantiles"]["pr"], model["quantiles"]["vals"]
-    if x <= vals.min(): return 0.0
-    if x >= vals.max(): return 1.0
-    idx = np.searchsorted(vals, x)
-    i0 = max(1, min(idx, len(vals)-1))
-    x0, x1 = vals[i0-1], vals[i0]
-    p0, p1 = pr[i0-1], pr[i0]
-    t = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
-    return float(p0 + t*(p1 - p0))
-
-def _baseline_at_value(model: dict, x: float) -> float:
-    pb_curve = model.get("pb_curve", None)
-    centers  = model.get("centers", None)
-    if pb_curve is not None and centers is not None and np.isfinite(x):
-        r = _rank_from_value(model, x)
-        j = int(np.clip(np.searchsorted(centers, r), 0, len(centers)-1))
-        pb = float(pb_curve[j])
-        if np.isfinite(pb):
-            return pb
-    return float(model.get("p_base_var", 0.5))
-
-def _support_at_value(model: dict, x: float) -> int:
-    if model is None or not np.isfinite(x): 
-        return 0
-    pr, vals = model["quantiles"]["pr"], model["quantiles"]["vals"]
-    if x <= vals.min(): r = 0.0
-    elif x >= vals.max(): r = 1.0
-    else:
-        idx = np.searchsorted(vals, x)
-        i0 = max(1, min(idx, len(vals)-1))
-        x0, x1 = vals[i0-1], vals[i0]
-        p0, p1 = pr[i0-1], pr[i0]
-        t = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
-        r = float(p0 + t*(p1 - p0))
-    centers = model["centers"]
-    j = int(np.clip(np.searchsorted(centers, r), 0, len(centers)-1))
-    supp = model.get("support", np.array([], dtype=int))
-    return int(supp[j]) if j < len(supp) else 0
-
-def _rank_percentile(model: dict, x: float) -> float:
-    if model is None or not np.isfinite(x): return 0.5
-    pr, vals = model["quantiles"]["pr"], model["quantiles"]["vals"]
-    if x <= vals.min(): return 0.0
-    if x >= vals.max(): return 1.0
-    idx = np.searchsorted(vals, x)
-    i0 = max(1, min(idx, len(vals)-1))
-    x0, x1 = vals[i0-1], vals[i0]
-    p0, p1 = pr[i0-1], pr[i0]
-    t = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
-    return float(p0 + t*(p1 - p0))
-
-def _is_ood_rank(r: float, lo: float = 0.01, hi: float = 0.99) -> bool:
-    return (r <= lo) or (r >= hi)
-
-# ---------- Exponential percentile warping (for calibration) ----------
-def _warp_p(s: float, alpha: float) -> float:
-    s = float(np.clip(s, 0.0, 1.0))
-    return float(1.0 - (1.0 - s) ** alpha)
-
-def _inv_warp_p(s_warped: float, alpha: float) -> float:
-    s_warped = float(np.clip(s_warped, 0.0, 1.0))
-    return float(1.0 - (1.0 - s_warped) ** (1.0 / max(1e-9, alpha)))
-
-# ---------- Hard floors to prevent absurd labels ----------
-ODDS_FLOORS  = {"very_high": 0.85, "high": 0.70, "moderate": 0.55, "low": 0.40}
-GRADE_FLOORS = {"App": 0.92, "Ap": 0.85, "A": 0.75, "B": 0.65, "C": 0.50}
-
-# ---------- Logistic stacking (ridge) ----------
-def _safe_logit(p: np.ndarray) -> np.ndarray:
-    p = np.clip(p, 1e-6, 1-1e-6)
-    return np.log(p/(1-p))
-
-def _fit_logistic_ridge(X: np.ndarray, y: np.ndarray, l2: float = 1.0, max_iter: int = 50, tol: float = 1e-6) -> Tuple[np.ndarray, float]:
-    n, k = X.shape
-    Xb = np.concatenate([np.ones((n,1)), X], axis=1)
-    w = np.zeros(k+1)
-
-    R = np.eye(k+1)
-    R[0,0] = 0.0
-    R *= l2
-
-    for _ in range(max_iter):
-        z = Xb @ w
-        p = 1.0 / (1.0 + np.exp(-np.clip(z, -35, 35)))
-        W = p * (1 - p)
-        if np.all(W < 1e-8):
-            break
-        WX = Xb * W[:, None]
-        H  = Xb.T @ WX + R
-        g  = Xb.T @ (y - p)
-        try:
-            delta = np.linalg.solve(H, g)
-        except np.linalg.LinAlgError:
-            delta = np.linalg.lstsq(H, g, rcond=None)[0]
-        w_new = w + delta
-        if np.linalg.norm(delta) < tol:
-            w = w_new
-            break
-        w = w_new
-
-    intercept_ = float(w[0])
-    coef_ = w[1:].astype(float)
-    return coef_, intercept_
-
-def _predict_logistic(X: np.ndarray, coef_: np.ndarray, intercept_: float) -> np.ndarray:
-    z = intercept_ + X @ coef_
-    z = np.clip(z, -35, 35)
-    return 1.0 / (1.0 + np.exp(-z))
-
-# ---------- Per-row per-variable probabilities (features for stacking) ----------
-def _per_var_probs_for_row(models: Dict[str,dict], row: dict) -> Tuple[List[str], np.ndarray]:
-    use_pm_daily = "pm_pct_daily" in models
-    var_order = [
-        "gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m","fr_x","pmmc_pct",
-        ("pm_pct_daily" if use_pm_daily else "pm_pct_pred"), "catalyst"
-    ]
-
-    keys: List[str] = []
-    vals: List[float] = []
-    for k in var_order:
-        mdl = models.get(k)
-        if mdl is None:
-            continue
-        x = row.get(k, np.nan)
-        p = value_to_prob(k, mdl, x)
-        pb_local = _baseline_at_value(mdl, x)
-        p = blend_with_prior(k, x, p)
-        if k == "atr_usd":
-            p = anchor_atr(p, x, pb_local)
-        p = anchor_pm_percent(k, p, x, pb_local)
-        keys.append(k)
-        vals.append(float(np.clip(p, 1e-6, 1-1e-6)))
-    return keys, np.array(vals, dtype=float)
-
-# ---------- Calibration helpers ----------
-def _prob_to_odds(prob: float, cuts: Dict[str, float]) -> str:
-    if prob >= cuts["very_high"]: return "Very High Odds"
-    if prob >= cuts["high"]:      return "High Odds"
-    if prob >= cuts["moderate"]:  return "Moderate Odds"
-    if prob >= cuts["low"]:       return "Low Odds"
-    return "Very Low Odds"
-
-def _prob_to_grade(prob: float, cuts: Dict[str, float]) -> str:
-    if prob >= cuts["App"]: return "A++"
-    if prob >= cuts["Ap"]:  return "A+"
-    if prob >= cuts["A"]:   return "A"
-    if prob >= cuts["B"]:   return "B"
-    if prob >= cuts["C"]:   return "C"
-    return "D"
-
-# ============================== Upload & Learn (Main Pane) ==============================
-st.markdown('<div class="section-title">Upload workbook</div>', unsafe_allow_html=True)
+# ============================== Upload workbook → Evaluate Weights ==============================
+st.markdown('<div class="section-title">Upload workbook (to evaluate numeric weights only)</div>', unsafe_allow_html=True)
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], label_visibility="collapsed")
 merged_sheet = st.text_input("Sheet name", "PMH BO Merged")
-learn_btn = st.button("Learn rules from merged", use_container_width=True)
+learn_btn = st.button("Evaluate weights from workbook", use_container_width=True)
 
 if learn_btn:
     if not uploaded:
@@ -438,18 +189,13 @@ if learn_btn:
             else:
                 raw = pd.read_excel(xls, merged_sheet)
 
-                # column mapping
+                # pick columns
                 col_ft    = _pick(raw, ["ft","FT"])
-                col_gap   = _pick(raw, ["gap %","gap%","premarket gap","gap"])
-                col_atr   = _pick(raw, ["atr","atr $","atr$","atr (usd)"])
+                col_atr   = _pick(raw, ["atr","atr $","atr$","atr (usd)","daily atr"])
                 col_rvol  = _pick(raw, ["rvol @ bo","rvol","relative volume"])
                 col_pmvol = _pick(raw, ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)"])
-                col_pmdol = _pick(raw, ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol"])
                 col_float = _pick(raw, ["float m shares","public float (m)","float (m)","float"])
-                col_mcap  = _pick(raw, ["marketcap m","market cap (m)","mcap m","mcap"])
                 col_si    = _pick(raw, ["si","short interest %","short float %","short interest (float) %"])
-                col_cat   = _pick(raw, ["catalyst","news","pr"])
-                col_daily = _pick(raw, ["daily vol (m)","day volume (m)","volume (m)"])
 
                 if col_ft is None:
                     st.error("No 'FT' column found in merged sheet.")
@@ -457,402 +203,208 @@ if learn_btn:
                     df = pd.DataFrame()
                     df["FT"] = pd.to_numeric(raw[col_ft], errors="coerce")
 
-                    if col_gap:   df["gap_pct"]  = pd.to_numeric(raw[col_gap],   errors="coerce")
-                    if col_atr:   df["atr_usd"]  = pd.to_numeric(raw[col_atr],   errors="coerce")
                     if col_rvol:  df["rvol"]     = pd.to_numeric(raw[col_rvol],  errors="coerce")
+                    if col_atr:   df["atr_usd"]  = pd.to_numeric(raw[col_atr],   errors="coerce")
                     if col_pmvol: df["pm_vol_m"] = pd.to_numeric(raw[col_pmvol], errors="coerce")
-                    if col_pmdol: df["pm_dol_m"] = pd.to_numeric(raw[col_pmdol], errors="coerce")
-                    if col_float: df["float_m"]  = pd.to_numeric(raw[col_float],  errors="coerce")
-                    if col_mcap:  df["mcap_m"]   = pd.to_numeric(raw[col_mcap],  errors="coerce")
+                    if col_float: df["float_m"]  = pd.to_numeric(raw[col_float], errors="coerce")
                     if col_si:    df["si_pct"]   = pd.to_numeric(raw[col_si],    errors="coerce")
-                    if col_cat:   df["catalyst"] = pd.to_numeric(raw[col_cat],   errors="coerce").clip(0,1)
-                    if col_daily: df["daily_vol_m"] = pd.to_numeric(raw[col_daily], errors="coerce")
 
-                    # derived
+                    # derived FR
                     if {"pm_vol_m","float_m"}.issubset(df.columns):
                         df["fr_x"] = df["pm_vol_m"] / df["float_m"]
-                    if {"pm_dol_m","mcap_m"}.issubset(df.columns):
-                        df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
-                    if {"pm_vol_m","daily_vol_m"}.issubset(df.columns):
-                        df["pm_pct_daily"] = 100.0 * df["pm_vol_m"] / df["daily_vol_m"]
-                    if {"mcap_m","gap_pct","atr_usd","pm_vol_m"}.issubset(df.columns):
-                        def _pred_row(r):
-                            try:
-                                return predict_day_volume_m_premarket(r["mcap_m"], r["gap_pct"], r["atr_usd"])
-                            except Exception:
-                                return np.nan
-                        pred = df.apply(_pred_row, axis=1)
-                        df["pm_pct_pred"] = 100.0 * df["pm_vol_m"] / pred
 
-                    df = df[df["FT"].notna()]
+                    # AUC-based weights
+                    from scipy.stats import rankdata
+                    metric_cols = {
+                        "RVOL": "rvol",
+                        "ATR ($)": "atr_usd",
+                        "Short Interest (%)": "si_pct",
+                        "PM Float Rotation (×)": "fr_x",
+                        "Float (M)": "float_m",
+                    }
+
                     y = df["FT"].astype(float)
+                    rows = []
+                    for label, col in metric_cols.items():
+                        if col not in df.columns:
+                            rows.append({"Metric": label, "AUC": np.nan, "n": 0})
+                            continue
+                        x = pd.to_numeric(df[col], errors="coerce")
+                        m = x.notna() & y.notna()
+                        xv = x[m].to_numpy(); yv = y[m].astype(int).to_numpy()
+                        if xv.size == 0 or yv.sum() == 0 or yv.sum() == yv.size:
+                            rows.append({"Metric": label, "AUC": np.nan, "n": int(xv.size)})
+                            continue
+                        r = rankdata(xv)  # average ranks
+                        n1 = yv.sum(); n0 = (1 - yv).sum()
+                        s1 = r[yv == 1].sum()
+                        auc = (s1 - n1*(n1+1)/2) / (n0*n1)
+                        rows.append({"Metric": label, "AUC": float(auc), "n": int(xv.size)})
 
-                    candidates = [
-                        "gap_pct","atr_usd","rvol","si_pct","float_m","mcap_m",
-                        "fr_x","pmmc_pct","pm_pct_daily","pm_pct_pred","catalyst"
-                    ]
-                    models: Dict[str, dict] = {}
-                    for v in candidates:
-                        if v in df.columns:
-                            m = rank_hist_model(df[v], y, bins=BINS)
-                            if m is not None:
-                                centers = m["centers"]
-                                p_base_var = m["p_base_var"]
-                                p_use = stretch_curve_to_unit(m["p_raw"], base_p=p_base_var)
-                                m["p"] = p_use
-                                pb_curve = _smooth_local_baseline(centers, p_use, m["support"], bandwidth=0.22)
-                                m["pb_curve"] = pb_curve
-                                models[v] = m
-
-                    # ---------- Calibration on merged sheet (logistic stacking) ----------
-                    stack_keys: List[str] = []
-                    X_list: List[np.ndarray] = []
-                    y_list: List[int] = []
-
-                    if models:
-                        if {"pm_vol_m","float_m"}.issubset(df.columns) and "fr_x" not in df.columns:
-                            df["fr_x"] = df["pm_vol_m"] / df["float_m"]
-                        if {"pm_dol_m","mcap_m"}.issubset(df.columns) and "pmmc_pct" not in df.columns:
-                            df["pmmc_pct"] = 100.0 * df["pm_dol_m"] / df["mcap_m"]
-
-                        if {"mcap_m","gap_pct","atr_usd","pm_vol_m"}.issubset(df.columns):
-                            def _pred_row_cal2(r):
-                                try:
-                                    return predict_day_volume_m_premarket(r["mcap_m"], r["gap_pct"], r["atr_usd"])
-                                except Exception:
-                                    return np.nan
-                            pred_cal2 = df.apply(_pred_row_cal2, axis=1)
-                            df["pm_pct_pred"] = np.where(
-                                (pred_cal2 > 0) & np.isfinite(pred_cal2),
-                                100.0 * df.get("pm_vol_m", np.nan) / pred_cal2,
-                                df.get("pm_pct_pred", np.nan)
-                            )
-
-                        for _, rr in df.iterrows():
-                            rowd = {k: float(rr[k]) if k in df.columns and np.isfinite(rr[k]) else np.nan for k in df.columns}
-                            if "pm_pct_daily" in models:
-                                rowd.setdefault("pm_pct_daily", float(rowd.get("pm_pct_pred", np.nan)))
-                            keys, pvec = _per_var_probs_for_row(models, rowd)
-                            if not stack_keys:
-                                stack_keys = keys[:]
-                            if keys != stack_keys:
-                                key_to_p = {k: v for k, v in zip(keys, pvec)}
-                                pvec = np.array([key_to_p.get(k, 0.5) for k in stack_keys], dtype=float)
-                            X_list.append(_safe_logit(pvec))
-                            y_list.append(int(rr["FT"]))
-
-                    X = np.array(X_list, dtype=float)
-                    y_arr = np.array(y_list, dtype=float)
-
-                    logit_coef = None
-                    logit_intercept = 0.0
-                    cal_probs = np.array([], dtype=float)
-
-                    if X.size > 0 and np.unique(y_arr).size == 2:
-                        logit_coef, logit_intercept = _fit_logistic_ridge(X, y_arr, l2=1.0, max_iter=60, tol=1e-6)
-                        cal_probs = _predict_logistic(X, logit_coef, logit_intercept)
+                    eff = pd.DataFrame(rows)
+                    eff["gain"] = eff["AUC"] - 0.5
+                    eff.loc[eff["gain"] < 0, "gain"] = 0.0
+                    total_gain = eff["gain"].sum()
+                    if total_gain <= 0:
+                        # fallback equal weights across available metrics
+                        k = max(1, (eff["gain"].notna()).sum())
+                        eff["weight"] = 1.0 / k
                     else:
-                        if X.size > 0:
-                            coef_eq = np.ones(X.shape[1]) / max(1, X.shape[1])
-                            logit_coef, logit_intercept = coef_eq, 0.0
-                            cal_probs = _predict_logistic(X, logit_coef, logit_intercept)
+                        eff["weight"] = eff["gain"] / total_gain
 
-                    ALPHA_ODDS  = 2.2
-                    ALPHA_GRADE = 2.8
+                    # stash into session & reflect to sidebar
+                    st.session_state.WEIGHTS = {
+                        row["Metric"]: float(row["weight"])
+                        for _, row in eff.iterrows() if np.isfinite(row["weight"])
+                    }
 
-                    odds_targets_warped = {"very_high": 0.98, "high": 0.90, "moderate": 0.65, "low": 0.35}
-                    grade_targets_warped = {"App": 0.995, "Ap": 0.97, "A": 0.90, "B": 0.65, "C": 0.35}
-
-                    def _cut_from_probs(probs: np.ndarray, warped_p: float, alpha: float) -> float:
-                        if probs.size == 0:
-                            return float(warped_p)
-                        raw_p = _inv_warp_p(warped_p, alpha)
-                        return float(np.quantile(probs, raw_p))
-
-                    odds_cuts = {k: _cut_from_probs(cal_probs, v, ALPHA_ODDS) for k, v in odds_targets_warped.items()}
-                    grade_cuts = {k: _cut_from_probs(cal_probs, v, ALPHA_GRADE) for k, v in grade_targets_warped.items()}
-
-                    for k, floor in ODDS_FLOORS.items():
-                        if k in odds_cuts: odds_cuts[k] = max(odds_cuts[k], floor)
-                    for k, floor in GRADE_FLOORS.items():
-                        if k in grade_cuts: grade_cuts[k] = max(grade_cuts[k], floor)
-
-                    st.session_state.MODELS       = models
-                    st.session_state.ODDS_CUTS    = odds_cuts
-                    st.session_state.GRADE_CUTS   = grade_cuts
-                    st.session_state.STACK_KEYS   = stack_keys
-                    st.session_state.STACK_COEF   = logit_coef
-                    st.session_state.STACK_BIAS   = logit_intercept
-
-                    st.success(f"Learned {len(models)} variables with {BINS} bins and trained logistic stacking.")
+                    st.success("Evaluated numeric weights from the workbook.")
+                    st.dataframe(
+                        eff[["Metric","AUC","n","weight"]].sort_values("weight", ascending=False),
+                        use_container_width=True, hide_index=True
+                    )
         except Exception as e:
-            st.error(f"Learning failed: {e}")
+            st.error(f"Weight evaluation failed: {e}")
 
 # ============================== Tabs ==============================
-tab_add, tab_rank, tab_curves = st.tabs(["➕ Add Stock", "📊 Ranking", "📈 Curves"])
+tab_add, tab_rank = st.tabs(["➕ Add Stock", "📊 Ranking"])
 
-# ============================== Add Stock (TWO COLUMNS; $VOL instead of VWAP) ==============================
+# ============================== Add Stock (two numeric cols + third for catalyst/dilution) ==============================
 with tab_add:
     st.markdown('<div class="section-title">Inputs</div>', unsafe_allow_html=True)
     with st.form("add_form", clear_on_submit=True):
-        # Two equal-width columns for inputs; keep catalyst & dilution here (unchanged)
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns([1.2, 1.2, 0.9])
+
         with c1:
             ticker   = st.text_input("Ticker", "").strip().upper()
             mc_m     = input_float("Market Cap (Millions $)", 0.0, min_value=0.0, decimals=2)
             float_m  = input_float("Public Float (Millions)",  0.0, min_value=0.0, decimals=2)
             si_pct   = input_float("Short Interest (%)",       0.0, min_value=0.0, decimals=2)
-            gap_pct  = input_float("Gap %", 0.0, min_value=0.0, decimals=1)
+            gap_pct  = input_float("Gap %",                    0.0, min_value=0.0, decimals=1)
 
         with c2:
             atr_usd  = input_float("ATR ($)", 0.0, min_value=0.0, decimals=2)
             rvol     = input_float("RVOL", 0.0, min_value=0.0, decimals=2)
             pm_vol_m = input_float("Premarket Volume (Millions)", 0.0, min_value=0.0, decimals=2)
             pm_dol_m = input_float("Premarket Dollar Volume (Millions $)", 0.0, min_value=0.0, decimals=2)
-            # Dilution slider (unchanged)
+
+        with c3:
+            # Catalyst weighted numeric (kept as requested)
+            catalyst_points = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.05,
+                                        help="Positive news adds, negative news subtracts.")
+            # Dilution slider stays here
             dilution_flag = st.slider("Dilution present? (0 = none, 1 = strong)", 0.0, 1.0, 0.0, 0.1,
-                                      help="Soft penalty applied in log-odds; try 0.2, 0.5, 1.0, etc.")
-            # Catalyst select (unchanged)
-            catalyst_flag = st.selectbox("Catalyst?", ["No","Yes"])
+                                      help="Continuous penalty applied to score.")
 
         submitted = st.form_submit_button("Add / Score", use_container_width=True)
 
     if submitted and ticker:
-        # Derived live
+        # Derived diagnostics (shown in ranking table)
         fr_x = (pm_vol_m / float_m) if float_m > 0 else float("nan")
         pmmc_pct = (100.0 * pm_dol_m / mc_m) if mc_m > 0 else float("nan")
 
-        # Predicted daily (fallback for PM%)
-        pred_vol_m = predict_day_volume_m_premarket(mc_m, gap_pct, atr_usd)
-        pm_pct_pred = (100.0 * pm_vol_m / pred_vol_m) if pred_vol_m > 0 else float("nan")
+        # Numeric points (1..7)
+        p_rvol  = pts_rvol(rvol)
+        p_atr   = pts_atr(atr_usd)
+        p_si    = pts_si(si_pct)
+        p_fr    = pts_fr(pm_vol_m, float_m)
+        p_float = pts_float(float_m)
 
-        models  = st.session_state.MODELS or {}
-
-        use_pm_pct_daily = "pm_pct_daily" in models
-        var_vals: Dict[str, float] = {
-            "gap_pct": gap_pct, "atr_usd": atr_usd, "rvol": rvol, "si_pct": si_pct,
-            "float_m": float_m, "mcap_m": mc_m, "fr_x": fr_x, "pmmc_pct": pmmc_pct,
-            ("pm_pct_daily" if use_pm_pct_daily else "pm_pct_pred"): (np.nan if use_pm_pct_daily else pm_pct_pred),
-            "catalyst": 1.0 if catalyst_flag=="Yes" else 0.0
+        # Weighted numeric % using current (normalized) weights
+        # Map metric names -> points
+        pts_map = {
+            "RVOL": p_rvol,
+            "PM Float Rotation (×)": p_fr,
+            "Short Interest (%)": p_si,
+            "ATR ($)": p_atr,
+            "Float (M)": p_float,
         }
-        if use_pm_pct_daily:
-            var_vals["pm_pct_daily"] = pm_pct_pred  # proxy during premarket
+        # Weighted average of points
+        num_0_7 = sum(W[k] * pts_map[k] for k in pts_map.keys())
+        numeric_pct = (num_0_7 / 7.0) * 100.0
 
-        keys_live, pvec_live = _per_var_probs_for_row(models, var_vals)
-        stack_keys = st.session_state.get("STACK_KEYS", keys_live)
-        coef_ = st.session_state.get("STACK_COEF", None)
-        bias_ = st.session_state.get("STACK_BIAS", 0.0)
+        # Modifiers
+        score = numeric_pct + cat_mult * float(catalyst_points) - dil_mult * float(dilution_flag)
+        final_score = float(np.clip(score, 0.0, 100.0))
 
-        if keys_live != stack_keys:
-            k2p = {k:v for k,v in zip(keys_live, pvec_live)}
-            pvec_live = np.array([k2p.get(k, 0.5) for k in stack_keys], dtype=float)
-        X_live = _safe_logit(np.array(pvec_live, dtype=float))[None, :]
-
-        if coef_ is not None and len(coef_) == X_live.shape[1]:
-            z_sum = float(bias_ + (X_live @ coef_)[0])
-        else:
-            z_sum = float(np.mean(X_live))
-
-        p_adj_list = []
-        supports = []
-        ranks = []
-        for k in stack_keys:
-            mdl = models.get(k)
-            xk = var_vals.get(k, np.nan)
-            if mdl is None:
-                continue
-            p = value_to_prob(k, mdl, xk)
-            pb = _baseline_at_value(mdl, xk)
-            p = blend_with_prior(k, xk, p)
-            if k == "atr_usd":
-                p = anchor_atr(p, xk, pb)
-            p = anchor_pm_percent(k, p, xk, pb)
-            p = float(np.clip(p, 1e-6, 1-1e-6))
-            p_adj_list.append(p)
-            supports.append(_support_at_value(mdl, xk))
-            ranks.append(_rank_percentile(mdl, xk))
-
-        if supports:
-            conf = [min(1.0, s / 40.0) for s in supports]
-            conf_mean = float(np.mean(conf))
-            SHRINK_MIN, SHRINK_MAX = 0.60, 1.00
-            shrink = SHRINK_MIN + (SHRINK_MAX - SHRINK_MIN) * conf_mean
-            z_sum *= shrink
-
-        if len(p_adj_list) >= 2:
-            std_p = float(np.std(p_adj_list))
-            DISAG_STRENGTH = 1.6
-            disag_factor = 1.0 / (1.0 + DISAG_STRENGTH * std_p)
-            disag_factor = max(0.70, min(1.0, disag_factor))
-            z_sum *= disag_factor
-
-        if ranks:
-            ood_flags = [_is_ood_rank(r) for r in ranks]
-            ood_frac  = sum(ood_flags) / len(ranks)
-            z_sum += -0.70 * ood_frac
-
-        z_sum += -0.90 * float(dilution_flag)
-        z_sum = float(np.clip(z_sum, -12, 12))
-        numeric_prob = 1.0 / (1.0 + math.exp(-z_sum))
-
-        odds_cuts = st.session_state.get("ODDS_CUTS", {"very_high":0.85,"high":0.70,"moderate":0.55,"low":0.40})
-        grade_cuts = st.session_state.get("GRADE_CUTS", {"App":0.92,"Ap":0.85,"A":0.75,"B":0.65,"C":0.50})
-
-        odds_name = _prob_to_odds(numeric_prob, odds_cuts)
-        level = _prob_to_grade(numeric_prob, grade_cuts)
-
-        final_score = float(np.clip(numeric_prob*100.0, 0.0, 100.0))
+        odds = odds_label(final_score)
+        level = grade(final_score)
         verdict_pill = (
             '<span class="pill pill-good">Strong Setup</span>' if level in ("A++","A+","A") else
             '<span class="pill pill-warn">Constructive</span>' if level in ("B","C") else
             '<span class="pill pill-bad">Weak / Avoid</span>'
         )
 
-        name_map = {
-            "gap_pct":"Gap %","atr_usd":"ATR $","rvol":"RVOL","si_pct":"Short Interest %",
-            "float_m":"Float (M)","mcap_m":"MarketCap (M)","fr_x":"PM Float Rotation ×",
-            "pmmc_pct":"PM $Vol / MC %","pm_pct_daily":"PM Vol % of Daily",
-            "pm_pct_pred":"PM Vol % of Pred","catalyst":"Catalyst"
-        }
-        good, warn, risk = [], [], []
-        for k in stack_keys:
-            mdl = models.get(k)
-            x = var_vals.get(k, np.nan)
-            if mdl is None: 
-                continue
-            p = value_to_prob(k, mdl, x)
-            pb = _baseline_at_value(mdl, x)
-            p = blend_with_prior(k, x, p)
-            if k == "atr_usd":
-                p = anchor_atr(p, x, pb)
-            p = anchor_pm_percent(k, p, x, pb)
-            p = float(np.clip(p,1e-6,1-1e-6))
-            p_pct = int(round(p*100))
-            nm = name_map.get(k, k)
-            if p >= pb + CLASS_LIFT:   good.append(f"{nm}: {_fmt_value(x)} — good (p≈{p_pct}%)")
-            elif p <= pb - CLASS_LIFT: risk.append(f"{nm}: {_fmt_value(x)} — risk (p≈{p_pct}%)")
-            else:                      warn.append(f"{nm}: {_fmt_value(x)} — caution (p≈{p_pct}%)")
-
         row = {
             "Ticker": ticker,
-            "Odds": odds_name,
+            "Odds": odds,
             "Level": level,
+            "Numeric_%": round(numeric_pct, 2),
             "FinalScore": round(final_score, 2),
-            "PredVol_M": round(pred_vol_m, 2),
+            "PM_FloatRot_x": round(fr_x, 3) if np.isfinite(fr_x) else "",
+            "PM$ / MC_%": round(pmmc_pct, 1) if np.isfinite(pmmc_pct) else "",
+            "Catalyst": round(float(catalyst_points), 2),
+            "Dilution": round(float(dilution_flag), 2),
+            # raw inputs (optional export/debug)
+            "_MCap_M": mc_m, "_Float_M": float_m, "_SI_%": si_pct, "_ATR_$": atr_usd,
+            "_PM_Vol_M": pm_vol_m, "_PM_$Vol_M": pm_dol_m, "_Gap_%": gap_pct,
             "VerdictPill": verdict_pill,
-            "GoodList": good, "WarnList": warn, "RiskList": risk,
         }
+
         st.session_state.rows.append(row)
         st.session_state.last = row
         st.success(f"Saved {ticker} — Odds {row['Odds']} (Score {row['FinalScore']})")
 
+    # Preview card
     l = st.session_state.last if isinstance(st.session_state.last, dict) else {}
     if l:
         st.markdown('<div class="block-divider"></div>', unsafe_allow_html=True)
-        a,b,c,d,e = st.columns(5)
+        a,b,c,d = st.columns(4)
         a.metric("Last Ticker", l.get("Ticker","—"))
         b.metric("Final Score", f"{l.get('FinalScore',0):.2f}")
         c.metric("Grade", l.get('Level','—'))
         d.metric("Odds", l.get('Odds','—'))
-        e.metric("PredVol (M)", f"{l.get('PredVol_M',0):.2f}")
 
-        with st.expander("Premarket Checklist", expanded=True):
+        with st.expander("Premarket Snapshot", expanded=True):
             st.markdown(f"**Verdict:** {l.get('VerdictPill','—')}", unsafe_allow_html=True)
-            g,w,r = st.columns(3)
-            def ul(items): return "<ul>"+"".join([f"<li>{x}</li>" for x in items])+"</ul>" if items else "<ul><li>—</li></ul>"
-            with g: st.markdown("**Good**");    st.markdown(ul(l.get("GoodList",[])), unsafe_allow_html=True)
-            with w: st.markdown("**Caution**"); st.markdown(ul(l.get("WarnList",[])), unsafe_allow_html=True)
-            with r: st.markdown("**Risk**");    st.markdown(ul(l.get("RiskList",[])), unsafe_allow_html=True)
+            st.markdown(
+                f"- PM Float Rotation: **{_fmt_value(l.get('PM_FloatRot_x'))}×**  \n"
+                f"- PM $Vol / MC: **{_fmt_value(l.get('PM$ / MC_%'))}%**  \n"
+                f"- Catalyst: **{_fmt_value(l.get('Catalyst'))}** · Dilution: **{_fmt_value(l.get('Dilution'))}**",
+                unsafe_allow_html=True
+            )
 
 # ============================== Ranking ==============================
 with tab_rank:
     st.markdown('<div class="section-title">Current Ranking</div>', unsafe_allow_html=True)
     if st.session_state.rows:
         df = pd.DataFrame(st.session_state.rows).sort_values("FinalScore", ascending=False).reset_index(drop=True)
-        cols_to_show = ["Ticker","Odds","Level","FinalScore","PredVol_M"]
+        cols_to_show = ["Ticker","Odds","Level","Numeric_%","FinalScore","PM_FloatRot_x","PM$ / MC_%","Catalyst","Dilution"]
         for c in cols_to_show:
             if c not in df.columns: df[c] = "" if c in ("Ticker","Odds","Level") else 0.0
+
         st.dataframe(
             df[cols_to_show], use_container_width=True, hide_index=True,
             column_config={
                 "Ticker": st.column_config.TextColumn("Ticker"),
                 "Odds": st.column_config.TextColumn("Odds"),
                 "Level": st.column_config.TextColumn("Grade"),
+                "Numeric_%": st.column_config.NumberColumn("Numeric %", format="%.2f"),
                 "FinalScore": st.column_config.NumberColumn("Final Score", format="%.2f"),
-                "PredVol_M": st.column_config.NumberColumn("Predicted Day Vol (M)", format="%.2f"),
+                "PM_FloatRot_x": st.column_config.NumberColumn("PM Float Rot (×)", format="%.3f"),
+                "PM$ / MC_%": st.column_config.NumberColumn("PM $Vol / MC %", format="%.1f"),
+                "Catalyst": st.column_config.NumberColumn("Catalyst", format="%.2f"),
+                "Dilution": st.column_config.NumberColumn("Dilution", format="%.2f"),
             }
         )
+
         st.download_button(
             "Download CSV",
             df[cols_to_show].to_csv(index=False).encode("utf-8"),
             "ranking.csv", "text/csv", use_container_width=True
         )
+
+        st.markdown("### 📋 Ranking (Markdown view)")
+        st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
     else:
         st.info("Add at least one stock.")
-
-# ============================== Curves ==============================
-with tab_curves:
-    st.markdown('<div class="section-title">Learned Curves (rank-space FT rate, local baselines dashed)</div>', unsafe_allow_html=True)
-    models = st.session_state.MODELS or {}
-    if not models:
-        st.info("Upload + Learn first.")
-    else:
-        if plot_all_curves:
-            learned_vars = list(models.keys())
-            n = len(learned_vars)
-            ncols = 3
-            nrows = int(np.ceil(n / ncols))
-            fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*4.6, nrows*3.2))
-            axes = np.atleast_2d(axes)
-            for i, var in enumerate(learned_vars):
-                ax = axes[i//ncols, i % ncols]
-                m = models[var]
-                centers = m["centers"]; p = m["p"]
-                ax.plot(centers, p, lw=2)
-                pb_curve = m.get("pb_curve")
-                if show_baseline:
-                    if pb_curve is not None:
-                        ax.plot(centers, pb_curve, ls="--", lw=1)
-                    else:
-                        ax.axhline(m.get("p_base_var", 0.5), ls="--", lw=1)
-                ax.set_title(var, fontsize=11)
-                ax.set_xlabel("Rank (percentile)", fontsize=10)
-                ax.set_ylabel("P(FT)", fontsize=10)
-                ax.tick_params(labelsize=9)
-            total_axes = nrows * ncols
-            for j in range(n, total_axes):
-                fig.delaxes(axes[j//ncols, j % ncols])
-            st.pyplot(fig, clear_figure=True)
-        else:
-            var = sel_curve_var
-            m = models.get(var)
-            if m is None:
-                st.warning(f"No curve learned for '{var}'.")
-            else:
-                centers = m["centers"]; p = m["p"]
-                fig, ax = plt.subplots(figsize=(6.4, 3.4))
-                ax.plot(centers, p, lw=2)
-                pb_curve = m.get("pb_curve")
-                if show_baseline:
-                    if pb_curve is not None:
-                        ax.plot(centers, pb_curve, ls="--", lw=1)
-                    else:
-                        ax.axhline(m.get("p_base_var", 0.5), ls="--", lw=1)
-                ax.set_xlabel("Rank (percentile of variable)", fontsize=10)
-                ax.set_ylabel("P(FT | rank)", fontsize=10)
-                ax.set_title(f"{var} — FT curve (baseline dashed)", fontsize=11)
-                ax.tick_params(labelsize=9)
-                st.pyplot(fig, clear_figure=True)
-
-        odds_cuts = st.session_state.get("ODDS_CUTS")
-        grade_cuts = st.session_state.get("GRADE_CUTS")
-        if odds_cuts and grade_cuts:
-            st.caption(
-                f"Odds cuts (prob): Very High ≥ {odds_cuts['very_high']:.3f}, "
-                f"High ≥ {odds_cuts['high']:.3f}, Moderate ≥ {odds_cuts['moderate']:.3f}, "
-                f"Low ≥ {odds_cuts['low']:.3f}."
-            )
-            st.caption(
-                f"Grade cuts (prob): A++ ≥ {grade_cuts['App']:.3f}, A+ ≥ {grade_cuts['Ap']:.3f}, "
-                f"A ≥ {grade_cuts['A']:.3f}, B ≥ {grade_cuts['B']:.3f}, C ≥ {grade_cuts['C']:.3f}."
-            )
