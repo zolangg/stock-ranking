@@ -511,3 +511,86 @@ with tab_models:
 
             except Exception as e:
                 st.error(f"Failed to build models: {e}")
+
+# ===== Divergence across model stocks =====
+if models:
+    st.markdown("### 🔎 Divergence across Model Stocks")
+
+    var_list = [
+        "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+        "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst_%Yes"
+    ]
+    model_names = list(models.keys())
+
+    comp_rows = []
+    for var in var_list:
+        row = {"Variable": var}
+        vals = []
+        for mname in model_names:
+            dfm = models[mname]
+            if var in dfm.columns and not dfm.empty:
+                v = pd.to_numeric(dfm[var], errors="coerce").iloc[0]
+                try:
+                    v = float(v)
+                except Exception:
+                    v = float("nan")
+            else:
+                v = float("nan")
+            row[mname] = v
+            vals.append(v)
+
+        s = pd.Series(vals, index=model_names, dtype="float64")
+        valid = s.dropna()
+        if len(valid) >= 2:
+            vmin = float(valid.min())
+            vmax = float(valid.max())
+            frng = float(vmax - vmin)
+            fold = (vmax / vmin) if vmin > 0 else float("inf")
+
+            # significance rules
+            pct_vars = {"ShortInt_%","Gap_%","PM$Vol/MC_%","Catalyst_%Yes"}
+            if var in pct_vars:
+                significant = (abs(frng) >= 15.0) or (fold >= 1.5 and vmin > 0)
+            elif var in {"FR_x","RVOL"}:
+                significant = (fold >= 1.5)
+            else:
+                significant = (fold >= 2.0)
+
+            row.update({"Min": vmin, "Max": vmax, "Range": frng, "Fold": fold,
+                        "Significant": "Yes" if significant else ""})
+        else:
+            row.update({"Min": float("nan"), "Max": float("nan"),
+                        "Range": float("nan"), "Fold": float("nan"),
+                        "Significant": ""})
+        comp_rows.append(row)
+
+    comp_df = pd.DataFrame(comp_rows)
+
+    # Controls
+    show_all = st.checkbox("Show all variables (not only significant)", value=False)
+    view_df = comp_df if show_all else comp_df[comp_df["Significant"] == "Yes"]
+
+    if view_df.empty:
+        st.info("No significant divergences based on current thresholds.")
+    else:
+        # display with 2-decimal formats
+        col_cfg = {
+            "Variable": st.column_config.TextColumn("Variable"),
+            "Min": st.column_config.NumberColumn("Min", format="%.2f"),
+            "Max": st.column_config.NumberColumn("Max", format="%.2f"),
+            "Range": st.column_config.NumberColumn("Range", format="%.2f"),
+            "Fold": st.column_config.NumberColumn("Fold (×)", format="%.2f"),
+            "Significant": st.column_config.TextColumn("Flag"),
+        }
+        # add model columns with 2-decimal format
+        for mname in model_names:
+            col_cfg[mname] = st.column_config.NumberColumn(mname, format="%.2f")
+
+        display_cols = ["Variable"] + model_names + ["Min","Max","Range","Fold","Significant"]
+        view_df = view_df[display_cols]
+
+        st.dataframe(view_df, use_container_width=True, hide_index=True, column_config=col_cfg)
+
+        # Markdown export (2 decimals via your helper)
+        st.markdown("**Markdown**")
+        st.code(df_to_markdown_table(view_df, display_cols), language="markdown")
