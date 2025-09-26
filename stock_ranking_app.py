@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import re
+import numpy as np
 
 # =========================== Page ===========================
 st.set_page_config(page_title="Premarket Table + Model Stocks", layout="wide")
@@ -20,7 +21,7 @@ def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
         cells = []
         for c in keep:
             v = row[c]
-            if isinstance(v, (int, float)):
+            if isinstance(v, (int, float, np.floating)):
                 cells.append(f"{float(v):.2f}")
             else:
                 cells.append(str(v))
@@ -33,6 +34,7 @@ def do_rerun():
 
 # ======================= Session state ======================
 if "rows" not in st.session_state: st.session_state.rows = []
+if "last_warnings" not in st.session_state: st.session_state.last_warnings = []
 
 # ================= Qualitative (short labels) ================
 QUAL_CRITERIA = [
@@ -94,7 +96,7 @@ QUAL_CRITERIA = [
 tab_manual, tab_models = st.tabs(["📝 Manual Table", "📥 Upload & Model Stocks"])
 
 # =============================================================================
-# TAB 1 — Manual Table (inputs + derived + qualitative tags)
+# TAB 1 — Manual Table (inputs + derived + qualitative tags + sanity flags)
 # =============================================================================
 with tab_manual:
     st.subheader("Add Stock")
@@ -108,7 +110,8 @@ with tab_manual:
             si_pct  = st.number_input("Short Interest (%)", 0.0, step=0.01, format="%.2f")
 
         with c2:
-            gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")
+            gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f",
+                                      help="Enter as percent (e.g., 45 for +45%, not 0.45).")
             atr_usd = st.number_input("ATR ($)", 0.0, step=0.01, format="%.2f")
             rvol    = st.number_input("RVOL", 0.0, step=0.01, format="%.2f")
 
@@ -126,7 +129,7 @@ with tab_manual:
             with q_cols[i % 3]:
                 choice = st.radio(
                     crit["question"],
-                    options=list(enumerate(crit["options"], 1)),  # (1..7, long)
+                    options=list(enumerate(crit["options"], 1)),
                     format_func=lambda x: f"{x[0]}. {x[1]}",
                     key=f"qual_{crit['name']}"
                 )
@@ -157,10 +160,27 @@ with tab_manual:
             "Monthly": qual_tags.get("Monthly",""),
         }
         st.session_state.rows.append(row)
+
+        # ---- Sanity flags for manual entry ----
+        flags = []
+        if gap_pct > 0 and gap_pct < 1.0:
+            flags.append("Gap % looks < 1 — did you mean percent (e.g., 45) not fraction (0.45)?")
+        if si_pct > 0 and si_pct < 1.0:
+            flags.append("Short Interest % looks < 1 — enter as percent (e.g., 12.5) not 0.125.")
+        if float_m > 0 and pm_vol/float_m > 30:
+            flags.append(f"PM Float Rotation = {pm_vol/float_m:.1f}× — unusually high, check units.")
+        if mc_m > 0 and (pm_dol/mc_m*100.0) > 200:
+            flags.append(f"PM $Vol / MC = {pm_dol/mc_m*100.0:.1f}% — unusually high, check units.")
+        st.session_state.last_warnings = flags
+
         do_rerun()
 
     st.subheader("Table")
     if st.session_state.rows:
+        if st.session_state.last_warnings:
+            for f in st.session_state.last_warnings:
+                st.warning(f)
+
         df = pd.DataFrame(st.session_state.rows)
         st.dataframe(
             df, use_container_width=True, hide_index=True,
@@ -195,6 +215,7 @@ with tab_manual:
         with c2:
             if st.button("Clear Table", use_container_width=True):
                 st.session_state.rows = []
+                st.session_state.last_warnings = []
                 do_rerun()
 
         st.markdown("### 📋 Table (Markdown)")
@@ -206,7 +227,7 @@ with tab_manual:
         st.info("Add a stock above to populate the table.")
 
 # =============================================================================
-# TAB 2 — Upload & Model Stocks (medians + Catalyst %Yes; no qualitative)
+# TAB 2 — Upload & Model Stocks (medians + Catalyst %Yes; unit normalization)
 # =============================================================================
 with tab_models:
     st.subheader("Upload workbook")
@@ -248,6 +269,63 @@ with tab_models:
         true_vals = {"y","yes","true","t","1","✓","✔","x"}
         return sm.apply(lambda x: 1.0 if x in true_vals else 0.0)
 
+    def normalize_units(df: pd.DataFrame) -> pd.DataFrame:
+        """Heuristically normalize units to:
+           - MarketCap_M$: millions of dollars
+           - Float_M: millions of shares
+           - ShortInt_%: percent (0..100)
+           - Gap_%: percent (0..100)
+           - ATR_$: dollars (as-is)
+           - RVOL: unitless
+           - PM_Vol_M: millions of shares
+           - PM_$Vol_M$: millions of dollars
+        """
+        out = df.copy()
+        def _med(name): 
+            s = pd.to_numeric(out[name], errors="coerce")
+            return float(s.median()) if s.notna().any() else np.nan
+        def _max(name):
+            s = pd.to_numeric(out[name], errors="coerce")
+            return float(s.max()) if s.notna().any() else np.nan
+
+        # Gap % (0..1 -> ×100)
+        if "Gap_%" in out.columns:
+            gmax = _max("Gap_%")
+            if pd.notna(gmax) and gmax <= 3.0:
+                out["Gap_%"] = pd.to_numeric(out["Gap_%"], errors="coerce") * 100.0
+
+        # Short Interest % (0..1 -> ×100)
+        if "ShortInt_%" in out.columns:
+            simax = _max("ShortInt_%")
+            if pd.notna(simax) and simax <= 1.5:
+                out["ShortInt_%"] = pd.to_numeric(out["ShortInt_%"], errors="coerce") * 100.0
+
+        # Market Cap (to M$)
+        if "MarketCap_M$" in out.columns:
+            mc_med = _med("MarketCap_M$")
+            if pd.notna(mc_med) and mc_med >= 1e6:
+                out["MarketCap_M$"] = pd.to_numeric(out["MarketCap_M$"], errors="coerce") / 1_000_000.0
+
+        # Float (to M shares)
+        if "Float_M" in out.columns:
+            fl_med = _med("Float_M")
+            if pd.notna(fl_med) and fl_med >= 1e6:
+                out["Float_M"] = pd.to_numeric(out["Float_M"], errors="coerce") / 1_000_000.0
+
+        # PM volume (to M shares)
+        if "PM_Vol_M" in out.columns:
+            pv_med = _med("PM_Vol_M")
+            if pd.notna(pv_med) and pv_med >= 1_000_000.0:
+                out["PM_Vol_M"] = pd.to_numeric(out["PM_Vol_M"], errors="coerce") / 1_000_000.0
+
+        # PM $ volume (to M$)
+        if "PM_$Vol_M$" in out.columns:
+            pd_med = _med("PM_$Vol_M$")
+            if pd.notna(pd_med) and pd_med >= 10_000_000.0:
+                out["PM_$Vol_M$"] = pd.to_numeric(out["PM_$Vol_M$"], errors="coerce") / 1_000_000.0
+
+        return out
+
     def build_model_rows(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         """
         Build 1-row model tables for:
@@ -287,6 +365,9 @@ with tab_models:
             "PM_$Vol_M$":   pd.to_numeric(df[col_pmdol], errors="coerce"),
         })
         base["Catalyst01"] = parse_catalyst_series(df[col_cat]) if col_cat else 0.0
+
+        # -------- Normalize units heuristically --------
+        base = normalize_units(base)
 
         # FT masks
         if col_ft and col_ft in df.columns:
