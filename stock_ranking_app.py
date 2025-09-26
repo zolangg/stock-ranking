@@ -210,5 +210,10 @@ with tab_rank:
         if st.button("Clear Ranking", use_container_width=True):
             st.session_state.rows,st.session_state.last=[],{}
             do_rerun()
+
+            st.markdown("### 📋 Ranking (Markdown view)")
+        cols_to_show = ["Ticker","Numeric_%","Qual_%","FinalScore","Grade"]
+        st.code(df_to_markdown_table(df, cols_to_show), language="markdown")
+
     else:
         st.info("No rows yet. Add a stock in the **Add Stock** tab.")
