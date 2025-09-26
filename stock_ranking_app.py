@@ -513,13 +513,13 @@ with tab_models:
                         # ===== Divergence across model stocks =====
                         if models:
                             st.markdown("### 🔎 Divergence across Model Stocks")
-
+                        
                             var_list = [
                                 "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
                                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst_%Yes"
                             ]
                             model_names = list(models.keys())
-
+                        
                             comp_rows = []
                             for var in var_list:
                                 row = {"Variable": var}
@@ -536,7 +536,7 @@ with tab_models:
                                         v = float("nan")
                                     row[mname] = v
                                     vals.append(v)
-
+                        
                                 s = pd.Series(vals, index=model_names, dtype="float64")
                                 valid = s.dropna()
                                 if len(valid) >= 2:
@@ -544,8 +544,7 @@ with tab_models:
                                     vmax = float(valid.max())
                                     frng = float(vmax - vmin)
                                     fold = (vmax / vmin) if vmin > 0 else float("inf")
-
-                                    # significance rules
+                        
                                     pct_vars = {"ShortInt_%","Gap_%","PM$Vol/MC_%","Catalyst_%Yes"}
                                     if var in pct_vars:
                                         significant = (abs(frng) >= 15.0) or (fold >= 1.5 and vmin > 0)
@@ -553,7 +552,7 @@ with tab_models:
                                         significant = (fold >= 1.5)
                                     else:
                                         significant = (fold >= 2.0)
-
+                        
                                     row.update({"Min": vmin, "Max": vmax, "Range": frng, "Fold": fold,
                                                 "Significant": "Yes" if significant else ""})
                                 else:
@@ -561,17 +560,20 @@ with tab_models:
                                                 "Range": float("nan"), "Fold": float("nan"),
                                                 "Significant": ""})
                                 comp_rows.append(row)
-
+                        
                             comp_df = pd.DataFrame(comp_rows)
-
-                            # Controls
+                        
+                            # Ensure all display columns exist
+                            for col in ["Min","Max","Range","Fold","Significant"]:
+                                if col not in comp_df.columns:
+                                    comp_df[col] = np.nan
+                        
                             show_all = st.checkbox("Show all variables (not only significant)", value=False)
                             view_df = comp_df if show_all else comp_df[comp_df["Significant"] == "Yes"]
-
+                        
                             if view_df.empty:
                                 st.info("No significant divergences based on current thresholds.")
                             else:
-                                # display with 2-decimal formats
                                 col_cfg2 = {
                                     "Variable": st.column_config.TextColumn("Variable"),
                                     "Min": st.column_config.NumberColumn("Min", format="%.2f"),
@@ -582,11 +584,12 @@ with tab_models:
                                 }
                                 for mname in model_names:
                                     col_cfg2[mname] = st.column_config.NumberColumn(mname, format="%.2f")
-
+                        
                                 display_cols = ["Variable"] + model_names + ["Min","Max","Range","Fold","Significant"]
-                                view_df = view_df[display_cols]
-
-                                st.dataframe(view_df, use_container_width=True, hide_index=True, column_config=col_cfg2)
+                                # keep only columns that actually exist
+                                display_cols = [c for c in display_cols if c in view_df.columns]
+                        
+                                st.dataframe(view_df[display_cols], use_container_width=True, hide_index=True, column_config=col_cfg2)
                                 st.markdown("**Markdown**")
                                 st.code(df_to_markdown_table(view_df, display_cols), language="markdown")
 
