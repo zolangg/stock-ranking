@@ -88,7 +88,13 @@ if "_last_deleted" not in st.session_state: st.session_state._last_deleted = ""
 
 # ============================== Handle delete via URL query (?del=...) ==============================
 # IMPORTANT: we handle this before rendering the table
-del_param = st.query_params.get("del", None)
+qp = st.query_params
+del_val = qp.get("del", None)
+# st.query_params may return list-like or str depending on Streamlit version
+if isinstance(del_val, (list, tuple)):
+    del_param = del_val[0] if del_val else None
+else:
+    del_param = del_val
 if del_param:
     tickers_to_delete = [t.strip() for t in del_param.split(",") if t.strip()]
     if tickers_to_delete and st.session_state._last_deleted != del_param:
@@ -608,15 +614,30 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
       table.on('select deselect', updateSelectionUI);
       updateSelectionUI();
 
-      // Delete selected → set query param ?del=... in SAME TAB
+      // Delete selected → set query param ?del=... on the PARENT Streamlit page
       $('#delBtn').on('click', function(){
         const rows = table.rows({ selected: true }).data().toArray();
         const tickers = rows.map(r => r.Ticker).filter(Boolean);
         if (!tickers.length) return;
-        const params = new URLSearchParams(window.location.search);
-        params.set('del', tickers.join(','));
-        // Same-tab navigation (keeps session): this triggers Streamlit rerun
-        window.location.search = params.toString();
+    
+        try {
+          // Prefer modifying the parent page (outside the iframe)
+          const url = new URL(window.parent.location.href);
+          url.searchParams.set('del', tickers.join(','));
+          // navigate in the same tab
+          window.parent.location.href = url.toString();
+        } catch (e) {
+          // Fallback: try top, then self (unlikely needed)
+          try {
+            const url2 = new URL(window.top.location.href);
+            url2.searchParams.set('del', tickers.join(','));
+            window.top.location.href = url2.toString();
+          } catch (e2) {
+            const url3 = new URL(window.location.href);
+            url3.searchParams.set('del', tickers.join(','));
+            window.location.href = url3.toString();
+          }
+        }
       });
     });
   </script>
