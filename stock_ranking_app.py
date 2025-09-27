@@ -457,10 +457,8 @@ with tab_tables:
         else:
             st.info("Need manual rows and built FT=1/FT=0 medians to run this comparison.")
 
-# ---------- Alignment Summary (AG Grid community: spark bars + selectable row details) ----------
-st.markdown("### Alignment Summary (model medians first; click a row for details)")
-
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+# ---------- Alignment Summary (model medians first; in-table progress bars + per-row expander) ----------
+st.markdown("### Alignment Summary (model medians + manual stocks)")
 
 def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
     if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
@@ -492,44 +490,48 @@ def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame
 if st.session_state.models and {"FT=1","FT=0"}.issubset(st.session_state.models["models_tbl"].columns):
     models_tbl: pd.DataFrame = st.session_state.models["models_tbl"]
 
-    # 1) Always include the two model "stocks"
+    # 1) Two model "stocks" first
     model_rows = []
     for g in ["FT=1","FT=0"]:
         vals = models_tbl[g].to_dict()
         vals.update({"Ticker": g})
         model_rows.append(vals)
 
-    # 2) Manual rows
+    # 2) Then manual rows (if any)
     manual_rows = st.session_state.rows if "rows" in st.session_state else []
     all_rows = model_rows + manual_rows
 
-    # Build master table + per-ticker detail data
+    # Build summary (progress bars only) + detail tables
     num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
 
-    master_rows, detail_map = [], {}
+    summary_rows = []
+    detail_data = {}  # ticker -> DataFrame of variable breakdown
+
     for row in all_rows:
         stock = dict(row)
         ticker = stock.get("Ticker", "—")
+
         counts = compute_alignment_counts_vs_binary(stock, models_tbl)
         if not counts:
             continue
         like1, like0 = counts.get("FT=1", 0), counts.get("FT=0", 0)
         n_used = counts.get("N_Vars_Used", 0)
+
         ft1_pct = like1 / n_used if n_used > 0 else 0.0
         ft0_pct = like0 / n_used if n_used > 0 else 0.0
         lean01  = ((like1 - like0) / n_used + 1) / 2.0 if n_used > 0 else 0.5
         lean_lbl = "FT=1" if like1 > like0 else "FT=0" if like0 > like1 else "Tie"
 
-        master_rows.append({
+        summary_rows.append({
             "Ticker": ticker,
-            "FT1_series": [round(ft1_pct * 100, 2)],   # spark bar expects array
-            "FT0_series": [round(ft0_pct * 100, 2)],
-            "Lean_series": [round(lean01 * 100, 2)],   # 0=FT0, 50=tie, 100=FT1
-            "Lean": lean_lbl,
+            "FT1_pct": ft1_pct,
+            "FT0_pct": ft0_pct,
+            "Lean01":  lean01,        # 0 = FT=0, 0.5 = tie, 1 = FT=1
+            "Lean":    lean_lbl,
         })
 
-        # Detail rows for this ticker
+        # details table
         drows = []
         for v in num_vars:
             va = pd.to_numeric(stock.get(v), errors="coerce")
@@ -538,97 +540,59 @@ if st.session_state.models and {"FT=1","FT=0"}.issubset(st.session_state.models[
             if pd.notna(va) or pd.notna(v1) or pd.notna(v0):
                 drows.append({
                     "Variable": v,
-                    "Value": va if pd.notna(va) else np.nan,
+                    f"{ticker}": va if pd.notna(va) else np.nan,
                     "FT=1": v1 if pd.notna(v1) else np.nan,
                     "FT=0": v0 if pd.notna(v0) else np.nan,
                     "Δ vs FT=1": (va - v1) if (pd.notna(va) and pd.notna(v1)) else np.nan,
                     "Δ vs FT=0": (va - v0) if (pd.notna(va) and pd.notna(v0)) else np.nan,
                 })
-        detail_map[ticker] = pd.DataFrame(drows)
+        detail_data[ticker] = pd.DataFrame(drows)
 
-    if master_rows:
-        sum_df_ag = pd.DataFrame(master_rows)
+    if summary_rows:
+        sum_df = pd.DataFrame(summary_rows)
 
-        gob = GridOptionsBuilder.from_dataframe(sum_df_ag[["Ticker","FT1_series","FT0_series","Lean_series","Lean"]])
-        gob.configure_grid_options(
-            rowSelection="single",
-            rowHeight=42,
-            suppressCellSelection=True,
-            animateRows=True,
-            defaultColDef={"sortable": True, "filter": True, "resizable": True},
-        )
-
-        # Sparkline options (community supports sparkline cell renderer)
-        spark_common = {
-            "cellRenderer": "agSparklineCellRenderer",
-            "cellRendererParams": {
-                "sparklineOptions": {
-                    "type": "bar",
-                    "axis": {"type": "number", "min": 0, "max": 100, "strokeWidth": 0},
-                    "paddingInner": 0.1,
-                    "paddingOuter": 0.1,
-                    "label": {"enabled": True, "placement": "outsideEnd", "format": "{y}"},
-                    "tooltip": {"enabled": True},
-                }
-            },
-            "width": 180,
+        # render: ONLY progress bars + Lean label
+        cfg = {
+            "Ticker":  st.column_config.TextColumn("Ticker"),
+            "FT1_pct": st.column_config.ProgressColumn("FT=1 %", format="%.0f%%", min_value=0.0, max_value=1.0),
+            "FT0_pct": st.column_config.ProgressColumn("FT=0 %", format="%.0f%%", min_value=0.0, max_value=1.0),
+            "Lean01":  st.column_config.ProgressColumn("Lean (0%=FT=0, 50%=tie, 100%=FT=1)",
+                                                       format="%.0f%%", min_value=0.0, max_value=1.0),
+            "Lean":    st.column_config.TextColumn("Lean"),
         }
+        st.data_editor(sum_df, hide_index=True, use_container_width=True,
+                       column_config=cfg, disabled=True, key="align_table_viz")
 
-        gob.configure_column("Ticker", headerName="Ticker", width=140)
-        gob.configure_column("FT1_series", headerName="FT=1 %", **spark_common)
-        gob.configure_column("FT0_series", headerName="FT=0 %", **spark_common)
-
-        lean_opts = spark_common["cellRendererParams"]["sparklineOptions"].copy()
-        lean_opts.update({"referenceLines": [{"type": "value", "value": 50, "strokeWidth": 1}]})
-        gob.configure_column(
-            "Lean_series",
-            headerName="Lean (0=FT0, 50=tie, 100=FT=1)",
-            cellRenderer="agSparklineCellRenderer",
-            cellRendererParams={"sparklineOptions": lean_opts},
-            width=260,
-        )
-        gob.configure_column("Lean", headerName="Lean", width=90)
-
-        grid_options = gob.build()
-
-        st.markdown("#### Click a row to show details below")
-        grid_resp = AgGrid(
-            sum_df_ag,
-            gridOptions=grid_options,
-            theme="alpine",
-            allow_unsafe_jscode=True,
-            update_mode=GridUpdateMode.SELECTION_CHANGED,
-            fit_columns_on_grid_load=False,
-            height=min(520, 72 + 44*len(sum_df_ag)),
-        )
-
-        # Selection → details panel
-        sel = grid_resp.get("selected_rows", [])
-        if sel:
-            sel_ticker = sel[0]["Ticker"]
-        else:
-            # auto-select first row to always show something
-            sel_ticker = sum_df_ag.iloc[0]["Ticker"] if not sum_df_ag.empty else None
-
-        if sel_ticker:
-            with st.expander(f"Details for {sel_ticker}", expanded=True):
-                det = detail_map.get(sel_ticker, pd.DataFrame())
-                if det.empty:
+        # per-row expanders with variable breakdown
+        for tkr, ddf in detail_data.items():
+            with st.expander(f"Details for {tkr}", expanded=False):
+                if ddf.empty:
                     st.info("No variable overlaps for this stock.")
                 else:
-                    # Nice formatting
-                    cfg = {
-                        "Variable": st.column_config.TextColumn("Variable"),
-                        "Value":   st.column_config.NumberColumn("Value", format="%.2f"),
-                        "FT=1":    st.column_config.NumberColumn("FT=1 median", format="%.2f"),
-                        "FT=0":    st.column_config.NumberColumn("FT=0 median", format="%.2f"),
-                        "Δ vs FT=1": st.column_config.NumberColumn("Δ vs FT=1", format="%.2f"),
-                        "Δ vs FT=0": st.column_config.NumberColumn("Δ vs FT=0", format="%.2f"),
+                    # nice formatting in details
+                    det_cfg = {
+                        "Variable":   st.column_config.TextColumn("Variable"),
+                        f"{tkr}":     st.column_config.NumberColumn(f"{tkr}", format="%.2f"),
+                        "FT=1":       st.column_config.NumberColumn("FT=1 median", format="%.2f"),
+                        "FT=0":       st.column_config.NumberColumn("FT=0 median", format="%.2f"),
+                        "Δ vs FT=1":  st.column_config.NumberColumn("Δ vs FT=1", format="%.2f"),
+                        "Δ vs FT=0":  st.column_config.NumberColumn("Δ vs FT=0", format="%.2f"),
                     }
-                    st.dataframe(det, use_container_width=True, hide_index=True, column_config=cfg)
+                    st.dataframe(ddf, use_container_width=True, hide_index=True, column_config=det_cfg)
+                    st.markdown("**Markdown**")
+                    st.code(df_to_markdown_table(ddf, list(ddf.columns)), language="markdown")
 
+        # optional download (summary)
+        st.download_button(
+            "Download Alignment Summary (CSV)",
+            sum_df.to_csv(index=False).encode("utf-8"),
+            "alignment_summary.csv", "text/csv",
+            use_container_width=True
+        )
+    else:
+        st.info("Add at least one manual stock to compute alignment.")
 else:
-    st.info("Upload DB (to build FT=1/FT=0 medians) and/or add manual stocks to see alignment.")
+    st.info("Upload DB (to build FT=1/FT=0 medians) and add manual stocks to see alignment.")
 
     # Clear
     st.markdown("---")
