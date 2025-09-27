@@ -238,7 +238,6 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
             st.caption("Highlighted where |median(FT=1)−median(FT=0)| ≥ σ × (MAD₁ + MAD₀).")
         else:
             st.info("Not enough info to compute significance (MADs missing). Rebuild models with the current DB.")
-            # fallback to plain table
             cfg = {
                 "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
                 "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
@@ -277,7 +276,6 @@ if submitted and ticker:
 
     row = {
         "Ticker": ticker,
-        # Numeric
         "MarketCap_M$": mc_m,
         "Float_M": float_m,
         "ShortInt_%": si_pct,
@@ -288,7 +286,6 @@ if submitted and ticker:
         "PM_$Vol_M$": pm_dol,
         "FR_x": fr,
         "PM$Vol/MC_%": pmmc,
-        # Catalyst
         "CatalystYN": catalyst_yn,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
@@ -300,32 +297,46 @@ if submitted and ticker:
 # ============================== Toolbar: Delete / Clear (ABOVE Alignment) ==============================
 tcol1, tcol2 = st.columns([1.6, 1.6])
 with tcol1:
-    # Read selected tickers directly from URL ?sel=
-    sel = st.query_params.get("sel", "")
-    chosen = [s.strip().upper() for s in sel.split(",") if s.strip()]
-    # Always enable the button; if nothing is selected we just show a message.
+    # Read selected tickers directly from parent/top URL ?sel=
+    sel_val = st.query_params.get("sel", "")
+    # Streamlit may return str or list; normalize:
+    if isinstance(sel_val, list):
+        sel_str = sel_val[0] if sel_val else ""
+    else:
+        sel_str = sel_val or ""
+    chosen = [s.strip().upper() for s in sel_str.split(",") if s.strip()]
+
+    # Always enable button; if none selected, show info
     if st.button("Delete selected", use_container_width=True, type="primary"):
-        before = len(st.session_state.rows)
-        chosen_set = set(chosen)
-        st.session_state.rows = [
-            r for r in st.session_state.rows
-            if str(r.get("Ticker", "")).strip().upper() not in chosen_set
-        ]
-        removed = before - len(st.session_state.rows)
-        # clear ?sel= after delete
-        st.query_params.update({k: v for k, v in st.query_params.items() if k != "sel"})
-        if removed > 0:
-            st.success(f"Removed {removed} row(s): {', '.join(sorted(chosen_set))}")
+        if not chosen:
+            st.info("No rows selected in the table.")
         else:
-            st.info("No rows removed.")
-        do_rerun()
+            before = len(st.session_state.rows)
+            chosen_set = set(chosen)
+            st.session_state.rows = [
+                r for r in st.session_state.rows
+                if str(r.get("Ticker", "")).strip().upper() not in chosen_set
+            ]
+            removed = before - len(st.session_state.rows)
+            # clear ?sel= after delete
+            try:
+                del st.query_params["sel"]
+            except Exception:
+                pass
+            if removed > 0:
+                st.success(f"Removed {removed} row(s): {', '.join(sorted(chosen_set))}")
+            else:
+                st.info("No rows removed.")
+            do_rerun()
 
 with tcol2:
     clear_disabled = len(st.session_state.rows) == 0
     if st.button("Clear Added Stocks", use_container_width=True, disabled=clear_disabled):
         st.session_state.rows = []
-        # clear ?sel= too
-        st.query_params.update({k: v for k, v in st.query_params.items() if k != "sel"})
+        try:
+            del st.query_params["sel"]
+        except Exception:
+            pass
         st.success("Cleared all added stocks.")
         do_rerun()
 
@@ -503,6 +514,30 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         </div>`;
     }
 
+    // === Helpers to target top/parent URL (so Streamlit can read ?sel=) ===
+    function getTargetWindow() {
+      try { if (window.parent && window.parent.location && window.parent !== window) return window.parent; } catch(e) {}
+      try { if (window.top && window.top.location) return window.top; } catch(e) {}
+      return window; // fallback
+    }
+    function qsWriteFromSet(selSet) {
+      try {
+        const tgt = getTargetWindow();
+        const url = new URL(tgt.location.href);
+        if (selSet.size) url.searchParams.set('sel', Array.from(selSet).join(','));
+        else url.searchParams.delete('sel');
+        tgt.history.replaceState(null, '', url.toString());
+      } catch(e) {}
+    }
+    function qsReadToSet(selSet) {
+      try {
+        const tgt = getTargetWindow();
+        const url = new URL(tgt.location.href);
+        const sel = url.searchParams.get('sel');
+        if (sel) sel.split(',').forEach(t => { if (t) selSet.add(String(t)); });
+      } catch(e) {}
+    }
+
     // Build the DataTable (with checkbox column)
     const table = $('#align').DataTable({
       data: data.rows,
@@ -522,17 +557,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
       ]
     });
 
-    // --- Selection state synced to URL ?sel= without reload
+    // Selection state synced to TOP/PARENT URL ?sel=
     const selected = new Set();
-
-    // Restore from ?sel=
-    (function restoreFromQuery(){
-      try {
-        const url = new URL(window.parent.location.href);
-        const sel = url.searchParams.get('sel');
-        if (sel) sel.split(',').forEach(t => { if (t) selected.add(String(t)); });
-      } catch(e) {}
-    })();
+    qsReadToSet(selected);
 
     // Keep checkboxes in sync on every draw
     table.on('draw', () => {
@@ -540,26 +567,17 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const t = String($(this).data('ticker') || '');
         this.checked = selected.has(t);
       });
-    });
+    }).trigger('draw');
 
-    // Toggle selection (and update URL) when clicking checkbox
+    // Toggle selection (and update parent/top URL) when clicking checkbox
     $('#align tbody').on('change', '.row-select', function(e){
       e.stopPropagation();
       const t = String($(this).data('ticker') || '');
       if (this.checked) selected.add(t); else selected.delete(t);
-
-        try {
-          const url = new URL(window.parent.location.href);
-          if (selected.size) {
-            url.searchParams.set('sel', Array.from(selected).join(','));
-          } else {
-            url.searchParams.delete('sel');
-          }
-          window.parent.history.replaceState(null, '', url.toString());
-        } catch(e) {}
+      qsWriteFromSet(selected);
     });
 
-    // Child rows
+    // Child rows (ignore clicks on checkbox)
     function childTableHTML(ticker) {
       const rows = data.details[ticker] || [];
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
