@@ -303,8 +303,8 @@ with tcol1:
     # Read selected tickers directly from URL ?sel=
     sel = st.query_params.get("sel", "")
     chosen = [s.strip().upper() for s in sel.split(",") if s.strip()]
-    delete_disabled = len(chosen) == 0
-    if st.button("Delete selected", use_container_width=True, type="primary", disabled=delete_disabled):
+    # Always enable the button; if nothing is selected we just show a message.
+    if st.button("Delete selected", use_container_width=True, type="primary"):
         before = len(st.session_state.rows)
         chosen_set = set(chosen)
         st.session_state.rows = [
@@ -528,7 +528,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
     // Restore from ?sel=
     (function restoreFromQuery(){
       try {
-        const url = new URL(window.location.href);
+        const url = new URL(window.parent.location.href);
         const sel = url.searchParams.get('sel');
         if (sel) sel.split(',').forEach(t => { if (t) selected.add(String(t)); });
       } catch(e) {}
@@ -548,15 +548,15 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
       const t = String($(this).data('ticker') || '');
       if (this.checked) selected.add(t); else selected.delete(t);
 
-      try {
-        const url = new URL(window.location.href);
-        if (selected.size) {
-          url.searchParams.set('sel', Array.from(selected).join(','));
-        } else {
-          url.searchParams.delete('sel');
-        }
-        history.replaceState(null, '', url.toString());
-      } catch(e) {}
+        try {
+          const url = new URL(window.parent.location.href);
+          if (selected.size) {
+            url.searchParams.set('sel', Array.from(selected).join(','));
+          } else {
+            url.searchParams.delete('sel');
+          }
+          window.parent.history.replaceState(null, '', url.toString());
+        } catch(e) {}
     });
 
     // Child rows
