@@ -42,14 +42,24 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     if df is None or df.empty:
         return None
     cols = list(df.columns)
-    nm = {c:_norm(c) for c in cols}
-    # exact
+    cols_lc = {c: c.strip().lower() for c in cols}
+
+    # 1) RAW case-insensitive exact match first (preserves '$' distinction)
+    for cand in candidates:
+        lc = cand.strip().lower()
+        for c in cols:
+            if cols_lc[c] == lc:
+                return c
+
+    # 2) Normalized exact match (your current logic)
+    nm = {c: _norm(c) for c in cols}
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n:
                 return c
-    # contains
+
+    # 3) Normalized 'contains' fallback (your current logic)
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
