@@ -84,33 +84,33 @@ def _to_float(s):
 if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "mad_tbl": DataFrame, "var_list": [...]}
-
+    
 # ---------- Handle delete via query param (st.query_params) ----------
 try:
-    # st.query_params is a live, mutable, dict-like mapping
     del_tkr = st.query_params.get("del_ticker", None)
-
-    # In case some environments still pass lists (older frontends), normalize:
     if isinstance(del_tkr, list):
         del_tkr = del_tkr[0] if del_tkr else None
 
     if del_tkr:
-        # Remove matching ticker(s) from session rows
         before = len(st.session_state.rows)
+        # case-insensitive + trimmed match
+        key = str(del_tkr).strip().upper()
         st.session_state.rows = [
             r for r in st.session_state.rows
-            if str(r.get("Ticker", "")).strip() != str(del_tkr).strip()
+            if str(r.get("Ticker", "")).strip().upper() != key
         ]
         after = len(st.session_state.rows)
 
         if before != after:
             st.success(f"Deleted {del_tkr}")
 
-        # Clear the query param (this updates the URL immediately)
+        # clear query params used for deletion
         if "del_ticker" in st.query_params:
             del st.query_params["del_ticker"]
+        if "ts" in st.query_params:
+            del st.query_params["ts"]
 
-        # Force UI refresh so the deleted row is gone right away
+        # refresh UI
         do_rerun()
 except Exception as e:
     st.error(f"Error handling delete: {e}")
@@ -585,9 +585,19 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
           { data: 'Ticker' },
           { data: 'FT1_val', render: (d)=>barCellBlue(d) },
           { data: 'FT0_val', render: (d)=>barCellRed(d) },
-          { data: null, className: 'del-col',
+          {
+            data: null,
+            className: 'del-col',
             orderable: false,
-            render: (data, type, row) => `<button class="del-btn" title="Delete ${row.Ticker}" data-ticker="${row.Ticker}">🗑️</button>`
+            render: (data, type, row) => {
+              const t = encodeURIComponent(String(row.Ticker || '').trim());
+              const ts = Date.now();
+              // Use a normal link with target="_top" so navigation escapes the iframe
+              return `<a class="del-btn" title="Delete ${row.Ticker}"
+                        href="?del_ticker=${t}&ts=${ts}"
+                        target="_top"
+                        onclick="return confirm('Delete ${row.Ticker}?')">🗑️</a>`;
+            }
           },
         ]
       });
@@ -607,7 +617,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
       // whole-row toggle child (except when clicking delete)
       $('#align tbody').on('click', 'tr', function (e) {
-        if ($(e.target).closest('.del-btn').length) return; // already handled
+        if ($(e.target).closest('.del-btn').length) return; // don't toggle when deleting
         const row = table.row(this);
         if (row.child.isShown()) {
           row.child.hide(); $(this).removeClass('shown');
