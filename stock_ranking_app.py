@@ -457,7 +457,7 @@ with tab_tables:
         else:
             st.info("Need manual rows and built FT=1/FT=0 medians to run this comparison.")
 
-# ---------- Alignment Summary (DataTables child-rows; simple Value; centered diverging Lean bar) ----------
+# ---------- Alignment Summary (DataTables child-rows; compact; colored FT columns) ----------
 st.markdown("### Alignment Summary (model medians + manual stocks — expandable child rows)")
 
 import json
@@ -473,10 +473,10 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
     counts = {g: 0 for g in groups}; used = 0
     for v in common:
         xv = pd.to_numeric(stock_row.get(v), errors="coerce")
-        if not np.isfinite(xv):
+        if not np.isfinite(xv): 
             continue
         med = models_tbl.loc[v, groups].astype(float).dropna()
-        if med.empty:
+        if med.empty: 
             continue
         diffs = (med - xv).abs()
         counts[diffs.idxmin()] += 1
@@ -498,7 +498,6 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
     manual_rows = st.session_state.get("rows", [])
     all_rows = model_rows + manual_rows
 
-    # variables in child detail
     num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
 
@@ -509,26 +508,23 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
         counts = _compute_alignment_counts(stock, models_tbl)
-        if not counts:
+        if not counts: 
             continue
         like1, like0 = counts.get("FT=1",0), counts.get("FT=0",0)
         n_used = counts.get("N_Vars_Used",0)
 
         ft1_pct = round((like1 / n_used * 100.0), 2) if n_used>0 else 0.0
         ft0_pct = round((like0 / n_used * 100.0), 2) if n_used>0 else 0.0
-        lean01  = ((like1 - like0) / n_used + 1) / 2.0 if n_used>0 else 0.5
-        lean_pct = round(lean01 * 100.0, 2)  # 0=FT=0 … 50=tie … 100=FT=1
         lean_lbl = "FT=1" if like1>like0 else "FT=0" if like0>like1 else "Tie"
 
         summary_rows.append({
             "Ticker": tkr,
             "FT1_pct": ft1_pct,
             "FT0_pct": ft0_pct,
-            "Lean_pct": lean_pct,
             "Lean": lean_lbl,
         })
 
-        # child table rows (Value only; no position bar)
+        # child table rows (compact)
         drows = []
         for v in num_vars:
             va = pd.to_numeric(stock.get(v), errors="coerce")
@@ -559,22 +555,28 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
 <style>
   body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }}
   table.dataTable tbody tr {{ cursor: pointer; }}
-  .bar {{ height: 16px; border-radius: 10px; background: #eee; position: relative; overflow: hidden; }}
-  .bar > span {{ position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: linear-gradient(90deg, #ef4444, #10b981); }}
-  .bar-label {{ font-size: 11px; margin-left: 8px; white-space: nowrap; color:#374151; }}
-  .bar-wrap {{ display:flex; align-items:center; gap:8px; }}
 
-  /* Diverging (centered) lean bar */
-  .lean-wrap {{ display:flex; align-items:center; gap:8px; }}
-  .lean {{ position:relative; width:260px; height:16px; border-radius:10px; background: linear-gradient(90deg,#fecaca 0%, #f3f4f6 50%, #bbf7d0 100%); overflow:hidden; }}
-  .lean::before {{ /* middle line */ content:''; position:absolute; left:50%; top:0; bottom:0; width:2px; background:#11182722; }}
-  .lean-fill {{ position:absolute; top:0; bottom:0; background:#10b981; }}
-  .lean-fill.left {{ background:#ef4444; }}
+  /* Parent row % bars */
+  .bar {{ height: 14px; border-radius: 9px; background: #eee; position: relative; overflow: hidden; }}
+  .bar > span {{ position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: #10b981; }}
+  .bar-label {{ font-size: 11px; margin-left: 6px; white-space: nowrap; color:#374151; }}
+  .bar-wrap {{ display:flex; align-items:center; gap:6px; }}
 
-  .child-table {{ width: 100%; border-collapse: collapse; margin: 6px 0 4px 32px; }}
-  .child-table th, .child-table td {{ font-size: 12px; padding: 6px 8px; border-bottom: 1px solid #e5e7eb; text-align:right; }}
+  /* Child table compact layout */
+  .child-table {{ width: 100%; border-collapse: collapse; margin: 4px 0 4px 28px; table-layout: fixed; }}
+  .child-table th, .child-table td {{ font-size: 11px; padding: 4px 6px; border-bottom: 1px solid #e5e7eb; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
   .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
-  .pos {{ color:#059669; }} .neg {{ color:#dc2626; }}
+
+  /* Tighter column widths */
+  .col-var {{ width: 28%; }}
+  .col-val {{ width: 16%; }}
+  .col-ft1 {{ width: 16%; color:#ef4444; }}   /* FT=1 in red */
+  .col-ft0 {{ width: 16%; color:#3b82f6; }}   /* FT=0 in blue */
+  .col-d1  {{ width: 12%; }}
+  .col-d0  {{ width: 12%; }}
+
+  .pos {{ color:#059669; }} 
+  .neg {{ color:#dc2626; }}
 </style>
 </head>
 <body>
@@ -584,7 +586,6 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
         <th>Ticker</th>
         <th>FT=1 %</th>
         <th>FT=0 %</th>
-        <th>Lean (centered)</th>
         <th>Lean</th>
       </tr>
     </thead>
@@ -600,59 +601,45 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
       const v = (pct==null||isNaN(pct)) ? 0 : Math.max(0, Math.min(100, pct));
       return `
         <div class="bar-wrap">
-          <div class="bar" style="width:140px"><span style="width:${{v}}%"></span></div>
-          <div class="bar-label">${{v.toFixed(0)}}%</div>
-        </div>`;
-    }}
-
-    // Centered diverging bar: middle at 50, fill extends left (<50) or right (>50)
-    function leanCenteredCell(pct) {{
-      const v = (pct==null||isNaN(pct)) ? 50 : Math.max(0, Math.min(100, pct));
-      const delta = Math.abs(v - 50);           // 0..50
-      const width = delta * 2;                  // scale to 0..100 relative to half-bar
-      const isLeft = v < 50;
-      const leftPos = isLeft ? (50 - delta) : 50;  // start from center outward
-      const cls = isLeft ? 'lean-fill left' : 'lean-fill';
-      return `
-        <div class="lean-wrap">
-          <div class="lean">
-            <div class="${{cls}}" style="left:${{leftPos}}%; width:${{width}}%;"></div>
-          </div>
+          <div class="bar" style="width:120px"><span style="width:${{v}}%"></span></div>
           <div class="bar-label">${{v.toFixed(0)}}%</div>
         </div>`;
     }}
 
     function childTableHTML(ticker) {{
       const rows = data.details[ticker] || [];
-      if (!rows.length) return '<div style="margin-left:32px;color:#6b7280;">No variable overlaps for this stock.</div>';
+      if (!rows.length) return '<div style="margin-left:28px;color:#6b7280;">No variable overlaps for this stock.</div>';
       const cells = rows.map(r => {{
         const v  = (r.Value==null||isNaN(r.Value)) ? '' : r.Value.toFixed(2);
-        const f1 = (r.FT1==null  ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
-        const f0 = (r.FT0==null  ||isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
+        const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
+        const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
         const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : r.d_vs_FT1.toFixed(2);
         const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : r.d_vs_FT0.toFixed(2);
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
         return `
           <tr>
-            <td>${{r.Variable}}</td>
-            <td>${{v}}</td>
-            <td>${{f1}}</td>
-            <td>${{f0}}</td>
-            <td class="${{c1}}">${{d1}}</td>
-            <td class="${{c0}}">${{d0}}</td>
+            <td class="col-var">${{r.Variable}}</td>
+            <td class="col-val">${{v}}</td>
+            <td class="col-ft1">${{f1}}</td>
+            <td class="col-ft0">${{f0}}</td>
+            <td class="col-d1 ${'{'}{c1}{'}'}">${{d1}}</td>
+            <td class="col-d0 ${'{'}{c0}{'}'}">${{d0}}</td>
           </tr>`;
       }}).join('');
       return `
         <table class="child-table">
+          <colgroup>
+            <col class="col-var"/><col class="col-val"/><col class="col-ft1"/><col class="col-ft0"/><col class="col-d1"/><col class="col-d0"/>
+          </colgroup>
           <thead>
             <tr>
-              <th>Variable</th>
-              <th>Value</th>
-              <th>FT=1 median</th>
-              <th>FT=0 median</th>
-              <th>Δ vs FT=1</th>
-              <th>Δ vs FT=0</th>
+              <th class="col-var">Variable</th>
+              <th class="col-val">Value</th>
+              <th class="col-ft1">FT=1 median</th>
+              <th class="col-ft0">FT=0 median</th>
+              <th class="col-d1">Δ vs FT=1</th>
+              <th class="col-d0">Δ vs FT=0</th>
             </tr>
           </thead>
           <tbody>${{cells}}</tbody>
@@ -669,7 +656,6 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
           {{ data: 'Ticker' }},
           {{ data: 'FT1_pct',  render: (d)=>barCell(d) }},
           {{ data: 'FT0_pct',  render: (d)=>barCell(d) }},
-          {{ data: 'Lean_pct', render: (d)=>leanCenteredCell(d) }},
           {{ data: 'Lean' }},
         ]
       }});
