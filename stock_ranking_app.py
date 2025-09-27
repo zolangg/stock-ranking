@@ -457,260 +457,228 @@ with tab_tables:
         else:
             st.info("Need manual rows and built FT=1/FT=0 medians to run this comparison.")
 
-    # ---------- Alignment Summary (DataTables.net child rows inside Streamlit) ----------
-        st.markdown("### Alignment Summary (model medians + manual stocks — expandable child rows)")
-        
-        import json
-        import streamlit.components.v1 as components
-        
-        def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
-            if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
-                return {}
-            groups_cols = ["FT=1","FT=0"]
-            cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-                         "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
-            common_vars = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
-            counts = {g: 0 for g in groups_cols}
-            used = 0
-            for v in common_vars:
-                x = stock_row.get(v, None)
-                try:
-                    xv = float(x)
-                except Exception:
-                    xv = np.nan
-                if not np.isfinite(xv):
-                    continue
-                med = models_tbl.loc[v, groups_cols].astype(float).dropna()
-                if med.empty:
-                    continue
-                diffs = (med - xv).abs()
-                nearest = diffs.idxmin()
-                counts[nearest] = counts.get(nearest, 0) + 1
-                used += 1
-            counts["N_Vars_Used"] = used
-            return counts
-        
-        if st.session_state.models and {"FT=1","FT=0"}.issubset(st.session_state.models["models_tbl"].columns):
-            models_tbl: pd.DataFrame = st.session_state.models["models_tbl"]
-        
-            # 1) Always include the two model "stocks" first
-            model_rows = []
-            for g in ["FT=1","FT=0"]:
-                vals = models_tbl[g].to_dict()
-                vals.update({"Ticker": g})
-                model_rows.append(vals)
-        
-            # 2) Then your manual rows
-            manual_rows = st.session_state.rows if "rows" in st.session_state else []
-            all_rows = model_rows + manual_rows
-        
-            # Build summary (bars only) + per-row details
-            num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-                        "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
-        
-            summary_rows = []
-            detail_map = {}  # ticker -> list of dicts with deltas
-        
-            for row in all_rows:
-                stock = dict(row)
-                ticker = stock.get("Ticker", "—")
-                if not ticker:
-                    continue
-        
-                counts = compute_alignment_counts_vs_binary(stock, models_tbl)
-                if not counts:
-                    continue
-                like1, like0 = counts.get("FT=1", 0), counts.get("FT=0", 0)
-                n_used = counts.get("N_Vars_Used", 0)
-        
-                ft1_pct = round((like1 / n_used * 100.0), 2) if n_used > 0 else 0.0
-                ft0_pct = round((like0 / n_used * 100.0), 2) if n_used > 0 else 0.0
-                lean01  = ((like1 - like0) / n_used + 1) / 2.0 if n_used > 0 else 0.5
-                lean_pct = round(lean01 * 100.0, 2)             # 0=FT0, 50=tie, 100=FT1
-                lean_lbl = "FT=1" if like1 > like0 else "FT=0" if like0 > like1 else "Tie"
-        
-                summary_rows.append({
-                    "Ticker": ticker,
-                    "FT1_pct": ft1_pct,
-                    "FT0_pct": ft0_pct,
-                    "Lean_pct": lean_pct,
-                    "Lean": lean_lbl,
+# ---------- Alignment Summary (DataTables child-rows) ----------
+st.markdown("### Alignment Summary (model medians + manual stocks)")
+
+import json
+import streamlit.components.v1 as components
+
+def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
+    if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
+        return {}
+    groups = ["FT=1","FT=0"]
+    cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
+    common = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
+    counts = {g: 0 for g in groups}; used = 0
+    for v in common:
+        xv = pd.to_numeric(stock_row.get(v), errors="coerce")
+        if not np.isfinite(xv): 
+            continue
+        med = models_tbl.loc[v, groups].astype(float).dropna()
+        if med.empty: 
+            continue
+        diffs = (med - xv).abs()
+        nearest = diffs.idxmin()
+        counts[nearest] += 1
+        used += 1
+    counts["N_Vars_Used"] = used
+    return counts
+
+models_data = st.session_state.get("models")
+if models_data and isinstance(models_data, dict):
+    models_tbl: pd.DataFrame = models_data.get("models_tbl", pd.DataFrame())
+else:
+    models_tbl = pd.DataFrame()
+
+if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
+    # two model “stocks”
+    model_rows = []
+    for g in ["FT=1","FT=0"]:
+        vals = models_tbl[g].to_dict()
+        vals.update({"Ticker": g})
+        model_rows.append(vals)
+
+    # manual rows (if any)
+    manual_rows = st.session_state.get("rows", [])
+    all_rows = model_rows + manual_rows
+
+    # variables shown in details
+    num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+                "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
+
+    summary_rows = []
+    detail_map = {}
+
+    for row in all_rows:
+        stock = dict(row)
+        tkr = stock.get("Ticker") or "—"
+        counts = _compute_alignment_counts(stock, models_tbl)
+        if not counts: 
+            continue
+        like1, like0 = counts.get("FT=1",0), counts.get("FT=0",0)
+        n_used = counts.get("N_Vars_Used",0)
+
+        ft1_pct = round((like1 / n_used * 100.0), 2) if n_used>0 else 0.0
+        ft0_pct = round((like0 / n_used * 100.0), 2) if n_used>0 else 0.0
+        lean01  = ((like1 - like0) / n_used + 1) / 2.0 if n_used>0 else 0.5
+        lean_pct = round(lean01 * 100.0, 2)
+        lean_lbl = "FT=1" if like1>like0 else "FT=0" if like0>like1 else "Tie"
+
+        summary_rows.append({
+            "Ticker": tkr,
+            "FT1_pct": ft1_pct,
+            "FT0_pct": ft0_pct,
+            "Lean_pct": lean_pct,
+            "Lean": lean_lbl,
+        })
+
+        # child table: per-variable values and deltas
+        drows = []
+        for v in num_vars:
+            va = pd.to_numeric(stock.get(v), errors="coerce")
+            v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
+            v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
+            if pd.notna(va) or pd.notna(v1) or pd.notna(v0):
+                drows.append({
+                    "Variable": v,
+                    "Value": None if pd.isna(va) else float(va),
+                    "FT1":   None if pd.isna(v1) else float(v1),
+                    "FT0":   None if pd.isna(v0) else float(v0),
+                    "d_vs_FT1": None if (pd.isna(va) or pd.isna(v1)) else float(va - v1),
+                    "d_vs_FT0": None if (pd.isna(va) or pd.isna(v0)) else float(va - v0),
                 })
-        
-                # Detail rows
-                drows = []
-                for v in num_vars:
-                    va = pd.to_numeric(stock.get(v), errors="coerce")
-                    v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
-                    v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
-                    if pd.notna(va) or pd.notna(v1) or pd.notna(v0):
-                        drows.append({
-                            "Variable": v,
-                            "Value": None if pd.isna(va) else float(va),
-                            "FT1":   None if pd.isna(v1) else float(v1),
-                            "FT0":   None if pd.isna(v0) else float(v0),
-                            "d_vs_FT1": None if (pd.isna(va) or pd.isna(v1)) else float(va - v1),
-                            "d_vs_FT0": None if (pd.isna(va) or pd.isna(v0)) else float(va - v0),
-                        })
-                detail_map[ticker] = drows
-        
-            if summary_rows:
-                data_payload = {
-                    "rows": summary_rows,
-                    "details": detail_map,
-                }
-                html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta charset="utf-8"/>
-        <meta name="viewport" content="width=device-width, initial-scale=1"/>
-        <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
-        <link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
-        <style>
-          body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }}
-          table.dataTable tbody tr {{ cursor: pointer; }}
-          .bar {{
-            height: 16px; border-radius: 10px; background: #eee; position: relative; overflow: hidden;
-          }}
-          .bar > span {{
-            position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
-            background: linear-gradient(90deg, #e11d48, #10b981);
-          }}
-          .bar-label {{
-            font-size: 11px; margin-left: 8px; white-space: nowrap; color:#374151;
-          }}
-          .bar-wrap {{ display:flex; align-items:center; }}
-          .child-table {{
-            width: 100%; border-collapse: collapse; margin: 6px 0 4px 32px;
-          }}
-          .child-table th, .child-table td {{
-            font-size: 12px; padding: 6px 8px; border-bottom: 1px solid #e5e7eb; text-align:right;
-          }}
-          .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
-          .pos {{ color:#059669; }}
-          .neg {{ color:#dc2626; }}
-        </style>
-        </head>
-        <body>
-          <table id="align" class="display nowrap stripe" style="width:100%">
-            <thead>
-              <tr>
-                <th>Ticker</th>
-                <th>FT=1 %</th>
-                <th>FT=0 %</th>
-                <th>Lean (0=FT0 • 50=tie • 100=FT1)</th>
-                <th>Lean</th>
-              </tr>
-            </thead>
-          </table>
-        
-          <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-          <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
-          <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
-          <script>
-            const payload = {json.dumps(data_payload)};
-            const rows = payload.rows;
-            const details = payload.details;
-        
-            function barCell(pct) {{
-              const v = (pct==null || isNaN(pct)) ? 0 : Math.max(0, Math.min(100, pct));
-              return `
-                <div class="bar-wrap">
-                  <div class="bar" style="width:140px"><span style="width:${{v}}%"></span></div>
-                  <div class="bar-label">${{v.toFixed(0)}}%</div>
-                </div>`;
-            }}
-        
-            function leanBarCell(pct) {{
-              const v = (pct==null || isNaN(pct)) ? 50 : Math.max(0, Math.min(100, pct));
-              // gradient left red → right green, with a faint mid marker
-              return `
-                <div class="bar-wrap">
-                  <div class="bar" style="width:220px; background: linear-gradient(90deg,#fecaca,#e5e7eb 50%,#bbf7d0);">
-                    <span style="width:${{v}}%; background: linear-gradient(90deg, #ef4444, #10b981)"></span>
-                  </div>
-                  <div class="bar-label">${{v.toFixed(0)}}%</div>
-                </div>`;
-            }}
-        
-            function formatChild(ticker) {{
-              const rows = details[ticker] || [];
-              if (!rows.length) return '<div style="margin-left:32px;color:#6b7280;">No variable overlaps for this stock.</div>';
-              const cells = rows.map(r => {{
-                const v  = (r.Value==null || isNaN(r.Value)) ? '' : r.Value.toFixed(2);
-                const f1 = (r.FT1==null  || isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
-                const f0 = (r.FT0==null  || isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
-                const d1 = (r.d_vs_FT1==null || isNaN(r.d_vs_FT1)) ? '' : r.d_vs_FT1.toFixed(2);
-                const d0 = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? '' : r.d_vs_FT0.toFixed(2);
-                const c1 = (!d1||d1==='')? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
-                const c0 = (!d0||d0==='')? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
-                return `
-                  <tr>
-                    <td>${{r.Variable}}</td>
-                    <td>${{v}}</td>
-                    <td>${{f1}}</td>
-                    <td>${{f0}}</td>
-                    <td class="${{c1}}">${{d1}}</td>
-                    <td class="${{c0}}">${{d0}}</td>
-                  </tr>`;
-              }}).join('');
-              return `
-                <table class="child-table">
-                  <thead>
-                    <tr>
-                      <th>Variable</th>
-                      <th>Value</th>
-                      <th>FT=1 median</th>
-                      <th>FT=0 median</th>
-                      <th>Δ vs FT=1</th>
-                      <th>Δ vs FT=0</th>
-                    </tr>
-                  </thead>
-                  <tbody>${{cells}}</tbody>
-                </table>`;
-            }}
-        
-            $(document).ready(function() {{
-              const table = $('#align').DataTable({{
-                data: rows,
-                responsive: true,
-                paging: false,
-                info: false,
-                searching: false,
-                order: [[0,'asc']], // Ticker
-                columns: [
-                  {{ data: 'Ticker' }},
-                  {{ data: 'FT1_pct', render: function(d) {{ return barCell(d); }} }},
-                  {{ data: 'FT0_pct', render: function(d) {{ return barCell(d); }} }},
-                  {{ data: 'Lean_pct', render: function(d) {{ return leanBarCell(d); }} }},
-                  {{ data: 'Lean' }},
-                ]
-              }});
-        
-              // Whole-row click to toggle child
-              $('#align tbody').on('click', 'tr', function () {{
-                const row = table.row(this);
-                if (row.child.isShown()) {{
-                  row.child.hide();
-                  $(this).removeClass('shown');
-                }} else {{
-                  const ticker = row.data().Ticker;
-                  row.child(formatChild(ticker)).show();
-                  $(this).addClass('shown');
-                }}
-              }});
-            }});
-          </script>
-        </body>
-        </html>
-                """
-                # Render the HTML app
-                components.html(html, height=600, scrolling=True)
-            else:
-                st.info("Add at least one manual stock to compute alignment.")
-        else:
-            st.info("Upload DB (to build FT=1/FT=0 medians) and add manual stocks to see alignment.") 
+        detail_map[tkr] = drows
+
+    if summary_rows:
+        payload = {"rows": summary_rows, "details": detail_map}
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
+<style>
+  body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }}
+  table.dataTable tbody tr {{ cursor: pointer; }}
+  .bar {{ height: 16px; border-radius: 10px; background: #eee; position: relative; overflow: hidden; }}
+  .bar > span {{ position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: linear-gradient(90deg, #ef4444, #10b981); }}
+  .bar-label {{ font-size: 11px; margin-left: 8px; white-space: nowrap; color:#374151; }}
+  .bar-wrap {{ display:flex; align-items:center; gap:8px; }}
+  .child-table {{ width: 100%; border-collapse: collapse; margin: 6px 0 4px 32px; }}
+  .child-table th, .child-table td {{ font-size: 12px; padding: 6px 8px; border-bottom: 1px solid #e5e7eb; text-align:right; }}
+  .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
+  .pos {{ color:#059669; }} .neg {{ color:#dc2626; }}
+</style>
+</head>
+<body>
+  <table id="align" class="display nowrap stripe" style="width:100%">
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>FT=1 %</th>
+        <th>FT=0 %</th>
+        <th>Lean (0=FT0 • 50=tie • 100=FT=1)</th>
+        <th>Lean</th>
+      </tr>
+    </thead>
+  </table>
+
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
+  <script>
+    const data = {json.dumps(payload)};
+
+    function barCell(pct) {{
+      const v = (pct==null||isNaN(pct)) ? 0 : Math.max(0, Math.min(100, pct));
+      return `
+        <div class="bar-wrap">
+          <div class="bar" style="width:140px"><span style="width:${{v}}%"></span></div>
+          <div class="bar-label">${{v.toFixed(0)}}%</div>
+        </div>`;
+    }}
+    function leanBarCell(pct) {{
+      const v = (pct==null||isNaN(pct)) ? 50 : Math.max(0, Math.min(100, pct));
+      return `
+        <div class="bar-wrap">
+          <div class="bar" style="width:220px; background: linear-gradient(90deg,#fecaca,#e5e7eb 50%,#bbf7d0);">
+            <span style="width:${{v}}%"></span>
+          </div>
+          <div class="bar-label">${{v.toFixed(0)}}%</div>
+        </div>`;
+    }}
+
+    function childTableHTML(ticker) {{
+      const rows = data.details[ticker] || [];
+      if (!rows.length) return '<div style="margin-left:32px;color:#6b7280;">No variable overlaps for this stock.</div>';
+      const cells = rows.map(r => {{
+        const v  = (r.Value==null||isNaN(r.Value)) ? '' : r.Value.toFixed(2);
+        const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
+        const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
+        const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : r.d_vs_FT1.toFixed(2);
+        const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : r.d_vs_FT0.toFixed(2);
+        const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
+        const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
+        return `
+          <tr>
+            <td>${{r.Variable}}</td>
+            <td>${{v}}</td>
+            <td>${{f1}}</td>
+            <td>${{f0}}</td>
+            <td class="${{c1}}">${{d1}}</td>
+            <td class="${{c0}}">${{d0}}</td>
+          </tr>`;
+      }}).join('');
+      return `
+        <table class="child-table">
+          <thead>
+            <tr>
+              <th>Variable</th><th>Value</th><th>FT=1 median</th><th>FT=0 median</th>
+              <th>Δ vs FT=1</th><th>Δ vs FT=0</th>
+            </tr>
+          </thead>
+          <tbody>${{cells}}</tbody>
+        </table>`;
+    }}
+
+    $(function() {{
+      const table = $('#align').DataTable({{
+        data: data.rows,
+        responsive: true,
+        paging: false, info: false, searching: false,
+        order: [[0,'asc']],
+        columns: [
+          {{ data: 'Ticker' }},
+          {{ data: 'FT1_pct',  render: (d)=>barCell(d) }},
+          {{ data: 'FT0_pct',  render: (d)=>barCell(d) }},
+          {{ data: 'Lean_pct', render: (d)=>leanBarCell(d) }},
+          {{ data: 'Lean' }},
+        ]
+      }});
+
+      // whole-row toggle child
+      $('#align tbody').on('click', 'tr', function () {{
+        const row = table.row(this);
+        if (row.child.isShown()) {{
+          row.child.hide(); $(this).removeClass('shown');
+        }} else {{
+          const ticker = row.data().Ticker;
+          row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
+        }}
+      }});
+    }});
+  </script>
+</body>
+</html>
+        """
+        components.html(html, height=600, scrolling=True)
+    else:
+        st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
+else:
+    st.info("Upload DB and click **Build model stocks** (to compute FT=1/FT=0 medians) first.")
 
     # Clear
     st.markdown("---")
