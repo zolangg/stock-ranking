@@ -457,7 +457,7 @@ with tab_tables:
         else:
             st.info("Need manual rows and built FT=1/FT=0 medians to run this comparison.")
 
-# ---------- Alignment Summary (DataTables child-rows; compact; colored FT columns) ----------
+# ---------- Alignment Summary (DataTables child-rows; blue FT=1 bar, red FT=0 bar; compact child table) ----------
 st.markdown("### Alignment Summary (model medians + manual stocks — expandable child rows)")
 
 import json
@@ -513,18 +513,17 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
         like1, like0 = counts.get("FT=1",0), counts.get("FT=0",0)
         n_used = counts.get("N_Vars_Used",0)
 
-        ft1_pct = round((like1 / n_used * 100.0), 2) if n_used>0 else 0.0
-        ft0_pct = round((like0 / n_used * 100.0), 2) if n_used>0 else 0.0
-        lean_lbl = "FT=1" if like1>like0 else "FT=0" if like0>like1 else "Tie"
+        # keep same math, but display WITHOUT the % symbol
+        ft1_val = round((like1 / n_used * 100.0), 0) if n_used>0 else 0.0
+        ft0_val = round((like0 / n_used * 100.0), 0) if n_used>0 else 0.0
 
         summary_rows.append({
             "Ticker": tkr,
-            "FT1_pct": ft1_pct,
-            "FT0_pct": ft0_pct,
-            "Lean": lean_lbl,
+            "FT1_val": ft1_val,  # 0..100 number (no % sign)
+            "FT0_val": ft0_val,  # 0..100 number (no % sign)
         })
 
-        # child table rows (compact)
+        # child table rows (extra-compact; no colors on text)
         drows = []
         for v in num_vars:
             va = pd.to_numeric(stock.get(v), errors="coerce")
@@ -556,24 +555,26 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
   body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }}
   table.dataTable tbody tr {{ cursor: pointer; }}
 
-  /* Parent row % bars */
-  .bar {{ height: 14px; border-radius: 9px; background: #eee; position: relative; overflow: hidden; }}
-  .bar > span {{ position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: #10b981; }}
+  /* Parent row bars */
+  .bar {{ height: 12px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }}
+  .bar > span {{ position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }}
   .bar-label {{ font-size: 11px; margin-left: 6px; white-space: nowrap; color:#374151; }}
   .bar-wrap {{ display:flex; align-items:center; gap:6px; }}
+  .blue > span {{ background:#3b82f6; }}  /* FT=1 = blue */
+  .red  > span {{ background:#ef4444; }}  /* FT=0 = red  */
 
-  /* Child table compact layout */
-  .child-table {{ width: 100%; border-collapse: collapse; margin: 4px 0 4px 28px; table-layout: fixed; }}
-  .child-table th, .child-table td {{ font-size: 11px; padding: 4px 6px; border-bottom: 1px solid #e5e7eb; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  /* Child table: extra compact & fixed layout */
+  .child-table {{ width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }}
+  .child-table th, .child-table td {{ font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
   .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
 
-  /* Tighter column widths */
-  .col-var {{ width: 28%; }}
-  .col-val {{ width: 16%; }}
-  .col-ft1 {{ width: 16%; color:#ef4444; }}   /* FT=1 in red */
-  .col-ft0 {{ width: 16%; color:#3b82f6; }}   /* FT=0 in blue */
-  .col-d1  {{ width: 12%; }}
-  .col-d0  {{ width: 12%; }}
+  /* Tighter column widths (Value very narrow) */
+  .col-var {{ width: 26%; }}
+  .col-val {{ width: 10%; }}  /* very tight per your request */
+  .col-ft1 {{ width: 16%; }}
+  .col-ft0 {{ width: 16%; }}
+  .col-d1  {{ width: 16%; }}
+  .col-d0  {{ width: 16%; }}
 
   .pos {{ color:#059669; }} 
   .neg {{ color:#dc2626; }}
@@ -584,9 +585,8 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
     <thead>
       <tr>
         <th>Ticker</th>
-        <th>FT=1 %</th>
-        <th>FT=0 %</th>
-        <th>Lean</th>
+        <th>FT=1</th>
+        <th>FT=0</th>
       </tr>
     </thead>
   </table>
@@ -597,18 +597,26 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
   <script>
     const data = {json.dumps(payload)};
 
-    function barCell(pct) {{
-      const v = (pct==null||isNaN(pct)) ? 0 : Math.max(0, Math.min(100, pct));
+    function barCellBlue(val) {{
+      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
       return `
         <div class="bar-wrap">
-          <div class="bar" style="width:120px"><span style="width:${{v}}%"></span></div>
-          <div class="bar-label">${{v.toFixed(0)}}%</div>
+          <div class="bar blue" style="width:110px"><span style="width:${{v}}%"></span></div>
+          <div class="bar-label">${{v.toFixed(0)}}</div>
+        </div>`;
+    }}
+    function barCellRed(val) {{
+      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
+      return `
+        <div class="bar-wrap">
+          <div class="bar red" style="width:110px"><span style="width:${{v}}%"></span></div>
+          <div class="bar-label">${{v.toFixed(0)}}</div>
         </div>`;
     }}
 
     function childTableHTML(ticker) {{
       const rows = data.details[ticker] || [];
-      if (!rows.length) return '<div style="margin-left:28px;color:#6b7280;">No variable overlaps for this stock.</div>';
+      if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
       const cells = rows.map(r => {{
         const v  = (r.Value==null||isNaN(r.Value)) ? '' : r.Value.toFixed(2);
         const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
@@ -654,9 +662,8 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
         order: [[0,'asc']],
         columns: [
           {{ data: 'Ticker' }},
-          {{ data: 'FT1_pct',  render: (d)=>barCell(d) }},
-          {{ data: 'FT0_pct',  render: (d)=>barCell(d) }},
-          {{ data: 'Lean' }},
+          {{ data: 'FT1_val', render: (d)=>barCellBlue(d) }},  // blue bar
+          {{ data: 'FT0_val', render: (d)=>barCellRed(d) }},   // red bar
         ]
       }});
 
@@ -675,7 +682,7 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
 </body>
 </html>
         """
-        components.html(html, height=640, scrolling=True)
+        components.html(html, height=620, scrolling=True)
     else:
         st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
 
