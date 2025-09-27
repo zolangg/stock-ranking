@@ -457,7 +457,7 @@ with tab_tables:
         else:
             st.info("Need manual rows and built FT=1/FT=0 medians to run this comparison.")
 
-# ---------- Alignment Summary (DataTables child-rows with variable values) ----------
+# ---------- Alignment Summary (DataTables child-rows; simple Value; centered diverging Lean bar) ----------
 st.markdown("### Alignment Summary (model medians + manual stocks — expandable child rows)")
 
 import json
@@ -473,10 +473,10 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
     counts = {g: 0 for g in groups}; used = 0
     for v in common:
         xv = pd.to_numeric(stock_row.get(v), errors="coerce")
-        if not np.isfinite(xv): 
+        if not np.isfinite(xv):
             continue
         med = models_tbl.loc[v, groups].astype(float).dropna()
-        if med.empty: 
+        if med.empty:
             continue
         diffs = (med - xv).abs()
         counts[diffs.idxmin()] += 1
@@ -498,17 +498,18 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
     manual_rows = st.session_state.get("rows", [])
     all_rows = model_rows + manual_rows
 
-    # variables in detail child table
+    # variables in child detail
     num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
 
-    summary_rows, detail_map = [], {}
+    summary_rows = []
+    detail_map = {}
 
     for row in all_rows:
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
         counts = _compute_alignment_counts(stock, models_tbl)
-        if not counts: 
+        if not counts:
             continue
         like1, like0 = counts.get("FT=1",0), counts.get("FT=0",0)
         n_used = counts.get("N_Vars_Used",0)
@@ -516,7 +517,7 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
         ft1_pct = round((like1 / n_used * 100.0), 2) if n_used>0 else 0.0
         ft0_pct = round((like0 / n_used * 100.0), 2) if n_used>0 else 0.0
         lean01  = ((like1 - like0) / n_used + 1) / 2.0 if n_used>0 else 0.5
-        lean_pct = round(lean01 * 100.0, 2)
+        lean_pct = round(lean01 * 100.0, 2)  # 0=FT=0 … 50=tie … 100=FT=1
         lean_lbl = "FT=1" if like1>like0 else "FT=0" if like0>like1 else "Tie"
 
         summary_rows.append({
@@ -527,7 +528,7 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
             "Lean": lean_lbl,
         })
 
-        # child table rows WITH values + deltas
+        # child table rows (Value only; no position bar)
         drows = []
         for v in num_vars:
             va = pd.to_numeric(stock.get(v), errors="coerce")
@@ -562,12 +563,18 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
   .bar > span {{ position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: linear-gradient(90deg, #ef4444, #10b981); }}
   .bar-label {{ font-size: 11px; margin-left: 8px; white-space: nowrap; color:#374151; }}
   .bar-wrap {{ display:flex; align-items:center; gap:8px; }}
+
+  /* Diverging (centered) lean bar */
+  .lean-wrap {{ display:flex; align-items:center; gap:8px; }}
+  .lean {{ position:relative; width:260px; height:16px; border-radius:10px; background: linear-gradient(90deg,#fecaca 0%, #f3f4f6 50%, #bbf7d0 100%); overflow:hidden; }}
+  .lean::before {{ /* middle line */ content:''; position:absolute; left:50%; top:0; bottom:0; width:2px; background:#11182722; }}
+  .lean-fill {{ position:absolute; top:0; bottom:0; background:#10b981; }}
+  .lean-fill.left {{ background:#ef4444; }}
+
   .child-table {{ width: 100%; border-collapse: collapse; margin: 6px 0 4px 32px; }}
   .child-table th, .child-table td {{ font-size: 12px; padding: 6px 8px; border-bottom: 1px solid #e5e7eb; text-align:right; }}
   .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
   .pos {{ color:#059669; }} .neg {{ color:#dc2626; }}
-  .posbar {{ height: 8px; background:#e5e7eb; position:relative; border-radius:6px; overflow:hidden; }}
-  .posbar > span {{ position:absolute; top:0; bottom:0; width:2px; background:#111827; }}
 </style>
 </head>
 <body>
@@ -577,7 +584,7 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
         <th>Ticker</th>
         <th>FT=1 %</th>
         <th>FT=0 %</th>
-        <th>Lean (0=FT0 • 50=tie • 100=FT=1)</th>
+        <th>Lean (centered)</th>
         <th>Lean</th>
       </tr>
     </thead>
@@ -597,24 +604,22 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
           <div class="bar-label">${{v.toFixed(0)}}%</div>
         </div>`;
     }}
-    function leanBarCell(pct) {{
+
+    // Centered diverging bar: middle at 50, fill extends left (<50) or right (>50)
+    function leanCenteredCell(pct) {{
       const v = (pct==null||isNaN(pct)) ? 50 : Math.max(0, Math.min(100, pct));
+      const delta = Math.abs(v - 50);           // 0..50
+      const width = delta * 2;                  // scale to 0..100 relative to half-bar
+      const isLeft = v < 50;
+      const leftPos = isLeft ? (50 - delta) : 50;  // start from center outward
+      const cls = isLeft ? 'lean-fill left' : 'lean-fill';
       return `
-        <div class="bar-wrap">
-          <div class="bar" style="width:220px; background: linear-gradient(90deg,#fecaca,#e5e7eb 50%,#bbf7d0);">
-            <span style="width:${{v}}%"></span>
+        <div class="lean-wrap">
+          <div class="lean">
+            <div class="${{cls}}" style="left:${{leftPos}}%; width:${{width}}%;"></div>
           </div>
           <div class="bar-label">${{v.toFixed(0)}}%</div>
         </div>`;
-    }}
-
-    // position bar: show Value relative to [min(FT0,FT1), max(FT0,FT1)]
-    function positionBar(value, f0, f1) {{
-      if (value==null || isNaN(value) || f0==null || isNaN(f0) || f1==null || isNaN(f1)) return '';
-      const lo = Math.min(f0, f1), hi = Math.max(f0, f1);
-      const pos = (hi===lo) ? 50 : ( (value - lo) / (hi - lo) * 100 );
-      const clamped = Math.max(0, Math.min(100, pos));
-      return `<div class="posbar"><span style="left:${{clamped}}%"></span></div>`;
     }}
 
     function childTableHTML(ticker) {{
@@ -622,17 +627,16 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
       if (!rows.length) return '<div style="margin-left:32px;color:#6b7280;">No variable overlaps for this stock.</div>';
       const cells = rows.map(r => {{
         const v  = (r.Value==null||isNaN(r.Value)) ? '' : r.Value.toFixed(2);
-        const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
-        const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
+        const f1 = (r.FT1==null  ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
+        const f0 = (r.FT0==null  ||isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
         const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : r.d_vs_FT1.toFixed(2);
         const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : r.d_vs_FT0.toFixed(2);
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
-        const pbar = positionBar(parseFloat(v), parseFloat(f0), parseFloat(f1));
         return `
           <tr>
             <td>${{r.Variable}}</td>
-            <td>${{v}}${{pbar?'<div style="margin-top:4px">'+pbar+'</div>':''}}</td>
+            <td>${{v}}</td>
             <td>${{f1}}</td>
             <td>${{f0}}</td>
             <td class="${{c1}}">${{d1}}</td>
@@ -644,7 +648,7 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
           <thead>
             <tr>
               <th>Variable</th>
-              <th>Value (with position vs FT medians)</th>
+              <th>Value</th>
               <th>FT=1 median</th>
               <th>FT=0 median</th>
               <th>Δ vs FT=1</th>
@@ -665,7 +669,7 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
           {{ data: 'Ticker' }},
           {{ data: 'FT1_pct',  render: (d)=>barCell(d) }},
           {{ data: 'FT0_pct',  render: (d)=>barCell(d) }},
-          {{ data: 'Lean_pct', render: (d)=>leanBarCell(d) }},
+          {{ data: 'Lean_pct', render: (d)=>leanCenteredCell(d) }},
           {{ data: 'Lean' }},
         ]
       }});
