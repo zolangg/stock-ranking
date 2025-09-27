@@ -1,9 +1,10 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re
 import json
-import streamlit.components.v1 as components  # needed for components.html
+import streamlit.components.v1 as components
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -87,23 +88,27 @@ if "models" not in st.session_state: st.session_state.models = {}  # {"models_tb
 if "_last_deleted" not in st.session_state: st.session_state._last_deleted = ""
 
 # ============================== Handle delete via URL query (?del=...) ==============================
-# IMPORTANT: we handle this before rendering the table
+# IMPORTANT: handle before rendering the table
 qp = st.query_params
+# Streamlit may return str or list-like depending on version
 del_val = qp.get("del", None)
-# st.query_params may return list-like or str depending on Streamlit version
 if isinstance(del_val, (list, tuple)):
     del_param = del_val[0] if del_val else None
 else:
     del_param = del_val
+
 if del_param:
-    tickers_to_delete = [t.strip() for t in del_param.split(",") if t.strip()]
+    tickers_to_delete = [t.strip() for t in str(del_param).split(",") if t.strip()]
     if tickers_to_delete and st.session_state._last_deleted != del_param:
         before = len(st.session_state.rows)
         st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker")) not in tickers_to_delete]
         removed = before - len(st.session_state.rows)
         st.session_state._last_deleted = del_param  # guard against double-processing
-        # Clear the query param and rerun in-place
-        st.query_params.clear()
+
+        # Clear only the 'del' param and rerun
+        new_q = dict(st.query_params)
+        new_q.pop("del", None)
+        st.query_params = new_q
         st.toast(f"Deleted {removed} row(s): {', '.join(tickers_to_delete)}", icon="✅")
         do_rerun()
 
@@ -153,11 +158,13 @@ if build_btn:
                 if "ShortInt_%" in df.columns:
                     s_si = pd.to_numeric(df["ShortInt_%"], errors="coerce")
                     df["ShortInt_%"] = np.where(s_si.notna() & (s_si.abs() <= 2), s_si * 100.0, s_si)
+
                 add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
                 # Scale fractional gaps (e.g., 0.90 -> 90.0), keep already-in-% as-is
                 if "Gap_%" in df.columns:
                     s = pd.to_numeric(df["Gap_%"], errors="coerce")
                     df["Gap_%"] = np.where(s.notna() & (s.abs() <= 2), s * 100.0, s)
+
                 add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
                 add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
@@ -408,7 +415,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         detail_map[tkr] = drows
 
     if summary_rows:
-        import streamlit.components.v1 as components
         payload = {"rows": summary_rows, "details": detail_map}
 
         html = """
@@ -591,7 +597,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         rowCallback: function(row, data) {
           // turn whole non-checkbox row into child toggler
           $(row).off('click.child').on('click.child', function(e){
-            const cellIndex = table.cell(this, 0).index();
             const clickedFirstCol = (e.target.closest('td') && e.target.closest('td').cellIndex === 0);
             if (clickedFirstCol) return; // don't toggle child when clicking checkbox
             const r = table.row(row);
@@ -614,39 +619,64 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
       table.on('select deselect', updateSelectionUI);
       updateSelectionUI();
 
-      // Delete selected → set query param ?del=... on the PARENT Streamlit page
+      // Delete selected → submit a GET form to the PARENT (top) page with ?del=...
       $('#delBtn').on('click', function(){
         const rows = table.rows({ selected: true }).data().toArray();
         const tickers = rows.map(r => r.Ticker).filter(Boolean);
         if (!tickers.length) return;
-    
+
+        // Build a GET form targeting the top window (outside the iframe)
+        const form = document.createElement('form');
+        form.method = 'GET';
+        form.target = '_top';
+
+        // Preserve existing parent query params except 'del'
+        let baseHref = '';
         try {
-          // Prefer modifying the parent page (outside the iframe)
-          const url = new URL(window.parent.location.href);
-          url.searchParams.set('del', tickers.join(','));
-          // navigate in the same tab
-          window.parent.location.href = url.toString();
-        } catch (e) {
-          // Fallback: try top, then self (unlikely needed)
-          try {
-            const url2 = new URL(window.top.location.href);
-            url2.searchParams.set('del', tickers.join(','));
-            window.top.location.href = url2.toString();
-          } catch (e2) {
-            const url3 = new URL(window.location.href);
-            url3.searchParams.set('del', tickers.join(','));
-            window.location.href = url3.toString();
-          }
+          const parentURL = new URL(window.parent.location.href);
+          baseHref = parentURL.origin + parentURL.pathname;
+          parentURL.searchParams.forEach((value, key) => {
+            if (key !== 'del') {
+              const input = document.createElement('input');
+              input.type = 'hidden';
+              input.name = key;
+              input.value = value;
+              form.appendChild(input);
+            }
+          });
+        } catch(e) {
+          // Fallback to current frame
+          const selfURL = new URL(window.location.href);
+          baseHref = selfURL.origin + selfURL.pathname;
+          selfURL.searchParams.forEach((value, key) => {
+            if (key !== 'del') {
+              const input = document.createElement('input');
+              input.type = 'hidden';
+              input.name = key;
+              input.value = value;
+              form.appendChild(input);
+            }
+          });
         }
+
+        // add the del param
+        const delInput = document.createElement('input');
+        delInput.type = 'hidden';
+        delInput.name = 'del';
+        delInput.value = tickers.join(',');
+        form.appendChild(delInput);
+
+        form.action = baseHref;
+        document.body.appendChild(form);
+        form.submit();
       });
     });
   </script>
 </body>
 </html>
         """
-        # Safely inject payload
         html = html.replace("%%PAYLOAD%%", json.dumps(payload))
-        components.html(html, height=680, scrolling=True)
+        components.html(html, height=700, scrolling=True)
     else:
         st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
 elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
@@ -654,7 +684,7 @@ elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset
 else:
     st.info("Add at least one stock above to compute alignment.")
 
-# ============================== Clear (keep simple) ==============================
+# ============================== Clear (simple) ==============================
 st.markdown("---")
 if st.button("Clear Added Stocks", use_container_width=True, disabled=(len(st.session_state.rows)==0)):
     st.session_state.rows = []
