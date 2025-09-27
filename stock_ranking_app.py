@@ -87,19 +87,19 @@ if "models" not in st.session_state: st.session_state.models = {}  # {"models_tb
 
 # ---------- Minimal addition: handle delete via query param ----------
 try:
-    qp = st.experimental_get_query_params()
-    del_tkr = qp.get("del_ticker", [None])[0]
+    qp = st.query_params  # dict-like (new API)
+    del_tkr = qp.get("del_ticker", None)
     if del_tkr:
         before = len(st.session_state.rows)
         st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker")) != str(del_tkr)]
         after = len(st.session_state.rows)
         if before != after:
             st.success(f"Deleted {del_tkr}")
-        # clear the param to avoid repeat deletions on rerun
-        qp.pop("del_ticker", None)
-        st.experimental_set_query_params(**qp)
-except Exception:
-    pass
+        # clear param
+        if "del_ticker" in qp:
+            del qp["del_ticker"]
+except Exception as e:
+    st.error(f"Error handling delete: {e}")
 # --------------------------------------------------------------------
 
 # ============================== Upload DB → Build Medians ==============================
