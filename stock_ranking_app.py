@@ -189,7 +189,6 @@ if build_btn:
                 st.session_state.models = {"models_tbl": gmed, "mad_tbl": gmads, "var_list": var_list}
                 st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
                 do_rerun()
-                    }
 
         except Exception as e:
             st.error("Loading/processing failed.")
