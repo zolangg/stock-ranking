@@ -124,6 +124,10 @@ if build_btn:
                     if src:
                         df[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
+                if "Gap_% " in df.columns:
+                    # if values look like fractions (<= 2.0), scale up to percent
+                    df["Gap_%"] = df["Gap_%"].apply(lambda x: x*100 if pd.notna(x) and abs(x) <= 2 else x)
+
                 add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
                 add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
                 add_num(df, "ShortInt_%",   ["shortint %","short interest %","short float %","si","short interest (float) %"])
