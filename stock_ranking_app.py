@@ -467,9 +467,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .col-var { width: 18%; }
   .col-val { width: 12%; }
   .col-ft1 { width: 18%; }
-  .col-ft0 { width: 18%; }
-  .col-d1  { width: 17%; }
-  .col-d0  { width: 17%; }
+  .col-ft0 { width: 15%; }
+  .col-d1  { width: 15%; }
+  .col-d0  { width: 15%; }
 
   .pos { color:#059669; } 
   .neg { color:#dc2626; }
