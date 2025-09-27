@@ -129,13 +129,11 @@ if build_btn:
                 add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
                 add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
                 add_num(df, "ShortInt_%",   ["shortint %","short interest %","short float %","si","short interest (float) %","SI"])
-                # Scale fractional short interest (e.g., 0.06 -> 6.0), keep already-in-% as-is
                 if "ShortInt_%" in df.columns:
                     s_si = pd.to_numeric(df["ShortInt_%"], errors="coerce")
                     df["ShortInt_%"] = np.where(s_si.notna() & (s_si.abs() <= 2), s_si * 100.0, s_si)
 
                 add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
-                # Scale fractional gaps (e.g., 0.90 -> 90.0), keep already-in-% as-is
                 if "Gap_%" in df.columns:
                     s = pd.to_numeric(df["Gap_%"], errors="coerce")
                     df["Gap_%"] = np.where(s.notna() & (s.abs() <= 2), s * 100.0, s)
@@ -228,7 +226,6 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
             sig_flag = sig >= sig_thresh  # per-variable boolean
 
             def _style_sig(col: pd.Series):
-                # color FT cells for rows deemed significant
                 return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
                         for idx in col.index]
 
@@ -302,7 +299,6 @@ if submitted and ticker:
 tcol1, tcol2 = st.columns([1.6, 1.6])
 with tcol1:
     if st.button("Delete selected", use_container_width=True, type="primary"):
-        # Will delete based on AG Grid's selection below (we read it right after grid render)
         st.session_state["_pending_delete"] = True
 
 with tcol2:
@@ -359,7 +355,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         ft1_val = round((like1 / n_used * 100.0), 0) if n_used > 0 else 0.0
         ft0_val = round((like0 / n_used * 100.0), 0) if n_used > 0 else 0.0
 
-        summary_rows.append({"Ticker": tkr, "FT1_val": ft1_val, "FT0_val": ft0_val})
+        summary_rows.append({"Ticker": tkr, "FT1_val": float(ft1_val), "FT0_val": float(ft0_val)})
 
         # ---- child details WITH significance flags vs FT=1 / FT=0 ----
         drows = []
@@ -388,10 +384,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
             sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
 
-            # direction class (yellow=up, red=down) based on bigger delta sign
             row_class = ""
             if sig1 or sig0:
-                # pick larger |delta|
                 a1 = -np.inf if d1 is None or np.isnan(d1) else abs(d1)
                 a0 = -np.inf if d0 is None or np.isnan(d0) else abs(d0)
                 dom = d1 if a1 >= a0 else d0
@@ -403,8 +397,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 "Value": None if pd.isna(va) else float(va),
                 "FT1":   None if pd.isna(v1) else float(v1),
                 "FT0":   None if pd.isna(v0) else float(v0),
-                "d_vs_FT1": None if d1 is None else d1,
-                "d_vs_FT0": None if d0 is None else d0,
+                "d_vs_FT1": None if d1 is None else float(d1),
+                "d_vs_FT0": None if d0 is None else float(d0),
                 "sig1": bool(sig1),
                 "sig0": bool(sig0),
                 "rowClass": row_class,
@@ -441,7 +435,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         }
     """)
 
-    # Detail renderer: a child grid with our variable deltas
+    # Detail renderer callbacks
     get_detail_row_data = JsCode("""
         function(params){
             const detMap = params.api.getGridOption('context').detailMap || {};
@@ -450,12 +444,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             params.successCallback(rows);
         }
     """)
-
-    # Per-row class for detail grid (uses row.data.rowClass)
     get_detail_row_style = JsCode("""
         function(params){
-            // background colors via CSS classes are not available here,
-            // so we set inline style based on rowClass.
             const cls = params.data && params.data.rowClass ? params.data.rowClass : '';
             if(cls === 'sig_up'){
                 return { background: 'rgba(253,230,138,0.85)' }; // yellow
@@ -465,22 +455,38 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             return null;
         }
     """)
+    is_row_master = JsCode("""
+        function(data){
+            // treat every row as master (expandable)
+            return true;
+        }
+    """)
+
+    # JS value formatters (must be JsCode, not strings)
+    fmt2 = JsCode("""
+        function(params){
+            if(params.value === null || params.value === undefined) return '';
+            var n = Number(params.value);
+            if(isNaN(n)) return '';
+            return n.toFixed(2);
+        }
+    """)
 
     # Build parent grid options
     gb = GridOptionsBuilder.from_dataframe(df_summary)
-    gb.configure_selection(selection_mode="multiple", use_checkbox=True)   # <-- row checkboxes
-    gb.configure_column("Ticker", header_name="Ticker", pinned=False, width=140)
-    gb.configure_column("FT1_val", header_name="FT=1", cellRenderer=bar_blue, width=200)
-    gb.configure_column("FT0_val", header_name="FT=0", cellRenderer=bar_red,  width=200)
+    gb.configure_selection(selection_mode="multiple", use_checkbox=True)
+    gb.configure_column("Ticker", header_name="Ticker", pinned=False, width=160)
+    gb.configure_column("FT1_val", header_name="FT=1", cellRenderer=bar_blue, width=220)
+    gb.configure_column("FT0_val", header_name="FT=0", cellRenderer=bar_red,  width=220)
 
     # Master/Detail setup
     detail_cols = [
         {"field":"Variable", "headerName":"Variable", "width":180},
-        {"field":"Value", "headerName":"Value", "width":110, "valueFormatter":"(v)=>v==null?'':Number(v).toFixed(2)"},
-        {"field":"FT1", "headerName":"FT=1 median", "width":130, "valueFormatter":"(v)=>v==null?'':Number(v).toFixed(2)"},
-        {"field":"FT0", "headerName":"FT=0 median", "width":130, "valueFormatter":"(v)=>v==null?'':Number(v).toFixed(2)"},
+        {"field":"Value", "headerName":"Value", "width":110, "valueFormatter": fmt2},
+        {"field":"FT1", "headerName":"FT=1 median", "width":130, "valueFormatter": fmt2},
+        {"field":"FT0", "headerName":"FT=0 median", "width":130, "valueFormatter": fmt2},
         {"field":"d_vs_FT1", "headerName":"Δ vs FT=1", "width":120,
-         "valueFormatter":"(v)=>v==null?'':Number(v).toFixed(2)",
+         "valueFormatter": fmt2,
          "cellStyle": JsCode("""
             function(p){ if(p.value==null) return null;
                 return Number(p.value)>=0? {'color':'#059669'} : {'color':'#dc2626'};
@@ -488,7 +494,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
          """)
         },
         {"field":"d_vs_FT0", "headerName":"Δ vs FT=0", "width":120,
-         "valueFormatter":"(v)=>v==null?'':Number(v).toFixed(2)",
+         "valueFormatter": fmt2,
          "cellStyle": JsCode("""
             function(p){ if(p.value==null) return null;
                 return Number(p.value)>=0? {'color':'#059669'} : {'color':'#dc2626'};
@@ -499,6 +505,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
     gb.configure_grid_options(
         masterDetail=True,
+        isRowMaster=is_row_master,
+        detailRowHeight=220,
         detailCellRendererParams={
             "detailGridOptions": {
                 "columnDefs": detail_cols,
@@ -507,7 +515,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             },
             "getDetailRowData": get_detail_row_data
         },
-        # center the two FT columns a bit
         suppressRowClickSelection=False,
         animateRows=True,
         context={"detailMap": detail_map}
@@ -515,14 +522,13 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
     grid_options = gb.build()
 
-    # Render grid
     grid_resp = AgGrid(
         df_summary,
         gridOptions=grid_options,
         update_mode=GridUpdateMode.SELECTION_CHANGED,
-        allow_unsafe_jscode=True,
+        allow_unsafe_jscode=True,          # <-- needed for JsCode renderers/formatters
         fit_columns_on_grid_load=False,
-        height=480,
+        height=520,
         theme="alpine",
     )
 
