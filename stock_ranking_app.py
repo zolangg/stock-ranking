@@ -177,6 +177,23 @@ if build_btn:
                     st.success("Built model stocks (FT=1 and FT=0 medians).")
                     do_rerun()
 
+                    # --- robust spread: MAD (median absolute deviation) per group ---
+                    def _mad(series: pd.Series) -> float:
+                        s = pd.to_numeric(series, errors="coerce").dropna()
+                        if s.empty:
+                            return np.nan
+                        med = np.median(s)
+                        return float(np.median(np.abs(s - med)))
+                    
+                    gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T  # rows=variables, cols=FT=1/FT=0
+                    
+                    # store both medians and MADs
+                    st.session_state.models = {
+                        "models_tbl": gmed,
+                        "mad_tbl": gmads,
+                        "var_list": var_list,
+                    }
+
         except Exception as e:
             st.error("Loading/processing failed.")
             st.exception(e)
@@ -186,11 +203,41 @@ models_data = st.session_state.models
 if models_data and isinstance(models_data, dict) and not models_data.get("models_tbl", pd.DataFrame()).empty:
     with st.expander("Model Medians (FT=1 vs FT=0)", expanded=False):
         med_tbl: pd.DataFrame = models_data["models_tbl"]
-        cfg = {
-            "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
-            "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
-        }
-        st.dataframe(med_tbl, use_container_width=True, column_config=cfg, hide_index=False)
+        mad_tbl: pd.DataFrame = models_data.get("mad_tbl", pd.DataFrame())
+
+        # User control for what we call "significant"
+        sig_thresh = st.slider("Significance threshold (σ)", 0.5, 5.0, 2.0, 0.5,
+                               help="Highlight rows where |FT=1 − FT=0| / (MAD₁ + MAD₀) ≥ σ")
+
+        if not mad_tbl.empty and {"FT=1","FT=0"}.issubset(mad_tbl.columns):
+            eps = 1e-9  # avoid /0
+            diff = (med_tbl["FT=1"] - med_tbl["FT=0"]).abs()
+            spread = (mad_tbl["FT=1"].fillna(0.0) + mad_tbl["FT=0"].fillna(0.0))
+            sig = diff / (spread.replace(0.0, np.nan) + eps)  # NaN if no spread
+
+            sig_flag = sig >= sig_thresh  # per-variable boolean
+
+            def _style_sig(col: pd.Series):
+                # color FT cells for rows deemed significant
+                return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
+                        for idx in col.index]
+
+            styled = (med_tbl
+                      .style
+                      .apply(_style_sig, subset=["FT=1"])
+                      .apply(_style_sig, subset=["FT=0"])
+                      .format("{:.2f}"))
+
+            st.dataframe(styled, use_container_width=True)
+            st.caption("Highlighted where |median(FT=1)−median(FT=0)| ≥ σ × (MAD₁ + MAD₀).")
+        else:
+            st.info("Not enough info to compute significance (MADs missing). Rebuild models with the current DB.")
+            # fallback to plain table
+            cfg = {
+                "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
+                "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
+            }
+            st.dataframe(med_tbl, use_container_width=True, column_config=cfg, hide_index=False)
 
 # ============================== ➕ Manual Input (simplified: NO dilution, NO qualitative) ==============================
 st.markdown("---")
