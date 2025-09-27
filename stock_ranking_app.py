@@ -448,8 +448,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .red  > span { background:#ef4444; }  /* FT=0 = red  */
 
   /* Align FT columns */
-  #align td:nth-child(3), #align th:nth-child(3),
-  #align td:nth-child(4), #align th:nth-child(4) { text-align: center; }
+  #align td:nth-child(2), #align th:nth-child(2),
+  #align td:nth-child(3), #align th:nth-child(3) { text-align: center; }
 
   /* Child table */
   .child-table { width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }
@@ -479,7 +479,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   <table id="align" class="display nowrap stripe" style="width:100%">
     <thead>
       <tr>
-        <th></th>         <!-- checkbox column (visual only) -->
         <th>Ticker</th>
         <th>FT=1</th>
         <th>FT=0</th>
@@ -510,26 +509,20 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         </div>`;
     }
 
-    // Build the DataTable (checkbox column is purely visual; actual deletion uses Streamlit multiselect)
+    // Build the DataTable (no checkbox column)
     const table = $('#align').DataTable({
       data: data.rows,
       responsive: true,
       paging: false, info: false, searching: false,
-      order: [[1,'asc']],
+      order: [[0,'asc']],
       columns: [
-        {
-          data: null,
-          orderable: false,
-          className: 'dt-checkbox',
-          render: (d,t,row)=>`<input type="checkbox" class="row-select" />`
-        },
         { data: 'Ticker' },
         { data: 'FT1_val', render: (d)=>barCellBlue(d) },
         { data: 'FT0_val', render: (d)=>barCellRed(d) },
       ]
     });
 
-    // Child rows (ignore clicks on checkbox)
+    // Child rows
     function childTableHTML(ticker) {
       const rows = data.details[ticker] || [];
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
@@ -588,8 +581,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         </table>`;
     }
 
-    $('#align tbody').on('click', 'tr', function (e) {
-      if ($(e.target).closest('.row-select').length) return; // don't expand when clicking checkbox
+    $('#align tbody').on('click', 'tr', function () {
       const row = table.row(this);
       if (row.child.isShown()) {
         row.child.hide(); $(this).removeClass('shown');
