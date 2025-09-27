@@ -3,7 +3,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
-import json
 
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
@@ -86,6 +85,7 @@ def _to_float(s):
 if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "mad_tbl": DataFrame, "var_list": [...]}
+if "_pending_delete" not in st.session_state: st.session_state["_pending_delete"] = False
 
 # ============================== Upload DB → Build Medians ==============================
 st.subheader("Upload Database")
@@ -309,7 +309,7 @@ with tcol2:
         st.success("Cleared all added stocks.")
         do_rerun()
 
-# ============================== Alignment (AG Grid master/detail; ONLY added stocks) ==============================
+# ============================== Alignment (AG Grid; selection + details panel) ==============================
 st.markdown("### Alignment")
 
 def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
@@ -384,6 +384,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
             sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
 
+            # direction class (yellow=up, red=down) based on bigger |Δ|
             row_class = ""
             if sig1 or sig0:
                 a1 = -np.inf if d1 is None or np.isnan(d1) else abs(d1)
@@ -406,10 +407,10 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
         detail_map[tkr] = drows
 
-    # ---------- AG Grid: Parent (summary) with master/detail ----------
+    # ---------- AG Grid: Parent (summary) ----------
     df_summary = pd.DataFrame(summary_rows)
 
-    # Simple bars for FT columns (blue/red)
+    # Bars for FT columns (blue/red)
     bar_blue = JsCode("""
         function(params){
             const v = Math.max(0, Math.min(100, Number(params.value||0)));
@@ -435,100 +436,21 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         }
     """)
 
-    # Detail renderer callbacks
-    get_detail_row_data = JsCode("""
-        function(params){
-            const detMap = params.api.getGridOption('context').detailMap || {};
-            const key = params.data.Ticker;
-            const rows = detMap[key] || [];
-            params.successCallback(rows);
-        }
-    """)
-    get_detail_row_style = JsCode("""
-        function(params){
-            const cls = params.data && params.data.rowClass ? params.data.rowClass : '';
-            if(cls === 'sig_up'){
-                return { background: 'rgba(253,230,138,0.85)' }; // yellow
-            } else if(cls === 'sig_down'){
-                return { background: 'rgba(254,202,202,0.85)' }; // red
-            }
-            return null;
-        }
-    """)
-    is_row_master = JsCode("""
-        function(data){
-            // treat every row as master (expandable)
-            return true;
-        }
-    """)
-
-    # JS value formatters (must be JsCode, not strings)
-    fmt2 = JsCode("""
-        function(params){
-            if(params.value === null || params.value === undefined) return '';
-            var n = Number(params.value);
-            if(isNaN(n)) return '';
-            return n.toFixed(2);
-        }
-    """)
-
-    # Build parent grid options
     gb = GridOptionsBuilder.from_dataframe(df_summary)
     gb.configure_selection(selection_mode="multiple", use_checkbox=True)
     gb.configure_column("Ticker", header_name="Ticker", pinned=False, width=160)
     gb.configure_column("FT1_val", header_name="FT=1", cellRenderer=bar_blue, width=220)
     gb.configure_column("FT0_val", header_name="FT=0", cellRenderer=bar_red,  width=220)
-
-    # Master/Detail setup
-    detail_cols = [
-        {"field":"Variable", "headerName":"Variable", "width":180},
-        {"field":"Value", "headerName":"Value", "width":110, "valueFormatter": fmt2},
-        {"field":"FT1", "headerName":"FT=1 median", "width":130, "valueFormatter": fmt2},
-        {"field":"FT0", "headerName":"FT=0 median", "width":130, "valueFormatter": fmt2},
-        {"field":"d_vs_FT1", "headerName":"Δ vs FT=1", "width":120,
-         "valueFormatter": fmt2,
-         "cellStyle": JsCode("""
-            function(p){ if(p.value==null) return null;
-                return Number(p.value)>=0? {'color':'#059669'} : {'color':'#dc2626'};
-            }
-         """)
-        },
-        {"field":"d_vs_FT0", "headerName":"Δ vs FT=0", "width":120,
-         "valueFormatter": fmt2,
-         "cellStyle": JsCode("""
-            function(p){ if(p.value==null) return null;
-                return Number(p.value)>=0? {'color':'#059669'} : {'color':'#dc2626'};
-            }
-         """)
-        },
-    ]
-
-    gb.configure_grid_options(
-        masterDetail=True,
-        isRowMaster=is_row_master,
-        detailRowHeight=220,
-        detailCellRendererParams={
-            "detailGridOptions": {
-                "columnDefs": detail_cols,
-                "getRowStyle": get_detail_row_style,
-                "defaultColDef": {"sortable": True, "resizable": True}
-            },
-            "getDetailRowData": get_detail_row_data
-        },
-        suppressRowClickSelection=False,
-        animateRows=True,
-        context={"detailMap": detail_map}
-    )
-
+    gb.configure_grid_options(suppressRowClickSelection=False, animateRows=True)
     grid_options = gb.build()
 
     grid_resp = AgGrid(
         df_summary,
         gridOptions=grid_options,
         update_mode=GridUpdateMode.SELECTION_CHANGED,
-        allow_unsafe_jscode=True,          # <-- needed for JsCode renderers/formatters
+        allow_unsafe_jscode=True,
         fit_columns_on_grid_load=False,
-        height=520,
+        height=420,
         theme="alpine",
     )
 
@@ -549,6 +471,37 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 st.info("No rows removed.")
         do_rerun()
 
+    # ----- Details panel (for first selected row) -----
+    sel_rows = grid_resp.get("selected_rows", []) or []
+    if sel_rows:
+        sel_ticker = sel_rows[0].get("Ticker")
+        st.markdown(f"#### Details: {sel_ticker}")
+        vars_rows = detail_map.get(sel_ticker, [])
+
+        if vars_rows:
+            # Build a pandas table with conditional coloring (yellow if dominant Δ >=0, red if <0)
+            ddf = pd.DataFrame(vars_rows)
+            # Display table with styling similar to earlier child coloring
+            def _row_style(row):
+                if row.get("rowClass") == "sig_up":
+                    return ['background-color: rgba(253,230,138,0.85)'] * len(row)
+                if row.get("rowClass") == "sig_down":
+                    return ['background-color: rgba(254,202,202,0.85)'] * len(row)
+                return [''] * len(row)
+
+            show_cols = ["Variable","Value","FT1","FT0","d_vs_FT1","d_vs_FT0"]
+            for c in show_cols:
+                if c not in ddf.columns:
+                    ddf[c] = np.nan
+
+            styled = (ddf[show_cols]
+                      .style
+                      .apply(_row_style, axis=1)
+                      .format("{:.2f}", na_rep=""))
+
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+        else:
+            st.info("No variable overlaps for this stock.")
 else:
     if not st.session_state.rows:
         st.info("Add at least one stock above to compute alignment.")
