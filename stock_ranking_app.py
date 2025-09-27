@@ -1,9 +1,9 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re
 import json
+import streamlit.components.v1 as components  # needed for components.html
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
