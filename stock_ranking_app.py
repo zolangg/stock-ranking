@@ -418,9 +418,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
 
   /* significance row highlights */
-  .sig1  { background: rgba(59,130,246,0.10); }  /* blue tint (far from FT=1) */
-  .sig0  { background: rgba(239,68,68,0.10); }   /* red tint  (far from FT=0) */
-  .sigb  { background: linear-gradient(90deg, rgba(239,68,68,0.12), rgba(59,130,246,0.12)); } /* both */
+  .sig1  {{ background: rgba(59,130,246,0.10); }}  /* blue tint (far from FT=1) */
+  .sig0  {{ background: rgba(239,68,68,0.10); }}   /* red tint  (far from FT=0) */
+  .sigb  {{ background: linear-gradient(90deg, rgba(239,68,68,0.12), rgba(59,130,246,0.12)); }} /* both */
 
   /* Narrower Value column as requested */
   .col-var {{ width: 10%; }}
@@ -471,7 +471,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
     function childTableHTML(ticker) {{
       const rows = data.details[ticker] || [];
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
-      const cells = rows.map(r => {
+      const cells = rows.map(r => {{
         const v  = (r.Value==null||isNaN(r.Value)) ? '' : r.Value.toFixed(2);
         const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
         const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
@@ -493,7 +493,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             <td class="col-d1 ${{c1}}">${{d1}}</td>
             <td class="col-d0 ${{c0}}">${{d0}}</td>
           </tr>`;
-      }).join('');
+      }}).join('');
       return `
         <table class="child-table">
           <colgroup>
