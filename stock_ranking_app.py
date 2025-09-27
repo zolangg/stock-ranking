@@ -123,14 +123,15 @@ if build_btn:
                     src = _pick(raw, src_candidates)
                     if src:
                         df[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
-                    if "Gap_% " in df.columns:
-                        # if values look like fractions (<= 2.0), scale up to percent
-                        df["Gap_%"] = df["Gap_%"].apply(lambda x: x*100 if pd.notna(x) and abs(x) <= 2 else x)
 
                 add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
                 add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
                 add_num(df, "ShortInt_%",   ["shortint %","short interest %","short float %","si","short interest (float) %"])
                 add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
+                # Scale fractional gaps (e.g., 0.90 -> 90.0), keep already-in-% values as-is
+                if "Gap_%" in df.columns:
+                    s = pd.to_numeric(df["Gap_%"], errors="coerce")
+                    df["Gap_%"] = np.where(s.notna() & (s.abs() <= 2), s * 100.0, s)
                 add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
                 add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
