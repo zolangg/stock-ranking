@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import re
 
-from st_tabulator import st_tabulator  # <-- Tabulator with Python <-> JS bridge
+from streamlit_tabulator import streamlit_tabulator  # <-- Tabulator with Python <-> JS bridge
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
