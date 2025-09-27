@@ -5,6 +5,8 @@ import numpy as np
 import re
 import json
 
+from streamlit_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
@@ -131,11 +133,13 @@ if build_btn:
                 if "ShortInt_%" in df.columns:
                     s_si = pd.to_numeric(df["ShortInt_%"], errors="coerce")
                     df["ShortInt_%"] = np.where(s_si.notna() & (s_si.abs() <= 2), s_si * 100.0, s_si)
+
                 add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
                 # Scale fractional gaps (e.g., 0.90 -> 90.0), keep already-in-% as-is
                 if "Gap_%" in df.columns:
                     s = pd.to_numeric(df["Gap_%"], errors="coerce")
                     df["Gap_%"] = np.where(s.notna() & (s.abs() <= 2), s * 100.0, s)
+
                 add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
                 add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
@@ -237,7 +241,7 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
             st.dataframe(styled, use_container_width=True)
             st.caption("Highlighted where |median(FT=1)−median(FT=0)| ≥ σ × (MAD₁ + MAD₀).")
         else:
-            st.info("Not enough info to compute significance (MADs missing). Rebuild models with the current DB.")
+            st.info("Not enough info to compute significance (MADs missing). Rebuild models with the current DB).")
             cfg = {
                 "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
                 "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
@@ -256,7 +260,7 @@ with st.form("add_form", clear_on_submit=True):
         mc_m    = st.number_input("Market Cap (M$)", 0.0, step=0.01, format="%.2f")
         float_m = st.number_input("Public Float (M)", 0.0, step=0.01, format="%.2f")
         si_pct  = st.number_input("Short Interest (%)", 0.0, step=0.01, format="%.2f")
-        gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")  # real percent e.g. 100 = +100%
+        gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")
 
     with c2:
         atr_usd = st.number_input("ATR ($)", 0.0, step=0.01, format="%.2f")
@@ -297,50 +301,19 @@ if submitted and ticker:
 # ============================== Toolbar: Delete / Clear (ABOVE Alignment) ==============================
 tcol1, tcol2 = st.columns([1.6, 1.6])
 with tcol1:
-    # Read selected tickers directly from parent/top URL ?sel=
-    sel_val = st.query_params.get("sel", "")
-    # Streamlit may return str or list; normalize:
-    if isinstance(sel_val, list):
-        sel_str = sel_val[0] if sel_val else ""
-    else:
-        sel_str = sel_val or ""
-    chosen = [s.strip().upper() for s in sel_str.split(",") if s.strip()]
-
-    # Always enable button; if none selected, show info
     if st.button("Delete selected", use_container_width=True, type="primary"):
-        if not chosen:
-            st.info("No rows selected in the table.")
-        else:
-            before = len(st.session_state.rows)
-            chosen_set = set(chosen)
-            st.session_state.rows = [
-                r for r in st.session_state.rows
-                if str(r.get("Ticker", "")).strip().upper() not in chosen_set
-            ]
-            removed = before - len(st.session_state.rows)
-            # clear ?sel= after delete
-            try:
-                del st.query_params["sel"]
-            except Exception:
-                pass
-            if removed > 0:
-                st.success(f"Removed {removed} row(s): {', '.join(sorted(chosen_set))}")
-            else:
-                st.info("No rows removed.")
-            do_rerun()
+        # Will delete based on AG Grid's selection below (we read it right after grid render)
+        st.session_state["_pending_delete"] = True
 
 with tcol2:
     clear_disabled = len(st.session_state.rows) == 0
     if st.button("Clear Added Stocks", use_container_width=True, disabled=clear_disabled):
         st.session_state.rows = []
-        try:
-            del st.query_params["sel"]
-        except Exception:
-            pass
+        st.session_state.pop("_pending_delete", None)
         st.success("Cleared all added stocks.")
         do_rerun()
 
-# ============================== Alignment (DataTables child-rows; ONLY added stocks) ==============================
+# ============================== Alignment (AG Grid master/detail; ONLY added stocks) ==============================
 st.markdown("### Alignment")
 
 def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
@@ -369,7 +342,7 @@ SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
-    # Build summary for ADDED stocks only (no model rows)
+    # Build summary + detail rows
     summary_rows, detail_map = [], {}
     num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
@@ -415,6 +388,16 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
             sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
 
+            # direction class (yellow=up, red=down) based on bigger delta sign
+            row_class = ""
+            if sig1 or sig0:
+                # pick larger |delta|
+                a1 = -np.inf if d1 is None or np.isnan(d1) else abs(d1)
+                a0 = -np.inf if d0 is None or np.isnan(d0) else abs(d0)
+                dom = d1 if a1 >= a0 else d0
+                if dom is not None and not np.isnan(dom):
+                    row_class = "sig_up" if dom >= 0 else "sig_down"
+
             drows.append({
                 "Variable": v,
                 "Value": None if pd.isna(va) else float(va),
@@ -422,240 +405,146 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 "FT0":   None if pd.isna(v0) else float(v0),
                 "d_vs_FT1": None if d1 is None else d1,
                 "d_vs_FT0": None if d0 is None else d0,
-                "sig1": sig1,
-                "sig0": sig0,
+                "sig1": bool(sig1),
+                "sig0": bool(sig0),
+                "rowClass": row_class,
             })
 
         detail_map[tkr] = drows
 
-    if summary_rows:
-        import streamlit.components.v1 as components
-        payload = {"rows": summary_rows, "details": detail_map}
+    # ---------- AG Grid: Parent (summary) with master/detail ----------
+    df_summary = pd.DataFrame(summary_rows)
 
-        html = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
-<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
-<style>
-  body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
-  table.dataTable tbody tr { cursor: pointer; }
-
-  .bar-wrap { display:flex; justify-content:center; align-items:center; gap:6px; }
-  .bar { height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }
-  .bar > span { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }
-  .bar-label { font-size: 11px; white-space: nowrap; color:#374151; min-width: 24px; text-align:center; }
-  .blue > span { background:#3b82f6; }  /* FT=1 = blue */
-  .red  > span { background:#ef4444; }  /* FT=0 = red  */
-
-  /* Align FT columns */
-  #align td:nth-child(3), #align th:nth-child(3),
-  #align td:nth-child(4), #align th:nth-child(4) { text-align: center; }
-
-  /* Child table */
-  .child-table { width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }
-  .child-table th, .child-table td {
-    font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb;
-    text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-  }
-  .child-table th:first-child, .child-table td:first-child { text-align:left; }
-
-  /* Significance backgrounds */
-  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }  /* yellow-ish */
-  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }  /* red-ish */
-
-  /* Column widths for child table */
-  .col-var { width: 18%; }
-  .col-val { width: 12%; }
-  .col-ft1 { width: 18%; }
-  .col-ft0 { width: 18%; }
-  .col-d1  { width: 17%; }
-  .col-d0  { width: 17%; }
-
-  .pos { color:#059669; } 
-  .neg { color:#dc2626; }
-</style>
-</head>
-<body>
-  <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead>
-      <tr>
-        <th></th>         <!-- checkbox column -->
-        <th>Ticker</th>
-        <th>FT=1</th>
-        <th>FT=0</th>
-      </tr>
-    </thead>
-  </table>
-
-  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-  <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
-  <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
-  <script>
-    const data = %%PAYLOAD%%;
-
-    function barCellBlue(val) {
-      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
-      return `
-        <div class="bar-wrap">
-          <div class="bar blue"><span style="width:${v}%"></span></div>
-          <div class="bar-label">${v.toFixed(0)}</div>
-        </div>`;
-    }
-    function barCellRed(val) {
-      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
-      return `
-        <div class="bar-wrap">
-          <div class="bar red"><span style="width:${v}%"></span></div>
-          <div class="bar-label">${v.toFixed(0)}</div>
-        </div>`;
-    }
-
-    // === Helpers to target top/parent URL (so Streamlit can read ?sel=) ===
-    function getTargetWindow() {
-      try { if (window.parent && window.parent.location && window.parent !== window) return window.parent; } catch(e) {}
-      try { if (window.top && window.top.location) return window.top; } catch(e) {}
-      return window; // fallback
-    }
-    function qsWriteFromSet(selSet) {
-      try {
-        const tgt = getTargetWindow();
-        const url = new URL(tgt.location.href);
-        if (selSet.size) url.searchParams.set('sel', Array.from(selSet).join(','));
-        else url.searchParams.delete('sel');
-        tgt.history.replaceState(null, '', url.toString());
-      } catch(e) {}
-    }
-    function qsReadToSet(selSet) {
-      try {
-        const tgt = getTargetWindow();
-        const url = new URL(tgt.location.href);
-        const sel = url.searchParams.get('sel');
-        if (sel) sel.split(',').forEach(t => { if (t) selSet.add(String(t)); });
-      } catch(e) {}
-    }
-
-    // Build the DataTable (with checkbox column)
-    const table = $('#align').DataTable({
-      data: data.rows,
-      responsive: true,
-      paging: false, info: false, searching: false,
-      order: [[1,'asc']],
-      columns: [
-        {
-          data: null,
-          orderable: false,
-          className: 'dt-checkbox',
-          render: (d,t,row)=>`<input type="checkbox" class="row-select" data-ticker="${row.Ticker}"/>`
-        },
-        { data: 'Ticker' },
-        { data: 'FT1_val', render: (d)=>barCellBlue(d) },
-        { data: 'FT0_val', render: (d)=>barCellRed(d) },
-      ]
-    });
-
-    // Selection state synced to TOP/PARENT URL ?sel=
-    const selected = new Set();
-    qsReadToSet(selected);
-
-    // Keep checkboxes in sync on every draw
-    table.on('draw', () => {
-      $('#align tbody .row-select').each(function(){
-        const t = String($(this).data('ticker') || '');
-        this.checked = selected.has(t);
-      });
-    }).trigger('draw');
-
-    // Toggle selection (and update parent/top URL) when clicking checkbox
-    $('#align tbody').on('change', '.row-select', function(e){
-      e.stopPropagation();
-      const t = String($(this).data('ticker') || '');
-      if (this.checked) selected.add(t); else selected.delete(t);
-      qsWriteFromSet(selected);
-    });
-
-    // Child rows (ignore clicks on checkbox)
-    function childTableHTML(ticker) {
-      const rows = data.details[ticker] || [];
-      if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
-      const cells = rows.map(r => {
-        const v  = (r.Value==null||isNaN(r.Value)) ? '' : Number(r.Value).toFixed(2);
-        const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : Number(r.FT1).toFixed(2);
-        const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : Number(r.FT0).toFixed(2);
-        const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : Number(r.d_vs_FT1).toFixed(2);
-        const d0 = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? '' : Number(r.d_vs_FT0).toFixed(2);
-        const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
-        const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
-
-        const s1 = !!r.sig1, s0 = !!r.sig0;
-        const d1num = (r.d_vs_FT1==null || isNaN(r.d_vs_FT1)) ? NaN : Number(r.d_vs_FT1);
-        const d0num = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? NaN : Number(r.d_vs_FT0);
-
-        let rowClass = '';
-        if (s1 || s0) {
-          let delta = NaN;
-          if (s1 && s0) {
-            const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
-            const abs0 = isNaN(d0num) ? -Infinity : Math.abs(d0num);
-            delta = (abs1 >= abs0) ? d1num : d0num;
-          } else {
-            delta = !isNaN(d1num) && s1 ? d1num : d0num;
-          }
-          rowClass = (delta >= 0) ? 'sig_up' : 'sig_down';
+    # Simple bars for FT columns (blue/red)
+    bar_blue = JsCode("""
+        function(params){
+            const v = Math.max(0, Math.min(100, Number(params.value||0)));
+            return `
+              <div style="display:flex;justify-content:center;align-items:center;gap:6px;">
+                <div style="height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden;">
+                  <span style="position:absolute;left:0;top:0;bottom:0;width:${v}%;background:#3b82f6;"></span>
+                </div>
+                <div style="font-size:11px;min-width:24px;text-align:center;color:#374151;">${v.toFixed(0)}</div>
+              </div>`;
         }
+    """)
+    bar_red = JsCode("""
+        function(params){
+            const v = Math.max(0, Math.min(100, Number(params.value||0)));
+            return `
+              <div style="display:flex;justify-content:center;align-items:center;gap:6px;">
+                <div style="height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden;">
+                  <span style="position:absolute;left:0;top:0;bottom:0;width:${v}%;background:#ef4444;"></span>
+                </div>
+                <div style="font-size:11px;min-width:24px;text-align:center;color:#374151;">${v.toFixed(0)}</div>
+              </div>`;
+        }
+    """)
 
-        return `
-          <tr class="${rowClass}">
-            <td class="col-var">${r.Variable}</td>
-            <td class="col-val">${v}</td>
-            <td class="col-ft1">${f1}</td>
-            <td class="col-ft0">${f0}</td>
-            <td class="col-d1 ${c1}">${d1}</td>
-            <td class="col-d0 ${c0}">${d0}</td>
-          </tr>`;
-      }).join('');
-      return `
-        <table class="child-table">
-          <colgroup>
-            <col class="col-var"/><col class="col-val"/><col class="col-ft1"/><col class="col-ft0"/><col class="col-d1"/><col class="col-d0"/>
-          </colgroup>
-          <thead>
-            <tr>
-              <th class="col-var">Variable</th>
-              <th class="col-val">Value</th>
-              <th class="col-ft1">FT=1 median</th>
-              <th class="col-ft0">FT=0 median</th>
-              <th class="col-d1">Δ vs FT=1</th>
-              <th class="col-d0">Δ vs FT=0</th>
-            </tr>
-          </thead>
-          <tbody>${cells}</tbody>
-        </table>`;
-    }
+    # Detail renderer: a child grid with our variable deltas
+    get_detail_row_data = JsCode("""
+        function(params){
+            const detMap = params.api.getGridOption('context').detailMap || {};
+            const key = params.data.Ticker;
+            const rows = detMap[key] || [];
+            params.successCallback(rows);
+        }
+    """)
 
-    $('#align tbody').on('click', 'tr', function (e) {
-      if ($(e.target).closest('.row-select').length) return; // don't expand when clicking checkbox
-      const row = table.row(this);
-      if (row.child.isShown()) {
-        row.child.hide(); $(this).removeClass('shown');
-      } else {
-        const ticker = row.data().Ticker;
-        row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
-      }
-    });
-  </script>
-</body>
-</html>
-        """
-        html = html.replace("%%PAYLOAD%%", json.dumps(payload))
-        import streamlit.components.v1 as components
-        components.html(html, height=620, scrolling=True)
-    else:
-        st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
-elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
-    st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
+    # Per-row class for detail grid (uses row.data.rowClass)
+    get_detail_row_style = JsCode("""
+        function(params){
+            // background colors via CSS classes are not available here,
+            // so we set inline style based on rowClass.
+            const cls = params.data && params.data.rowClass ? params.data.rowClass : '';
+            if(cls === 'sig_up'){
+                return { background: 'rgba(253,230,138,0.85)' }; // yellow
+            } else if(cls === 'sig_down'){
+                return { background: 'rgba(254,202,202,0.85)' }; // red
+            }
+            return null;
+        }
+    """)
+
+    # Build parent grid options
+    gb = GridOptionsBuilder.from_dataframe(df_summary)
+    gb.configure_selection(selection_mode="multiple", use_checkbox=True)   # <-- row checkboxes
+    gb.configure_column("Ticker", header_name="Ticker", pinned=False, width=140)
+    gb.configure_column("FT1_val", header_name="FT=1", cellRenderer=bar_blue, width=200)
+    gb.configure_column("FT0_val", header_name="FT=0", cellRenderer=bar_red,  width=200)
+
+    # Master/Detail setup
+    detail_cols = [
+        {"field":"Variable", "headerName":"Variable", "width":180},
+        {"field":"Value", "headerName":"Value", "width":110, "valueFormatter":"(v)=>v==null?'':Number(v).toFixed(2)"},
+        {"field":"FT1", "headerName":"FT=1 median", "width":130, "valueFormatter":"(v)=>v==null?'':Number(v).toFixed(2)"},
+        {"field":"FT0", "headerName":"FT=0 median", "width":130, "valueFormatter":"(v)=>v==null?'':Number(v).toFixed(2)"},
+        {"field":"d_vs_FT1", "headerName":"Δ vs FT=1", "width":120,
+         "valueFormatter":"(v)=>v==null?'':Number(v).toFixed(2)",
+         "cellStyle": JsCode("""
+            function(p){ if(p.value==null) return null;
+                return Number(p.value)>=0? {'color':'#059669'} : {'color':'#dc2626'};
+            }
+         """)
+        },
+        {"field":"d_vs_FT0", "headerName":"Δ vs FT=0", "width":120,
+         "valueFormatter":"(v)=>v==null?'':Number(v).toFixed(2)",
+         "cellStyle": JsCode("""
+            function(p){ if(p.value==null) return null;
+                return Number(p.value)>=0? {'color':'#059669'} : {'color':'#dc2626'};
+            }
+         """)
+        },
+    ]
+
+    gb.configure_grid_options(
+        masterDetail=True,
+        detailCellRendererParams={
+            "detailGridOptions": {
+                "columnDefs": detail_cols,
+                "getRowStyle": get_detail_row_style,
+                "defaultColDef": {"sortable": True, "resizable": True}
+            },
+            "getDetailRowData": get_detail_row_data
+        },
+        # center the two FT columns a bit
+        suppressRowClickSelection=False,
+        animateRows=True,
+        context={"detailMap": detail_map}
+    )
+
+    grid_options = gb.build()
+
+    # Render grid
+    grid_resp = AgGrid(
+        df_summary,
+        gridOptions=grid_options,
+        update_mode=GridUpdateMode.SELECTION_CHANGED,
+        allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=False,
+        height=480,
+        theme="alpine",
+    )
+
+    # ----- Delete selected handling -----
+    if st.session_state.get("_pending_delete"):
+        st.session_state["_pending_delete"] = False
+        selected_rows = grid_resp.get("selected_rows", []) or []
+        sel_tickers = {str(r.get("Ticker","")).upper() for r in selected_rows if r.get("Ticker")}
+        if not sel_tickers:
+            st.info("No rows selected in the table.")
+        else:
+            before = len(st.session_state.rows)
+            st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker","")).upper() not in sel_tickers]
+            removed = before - len(st.session_state.rows)
+            if removed > 0:
+                st.success(f"Removed {removed} row(s): {', '.join(sorted(sel_tickers))}")
+            else:
+                st.info("No rows removed.")
+        do_rerun()
+
 else:
-    st.info("Add at least one stock above to compute alignment.")
+    if not st.session_state.rows:
+        st.info("Add at least one stock above to compute alignment.")
+    else:
+        st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
