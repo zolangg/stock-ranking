@@ -3,8 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
-
-from st_tabulator import st_tabulator  # <-- Tabulator with Python <-> JS bridge
+import json
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -85,8 +84,22 @@ def _to_float(s):
 if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "mad_tbl": DataFrame, "var_list": [...]}
-if "_pending_delete" not in st.session_state: st.session_state["_pending_delete"] = False
-if "_selected_tickers" not in st.session_state: st.session_state["_selected_tickers"] = []
+if "_last_deleted" not in st.session_state: st.session_state._last_deleted = ""
+
+# ============================== Handle delete via URL query (?del=...) ==============================
+# IMPORTANT: we handle this before rendering the table
+del_param = st.query_params.get("del", None)
+if del_param:
+    tickers_to_delete = [t.strip() for t in del_param.split(",") if t.strip()]
+    if tickers_to_delete and st.session_state._last_deleted != del_param:
+        before = len(st.session_state.rows)
+        st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker")) not in tickers_to_delete]
+        removed = before - len(st.session_state.rows)
+        st.session_state._last_deleted = del_param  # guard against double-processing
+        # Clear the query param and rerun in-place
+        st.query_params.clear()
+        st.toast(f"Deleted {removed} row(s): {', '.join(tickers_to_delete)}", icon="✅")
+        do_rerun()
 
 # ============================== Upload DB → Build Medians ==============================
 st.subheader("Upload Database")
@@ -134,13 +147,11 @@ if build_btn:
                 if "ShortInt_%" in df.columns:
                     s_si = pd.to_numeric(df["ShortInt_%"], errors="coerce")
                     df["ShortInt_%"] = np.where(s_si.notna() & (s_si.abs() <= 2), s_si * 100.0, s_si)
-
                 add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
                 # Scale fractional gaps (e.g., 0.90 -> 90.0), keep already-in-% as-is
                 if "Gap_%" in df.columns:
                     s = pd.to_numeric(df["Gap_%"], errors="coerce")
                     df["Gap_%"] = np.where(s.notna() & (s.abs() <= 2), s * 100.0, s)
-
                 add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
                 add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
@@ -274,6 +285,7 @@ with st.form("add_form", clear_on_submit=True):
     submitted = st.form_submit_button("Add to Table", use_container_width=True)
 
 if submitted and ticker:
+    # Derived metrics
     fr = (pm_vol / float_m) if float_m > 0 else 0.0
     pmmc = (pm_dol / mc_m * 100.0) if mc_m > 0 else 0.0
 
@@ -297,19 +309,7 @@ if submitted and ticker:
     st.success(f"Saved {ticker}.")
     do_rerun()
 
-# ============================== Toolbar (above Alignment) ==============================
-tcol1, tcol2 = st.columns([1.3, 1.3])
-with tcol1:
-    del_click = st.button("Delete selected", use_container_width=True, type="primary")
-with tcol2:
-    clear_disabled = len(st.session_state.rows) == 0
-    if st.button("Clear Added Stocks", use_container_width=True, disabled=clear_disabled):
-        st.session_state.rows = []
-        st.session_state._selected_tickers = []
-        st.success("Cleared all added stocks.")
-        do_rerun()
-
-# ============================== Alignment (Tabulator with selection) ==============================
+# ============================== Alignment (DataTables child-rows; ONLY added stocks) ==============================
 st.markdown("### Alignment")
 
 def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
@@ -334,11 +334,13 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
     return counts
 
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
+
+# pull threshold (fallback to 2.0 if not set)
 SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
-    # Build summary rows and detail map
+    # Build summary for ADDED stocks only (no model rows)
     summary_rows, detail_map = [], {}
     num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
@@ -355,9 +357,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         ft1_val = round((like1 / n_used * 100.0), 0) if n_used > 0 else 0.0
         ft0_val = round((like0 / n_used * 100.0), 0) if n_used > 0 else 0.0
 
-        summary_rows.append({"Ticker": tkr, "FT1_val": float(ft1_val), "FT0_val": float(ft0_val)})
+        summary_rows.append({"Ticker": tkr, "FT1_val": ft1_val, "FT0_val": ft0_val})
 
-        # detail rows with significance flags
+        # ---- child details WITH significance flags vs FT=1 / FT=0 ----
         drows = []
         for v in num_vars:
             va = pd.to_numeric(stock.get(v), errors="coerce")
@@ -369,6 +371,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
                 continue
 
+            # significance vs each group (use MAD; if MAD==0 and delta>0 -> infinite -> significant)
             def _sig(delta, mad):
                 if pd.isna(delta): return np.nan
                 if pd.isna(mad):   return np.nan
@@ -384,129 +387,255 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
             sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
 
-            # determine dominant direction for color
-            row_class = ""
-            if sig1 or sig0:
-                a1 = -np.inf if d1 is None or np.isnan(d1) else abs(d1)
-                a0 = -np.inf if d0 is None or np.isnan(d0) else abs(d0)
-                dom = d1 if a1 >= a0 else d0
-                if dom is not None and not np.isnan(dom):
-                    row_class = "up" if dom >= 0 else "down"
-
             drows.append({
                 "Variable": v,
                 "Value": None if pd.isna(va) else float(va),
                 "FT1":   None if pd.isna(v1) else float(v1),
                 "FT0":   None if pd.isna(v0) else float(v0),
-                "d_vs_FT1": None if d1 is None else float(d1),
-                "d_vs_FT0": None if d0 is None else float(d0),
-                "rowClass": row_class,
+                "d_vs_FT1": None if d1 is None else d1,
+                "d_vs_FT0": None if d0 is None else d0,
+                # flags for coloring
+                "sig1": sig1,   # far from FT=1
+                "sig0": sig0,   # far from FT=0
             })
 
         detail_map[tkr] = drows
 
-    # ---------- Parent Tabulator config ----------
-    df_summary = pd.DataFrame(summary_rows)
-    if df_summary.empty:
-        st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
-    else:
-        # HTML bar formatters
-        def html_bar(color):
-            # returns a JS function body as string for Tabulator
-            fill = "#3b82f6" if color == "blue" else "#ef4444"
-            return f"""
-            function(cell) {{
-              var v = Number(cell.getValue() || 0);
-              if (v < 0) v = 0; if (v > 100) v = 100;
-              return `
-                <div style="display:flex;justify-content:center;align-items:center;gap:6px;">
-                  <div style="height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden;">
-                    <span style="position:absolute;left:0;top:0;bottom:0;width:${{v}}%;background:{fill};"></span>
-                  </div>
-                  <div style="font-size:11px;min-width:24px;text-align:center;color:#374151;">${{v.toFixed(0)}}</div>
-                </div>`;
-            }}
-            """
+    if summary_rows:
+        import streamlit.components.v1 as components
+        payload = {"rows": summary_rows, "details": detail_map}
 
-        columns = [
-            {"title": "", "formatter": "rowSelection", "titleFormatter": "rowSelection", "hozAlign": "center",
-             "headerSort": False, "width": 44},
-            {"title": "Ticker", "field": "Ticker", "width": 160},
-            {"title": "FT=1", "field": "FT1_val", "hozAlign": "center", "headerSort": False,
-             "formatter": "html", "formatterParams": {"html": html_bar("blue")}},
-            {"title": "FT=0", "field": "FT0_val", "hozAlign": "center", "headerSort": False,
-             "formatter": "html", "formatterParams": {"html": html_bar("red")}},
-        ]
+        html = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 
-        options = {
-            "height": "420px",
-            "layout": "fitColumns",
-            "selectable": True,              # enable checkbox selection
-            "selectableRangeMode": "click",
-            "movableColumns": False,
-            "reactiveData": False,
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/select/1.7.0/css/select.dataTables.min.css"/>
+
+<style>
+  body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
+  table.dataTable tbody tr { cursor: pointer; }
+
+  /* Parent bars */
+  .bar-wrap { display:flex; justify-content:center; align-items:center; gap:6px; }
+  .bar { height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }
+  .bar > span { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }
+  .bar-label { font-size: 11px; white-space: nowrap; color:#374151; min-width: 24px; text-align:center; }
+  .blue > span { background:#3b82f6; }  /* FT=1 = blue */
+  .red  > span { background:#ef4444; }  /* FT=0 = red  */
+
+  /* Force center alignment for FT columns */
+  #align td:nth-child(3), #align th:nth-child(3),
+  #align td:nth-child(4), #align th:nth-child(4) { text-align: center; }
+
+  /* Child table: compact & fixed layout */
+  .child-table { width: 100%; border-collapse: collapse; margin: 6px 0 6px 28px; table-layout: fixed; }
+  .child-table th, .child-table td {
+    font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb;
+    text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .child-table th:first-child, .child-table td:first-child { text-align:left; }
+
+  /* Directional significance background */
+  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }  /* yellow */
+  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }  /* soft red */
+
+  /* Toolbar */
+  .toolbar { margin-bottom: 8px; display:flex; gap:8px; align-items:center; }
+  .btn { background:#ef4444; color:white; border:none; border-radius:6px; padding:6px 10px; cursor:pointer; }
+  .btn:disabled { opacity:0.5; cursor:not-allowed; background:#fca5a5; }
+</style>
+</head>
+<body>
+
+  <div class="toolbar">
+    <button id="delBtn" class="btn" disabled>Delete selected</button>
+    <span id="selCount" style="font-size:12px;color:#374151;"></span>
+  </div>
+
+  <table id="align" class="display nowrap stripe" style="width:100%">
+    <thead>
+      <tr>
+        <th></th>         <!-- checkbox -->
+        <th>Ticker</th>
+        <th>FT=1</th>
+        <th>FT=0</th>
+      </tr>
+    </thead>
+  </table>
+
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
+  <script src="https://cdn.datatables.net/select/1.7.0/js/dataTables.select.min.js"></script>
+
+  <script>
+    const data = %%PAYLOAD%%;
+
+    function barCellBlue(val) {
+      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
+      return `
+        <div class="bar-wrap">
+          <div class="bar blue"><span style="width:${v}%"></span></div>
+          <div class="bar-label">${v.toFixed(0)}</div>
+        </div>`;
+    }
+    function barCellRed(val) {
+      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
+      return `
+        <div class="bar-wrap">
+          <div class="bar red"><span style="width:${v}%"></span></div>
+          <div class="bar-label">${v.toFixed(0)}</div>
+        </div>`;
+    }
+
+    function childTableHTML(ticker) {
+      const rows = data.details[ticker] || [];
+      if (!rows.length) return '<div style="margin-left:28px;color:#6b7280;">No variable overlaps for this stock.</div>';
+
+      const cells = rows.map(r => {
+        const v  = (r.Value==null||isNaN(r.Value)) ? '' : Number(r.Value).toFixed(2);
+        const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : Number(r.FT1).toFixed(2);
+        const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : Number(r.FT0).toFixed(2);
+        const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : Number(r.d_vs_FT1).toFixed(2);
+        const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : Number(r.d_vs_FT0).toFixed(2);
+
+        const s1 = !!r.sig1, s0 = !!r.sig0;
+        const d1n = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? null : Number(r.d_vs_FT1);
+        const d0n = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? null : Number(r.d_vs_FT0);
+        let rowClass = '';
+        if (s1 || s0) {
+          let dom = null;
+          if (s1 && s0) {
+            const a1 = (d1n==null) ? -Infinity : Math.abs(d1n);
+            const a0 = (d0n==null) ? -Infinity : Math.abs(d0n);
+            dom = (a1 >= a0) ? d1n : d0n;
+          } else {
+            dom = s1 ? d1n : d0n;
+          }
+          if (dom!=null && !isNaN(dom)) rowClass = (dom >= 0) ? 'sig_up' : 'sig_down';
         }
 
-        tab_resp = st_tabulator(
-            df_summary,
-            options=options,
-            columns=columns,
-            theme="modern",
-            key="align_tabulator",
-        )
+        return `
+          <tr class="${rowClass}">
+            <td>${r.Variable}</td>
+            <td>${v}</td>
+            <td>${f1}</td>
+            <td>${f0}</td>
+            <td>${d1}</td>
+            <td>${d0}</td>
+          </tr>`;
+      }).join('');
 
-        # tab_resp contains "selectedRows" with the selected rows' data dicts
-        selected_rows = (tab_resp or {}).get("selectedRows") or []
-        sel_tickers = [str(r.get("Ticker")) for r in selected_rows if r.get("Ticker")]
+      return `
+        <table class="child-table">
+          <thead>
+            <tr>
+              <th>Variable</th>
+              <th>Value</th>
+              <th>FT=1 median</th>
+              <th>FT=0 median</th>
+              <th>Δ vs FT=1</th>
+              <th>Δ vs FT=0</th>
+            </tr>
+          </thead>
+          <tbody>${cells}</tbody>
+        </table>`;
+    }
 
-        # Persist selection (helps across reruns)
-        st.session_state._selected_tickers = sel_tickers
+    $(function() {
+      const table = $('#align').DataTable({
+        data: data.rows,
+        responsive: true,
+        paging: false, info: false, searching: false,
+        order: [[1,'asc']],
+        select: {
+          style: 'multi',
+          selector: 'td:first-child'   // checkbox column
+        },
+        columnDefs: [
+          { // selection checkbox
+            targets: 0,
+            className: 'select-checkbox',
+            orderable: false,
+            data: null,
+            defaultContent: ''
+          },
+          { // Ticker
+            targets: 1,
+            data: 'Ticker'
+          },
+          { // FT=1 bar
+            targets: 2,
+            data: 'FT1_val',
+            render: (d)=>barCellBlue(d),
+            orderable: false
+          },
+          { // FT=0 bar
+            targets: 3,
+            data: 'FT0_val',
+            render: (d)=>barCellRed(d),
+            orderable: false
+          },
+        ],
+        rowCallback: function(row, data) {
+          // turn whole non-checkbox row into child toggler
+          $(row).off('click.child').on('click.child', function(e){
+            const cellIndex = table.cell(this, 0).index();
+            const clickedFirstCol = (e.target.closest('td') && e.target.closest('td').cellIndex === 0);
+            if (clickedFirstCol) return; // don't toggle child when clicking checkbox
+            const r = table.row(row);
+            if (r.child.isShown()) {
+              r.child.hide();
+              $(row).removeClass('shown');
+            } else {
+              r.child(childTableHTML(data.Ticker)).show();
+              $(row).addClass('shown');
+            }
+          });
+        }
+      });
 
-        # ----- Delete selected -----
-        if del_click:
-            if not sel_tickers:
-                st.info("No rows selected in the table.")
-            else:
-                before = len(st.session_state.rows)
-                st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker")) not in sel_tickers]
-                removed = before - len(st.session_state.rows)
-                if removed > 0:
-                    st.success(f"Removed {removed} row(s): {', '.join(sorted(sel_tickers))}")
-                else:
-                    st.info("No rows removed.")
-                do_rerun()
+      function updateSelectionUI(){
+        const selectedCount = table.rows({ selected: true }).count();
+        $('#delBtn').prop('disabled', selectedCount === 0);
+        $('#selCount').text(selectedCount ? `${selectedCount} selected` : '');
+      }
+      table.on('select deselect', updateSelectionUI);
+      updateSelectionUI();
 
-        # ----- Details panel below for the first selected row -----
-        if sel_tickers:
-            sel_ticker = sel_tickers[0]
-            st.markdown(f"#### Details: {sel_ticker}")
-            drows = detail_map.get(sel_ticker, [])
-            if drows:
-                ddf = pd.DataFrame(drows)
-
-                # style according to rowClass
-                def _row_style(row):
-                    rc = row.get("rowClass", "")
-                    if rc == "up":   # yellow
-                        return ['background-color: rgba(253,230,138,0.85)'] * len(row)
-                    if rc == "down": # soft red
-                        return ['background-color: rgba(254,202,202,0.85)'] * len(row)
-                    return [''] * len(row)
-
-                show_cols = ["Variable","Value","FT1","FT0","d_vs_FT1","d_vs_FT0"]
-                for c in show_cols:
-                    if c not in ddf.columns: ddf[c] = np.nan
-
-                styled = (ddf[show_cols]
-                          .style
-                          .apply(_row_style, axis=1)
-                          .format("{:.2f}", na_rep=""))
-
-                st.dataframe(styled, use_container_width=True, hide_index=True)
-            else:
-                st.info("No variable overlaps for this stock.")
-else:
-    if not st.session_state.rows:
-        st.info("Add at least one stock above to compute alignment.")
+      // Delete selected → set query param ?del=... in SAME TAB
+      $('#delBtn').on('click', function(){
+        const rows = table.rows({ selected: true }).data().toArray();
+        const tickers = rows.map(r => r.Ticker).filter(Boolean);
+        if (!tickers.length) return;
+        const params = new URLSearchParams(window.location.search);
+        params.set('del', tickers.join(','));
+        // Same-tab navigation (keeps session): this triggers Streamlit rerun
+        window.location.search = params.toString();
+      });
+    });
+  </script>
+</body>
+</html>
+        """
+        # Safely inject payload
+        html = html.replace("%%PAYLOAD%%", json.dumps(payload))
+        components.html(html, height=680, scrolling=True)
     else:
-        st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
+        st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
+elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
+    st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
+else:
+    st.info("Add at least one stock above to compute alignment.")
+
+# ============================== Clear (keep simple) ==============================
+st.markdown("---")
+if st.button("Clear Added Stocks", use_container_width=True, disabled=(len(st.session_state.rows)==0)):
+    st.session_state.rows = []
+    st.success("Cleared all added stocks.")
+    do_rerun()
