@@ -417,10 +417,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   }}
   .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
 
-  /* significance row highlights */
-  .sig1  {{ background: rgba(59,130,246,0.10); }}  /* blue tint (far from FT=1) */
-  .sig0  {{ background: rgba(239,68,68,0.10); }}   /* red tint  (far from FT=0) */
-  .sigb  {{ background: linear-gradient(90deg, rgba(239,68,68,0.12), rgba(59,130,246,0.12)); }} /* both */
+  /* significance row highlights (directional) */
+  .sig1_up   {{ background: rgba(59,130,246,0.18); }}  /* far from FT=1, value ABOVE FT=1 median */
+  .sig1_down {{ background: rgba(59,130,246,0.08); }}  /* far from FT=1, value BELOW FT=1 median */
+  .sig0_up   {{ background: rgba(239,68,68,0.18); }}   /* far from FT=0, value ABOVE FT=0 median */
+  .sig0_down {{ background: rgba(239,68,68,0.08); }}   /* far from FT=0, value BELOW FT=0 median */
+  .sigb      {{ background: linear-gradient(90deg, rgba(239,68,68,0.12), rgba(59,130,246,0.12)); }} /* far from BOTH */
 
   /* Narrower Value column as requested */
   .col-var {{ width: 10%; }}
@@ -482,7 +484,22 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
         // significance flags from payload
         const s1 = !!r.sig1, s0 = !!r.sig0;
-        const rowClass = (s1 && s0) ? 'sigb' : s1 ? 'sig1' : s0 ? 'sig0' : '';
+
+        // numeric deltas for direction
+        const d1num = (r.d_vs_FT1==null || isNaN(r.d_vs_FT1)) ? NaN : Number(r.d_vs_FT1);
+        const d0num = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? NaN : Number(r.d_vs_FT0);
+
+        let rowClass = '';
+        if (s1 && !s0) {
+          // far from FT=1 only
+          rowClass = (d1num >= 0) ? 'sig1_up' : 'sig1_down';
+        } else if (s0 && !s1) {
+          // far from FT=0 only
+          rowClass = (d0num >= 0) ? 'sig0_up' : 'sig0_down';
+        } else if (s1 && s0) {
+          // far from both
+          rowClass = 'sigb';
+        }
 
         return `
           <tr class="${{rowClass}}">
