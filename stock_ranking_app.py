@@ -297,6 +297,38 @@ if submitted and ticker:
     st.success(f"Saved {ticker}.")
     do_rerun()
 
+# ============================== Toolbar: Delete / Clear (placed ABOVE Alignment) ==============================
+# Clean single-row toolbar with multiselect + Delete selected + Clear Added Stocks
+_current_tickers = [str(r.get("Ticker", "")).strip() for r in st.session_state.rows if str(r.get("Ticker", "")).strip()]
+
+tcol1, tcol2, tcol3 = st.columns([4, 1.2, 1.6])
+with tcol1:
+    to_delete = st.multiselect("Select tickers to delete", _current_tickers, key="tickers_to_delete")
+with tcol2:
+    delete_disabled = len(st.session_state.get('tickers_to_delete', [])) == 0
+    if st.button("Delete selected", use_container_width=True, type="primary", disabled=delete_disabled):
+        chosen = set([t.strip().upper() for t in st.session_state.get('tickers_to_delete', [])])
+        before = len(st.session_state.rows)
+        st.session_state.rows = [
+            r for r in st.session_state.rows
+            if str(r.get("Ticker", "")).strip().upper() not in chosen
+        ]
+        after = len(st.session_state.rows)
+        removed = before - after
+        if removed > 0:
+            st.success(f"Removed {removed} row(s): {', '.join(sorted(chosen))}")
+        else:
+            st.info("No rows removed.")
+        st.session_state.pop('tickers_to_delete', None)
+        do_rerun()
+with tcol3:
+    clear_disabled = len(st.session_state.rows) == 0
+    if st.button("Clear Added Stocks", use_container_width=True, disabled=clear_disabled):
+        st.session_state.rows = []
+        st.session_state.pop('tickers_to_delete', None)
+        st.success("Cleared all added stocks.")
+        do_rerun()
+
 # ============================== Alignment (DataTables child-rows; ONLY added stocks) ==============================
 st.markdown("### Alignment")
 
@@ -574,41 +606,3 @@ elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset
     st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
 else:
     st.info("Add at least one stock above to compute alignment.")
-
-# ============================== Manage rows (reliable Streamlit-side delete) ==============================
-st.markdown("### Manage Added Stocks")
-
-_current_tickers = [str(r.get("Ticker", "")).strip() for r in st.session_state.rows if str(r.get("Ticker", "")).strip()]
-
-col_a, col_b = st.columns([3, 1])
-with col_a:
-    to_delete = st.multiselect("Select tickers to delete", _current_tickers, key="tickers_to_delete")
-with col_b:
-    if st.button("Delete selected", use_container_width=True, type="primary", disabled=(len(st.session_state.get('tickers_to_delete', [])) == 0)):
-        chosen = set([t.strip().upper() for t in st.session_state.get('tickers_to_delete', [])])
-        before = len(st.session_state.rows)
-        st.session_state.rows = [
-            r for r in st.session_state.rows
-            if str(r.get("Ticker", "")).strip().upper() not in chosen
-        ]
-        after = len(st.session_state.rows)
-        removed = before - after
-        if removed > 0:
-            st.success(f"Removed {removed} row(s): {', '.join(sorted(chosen))}")
-        else:
-            st.info("No rows removed.")
-        # --- FIX: do not assign to widget key; safely remove it then rerun
-        st.session_state.pop('tickers_to_delete', None)
-        do_rerun()
-
-# ============================== Clear ==============================
-st.markdown("---")
-c1, c2 = st.columns(2)
-with c1:
-    if st.button("Clear Added Stocks", use_container_width=True):
-        st.session_state.rows = []
-        do_rerun()
-with c2:
-    if st.button("Clear Model Medians (FT=1/FT=0)", use_container_width=True):
-        st.session_state.models = {}
-        do_rerun()
