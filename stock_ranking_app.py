@@ -126,7 +126,11 @@ if build_btn:
 
                 add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
                 add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
-                add_num(df, "ShortInt_%",   ["shortint %","short interest %","short float %","si","short interest (float) %"])
+                add_num(df, "ShortInt_%",   ["shortint %","short interest %","short float %","si","short interest (float) %","SI"])
+                # Scale fractional short interest (e.g., 0.06 -> 6.0), keep already-in-% as-is
+                if "ShortInt_%" in df.columns:
+                    s_si = pd.to_numeric(df["ShortInt_%"], errors="coerce")
+                    df["ShortInt_%"] = np.where(s_si.notna() & (s_si.abs() <= 2), s_si * 100.0, s_si)
                 add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
                 # Scale fractional gaps (e.g., 0.90 -> 90.0), keep already-in-% as-is
                 if "Gap_%" in df.columns:
@@ -270,6 +274,9 @@ if submitted and ticker:
     # Derived metrics
     fr = (pm_vol / float_m) if float_m > 0 else 0.0
     pmmc = (pm_dol / mc_m * 100.0) if mc_m > 0 else 0.0
+    # Normalize % fields if user entered fractional values
+    if si_pct <= 2:    si_pct  *= 100.0
+    if gap_pct <= 2:   gap_pct *= 100.0  # safe-guard for Gap_% too, consistent with DB scaling
 
     row = {
         "Ticker": ticker,
