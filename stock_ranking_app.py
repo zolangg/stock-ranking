@@ -303,7 +303,7 @@ _current_tickers = [str(r.get("Ticker", "")).strip() for r in st.session_state.r
 
 tcol1, tcol2, tcol3 = st.columns([4, 1.2, 1.6])
 with tcol1:
-    to_delete = st.multiselect("Select tickers to delete", _current_tickers, key="tickers_to_delete")
+    to_delete = st.multiselect(_current_tickers, key="tickers_to_delete")
 with tcol2:
     delete_disabled = len(st.session_state.get('tickers_to_delete', [])) == 0
     if st.button("Delete selected", use_container_width=True, type="primary", disabled=delete_disabled):
