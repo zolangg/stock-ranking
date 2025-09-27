@@ -76,6 +76,7 @@ def _to_float(s):
             ss = ss.replace(",", ".")
         else:
             ss = ss.replace(",", "")
+        ss = ss.replace("%","")  # <-- small fix: strip percent signs
         return float(ss)
     except Exception:
         return np.nan
@@ -496,7 +497,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
         let rowClass = '';
         if (s1 || s0) {
-          // choose the delta with larger absolute value if both significant
+          # choose the delta with larger absolute value if both significant
           let delta = NaN;
           if (s1 && s0) {
             const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
