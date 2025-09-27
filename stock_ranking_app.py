@@ -297,35 +297,35 @@ if submitted and ticker:
     st.success(f"Saved {ticker}.")
     do_rerun()
 
-# ============================== Toolbar: Delete / Clear (placed ABOVE Alignment) ==============================
-# Clean single-row toolbar with multiselect + Delete selected + Clear Added Stocks
-_current_tickers = [str(r.get("Ticker", "")).strip() for r in st.session_state.rows if str(r.get("Ticker", "")).strip()]
-
-tcol1, tcol2, tcol3 = st.columns([4, 1.2, 1.6])
+# ============================== Toolbar: Delete / Clear (ABOVE Alignment) ==============================
+tcol1, tcol2 = st.columns([1.6, 1.6])
 with tcol1:
-    to_delete = st.multiselect("",_current_tickers, key="tickers_to_delete")
-with tcol2:
-    delete_disabled = len(st.session_state.get('tickers_to_delete', [])) == 0
+    # Read selected tickers directly from URL ?sel=
+    sel = st.query_params.get("sel", "")
+    chosen = [s.strip().upper() for s in sel.split(",") if s.strip()]
+    delete_disabled = len(chosen) == 0
     if st.button("Delete selected", use_container_width=True, type="primary", disabled=delete_disabled):
-        chosen = set([t.strip().upper() for t in st.session_state.get('tickers_to_delete', [])])
         before = len(st.session_state.rows)
+        chosen_set = set(chosen)
         st.session_state.rows = [
             r for r in st.session_state.rows
-            if str(r.get("Ticker", "")).strip().upper() not in chosen
+            if str(r.get("Ticker", "")).strip().upper() not in chosen_set
         ]
-        after = len(st.session_state.rows)
-        removed = before - after
+        removed = before - len(st.session_state.rows)
+        # clear ?sel= after delete
+        st.query_params.update({k: v for k, v in st.query_params.items() if k != "sel"})
         if removed > 0:
-            st.success(f"Removed {removed} row(s): {', '.join(sorted(chosen))}")
+            st.success(f"Removed {removed} row(s): {', '.join(sorted(chosen_set))}")
         else:
             st.info("No rows removed.")
-        st.session_state.pop('tickers_to_delete', None)
         do_rerun()
-with tcol3:
+
+with tcol2:
     clear_disabled = len(st.session_state.rows) == 0
     if st.button("Clear Added Stocks", use_container_width=True, disabled=clear_disabled):
         st.session_state.rows = []
-        st.session_state.pop('tickers_to_delete', None)
+        # clear ?sel= too
+        st.query_params.update({k: v for k, v in st.query_params.items() if k != "sel"})
         st.success("Cleared all added stocks.")
         do_rerun()
 
@@ -354,8 +354,6 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
     return counts
 
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
-
-# pull threshold (fallback to 2.0 if not set)
 SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
 
@@ -391,7 +389,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
                 continue
 
-            # significance vs each group (use MAD; if MAD==0 and delta>0 -> infinite -> significant)
             def _sig(delta, mad):
                 if pd.isna(delta): return np.nan
                 if pd.isna(mad):   return np.nan
@@ -414,9 +411,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 "FT0":   None if pd.isna(v0) else float(v0),
                 "d_vs_FT1": None if d1 is None else d1,
                 "d_vs_FT0": None if d0 is None else d0,
-                # flags for coloring
-                "sig1": sig1,   # far from FT=1
-                "sig0": sig0,   # far from FT=0
+                "sig1": sig1,
+                "sig0": sig0,
             })
 
         detail_map[tkr] = drows
@@ -437,7 +433,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
   table.dataTable tbody tr { cursor: pointer; }
 
-  /* Parent bars: centered look with fixed width and centered container */
   .bar-wrap { display:flex; justify-content:center; align-items:center; gap:6px; }
   .bar { height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }
   .bar > span { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }
@@ -445,11 +440,11 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .blue > span { background:#3b82f6; }  /* FT=1 = blue */
   .red  > span { background:#ef4444; }  /* FT=0 = red  */
 
-  /* Force center alignment for FT columns */
-  #align td:nth-child(2), #align th:nth-child(2),
-  #align td:nth-child(3), #align th:nth-child(3) { text-align: center; }
+  /* Align FT columns */
+  #align td:nth-child(3), #align th:nth-child(3),
+  #align td:nth-child(4), #align th:nth-child(4) { text-align: center; }
 
-  /* Child table: compact & fixed layout */
+  /* Child table */
   .child-table { width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }
   .child-table th, .child-table td {
     font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb;
@@ -457,11 +452,11 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   }
   .child-table th:first-child, .child-table td:first-child { text-align:left; }
 
-  /* significance row highlights (directional) */
-  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }
-  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }
+  /* Significance backgrounds */
+  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }  /* yellow-ish */
+  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }  /* red-ish */
 
-  /* Column widths */
+  /* Column widths for child table */
   .col-var { width: 18%; }
   .col-val { width: 12%; }
   .col-ft1 { width: 18%; }
@@ -477,6 +472,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   <table id="align" class="display nowrap stripe" style="width:100%">
     <thead>
       <tr>
+        <th></th>         <!-- checkbox column -->
         <th>Ticker</th>
         <th>FT=1</th>
         <th>FT=0</th>
@@ -507,6 +503,63 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         </div>`;
     }
 
+    // Build the DataTable (with checkbox column)
+    const table = $('#align').DataTable({
+      data: data.rows,
+      responsive: true,
+      paging: false, info: false, searching: false,
+      order: [[1,'asc']],
+      columns: [
+        {
+          data: null,
+          orderable: false,
+          className: 'dt-checkbox',
+          render: (d,t,row)=>`<input type="checkbox" class="row-select" data-ticker="${row.Ticker}"/>`
+        },
+        { data: 'Ticker' },
+        { data: 'FT1_val', render: (d)=>barCellBlue(d) },
+        { data: 'FT0_val', render: (d)=>barCellRed(d) },
+      ]
+    });
+
+    // --- Selection state synced to URL ?sel= without reload
+    const selected = new Set();
+
+    // Restore from ?sel=
+    (function restoreFromQuery(){
+      try {
+        const url = new URL(window.location.href);
+        const sel = url.searchParams.get('sel');
+        if (sel) sel.split(',').forEach(t => { if (t) selected.add(String(t)); });
+      } catch(e) {}
+    })();
+
+    // Keep checkboxes in sync on every draw
+    table.on('draw', () => {
+      $('#align tbody .row-select').each(function(){
+        const t = String($(this).data('ticker') || '');
+        this.checked = selected.has(t);
+      });
+    });
+
+    // Toggle selection (and update URL) when clicking checkbox
+    $('#align tbody').on('change', '.row-select', function(e){
+      e.stopPropagation();
+      const t = String($(this).data('ticker') || '');
+      if (this.checked) selected.add(t); else selected.delete(t);
+
+      try {
+        const url = new URL(window.location.href);
+        if (selected.size) {
+          url.searchParams.set('sel', Array.from(selected).join(','));
+        } else {
+          url.searchParams.delete('sel');
+        }
+        history.replaceState(null, '', url.toString());
+      } catch(e) {}
+    });
+
+    // Child rows
     function childTableHTML(ticker) {
       const rows = data.details[ticker] || [];
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
@@ -519,16 +572,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
 
-        // significance flags from payload
         const s1 = !!r.sig1, s0 = !!r.sig0;
-
-        // numeric deltas for direction
         const d1num = (r.d_vs_FT1==null || isNaN(r.d_vs_FT1)) ? NaN : Number(r.d_vs_FT1);
         const d0num = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? NaN : Number(r.d_vs_FT0);
 
         let rowClass = '';
         if (s1 || s0) {
-          // choose the delta with larger absolute value if both significant
           let delta = NaN;
           if (s1 && s0) {
             const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
@@ -569,29 +618,15 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         </table>`;
     }
 
-    $(function() {
-      const table = $('#align').DataTable({
-        data: data.rows,
-        responsive: true,
-        paging: false, info: false, searching: false,
-        order: [[0,'asc']],
-        columns: [
-          { data: 'Ticker' },
-          { data: 'FT1_val', render: (d)=>barCellBlue(d) },
-          { data: 'FT0_val', render: (d)=>barCellRed(d) },
-        ]
-      });
-
-      // whole-row toggle child
-      $('#align tbody').on('click', 'tr', function (e) {
-        const row = table.row(this);
-        if (row.child.isShown()) {
-          row.child.hide(); $(this).removeClass('shown');
-        } else {
-          const ticker = row.data().Ticker;
-          row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
-        }
-      });
+    $('#align tbody').on('click', 'tr', function (e) {
+      if ($(e.target).closest('.row-select').length) return; // don't expand when clicking checkbox
+      const row = table.row(this);
+      if (row.child.isShown()) {
+        row.child.hide(); $(this).removeClass('shown');
+      } else {
+        const ticker = row.data().Ticker;
+        row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
+      }
     });
   </script>
 </body>
