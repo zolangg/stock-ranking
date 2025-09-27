@@ -418,8 +418,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .child-table th:first-child, .child-table td:first-child { text-align:left; }
 
   /* significance row highlights (directional) */
-  tr.sig_up td   { background: #fde68a !important; }  /* significantly ABOVE, yellow */
-  tr.sig_down td { background: #fecaca !important; }  /* significantly BELOW, red   */
+  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }
+  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }
 
   /* Column widths */
   .col-var { width: 18%; }
