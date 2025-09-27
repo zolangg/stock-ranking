@@ -121,9 +121,8 @@ if build_btn:
                 add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
                 add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
-
+                
                 # --- Catalyst (binary: Yes/No/1/0/True/False) from DB, if present ---
-                # Try to detect a catalyst column
                 cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
                 def _to_binary_local(v):
                     sv = str(v).strip().lower()
@@ -136,8 +135,7 @@ if build_btn:
                         return np.nan
                 if cand_catalyst:
                     df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
-                # If not found in DB, we leave Catalyst as NaN in medians; alignment will ignore it unless present.
-
+                
                 # derived
                 if {"PM_Vol_M","Float_M"}.issubset(df.columns):
                     df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
