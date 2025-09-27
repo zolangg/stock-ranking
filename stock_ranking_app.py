@@ -85,36 +85,6 @@ if "rows" not in st.session_state: st.session_state.rows = []      # manual rows
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "mad_tbl": DataFrame, "var_list": [...]}
 
-# ---------- Handle delete via query param (st.query_params) ----------
-try:
-    # Read once and normalize
-    del_tkr = st.query_params.get("del_ticker", None)
-    if isinstance(del_tkr, list):
-        del_tkr = del_tkr[0] if del_tkr else None
-    del_tkr = (str(del_tkr).strip().upper()) if del_tkr else None
-
-    if del_tkr:
-        # Delete exactly one ticker (case-insensitive match)
-        before = len(st.session_state.rows)
-        st.session_state.rows = [
-            r for r in st.session_state.rows
-            if str(r.get("Ticker", "")).strip().upper() != del_tkr
-        ]
-        after = len(st.session_state.rows)
-        if before != after:
-            st.success(f"Deleted {del_tkr}")
-
-        # Clear params via reassignment (most reliable across versions)
-        kept = {k: v for k, v in dict(st.query_params).items()
-                if k not in ("del_ticker", "ts", "del_nonce")}
-        st.query_params = kept  # updates the URL immediately
-
-        # Stop this run so it won't apply deletion logic again
-        st.stop()
-except Exception as e:
-    st.error(f"Error handling delete: {e}")
-# --------------------------------------------------------------------
-
 # ============================== Upload DB → Build Medians ==============================
 st.subheader("Upload Database")
 
@@ -275,7 +245,7 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
             }
             st.dataframe(med_tbl, use_container_width=True, column_config=cfg, hide_index=False)
 
-# ============================== ➕ Manual Input (simplified: NO dilution, NO qualitative) ==============================
+# ============================== ➕ Manual Input ==============================
 st.markdown("---")
 st.subheader("Add Stock")
 
@@ -318,7 +288,7 @@ if submitted and ticker:
         "PM_$Vol_M$": pm_dol,
         "FR_x": fr,
         "PM$Vol/MC_%": pmmc,
-        # Catalyst (Yes/No -> 1/0 stored + label for UI if you ever need it)
+        # Catalyst
         "CatalystYN": catalyst_yn,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
@@ -469,12 +439,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
   .pos { color:#059669; } 
   .neg { color:#dc2626; }
-
-  /* Delete column styles */
-  .del-btn {
-    background: transparent; border: none; cursor: pointer; font-size: 16px; line-height: 1; text-decoration: none;
-  }
-  .del-col, th.del-col { text-align: center !important; width: 48px; }
 </style>
 </head>
 <body>
@@ -484,7 +448,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         <th>Ticker</th>
         <th>FT=1</th>
         <th>FT=0</th>
-        <th class="del-col">Delete</th>
       </tr>
     </thead>
   </table>
@@ -520,7 +483,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : Number(r.FT1).toFixed(2);
         const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : Number(r.FT0).toFixed(2);
         const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : Number(r.d_vs_FT1).toFixed(2);
-        const d0 = (r.d_vs_FT0==null ||isNaN(r.d_vs_FT0)) ? '' : Number(r.d_vs_FT0).toFixed(2);
+        const d0 = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? '' : Number(r.d_vs_FT0).toFixed(2);
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
 
@@ -584,25 +547,11 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
           { data: 'Ticker' },
           { data: 'FT1_val', render: (d)=>barCellBlue(d) },
           { data: 'FT0_val', render: (d)=>barCellRed(d) },
-          {
-            data: null,
-            className: 'del-col',
-            orderable: false,
-            render: (data, type, row) => {
-              const t = encodeURIComponent(String(row.Ticker || '').trim());
-              const ts = Date.now();
-              // Force same-tab, top window navigation; prevent default link behavior.
-              return `<a class="del-btn" title="Delete ${row.Ticker}"
-                        href="#"
-                        onclick="if(confirm('Delete ${row.Ticker}?')){ const u = new URL(window.top.location.href); u.searchParams.set('del_ticker','${t}'); u.searchParams.set('ts','${ts}'); window.top.location.assign(u.toString()); } return false;">🗑️</a>`;
-            }
-          },
         ]
       });
 
-      // whole-row toggle child (except when clicking delete)
+      // whole-row toggle child
       $('#align tbody').on('click', 'tr', function (e) {
-        if ($(e.target).closest('.del-btn').length) return; // don't toggle when deleting
         const row = table.row(this);
         if (row.child.isShown()) {
           row.child.hide(); $(this).removeClass('shown');
@@ -616,7 +565,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 </body>
 </html>
         """
-        # Safely inject payload without f-string conflicts
         html = html.replace("%%PAYLOAD%%", json.dumps(payload))
         import streamlit.components.v1 as components
         components.html(html, height=620, scrolling=True)
@@ -626,6 +574,31 @@ elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset
     st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
 else:
     st.info("Add at least one stock above to compute alignment.")
+
+# ============================== Manage rows (reliable Streamlit-side delete) ==============================
+st.markdown("### Manage Added Stocks")
+
+_current_tickers = [str(r.get("Ticker", "")).strip() for r in st.session_state.rows if str(r.get("Ticker", "")).strip()]
+
+col_a, col_b = st.columns([3, 1])
+with col_a:
+    to_delete = st.multiselect("Select tickers to delete", _current_tickers, key="tickers_to_delete")
+with col_b:
+    if st.button("Delete selected", use_container_width=True, type="primary", disabled=(len(st.session_state.get('tickers_to_delete', [])) == 0)):
+        chosen = set([t.strip().upper() for t in st.session_state.get('tickers_to_delete', [])])
+        before = len(st.session_state.rows)
+        st.session_state.rows = [
+            r for r in st.session_state.rows
+            if str(r.get("Ticker", "")).strip().upper() not in chosen
+        ]
+        after = len(st.session_state.rows)
+        removed = before - after
+        if removed > 0:
+            st.success(f"Removed {removed} row(s): {', '.join(sorted(chosen))}")
+        else:
+            st.info("No rows removed.")
+        st.session_state.tickers_to_delete = []
+        do_rerun()
 
 # ============================== Clear ==============================
 st.markdown("---")
