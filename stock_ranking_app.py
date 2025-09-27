@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+import json
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -51,7 +52,7 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
             if cols_lc[c] == lc:
                 return c
 
-    # 2) Normalized exact match (your current logic)
+    # 2) Normalized exact match
     nm = {c: _norm(c) for c in cols}
     for cand in candidates:
         n = _norm(cand)
@@ -59,7 +60,7 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
             if nm[c] == n:
                 return c
 
-    # 3) Normalized 'contains' fallback (your current logic)
+    # 3) Normalized 'contains' fallback
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
@@ -82,7 +83,7 @@ def _to_float(s):
 # ============================== Session State ==============================
 if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
-if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "var_list": [...]}
+if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "mad_tbl": DataFrame, "var_list": [...]}
 
 # ============================== Upload DB → Build Medians ==============================
 st.subheader("Upload Database")
@@ -131,7 +132,7 @@ if build_btn:
                 add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
                 add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
-                
+
                 # --- Catalyst (binary: Yes/No/1/0/True/False) from DB, if present ---
                 cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
                 def _to_binary_local(v):
@@ -145,14 +146,14 @@ if build_btn:
                         return np.nan
                 if cand_catalyst:
                     df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
-                
+
                 # derived
                 if {"PM_Vol_M","Float_M"}.issubset(df.columns):
                     df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
                 if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
                     df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-                # normalize to binary
+                # normalize to binary for FT groups
                 def _to_binary(v):
                     sv = str(v).strip().lower()
                     if sv in {"1","true","yes","y","t"}: return 1
@@ -170,25 +171,25 @@ if build_btn:
                 else:
                     df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-                # medians per group
-                var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-                            "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]  # include Catalyst if available
-                gmed = df.groupby("Group")[var_list].median(numeric_only=True).T  # rows=variables, cols=FT=0/FT=1
-                
-                # --- robust spread: MAD (median absolute deviation) per group ---
-                def _mad(series: pd.Series) -> float:
-                    s = pd.to_numeric(series, errors="coerce").dropna()
-                    if s.empty:
-                        return np.nan
-                    med = float(np.median(s))
-                    return float(np.median(np.abs(s - med)))
-                
-                gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T  # same shape as gmed
-                
-                # store both
-                st.session_state.models = {"models_tbl": gmed, "mad_tbl": gmads, "var_list": var_list}
-                st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
-                do_rerun()
+                    # medians per group
+                    var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+                                "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
+                    gmed = df.groupby("Group")[var_list].median(numeric_only=True).T  # rows=variables, cols=FT=0/FT=1
+
+                    # --- robust spread: MAD (median absolute deviation) per group ---
+                    def _mad(series: pd.Series) -> float:
+                        s = pd.to_numeric(series, errors="coerce").dropna()
+                        if s.empty:
+                            return np.nan
+                        med = float(np.median(s))
+                        return float(np.median(np.abs(s - med)))
+
+                    gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T  # same shape as gmed
+
+                    # store both
+                    st.session_state.models = {"models_tbl": gmed, "mad_tbl": gmads, "var_list": var_list}
+                    st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
+                    do_rerun()
 
         except Exception as e:
             st.error("Loading/processing failed.")
@@ -295,7 +296,6 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
     if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
         return {}
     groups = ["FT=1","FT=0"]
-    # numeric vars (Catalyst is not included here unless present in models medians)
     cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
                  "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
     common = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
@@ -382,10 +382,10 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         detail_map[tkr] = drows
 
     if summary_rows:
-        import json, streamlit.components.v1 as components
+        import streamlit.components.v1 as components
         payload = {"rows": summary_rows, "details": detail_map}
 
-        html = f"""
+        html = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -394,46 +394,43 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
 <style>
-  body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }}
-  table.dataTable tbody tr {{ cursor: pointer; }}
+  body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
+  table.dataTable tbody tr { cursor: pointer; }
 
   /* Parent bars: centered look with fixed width and centered container */
-  .bar-wrap {{ display:flex; justify-content:center; align-items:center; gap:6px; }}
-  .bar {{ height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }}
-  .bar > span {{ position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }}
-  .bar-label {{ font-size: 11px; white-space: nowrap; color:#374151; min-width: 24px; text-align:center; }}
-  .blue > span {{ background:#3b82f6; }}  /* FT=1 = blue */
-  .red  > span {{ background:#ef4444; }}  /* FT=0 = red  */
+  .bar-wrap { display:flex; justify-content:center; align-items:center; gap:6px; }
+  .bar { height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }
+  .bar > span { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }
+  .bar-label { font-size: 11px; white-space: nowrap; color:#374151; min-width: 24px; text-align:center; }
+  .blue > span { background:#3b82f6; }  /* FT=1 = blue */
+  .red  > span { background:#ef4444; }  /* FT=0 = red  */
 
   /* Force center alignment for FT columns */
   #align td:nth-child(2), #align th:nth-child(2),
-  #align td:nth-child(3), #align th:nth-child(3) {{ text-align: center; }}
+  #align td:nth-child(3), #align th:nth-child(3) { text-align: center; }
 
   /* Child table: compact & fixed layout */
-  .child-table {{ width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }}
-  .child-table th, .child-table td {{
+  .child-table { width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }
+  .child-table th, .child-table td {
     font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb;
     text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-  }}
-  .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
+  }
+  .child-table th:first-child, .child-table td:first-child { text-align:left; }
 
   /* significance row highlights (directional) */
-  .sig1_up   {{ background: rgba(59,130,246,0.18); }}  /* far from FT=1, value ABOVE FT=1 median */
-  .sig1_down {{ background: rgba(59,130,246,0.08); }}  /* far from FT=1, value BELOW FT=1 median */
-  .sig0_up   {{ background: rgba(239,68,68,0.18); }}   /* far from FT=0, value ABOVE FT=0 median */
-  .sig0_down {{ background: rgba(239,68,68,0.08); }}   /* far from FT=0, value BELOW FT=0 median */
-  .sigb      {{ background: linear-gradient(90deg, rgba(239,68,68,0.12), rgba(59,130,246,0.12)); }} /* far from BOTH */
+  .sig_up   { background: #fde68a; }   /* significantly ABOVE */
+  .sig_down { background: #fecaca; }   /* significantly BELOW */
 
-  /* Narrower Value column as requested */
-  .col-var {{ width: 10%; }}
-  .col-val {{ width: 10%; }}
-  .col-ft1 {{ width: 10%; }}
-  .col-ft0 {{ width: 10%; }}
-  .col-d1  {{ width: 10%; }}
-  .col-d0  {{ width: 10%; }}
+  /* Column widths */
+  .col-var { width: 18%; }
+  .col-val { width: 12%; }
+  .col-ft1 { width: 18%; }
+  .col-ft0 { width: 18%; }
+  .col-d1  { width: 17%; }
+  .col-d0  { width: 17%; }
 
-  .pos {{ color:#059669; }} 
-  .neg {{ color:#dc2626; }}
+  .pos { color:#059669; } 
+  .neg { color:#dc2626; }
 </style>
 </head>
 <body>
@@ -451,34 +448,34 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
   <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
   <script>
-    const data = {json.dumps(payload)};
+    const data = %%PAYLOAD%%;
 
-    function barCellBlue(val) {{
+    function barCellBlue(val) {
       const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
       return `
         <div class="bar-wrap">
-          <div class="bar blue"><span style="width:${{v}}%"></span></div>
-          <div class="bar-label">${{v.toFixed(0)}}</div>
+          <div class="bar blue"><span style="width:${v}%"></span></div>
+          <div class="bar-label">${v.toFixed(0)}</div>
         </div>`;
-    }}
-    function barCellRed(val) {{
+    }
+    function barCellRed(val) {
       const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
       return `
         <div class="bar-wrap">
-          <div class="bar red"><span style="width:${{v}}%"></span></div>
-          <div class="bar-label">${{v.toFixed(0)}}</div>
+          <div class="bar red"><span style="width:${v}%"></span></div>
+          <div class="bar-label">${v.toFixed(0)}</div>
         </div>`;
-    }}
+    }
 
-    function childTableHTML(ticker) {{
+    function childTableHTML(ticker) {
       const rows = data.details[ticker] || [];
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
-      const cells = rows.map(r => {{
-        const v  = (r.Value==null||isNaN(r.Value)) ? '' : r.Value.toFixed(2);
-        const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
-        const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
-        const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : r.d_vs_FT1.toFixed(2);
-        const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : r.d_vs_FT0.toFixed(2);
+      const cells = rows.map(r => {
+        const v  = (r.Value==null||isNaN(r.Value)) ? '' : Number(r.Value).toFixed(2);
+        const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : Number(r.FT1).toFixed(2);
+        const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : Number(r.FT0).toFixed(2);
+        const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : Number(r.d_vs_FT1).toFixed(2);
+        const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : Number(r.d_vs_FT0).toFixed(2);
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
 
@@ -490,27 +487,22 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const d0num = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? NaN : Number(r.d_vs_FT0);
 
         let rowClass = '';
-        if (s1 && !s0) {
-          // far from FT=1 only
-          rowClass = (d1num >= 0) ? 'sig1_up' : 'sig1_down';
-        } else if (s0 && !s1) {
-          // far from FT=0 only
-          rowClass = (d0num >= 0) ? 'sig0_up' : 'sig0_down';
-        } else if (s1 && s0) {
-          // far from both
-          rowClass = 'sigb';
+        if (s1 || s0) {
+          // if significant vs either FT=1 or FT=0, take whichever delta is available
+          const delta = !isNaN(d1num) ? d1num : d0num;
+          rowClass = (delta >= 0) ? 'sig_up' : 'sig_down';
         }
 
         return `
-          <tr class="${{rowClass}}">
-            <td class="col-var">${{r.Variable}}</td>
-            <td class="col-val">${{v}}</td>
-            <td class="col-ft1">${{f1}}</td>
-            <td class="col-ft0">${{f0}}</td>
-            <td class="col-d1 ${{c1}}">${{d1}}</td>
-            <td class="col-d0 ${{c0}}">${{d0}}</td>
+          <tr class="${rowClass}">
+            <td class="col-var">${r.Variable}</td>
+            <td class="col-val">${v}</td>
+            <td class="col-ft1">${f1}</td>
+            <td class="col-ft0">${f0}</td>
+            <td class="col-d1 ${c1}">${d1}</td>
+            <td class="col-d0 ${c0}">${d0}</td>
           </tr>`;
-      }}).join('');
+      }).join('');
       return `
         <table class="child-table">
           <colgroup>
@@ -526,38 +518,40 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
               <th class="col-d0">Δ vs FT=0</th>
             </tr>
           </thead>
-          <tbody>${{cells}}</tbody>
+          <tbody>${cells}</tbody>
         </table>`;
-    }}
+    }
 
-    $(function() {{
-      const table = $('#align').DataTable({{
+    $(function() {
+      const table = $('#align').DataTable({
         data: data.rows,
         responsive: true,
         paging: false, info: false, searching: false,
         order: [[0,'asc']],
         columns: [
-          {{ data: 'Ticker' }},
-          {{ data: 'FT1_val', render: (d)=>barCellBlue(d) }},
-          {{ data: 'FT0_val', render: (d)=>barCellRed(d) }},
+          { data: 'Ticker' },
+          { data: 'FT1_val', render: (d)=>barCellBlue(d) },
+          { data: 'FT0_val', render: (d)=>barCellRed(d) },
         ]
-      }});
+      });
 
       // whole-row toggle child
-      $('#align tbody').on('click', 'tr', function () {{
+      $('#align tbody').on('click', 'tr', function () {
         const row = table.row(this);
-        if (row.child.isShown()) {{
+        if (row.child.isShown()) {
           row.child.hide(); $(this).removeClass('shown');
-        }} else {{
+        } else {
           const ticker = row.data().Ticker;
           row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
-        }}
-      }});
-    }});
+        }
+      });
+    });
   </script>
 </body>
 </html>
         """
+        # Safely inject payload without f-string conflicts
+        html = html.replace("%%PAYLOAD%%", json.dumps(payload))
         components.html(html, height=620, scrolling=True)
     else:
         st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
