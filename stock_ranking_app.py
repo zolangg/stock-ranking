@@ -488,8 +488,15 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
         let rowClass = '';
         if (s1 || s0) {
-          // if significant vs either FT=1 or FT=0, take whichever delta is available
-          const delta = !isNaN(d1num) ? d1num : d0num;
+          // choose the delta with larger absolute value if both significant
+          let delta = NaN;
+          if (s1 && s0) {
+            const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
+            const abs0 = isNaN(d0num) ? -Infinity : Math.abs(d0num);
+            delta = (abs1 >= abs0) ? d1num : d0num;
+          } else {
+            delta = !isNaN(d1num) && s1 ? d1num : d0num;
+          }
           rowClass = (delta >= 0) ? 'sig_up' : 'sig_down';
         }
 
