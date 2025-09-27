@@ -207,7 +207,7 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
         mad_tbl: pd.DataFrame = models_data.get("mad_tbl", pd.DataFrame())
 
         # User control for what we call "significant"
-        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 3.0, 3.0, 0.1,
+        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
                                help="Highlight rows where |FT=1 − FT=0| / (MAD₁ + MAD₀) ≥ σ")
         st.session_state["sig_thresh"] = float(sig_thresh)
 
