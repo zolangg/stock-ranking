@@ -75,11 +75,10 @@ if "last" not in st.session_state: st.session_state.last = {}      # last manual
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "var_list": [...]}
 
 # ============================== Upload DB → Build Medians ==============================
-st.subheader("Upload Database → Build Model Stocks (FT=1 and FT=0 medians)")
+st.subheader("Upload Database")
 
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
-group_field = st.text_input("Group field (must have 0/1 values, e.g., 'FT')", value="FT", key="db_group")
-build_btn = st.button("Build model stocks (medians for FT=1 and FT=0)", use_container_width=True, key="db_build_btn")
+build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
 
 if build_btn:
     if not uploaded:
@@ -92,10 +91,19 @@ if build_btn:
             sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
             raw = pd.read_excel(xls, sheet)
 
-            # map columns
-            col_group = _pick(raw, [group_field])
+            # --- auto-detect group column ---
+            possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
+            col_group = possible[0] if possible else None
             if col_group is None:
-                st.error(f"Group field '{group_field}' not found in sheet '{sheet}'.")
+                # fallback: look for binary column
+                for c in raw.columns:
+                    vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
+                    if vals.isin(["0","1","true","false","yes","no"]).all():
+                        col_group = c
+                        break
+
+            if col_group is None:
+                st.error("Could not detect FT column (0/1). Please ensure your sheet has an FT or binary column.")
             else:
                 df = pd.DataFrame()
                 df["GroupRaw"] = raw[col_group]
@@ -120,7 +128,7 @@ if build_btn:
                 if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
                     df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-                # reduce to binary groups FT=1 vs FT=0 (or general 1 vs 0)
+                # normalize to binary
                 def _to_binary(v):
                     sv = str(v).strip().lower()
                     if sv in {"1","true","yes","y","t"}: return 1
@@ -140,10 +148,9 @@ if build_btn:
 
                     # medians per group
                     var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
-                    gmed = df.groupby("Group")[var_list].median(numeric_only=True).T  # variables as rows, columns FT=0/FT=1
-
+                    gmed = df.groupby("Group")[var_list].median(numeric_only=True).T
                     st.session_state.models = {"models_tbl": gmed, "var_list": var_list}
-                    st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
+                    st.success("Built model stocks (FT=1 and FT=0 medians).")
                     do_rerun()
 
         except Exception as e:
@@ -214,7 +221,7 @@ if submitted and ticker:
     do_rerun()
 
 # ============================== Alignment (DataTables child-rows; ONLY added stocks) ==============================
-st.markdown("### Alignment (added stocks; click row to expand details)")
+st.markdown("### Alignment")
 
 def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
     if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
