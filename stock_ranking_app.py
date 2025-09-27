@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import re
 import json
+import streamlit.components.v1 as components
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -224,7 +225,6 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
             sig_flag = sig >= sig_thresh  # per-variable boolean
 
             def _style_sig(col: pd.Series):
-                # color FT cells for rows deemed significant
                 return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
                         for idx in col.index]
 
@@ -244,7 +244,7 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
             }
             st.dataframe(med_tbl, use_container_width=True, column_config=cfg, hide_index=False)
 
-# ============================== ➕ Manual Input ==============================
+# ============================== ➕ Manual Input (simplified) ==============================
 st.markdown("---")
 st.subheader("Add Stock")
 
@@ -294,51 +294,20 @@ if submitted and ticker:
     st.success(f"Saved {ticker}.")
     do_rerun()
 
-# ============================== Toolbar: Delete / Clear (ABOVE Alignment) ==============================
-tcol1, tcol2 = st.columns([1.6, 1.6])
-with tcol1:
-    # Read selected tickers directly from parent/top URL ?sel=
-    sel_val = st.query_params.get("sel", "")
-    # Streamlit may return str or list; normalize:
-    if isinstance(sel_val, list):
-        sel_str = sel_val[0] if sel_val else ""
-    else:
-        sel_str = sel_val or ""
-    chosen = [s.strip().upper() for s in sel_str.split(",") if s.strip()]
-
-    # Always enable button; if none selected, show info
-    if st.button("Delete selected", use_container_width=True, type="primary"):
-        if not chosen:
-            st.info("No rows selected in the table.")
-        else:
+# ============================== Manage selections (native Streamlit delete) ==============================
+st.markdown("---")
+if st.session_state.rows:
+    current_tickers = [str(r.get("Ticker", "")) for r in st.session_state.rows if str(r.get("Ticker","")).strip() != ""]
+    c1, c2 = st.columns([3,1])
+    with c1:
+        sel_to_delete = st.multiselect("Select tickers to delete", options=current_tickers, default=[])
+    with c2:
+        if st.button("Delete selected", use_container_width=True, disabled=(len(sel_to_delete)==0)):
             before = len(st.session_state.rows)
-            chosen_set = set(chosen)
-            st.session_state.rows = [
-                r for r in st.session_state.rows
-                if str(r.get("Ticker", "")).strip().upper() not in chosen_set
-            ]
+            st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker")) not in set(sel_to_delete)]
             removed = before - len(st.session_state.rows)
-            # clear ?sel= after delete
-            try:
-                del st.query_params["sel"]
-            except Exception:
-                pass
-            if removed > 0:
-                st.success(f"Removed {removed} row(s): {', '.join(sorted(chosen_set))}")
-            else:
-                st.info("No rows removed.")
+            st.success(f"Deleted {removed} row(s): {', '.join(sel_to_delete)}")
             do_rerun()
-
-with tcol2:
-    clear_disabled = len(st.session_state.rows) == 0
-    if st.button("Clear Added Stocks", use_container_width=True, disabled=clear_disabled):
-        st.session_state.rows = []
-        try:
-            del st.query_params["sel"]
-        except Exception:
-            pass
-        st.success("Cleared all added stocks.")
-        do_rerun()
 
 # ============================== Alignment (DataTables child-rows; ONLY added stocks) ==============================
 st.markdown("### Alignment")
@@ -365,6 +334,8 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
     return counts
 
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
+
+# pull threshold (fallback to 2.0 if not set)
 SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
 
@@ -400,6 +371,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
                 continue
 
+            # significance vs each group (use MAD; if MAD==0 and delta>0 -> infinite -> significant)
             def _sig(delta, mad):
                 if pd.isna(delta): return np.nan
                 if pd.isna(mad):   return np.nan
@@ -422,14 +394,14 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 "FT0":   None if pd.isna(v0) else float(v0),
                 "d_vs_FT1": None if d1 is None else d1,
                 "d_vs_FT0": None if d0 is None else d0,
-                "sig1": sig1,
-                "sig0": sig0,
+                # flags for coloring
+                "sig1": sig1,   # far from FT=1
+                "sig0": sig0,   # far from FT=0
             })
 
         detail_map[tkr] = drows
 
     if summary_rows:
-        import streamlit.components.v1 as components
         payload = {"rows": summary_rows, "details": detail_map}
 
         html = """
@@ -438,12 +410,16 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
+
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/select/1.7.0/css/select.dataTables.min.css"/>
+
 <style>
   body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
   table.dataTable tbody tr { cursor: pointer; }
 
+  /* Parent bars */
   .bar-wrap { display:flex; justify-content:center; align-items:center; gap:6px; }
   .bar { height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }
   .bar > span { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }
@@ -451,39 +427,29 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .blue > span { background:#3b82f6; }  /* FT=1 = blue */
   .red  > span { background:#ef4444; }  /* FT=0 = red  */
 
-  /* Align FT columns */
+  /* Force center alignment for FT columns */
   #align td:nth-child(3), #align th:nth-child(3),
   #align td:nth-child(4), #align th:nth-child(4) { text-align: center; }
 
-  /* Child table */
-  .child-table { width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }
+  /* Child table: compact & fixed layout */
+  .child-table { width: 100%; border-collapse: collapse; margin: 6px 0 6px 28px; table-layout: fixed; }
   .child-table th, .child-table td {
     font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb;
     text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   }
   .child-table th:first-child, .child-table td:first-child { text-align:left; }
 
-  /* Significance backgrounds */
-  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }  /* yellow-ish */
-  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }  /* red-ish */
-
-  /* Column widths for child table */
-  .col-var { width: 18%; }
-  .col-val { width: 12%; }
-  .col-ft1 { width: 18%; }
-  .col-ft0 { width: 18%; }
-  .col-d1  { width: 17%; }
-  .col-d0  { width: 17%; }
-
-  .pos { color:#059669; } 
-  .neg { color:#dc2626; }
+  /* Directional significance background */
+  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }  /* yellow */
+  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }  /* soft red */
 </style>
 </head>
 <body>
+
   <table id="align" class="display nowrap stripe" style="width:100%">
     <thead>
       <tr>
-        <th></th>         <!-- checkbox column -->
+        <th></th>         <!-- checkbox -->
         <th>Ticker</th>
         <th>FT=1</th>
         <th>FT=0</th>
@@ -494,6 +460,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
   <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
+  <script src="https://cdn.datatables.net/select/1.7.0/js/dataTables.select.min.js"></script>
+
   <script>
     const data = %%PAYLOAD%%;
 
@@ -514,148 +482,131 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         </div>`;
     }
 
-    // === Helpers to target top/parent URL (so Streamlit can read ?sel=) ===
-    function getTargetWindow() {
-      try { if (window.parent && window.parent.location && window.parent !== window) return window.parent; } catch(e) {}
-      try { if (window.top && window.top.location) return window.top; } catch(e) {}
-      return window; // fallback
-    }
-    function qsWriteFromSet(selSet) {
-      try {
-        const tgt = getTargetWindow();
-        const url = new URL(tgt.location.href);
-        if (selSet.size) url.searchParams.set('sel', Array.from(selSet).join(','));
-        else url.searchParams.delete('sel');
-        tgt.history.replaceState(null, '', url.toString());
-      } catch(e) {}
-    }
-    function qsReadToSet(selSet) {
-      try {
-        const tgt = getTargetWindow();
-        const url = new URL(tgt.location.href);
-        const sel = url.searchParams.get('sel');
-        if (sel) sel.split(',').forEach(t => { if (t) selSet.add(String(t)); });
-      } catch(e) {}
-    }
-
-    // Build the DataTable (with checkbox column)
-    const table = $('#align').DataTable({
-      data: data.rows,
-      responsive: true,
-      paging: false, info: false, searching: false,
-      order: [[1,'asc']],
-      columns: [
-        {
-          data: null,
-          orderable: false,
-          className: 'dt-checkbox',
-          render: (d,t,row)=>`<input type="checkbox" class="row-select" data-ticker="${row.Ticker}"/>`
-        },
-        { data: 'Ticker' },
-        { data: 'FT1_val', render: (d)=>barCellBlue(d) },
-        { data: 'FT0_val', render: (d)=>barCellRed(d) },
-      ]
-    });
-
-    // Selection state synced to TOP/PARENT URL ?sel=
-    const selected = new Set();
-    qsReadToSet(selected);
-
-    // Keep checkboxes in sync on every draw
-    table.on('draw', () => {
-      $('#align tbody .row-select').each(function(){
-        const t = String($(this).data('ticker') || '');
-        this.checked = selected.has(t);
-      });
-    }).trigger('draw');
-
-    // Toggle selection (and update parent/top URL) when clicking checkbox
-    $('#align tbody').on('change', '.row-select', function(e){
-      e.stopPropagation();
-      const t = String($(this).data('ticker') || '');
-      if (this.checked) selected.add(t); else selected.delete(t);
-      qsWriteFromSet(selected);
-    });
-
-    // Child rows (ignore clicks on checkbox)
     function childTableHTML(ticker) {
       const rows = data.details[ticker] || [];
-      if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
+      if (!rows.length) return '<div style="margin-left:28px;color:#6b7280;">No variable overlaps for this stock.</div>';
+
       const cells = rows.map(r => {
         const v  = (r.Value==null||isNaN(r.Value)) ? '' : Number(r.Value).toFixed(2);
         const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : Number(r.FT1).toFixed(2);
         const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : Number(r.FT0).toFixed(2);
         const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : Number(r.d_vs_FT1).toFixed(2);
-        const d0 = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? '' : Number(r.d_vs_FT0).toFixed(2);
-        const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
-        const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
+        const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : Number(r.d_vs_FT0).toFixed(2);
 
         const s1 = !!r.sig1, s0 = !!r.sig0;
-        const d1num = (r.d_vs_FT1==null || isNaN(r.d_vs_FT1)) ? NaN : Number(r.d_vs_FT1);
-        const d0num = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? NaN : Number(r.d_vs_FT0);
-
+        const d1n = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? null : Number(r.d_vs_FT1);
+        const d0n = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? null : Number(r.d_vs_FT0);
         let rowClass = '';
         if (s1 || s0) {
-          let delta = NaN;
+          let dom = null;
           if (s1 && s0) {
-            const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
-            const abs0 = isNaN(d0num) ? -Infinity : Math.abs(d0num);
-            delta = (abs1 >= abs0) ? d1num : d0num;
+            const a1 = (d1n==null) ? -Infinity : Math.abs(d1n);
+            const a0 = (d0n==null) ? -Infinity : Math.abs(d0n);
+            dom = (a1 >= a0) ? d1n : d0n;
           } else {
-            delta = !isNaN(d1num) && s1 ? d1num : d0num;
+            dom = s1 ? d1n : d0n;
           }
-          rowClass = (delta >= 0) ? 'sig_up' : 'sig_down';
+          if (dom!=null && !isNaN(dom)) rowClass = (dom >= 0) ? 'sig_up' : 'sig_down';
         }
 
         return `
           <tr class="${rowClass}">
-            <td class="col-var">${r.Variable}</td>
-            <td class="col-val">${v}</td>
-            <td class="col-ft1">${f1}</td>
-            <td class="col-ft0">${f0}</td>
-            <td class="col-d1 ${c1}">${d1}</td>
-            <td class="col-d0 ${c0}">${d0}</td>
+            <td>${r.Variable}</td>
+            <td>${v}</td>
+            <td>${f1}</td>
+            <td>${f0}</td>
+            <td>${d1}</td>
+            <td>${d0}</td>
           </tr>`;
       }).join('');
+
       return `
         <table class="child-table">
-          <colgroup>
-            <col class="col-var"/><col class="col-val"/><col class="col-ft1"/><col class="col-ft0"/><col class="col-d1"/><col class="col-d0"/>
-          </colgroup>
           <thead>
             <tr>
-              <th class="col-var">Variable</th>
-              <th class="col-val">Value</th>
-              <th class="col-ft1">FT=1 median</th>
-              <th class="col-ft0">FT=0 median</th>
-              <th class="col-d1">Δ vs FT=1</th>
-              <th class="col-d0">Δ vs FT=0</th>
+              <th>Variable</th>
+              <th>Value</th>
+              <th>FT=1 median</th>
+              <th>FT=0 median</th>
+              <th>Δ vs FT=1</th>
+              <th>Δ vs FT=0</th>
             </tr>
           </thead>
           <tbody>${cells}</tbody>
         </table>`;
     }
 
-    $('#align tbody').on('click', 'tr', function (e) {
-      if ($(e.target).closest('.row-select').length) return; // don't expand when clicking checkbox
-      const row = table.row(this);
-      if (row.child.isShown()) {
-        row.child.hide(); $(this).removeClass('shown');
-      } else {
-        const ticker = row.data().Ticker;
-        row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
-      }
+    $(function() {
+      const table = $('#align').DataTable({
+        data: data.rows,
+        responsive: true,
+        paging: false, info: false, searching: false,
+        order: [[1,'asc']],
+        select: {
+          style: 'multi',
+          selector: 'td:first-child'   // checkbox column
+        },
+        columnDefs: [
+          { // selection checkbox
+            targets: 0,
+            className: 'select-checkbox',
+            orderable: false,
+            data: null,
+            defaultContent: ''
+          },
+          { // Ticker
+            targets: 1,
+            data: 'Ticker'
+          },
+          { // FT=1 bar
+            targets: 2,
+            data: 'FT1_val',
+            render: (d)=>barCellBlue(d),
+            orderable: false
+          },
+          { // FT=0 bar
+            targets: 3,
+            data: 'FT0_val',
+            render: (d)=>barCellRed(d),
+            orderable: false
+          },
+        ],
+        rowCallback: function(row, data) {
+          // turn whole non-checkbox row into child toggler
+          $(row).off('click.child').on('click.child', function(e){
+            const clickedFirstCol = (e.target.closest('td') && e.target.closest('td').cellIndex === 0);
+            if (clickedFirstCol) return; // don't toggle child when clicking checkbox
+            const r = table.row(row);
+            if (r.child.isShown()) {
+              r.child.hide();
+              $(row).removeClass('shown');
+            } else {
+              r.child(childTableHTML(data.Ticker)).show();
+              $(row).addClass('shown');
+            }
+          });
+        }
+      });
+
+      // We intentionally DO NOT implement deletion inside the iframe due to browser sandbox limits.
+      // Use the native Streamlit multiselect + button above for reliable deletion.
     });
   </script>
 </body>
 </html>
         """
         html = html.replace("%%PAYLOAD%%", json.dumps(payload))
-        import streamlit.components.v1 as components
-        components.html(html, height=620, scrolling=True)
+        components.html(html, height=700, scrolling=True)
     else:
         st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
 elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
     st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
 else:
     st.info("Add at least one stock above to compute alignment.")
+
+# ============================== Clear (simple) ==============================
+st.markdown("---")
+if st.button("Clear Added Stocks", use_container_width=True, disabled=(len(st.session_state.rows)==0)):
+    st.session_state.rows = []
+    st.success("Cleared all added stocks.")
+    do_rerun()
