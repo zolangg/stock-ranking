@@ -591,10 +591,10 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             render: (data, type, row) => {
               const t = encodeURIComponent(String(row.Ticker || '').trim());
               const ts = Date.now();
+              // Force same-tab, top window navigation; prevent default link behavior.
               return `<a class="del-btn" title="Delete ${row.Ticker}"
-                        href="?del_ticker=${t}&ts=${ts}"
-                        target="_top"
-                        onclick="return confirm('Delete ${row.Ticker}?')">🗑️</a>`;
+                        href="#"
+                        onclick="if(confirm('Delete ${row.Ticker}?')){ const u = new URL(window.top.location.href); u.searchParams.set('del_ticker','${t}'); u.searchParams.set('ts','${ts}'); window.top.location.assign(u.toString()); } return false;">🗑️</a>`;
             }
           },
         ]
@@ -618,6 +618,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         """
         # Safely inject payload without f-string conflicts
         html = html.replace("%%PAYLOAD%%", json.dumps(payload))
+        import streamlit.components.v1 as components
         components.html(html, height=620, scrolling=True)
     else:
         st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
