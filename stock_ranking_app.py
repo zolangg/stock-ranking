@@ -485,13 +485,13 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const rowClass = (s1 && s0) ? 'sigb' : s1 ? 'sig1' : s0 ? 'sig0' : '';
 
         return `
-          <tr class="${rowClass}">
-            <td class="col-var">${r.Variable}</td>
-            <td class="col-val">${v}</td>
-            <td class="col-ft1">${f1}</td>
-            <td class="col-ft0">${f0}</td>
-            <td class="col-d1 ${c1}">${d1}</td>
-            <td class="col-d0 ${c0}">${d0}</td>
+          <tr class="${{rowClass}}">
+            <td class="col-var">${{r.Variable}}</td>
+            <td class="col-val">${{v}}</td>
+            <td class="col-ft1">${{f1}}</td>
+            <td class="col-ft0">${{f0}}</td>
+            <td class="col-d1 ${{c1}}">${{d1}}</td>
+            <td class="col-d0 ${{c0}}">${{d0}}</td>
           </tr>`;
       }).join('');
       return `
