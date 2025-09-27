@@ -339,9 +339,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
 
   /* Narrower Value column as requested */
-  .col-var {{ width: 15%; }}
-  .col-val {{ width: 15%; }}
-  .col-ft1 {{ width: 15%; }}
+  .col-var {{ width: 10%; }}
+  .col-val {{ width: 10%; }}
+  .col-ft1 {{ width: 10%; }}
   .col-ft0 {{ width: 10%; }}
   .col-d1  {{ width: 10%; }}
   .col-d0  {{ width: 10%; }}
