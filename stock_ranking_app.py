@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import re
 
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+from st_tabulator import st_tabulator  # <-- Tabulator with Python <-> JS bridge
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -86,6 +86,7 @@ if "rows" not in st.session_state: st.session_state.rows = []      # manual rows
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "mad_tbl": DataFrame, "var_list": [...]}
 if "_pending_delete" not in st.session_state: st.session_state["_pending_delete"] = False
+if "_selected_tickers" not in st.session_state: st.session_state["_selected_tickers"] = []
 
 # ============================== Upload DB → Build Medians ==============================
 st.subheader("Upload Database")
@@ -129,11 +130,13 @@ if build_btn:
                 add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
                 add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
                 add_num(df, "ShortInt_%",   ["shortint %","short interest %","short float %","si","short interest (float) %","SI"])
+                # Scale fractional short interest (e.g., 0.06 -> 6.0), keep already-in-% as-is
                 if "ShortInt_%" in df.columns:
                     s_si = pd.to_numeric(df["ShortInt_%"], errors="coerce")
                     df["ShortInt_%"] = np.where(s_si.notna() & (s_si.abs() <= 2), s_si * 100.0, s_si)
 
                 add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
+                # Scale fractional gaps (e.g., 0.90 -> 90.0), keep already-in-% as-is
                 if "Gap_%" in df.columns:
                     s = pd.to_numeric(df["Gap_%"], errors="coerce")
                     df["Gap_%"] = np.where(s.notna() & (s.abs() <= 2), s * 100.0, s)
@@ -238,14 +241,14 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
             st.dataframe(styled, use_container_width=True)
             st.caption("Highlighted where |median(FT=1)−median(FT=0)| ≥ σ × (MAD₁ + MAD₀).")
         else:
-            st.info("Not enough info to compute significance (MADs missing). Rebuild models with the current DB).")
+            st.info("Not enough info to compute significance (MADs missing). Rebuild models with the current DB.")
             cfg = {
                 "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
                 "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
             }
             st.dataframe(med_tbl, use_container_width=True, column_config=cfg, hide_index=False)
 
-# ============================== ➕ Manual Input ==============================
+# ============================== ➕ Manual Input (simplified) ==============================
 st.markdown("---")
 st.subheader("Add Stock")
 
@@ -257,7 +260,7 @@ with st.form("add_form", clear_on_submit=True):
         mc_m    = st.number_input("Market Cap (M$)", 0.0, step=0.01, format="%.2f")
         float_m = st.number_input("Public Float (M)", 0.0, step=0.01, format="%.2f")
         si_pct  = st.number_input("Short Interest (%)", 0.0, step=0.01, format="%.2f")
-        gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")
+        gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")  # real percent e.g. 100 = +100%
 
     with c2:
         atr_usd = st.number_input("ATR ($)", 0.0, step=0.01, format="%.2f")
@@ -271,7 +274,6 @@ with st.form("add_form", clear_on_submit=True):
     submitted = st.form_submit_button("Add to Table", use_container_width=True)
 
 if submitted and ticker:
-    # Derived metrics
     fr = (pm_vol / float_m) if float_m > 0 else 0.0
     pmmc = (pm_dol / mc_m * 100.0) if mc_m > 0 else 0.0
 
@@ -295,21 +297,19 @@ if submitted and ticker:
     st.success(f"Saved {ticker}.")
     do_rerun()
 
-# ============================== Toolbar: Delete / Clear (ABOVE Alignment) ==============================
-tcol1, tcol2 = st.columns([1.6, 1.6])
+# ============================== Toolbar (above Alignment) ==============================
+tcol1, tcol2 = st.columns([1.3, 1.3])
 with tcol1:
-    if st.button("Delete selected", use_container_width=True, type="primary"):
-        st.session_state["_pending_delete"] = True
-
+    del_click = st.button("Delete selected", use_container_width=True, type="primary")
 with tcol2:
     clear_disabled = len(st.session_state.rows) == 0
     if st.button("Clear Added Stocks", use_container_width=True, disabled=clear_disabled):
         st.session_state.rows = []
-        st.session_state.pop("_pending_delete", None)
+        st.session_state._selected_tickers = []
         st.success("Cleared all added stocks.")
         do_rerun()
 
-# ============================== Alignment (AG Grid; selection + details panel) ==============================
+# ============================== Alignment (Tabulator with selection) ==============================
 st.markdown("### Alignment")
 
 def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
@@ -338,7 +338,7 @@ SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
-    # Build summary + detail rows
+    # Build summary rows and detail map
     summary_rows, detail_map = [], {}
     num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
@@ -357,7 +357,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
         summary_rows.append({"Ticker": tkr, "FT1_val": float(ft1_val), "FT0_val": float(ft0_val)})
 
-        # ---- child details WITH significance flags vs FT=1 / FT=0 ----
+        # detail rows with significance flags
         drows = []
         for v in num_vars:
             va = pd.to_numeric(stock.get(v), errors="coerce")
@@ -384,14 +384,14 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
             sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
 
-            # direction class (yellow=up, red=down) based on bigger |Δ|
+            # determine dominant direction for color
             row_class = ""
             if sig1 or sig0:
                 a1 = -np.inf if d1 is None or np.isnan(d1) else abs(d1)
                 a0 = -np.inf if d0 is None or np.isnan(d0) else abs(d0)
                 dom = d1 if a1 >= a0 else d0
                 if dom is not None and not np.isnan(dom):
-                    row_class = "sig_up" if dom >= 0 else "sig_down"
+                    row_class = "up" if dom >= 0 else "down"
 
             drows.append({
                 "Variable": v,
@@ -400,108 +400,111 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 "FT0":   None if pd.isna(v0) else float(v0),
                 "d_vs_FT1": None if d1 is None else float(d1),
                 "d_vs_FT0": None if d0 is None else float(d0),
-                "sig1": bool(sig1),
-                "sig0": bool(sig0),
                 "rowClass": row_class,
             })
 
         detail_map[tkr] = drows
 
-    # ---------- AG Grid: Parent (summary) ----------
+    # ---------- Parent Tabulator config ----------
     df_summary = pd.DataFrame(summary_rows)
+    if df_summary.empty:
+        st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
+    else:
+        # HTML bar formatters
+        def html_bar(color):
+            # returns a JS function body as string for Tabulator
+            fill = "#3b82f6" if color == "blue" else "#ef4444"
+            return f"""
+            function(cell) {{
+              var v = Number(cell.getValue() || 0);
+              if (v < 0) v = 0; if (v > 100) v = 100;
+              return `
+                <div style="display:flex;justify-content:center;align-items:center;gap:6px;">
+                  <div style="height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden;">
+                    <span style="position:absolute;left:0;top:0;bottom:0;width:${{v}}%;background:{fill};"></span>
+                  </div>
+                  <div style="font-size:11px;min-width:24px;text-align:center;color:#374151;">${{v.toFixed(0)}}</div>
+                </div>`;
+            }}
+            """
 
-    # Bars for FT columns (blue/red)
-    bar_blue = JsCode("""
-        function(params){
-            const v = Math.max(0, Math.min(100, Number(params.value||0)));
-            return `
-              <div style="display:flex;justify-content:center;align-items:center;gap:6px;">
-                <div style="height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden;">
-                  <span style="position:absolute;left:0;top:0;bottom:0;width:${v}%;background:#3b82f6;"></span>
-                </div>
-                <div style="font-size:11px;min-width:24px;text-align:center;color:#374151;">${v.toFixed(0)}</div>
-              </div>`;
+        columns = [
+            {"title": "", "formatter": "rowSelection", "titleFormatter": "rowSelection", "hozAlign": "center",
+             "headerSort": False, "width": 44},
+            {"title": "Ticker", "field": "Ticker", "width": 160},
+            {"title": "FT=1", "field": "FT1_val", "hozAlign": "center", "headerSort": False,
+             "formatter": "html", "formatterParams": {"html": html_bar("blue")}},
+            {"title": "FT=0", "field": "FT0_val", "hozAlign": "center", "headerSort": False,
+             "formatter": "html", "formatterParams": {"html": html_bar("red")}},
+        ]
+
+        options = {
+            "height": "420px",
+            "layout": "fitColumns",
+            "selectable": True,              # enable checkbox selection
+            "selectableRangeMode": "click",
+            "movableColumns": False,
+            "reactiveData": False,
         }
-    """)
-    bar_red = JsCode("""
-        function(params){
-            const v = Math.max(0, Math.min(100, Number(params.value||0)));
-            return `
-              <div style="display:flex;justify-content:center;align-items:center;gap:6px;">
-                <div style="height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden;">
-                  <span style="position:absolute;left:0;top:0;bottom:0;width:${v}%;background:#ef4444;"></span>
-                </div>
-                <div style="font-size:11px;min-width:24px;text-align:center;color:#374151;">${v.toFixed(0)}</div>
-              </div>`;
-        }
-    """)
 
-    gb = GridOptionsBuilder.from_dataframe(df_summary)
-    gb.configure_selection(selection_mode="multiple", use_checkbox=True)
-    gb.configure_column("Ticker", header_name="Ticker", pinned=False, width=160)
-    gb.configure_column("FT1_val", header_name="FT=1", cellRenderer=bar_blue, width=220)
-    gb.configure_column("FT0_val", header_name="FT=0", cellRenderer=bar_red,  width=220)
-    gb.configure_grid_options(suppressRowClickSelection=False, animateRows=True)
-    grid_options = gb.build()
+        tab_resp = st_tabulator(
+            df_summary,
+            options=options,
+            columns=columns,
+            theme="modern",
+            key="align_tabulator",
+        )
 
-    grid_resp = AgGrid(
-        df_summary,
-        gridOptions=grid_options,
-        update_mode=GridUpdateMode.SELECTION_CHANGED,
-        allow_unsafe_jscode=True,
-        fit_columns_on_grid_load=False,
-        height=420,
-        theme="alpine",
-    )
+        # tab_resp contains "selectedRows" with the selected rows' data dicts
+        selected_rows = (tab_resp or {}).get("selectedRows") or []
+        sel_tickers = [str(r.get("Ticker")) for r in selected_rows if r.get("Ticker")]
 
-    # ----- Delete selected handling -----
-    if st.session_state.get("_pending_delete"):
-        st.session_state["_pending_delete"] = False
-        selected_rows = grid_resp.get("selected_rows", []) or []
-        sel_tickers = {str(r.get("Ticker","")).upper() for r in selected_rows if r.get("Ticker")}
-        if not sel_tickers:
-            st.info("No rows selected in the table.")
-        else:
-            before = len(st.session_state.rows)
-            st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker","")).upper() not in sel_tickers]
-            removed = before - len(st.session_state.rows)
-            if removed > 0:
-                st.success(f"Removed {removed} row(s): {', '.join(sorted(sel_tickers))}")
+        # Persist selection (helps across reruns)
+        st.session_state._selected_tickers = sel_tickers
+
+        # ----- Delete selected -----
+        if del_click:
+            if not sel_tickers:
+                st.info("No rows selected in the table.")
             else:
-                st.info("No rows removed.")
-        do_rerun()
+                before = len(st.session_state.rows)
+                st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker")) not in sel_tickers]
+                removed = before - len(st.session_state.rows)
+                if removed > 0:
+                    st.success(f"Removed {removed} row(s): {', '.join(sorted(sel_tickers))}")
+                else:
+                    st.info("No rows removed.")
+                do_rerun()
 
-    # ----- Details panel (for first selected row) -----
-    sel_rows = grid_resp.get("selected_rows", []) or []
-    if sel_rows:
-        sel_ticker = sel_rows[0].get("Ticker")
-        st.markdown(f"#### Details: {sel_ticker}")
-        vars_rows = detail_map.get(sel_ticker, [])
+        # ----- Details panel below for the first selected row -----
+        if sel_tickers:
+            sel_ticker = sel_tickers[0]
+            st.markdown(f"#### Details: {sel_ticker}")
+            drows = detail_map.get(sel_ticker, [])
+            if drows:
+                ddf = pd.DataFrame(drows)
 
-        if vars_rows:
-            # Build a pandas table with conditional coloring (yellow if dominant Δ >=0, red if <0)
-            ddf = pd.DataFrame(vars_rows)
-            # Display table with styling similar to earlier child coloring
-            def _row_style(row):
-                if row.get("rowClass") == "sig_up":
-                    return ['background-color: rgba(253,230,138,0.85)'] * len(row)
-                if row.get("rowClass") == "sig_down":
-                    return ['background-color: rgba(254,202,202,0.85)'] * len(row)
-                return [''] * len(row)
+                # style according to rowClass
+                def _row_style(row):
+                    rc = row.get("rowClass", "")
+                    if rc == "up":   # yellow
+                        return ['background-color: rgba(253,230,138,0.85)'] * len(row)
+                    if rc == "down": # soft red
+                        return ['background-color: rgba(254,202,202,0.85)'] * len(row)
+                    return [''] * len(row)
 
-            show_cols = ["Variable","Value","FT1","FT0","d_vs_FT1","d_vs_FT0"]
-            for c in show_cols:
-                if c not in ddf.columns:
-                    ddf[c] = np.nan
+                show_cols = ["Variable","Value","FT1","FT0","d_vs_FT1","d_vs_FT0"]
+                for c in show_cols:
+                    if c not in ddf.columns: ddf[c] = np.nan
 
-            styled = (ddf[show_cols]
-                      .style
-                      .apply(_row_style, axis=1)
-                      .format("{:.2f}", na_rep=""))
+                styled = (ddf[show_cols]
+                          .style
+                          .apply(_row_style, axis=1)
+                          .format("{:.2f}", na_rep=""))
 
-            st.dataframe(styled, use_container_width=True, hide_index=True)
-        else:
-            st.info("No variable overlaps for this stock.")
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+            else:
+                st.info("No variable overlaps for this stock.")
 else:
     if not st.session_state.rows:
         st.info("Add at least one stock above to compute alignment.")
