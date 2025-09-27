@@ -274,18 +274,6 @@ if submitted and ticker:
     # Derived metrics
     fr = (pm_vol / float_m) if float_m > 0 else 0.0
     pmmc = (pm_dol / mc_m * 100.0) if mc_m > 0 else 0.0
-    # Normalize % fields if user entered fractional values
-    def normalize_percent(x: float) -> float:
-        """Convert fractions like 0.6 → 60, leave normal percents untouched."""
-        if pd.isna(x): 
-            return x
-        if 0 <= x <= 2:   # clearly a fraction
-            return x * 100.0
-        return x          # already a percent
-    
-    si_pct  = normalize_percent(si_pct)
-    gap_pct = normalize_percent(gap_pct)
-    if gap_pct <= 2:   gap_pct *= 100.0  # safe-guard for Gap_% too, consistent with DB scaling
 
     row = {
         "Ticker": ticker,
