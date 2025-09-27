@@ -597,7 +597,8 @@ with col_b:
             st.success(f"Removed {removed} row(s): {', '.join(sorted(chosen))}")
         else:
             st.info("No rows removed.")
-        st.session_state.tickers_to_delete = []
+        # --- FIX: do not assign to widget key; safely remove it then rerun
+        st.session_state.pop('tickers_to_delete', None)
         do_rerun()
 
 # ============================== Clear ==============================
