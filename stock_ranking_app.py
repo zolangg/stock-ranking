@@ -342,7 +342,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .col-var {{ width: 15%; }}
   .col-val {{ width: 15%; }}
   .col-ft1 {{ width: 15%; }}
-  .col-ft0 {{ width: 15%; }}
+  .col-ft0 {{ width: 10%; }}
   .col-d1  {{ width: 15%; }}
   .col-d0  {{ width: 15%; }}
 
