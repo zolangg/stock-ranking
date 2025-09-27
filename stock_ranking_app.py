@@ -122,6 +122,22 @@ if build_btn:
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
                 add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
 
+                # --- Catalyst (binary: Yes/No/1/0/True/False) from DB, if present ---
+                # Try to detect a catalyst column
+                cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
+                def _to_binary_local(v):
+                    sv = str(v).strip().lower()
+                    if sv in {"1","true","yes","y","t"}: return 1.0
+                    if sv in {"0","false","no","n","f"}: return 0.0
+                    try:
+                        fv = float(sv)
+                        return 1.0 if fv >= 0.5 else 0.0
+                    except:
+                        return np.nan
+                if cand_catalyst:
+                    df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
+                # If not found in DB, we leave Catalyst as NaN in medians; alignment will ignore it unless present.
+
                 # derived
                 if {"PM_Vol_M","Float_M"}.issubset(df.columns):
                     df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
@@ -147,7 +163,7 @@ if build_btn:
                     df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
                     # medians per group
-                    var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
+                    var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
                     gmed = df.groupby("Group")[var_list].median(numeric_only=True).T
                     st.session_state.models = {"models_tbl": gmed, "var_list": var_list}
                     st.success("Built model stocks (FT=1 and FT=0 medians).")
@@ -229,7 +245,7 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
     groups = ["FT=1","FT=0"]
     # numeric vars (Catalyst is not included here unless present in models medians)
     cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
+                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
     common = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
     counts = {g: 0 for g in groups}; used = 0
     for v in common:
@@ -251,7 +267,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
     # Build summary for ADDED stocks only (no model rows)
     summary_rows, detail_map = [], {}
     num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-                "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
+                "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
 
     for row in st.session_state.rows:
         stock = dict(row)
