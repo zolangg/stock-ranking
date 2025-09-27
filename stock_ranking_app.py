@@ -76,7 +76,9 @@ if "models" not in st.session_state: st.session_state.models = {}  # {"models_tb
 
 # ============================== Upload DB → Build Medians ==============================
 st.subheader("Upload Database → Build Model Stocks (FT=1 and FT=0 medians)")
+
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
+group_field = st.text_input("Group field (must have 0/1 values, e.g., 'FT')", value="FT", key="db_group")
 build_btn = st.button("Build model stocks (medians for FT=1 and FT=0)", use_container_width=True, key="db_build_btn")
 
 if build_btn:
@@ -91,9 +93,9 @@ if build_btn:
             raw = pd.read_excel(xls, sheet)
 
             # map columns
-            col_group = _pick(raw, ["FT"])
+            col_group = _pick(raw, [group_field])
             if col_group is None:
-                st.error(f"Group field 'FT' not found in sheet '{sheet}'. It must have 0/1 values.")
+                st.error(f"Group field '{group_field}' not found in sheet '{sheet}'.")
             else:
                 df = pd.DataFrame()
                 df["GroupRaw"] = raw[col_group]
@@ -132,7 +134,7 @@ if build_btn:
                 df["FT01"] = df["GroupRaw"].map(_to_binary)
                 df = df[df["FT01"].isin([0,1])]
                 if df.empty or df["FT01"].nunique() < 2:
-                    st.error("Could not find both FT=1 and FT=0 rows in the DB. Please check the FT column.")
+                    st.error("Could not find both FT=1 and FT=0 rows in the DB. Please check the group column.")
                 else:
                     df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
@@ -182,7 +184,6 @@ with st.form("add_form", clear_on_submit=True):
     with c3:
         catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
 
-    st.form_submit_button.disabled = False
     submitted = st.form_submit_button("Add to Table", use_container_width=True)
 
 if submitted and ticker:
@@ -203,77 +204,24 @@ if submitted and ticker:
         "PM_$Vol_M$": pm_dol,
         "FR_x": fr,
         "PM$Vol/MC_%": pmmc,
-        # Catalyst as 1/0 plus label
-        "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
+        # Catalyst (Yes/No -> 1/0 stored + label for UI)
         "CatalystYN": catalyst_yn,
+        "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
     st.session_state.rows.append(row)
     st.session_state.last = row
     st.success(f"Saved {ticker}.")
     do_rerun()
 
-# ============================== Added Stocks (editable) ==============================
-st.markdown("### Added Stocks (editable)")
-if st.session_state.rows:
-    df_rows = pd.DataFrame(st.session_state.rows)
-    show_cols = [
-        "Ticker",
-        "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-        "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%",
-        "CatalystYN","Catalyst",
-    ]
-    for c in show_cols:
-        if c not in df_rows.columns:
-            df_rows[c] = ""
-
-    num_cols_cfg = {
-        c: st.column_config.NumberColumn(c, format="%.2f")
-        for c in show_cols
-        if c not in ["Ticker","CatalystYN"]
-    }
-    text_cols_cfg = {
-        "Ticker": st.column_config.TextColumn("Ticker"),
-        "CatalystYN": st.column_config.SelectboxColumn("Catalyst?",
-                                                       options=["No","Yes"])
-    }
-
-    edited_df = st.data_editor(
-        df_rows[show_cols],
-        use_container_width=True,
-        hide_index=True,
-        column_config={**num_cols_cfg, **text_cols_cfg},
-        num_rows="dynamic",
-        key="manual_editor",
-    )
-
-    # Convert CatalystYN back to numeric Catalyst consistently
-    edited_df["Catalyst"] = edited_df["CatalystYN"].map({"Yes":1.0,"No":0.0}).fillna(0.0)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Save Changes", use_container_width=True, key="save_manual_changes"):
-            st.session_state.rows = edited_df.to_dict(orient="records")
-            st.success("Manual table updated.")
-            do_rerun()
-    with c2:
-        st.download_button(
-            "Download Added Stocks CSV",
-            edited_df.to_csv(index=False).encode("utf-8"),
-            "added_stocks.csv", "text/csv",
-            use_container_width=True,
-        )
-else:
-    st.info("No manual rows yet. Add a stock above.")
-
-# ============================== Alignment (only added stocks; FT=1 / FT=0 bars) ==============================
+# ============================== Alignment (only added stocks; editable ticker/catalyst) ==============================
 st.markdown("### Alignment (only added stocks)")
-
 def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
     if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
         return {}
     groups_cols = ["FT=1","FT=0"]
+    # Only numeric variables present in both manual row & models medians
     cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
+                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
     common_vars = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
     counts = {g: 0 for g in groups_cols}
     used = 0
@@ -296,45 +244,72 @@ def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame
     return counts
 
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
+
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
-    # Build alignment summary ONLY for added stocks (no model rows)
+    # Build alignment summary ONLY for added stocks
     summary_rows = []
+    base_rows = []
+
     for row in st.session_state.rows:
         counts = compute_alignment_counts_vs_binary(row, models_tbl)
-        if not counts: 
+        if not counts:
             continue
         like1, like0 = counts.get("FT=1", 0), counts.get("FT=0", 0)
         n_used = counts.get("N_Vars_Used", 0)
-        ft1_val = (like1 / n_used) if n_used > 0 else 0.0
-        ft0_val = (like0 / n_used) if n_used > 0 else 0.0
+        ft1 = (like1 / n_used) if n_used > 0 else 0.0
+        ft0 = (like0 / n_used) if n_used > 0 else 0.0
+
+        # Keep editable fields in the same row (Ticker, CatalystYN) + computed bars (FT1/FT0)
         summary_rows.append({
             "Ticker": row.get("Ticker","—"),
-            "FT1": ft1_val,   # 0..1 for ProgressColumn
-            "FT0": ft0_val,   # 0..1 for ProgressColumn
+            "CatalystYN": row.get("CatalystYN","No"),
+            "FT1": ft1,   # 0..1 for ProgressColumn
+            "FT0": ft0,   # 0..1 for ProgressColumn
         })
+        # keep a copy to map edits back
+        base_rows.append(row)
 
     if summary_rows:
         sum_df = pd.DataFrame(summary_rows)
-        # Order columns to feel centered visually: Ticker | (spacer via narrow col?) Not possible directly,
-        # but we can at least put FT=1 and FT=0 beside each other and keep ticker narrow.
+
+        # Visual layout: Ticker | Catalyst? | FT=1 | FT=0
         cfg = {
-            "Ticker": st.column_config.TextColumn("Ticker"),
-            "FT1": st.column_config.ProgressColumn("FT=1", format="%.0f%%", min_value=0.0, max_value=1.0, help="Share of variables closer to FT=1"),
-            "FT0": st.column_config.ProgressColumn("FT=0", format="%.0f%%", min_value=0.0, max_value=1.0, help="Share of variables closer to FT=0"),
+            "Ticker":      st.column_config.TextColumn("Ticker"),
+            "CatalystYN":  st.column_config.SelectboxColumn("Catalyst?", options=["No","Yes"]),
+            "FT1":         st.column_config.ProgressColumn("FT=1", format="%.0f%%", min_value=0.0, max_value=1.0, help="Share of variables closer to FT=1"),
+            "FT0":         st.column_config.ProgressColumn("FT=0", format="%.0f%%", min_value=0.0, max_value=1.0, help="Share of variables closer to FT=0"),
         }
-        # Small trick to visually center: use empty text column left & right (narrow). Commented out by default.
-        st.data_editor(
-            sum_df[["Ticker","FT1","FT0"]],
+
+        # Make the table editable so you can correct Ticker/Catalyst; FT1/FT0 will recompute on save.
+        edited_df = st.data_editor(
+            sum_df[["Ticker","CatalystYN","FT1","FT0"]],
             hide_index=True,
             use_container_width=True,
             column_config=cfg,
-            disabled=True,
-            key="align_only_added",
+            num_rows="dynamic",
+            key="align_editor",
         )
 
-        # Markdown copy if needed
+        # ---- Persist edits back to manual rows (Ticker, CatalystYN -> Catalyst) ----
+        if st.button("Save Alignment Changes", use_container_width=True, key="save_align_changes"):
+            # Build a map from old tickers to edited rows (by index)
+            # We align by index here; if you add/remove rows in the alignment editor,
+            # we'll just overwrite session rows with edited table values for these two fields.
+            new_rows = []
+            for i, old in enumerate(st.session_state.rows):
+                if i < len(edited_df):
+                    upd = edited_df.iloc[i]
+                    old["Ticker"] = str(upd.get("Ticker", old.get("Ticker",""))).strip().upper()
+                    yn = str(upd.get("CatalystYN", old.get("CatalystYN","No")))
+                    old["CatalystYN"] = "Yes" if yn == "Yes" else "No"
+                    old["Catalyst"] = 1.0 if old["CatalystYN"] == "Yes" else 0.0
+                new_rows.append(old)
+            st.session_state.rows = new_rows
+            st.success("Alignment edits saved. Recomputing…")
+            do_rerun()
+
         st.markdown("**Markdown**")
-        st.code(df_to_markdown_table(sum_df, list(sum_df.columns)), language="markdown")
+        st.code(df_to_markdown_table(edited_df, list(edited_df.columns)), language="markdown")
     else:
         st.info("No overlapping variables between added stocks and model medians yet.")
 elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
