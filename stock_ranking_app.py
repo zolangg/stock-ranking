@@ -85,19 +85,33 @@ if "rows" not in st.session_state: st.session_state.rows = []      # manual rows
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "mad_tbl": DataFrame, "var_list": [...]}
 
-# ---------- Minimal addition: handle delete via query param ----------
+# ---------- Handle delete via query param (st.query_params) ----------
 try:
-    qp = st.query_params  # dict-like (new API)
-    del_tkr = qp.get("del_ticker", None)
+    # st.query_params is a live, mutable, dict-like mapping
+    del_tkr = st.query_params.get("del_ticker", None)
+
+    # In case some environments still pass lists (older frontends), normalize:
+    if isinstance(del_tkr, list):
+        del_tkr = del_tkr[0] if del_tkr else None
+
     if del_tkr:
+        # Remove matching ticker(s) from session rows
         before = len(st.session_state.rows)
-        st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker")) != str(del_tkr)]
+        st.session_state.rows = [
+            r for r in st.session_state.rows
+            if str(r.get("Ticker", "")).strip() != str(del_tkr).strip()
+        ]
         after = len(st.session_state.rows)
+
         if before != after:
             st.success(f"Deleted {del_tkr}")
-        # clear param
-        if "del_ticker" in qp:
-            del qp["del_ticker"]
+
+        # Clear the query param (this updates the URL immediately)
+        if "del_ticker" in st.query_params:
+            del st.query_params["del_ticker"]
+
+        # Force UI refresh so the deleted row is gone right away
+        do_rerun()
 except Exception as e:
     st.error(f"Error handling delete: {e}")
 # --------------------------------------------------------------------
