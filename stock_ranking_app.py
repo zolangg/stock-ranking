@@ -170,28 +170,25 @@ if build_btn:
                 else:
                     df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-                    # medians per group
-                    var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
-                    gmed = df.groupby("Group")[var_list].median(numeric_only=True).T
-                    st.session_state.models = {"models_tbl": gmed, "var_list": var_list}
-                    st.success("Built model stocks (FT=1 and FT=0 medians).")
-                    do_rerun()
-
-                    # --- robust spread: MAD (median absolute deviation) per group ---
-                    def _mad(series: pd.Series) -> float:
-                        s = pd.to_numeric(series, errors="coerce").dropna()
-                        if s.empty:
-                            return np.nan
-                        med = np.median(s)
-                        return float(np.median(np.abs(s - med)))
-                    
-                    gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T  # rows=variables, cols=FT=1/FT=0
-                    
-                    # store both medians and MADs
-                    st.session_state.models = {
-                        "models_tbl": gmed,
-                        "mad_tbl": gmads,
-                        "var_list": var_list,
+                # medians per group
+                var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+                            "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]  # include Catalyst if available
+                gmed = df.groupby("Group")[var_list].median(numeric_only=True).T  # rows=variables, cols=FT=0/FT=1
+                
+                # --- robust spread: MAD (median absolute deviation) per group ---
+                def _mad(series: pd.Series) -> float:
+                    s = pd.to_numeric(series, errors="coerce").dropna()
+                    if s.empty:
+                        return np.nan
+                    med = float(np.median(s))
+                    return float(np.median(np.abs(s - med)))
+                
+                gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T  # same shape as gmed
+                
+                # store both
+                st.session_state.models = {"models_tbl": gmed, "mad_tbl": gmads, "var_list": var_list}
+                st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
+                do_rerun()
                     }
 
         except Exception as e:
