@@ -202,7 +202,7 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
         mad_tbl: pd.DataFrame = models_data.get("mad_tbl", pd.DataFrame())
 
         # User control for what we call "significant"
-        sig_thresh = st.slider("Significance threshold (σ)", 0.5, 5.0, 2.0, 0.5,
+        sig_thresh = st.slider("Significance threshold (σ)", 0.5, 3.0, 0.5, 0.1,
                                help="Highlight rows where |FT=1 − FT=0| / (MAD₁ + MAD₀) ≥ σ")
 
         if not mad_tbl.empty and {"FT=1","FT=0"}.issubset(mad_tbl.columns):
