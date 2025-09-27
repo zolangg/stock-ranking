@@ -204,6 +204,7 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
         # User control for what we call "significant"
         sig_thresh = st.slider("Significance threshold (σ)", 0.0, 3.0, 0.5, 0.1,
                                help="Highlight rows where |FT=1 − FT=0| / (MAD₁ + MAD₀) ≥ σ")
+        st.session_state["sig_thresh"] = float(sig_thresh)
 
         if not mad_tbl.empty and {"FT=1","FT=0"}.issubset(mad_tbl.columns):
             eps = 1e-9  # avoid /0
@@ -314,6 +315,10 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
 
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
 
+# pull threshold (fallback to 2.0 if not set)
+SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
+mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
+
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
     # Build summary for ADDED stocks only (no model rows)
     summary_rows, detail_map = [], {}
@@ -324,35 +329,56 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
         counts = _compute_alignment_counts(stock, models_tbl)
-        if not counts: 
+        if not counts:
             continue
+
         like1, like0 = counts.get("FT=1",0), counts.get("FT=0",0)
         n_used = counts.get("N_Vars_Used",0)
         ft1_val = round((like1 / n_used * 100.0), 0) if n_used > 0 else 0.0
         ft0_val = round((like0 / n_used * 100.0), 0) if n_used > 0 else 0.0
 
-        summary_rows.append({
-            "Ticker": tkr,
-            "FT1_val": ft1_val,  # number 0..100 (no % sign)
-            "FT0_val": ft0_val,  # number 0..100 (no % sign)
-        })
+        summary_rows.append({"Ticker": tkr, "FT1_val": ft1_val, "FT0_val": ft0_val})
 
-        # child details
+        # ---- child details WITH significance flags vs FT=1 / FT=0 ----
         drows = []
         for v in num_vars:
             va = pd.to_numeric(stock.get(v), errors="coerce")
             v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
             v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
+            m1 = mad_tbl.loc[v, "FT=1"] if (not mad_tbl.empty and v in mad_tbl.index and "FT=1" in mad_tbl.columns) else np.nan
+            m0 = mad_tbl.loc[v, "FT=0"] if (not mad_tbl.empty and v in mad_tbl.index and "FT=0" in mad_tbl.columns) else np.nan
+
             if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
                 continue
+
+            # significance vs each group (use MAD; if MAD==0 and delta>0 -> infinite -> significant)
+            def _sig(delta, mad):
+                if pd.isna(delta): return np.nan
+                if pd.isna(mad):   return np.nan
+                if mad == 0:
+                    return np.inf if abs(delta) > 0 else 0.0
+                return abs(delta) / abs(mad)
+
+            d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
+            d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
+            s1 = _sig(d1, float(m1) if pd.notna(m1) else np.nan)
+            s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
+
+            sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
+            sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
+
             drows.append({
                 "Variable": v,
                 "Value": None if pd.isna(va) else float(va),
                 "FT1":   None if pd.isna(v1) else float(v1),
                 "FT0":   None if pd.isna(v0) else float(v0),
-                "d_vs_FT1": None if (pd.isna(va) or pd.isna(v1)) else float(va - v1),
-                "d_vs_FT0": None if (pd.isna(va) or pd.isna(v0)) else float(va - v0),
+                "d_vs_FT1": None if d1 is None else d1,
+                "d_vs_FT0": None if d0 is None else d0,
+                # flags for coloring
+                "sig1": sig1,   # far from FT=1
+                "sig0": sig0,   # far from FT=0
             })
+
         detail_map[tkr] = drows
 
     if summary_rows:
@@ -390,6 +416,11 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
     text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   }}
   .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
+
+  /* significance row highlights */
+  .sig1  { background: rgba(59,130,246,0.10); }  /* blue tint (far from FT=1) */
+  .sig0  { background: rgba(239,68,68,0.10); }   /* red tint  (far from FT=0) */
+  .sigb  { background: linear-gradient(90deg, rgba(239,68,68,0.12), rgba(59,130,246,0.12)); } /* both */
 
   /* Narrower Value column as requested */
   .col-var {{ width: 10%; }}
@@ -440,7 +471,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
     function childTableHTML(ticker) {{
       const rows = data.details[ticker] || [];
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
-      const cells = rows.map(r => {{
+      const cells = rows.map(r => {
         const v  = (r.Value==null||isNaN(r.Value)) ? '' : r.Value.toFixed(2);
         const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
         const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
@@ -448,16 +479,21 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : r.d_vs_FT0.toFixed(2);
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
+
+        // significance flags from payload
+        const s1 = !!r.sig1, s0 = !!r.sig0;
+        const rowClass = (s1 && s0) ? 'sigb' : s1 ? 'sig1' : s0 ? 'sig0' : '';
+
         return `
-          <tr>
-            <td class="col-var">${{r.Variable}}</td>
-            <td class="col-val">${{v}}</td>
-            <td class="col-ft1">${{f1}}</td>
-            <td class="col-ft0">${{f0}}</td>
-            <td class="col-d1 ${{c1}}">${{d1}}</td>
-            <td class="col-d0 ${{c0}}">${{d0}}</td>
+          <tr class="${rowClass}">
+            <td class="col-var">${r.Variable}</td>
+            <td class="col-val">${v}</td>
+            <td class="col-ft1">${f1}</td>
+            <td class="col-ft0">${f0}</td>
+            <td class="col-d1 ${c1}">${d1}</td>
+            <td class="col-d0 ${c0}">${d0}</td>
           </tr>`;
-      }}).join('');
+      }).join('');
       return `
         <table class="child-table">
           <colgroup>
