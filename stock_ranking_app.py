@@ -457,8 +457,8 @@ with tab_tables:
         else:
             st.info("Need manual rows and built FT=1/FT=0 medians to run this comparison.")
 
-# ---------- Alignment Summary (DataTables child-rows) ----------
-st.markdown("### Alignment Summary (model medians + manual stocks)")
+# ---------- Alignment Summary (DataTables child-rows with variable values) ----------
+st.markdown("### Alignment Summary (model medians + manual stocks — expandable child rows)")
 
 import json
 import streamlit.components.v1 as components
@@ -479,17 +479,12 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
         if med.empty: 
             continue
         diffs = (med - xv).abs()
-        nearest = diffs.idxmin()
-        counts[nearest] += 1
+        counts[diffs.idxmin()] += 1
         used += 1
     counts["N_Vars_Used"] = used
     return counts
 
-models_data = st.session_state.get("models")
-if models_data and isinstance(models_data, dict):
-    models_tbl: pd.DataFrame = models_data.get("models_tbl", pd.DataFrame())
-else:
-    models_tbl = pd.DataFrame()
+models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
 
 if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
     # two model “stocks”
@@ -503,12 +498,11 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
     manual_rows = st.session_state.get("rows", [])
     all_rows = model_rows + manual_rows
 
-    # variables shown in details
+    # variables in detail child table
     num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
 
-    summary_rows = []
-    detail_map = {}
+    summary_rows, detail_map = [], {}
 
     for row in all_rows:
         stock = dict(row)
@@ -533,21 +527,22 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
             "Lean": lean_lbl,
         })
 
-        # child table: per-variable values and deltas
+        # child table rows WITH values + deltas
         drows = []
         for v in num_vars:
             va = pd.to_numeric(stock.get(v), errors="coerce")
             v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
             v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
-            if pd.notna(va) or pd.notna(v1) or pd.notna(v0):
-                drows.append({
-                    "Variable": v,
-                    "Value": None if pd.isna(va) else float(va),
-                    "FT1":   None if pd.isna(v1) else float(v1),
-                    "FT0":   None if pd.isna(v0) else float(v0),
-                    "d_vs_FT1": None if (pd.isna(va) or pd.isna(v1)) else float(va - v1),
-                    "d_vs_FT0": None if (pd.isna(va) or pd.isna(v0)) else float(va - v0),
-                })
+            if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
+                continue
+            drows.append({
+                "Variable": v,
+                "Value": None if pd.isna(va) else float(va),
+                "FT1":   None if pd.isna(v1) else float(v1),
+                "FT0":   None if pd.isna(v0) else float(v0),
+                "d_vs_FT1": None if (pd.isna(va) or pd.isna(v1)) else float(va - v1),
+                "d_vs_FT0": None if (pd.isna(va) or pd.isna(v0)) else float(va - v0),
+            })
         detail_map[tkr] = drows
 
     if summary_rows:
@@ -571,6 +566,8 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
   .child-table th, .child-table td {{ font-size: 12px; padding: 6px 8px; border-bottom: 1px solid #e5e7eb; text-align:right; }}
   .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
   .pos {{ color:#059669; }} .neg {{ color:#dc2626; }}
+  .posbar {{ height: 8px; background:#e5e7eb; position:relative; border-radius:6px; overflow:hidden; }}
+  .posbar > span {{ position:absolute; top:0; bottom:0; width:2px; background:#111827; }}
 </style>
 </head>
 <body>
@@ -611,6 +608,15 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
         </div>`;
     }}
 
+    // position bar: show Value relative to [min(FT0,FT1), max(FT0,FT1)]
+    function positionBar(value, f0, f1) {{
+      if (value==null || isNaN(value) || f0==null || isNaN(f0) || f1==null || isNaN(f1)) return '';
+      const lo = Math.min(f0, f1), hi = Math.max(f0, f1);
+      const pos = (hi===lo) ? 50 : ( (value - lo) / (hi - lo) * 100 );
+      const clamped = Math.max(0, Math.min(100, pos));
+      return `<div class="posbar"><span style="left:${{clamped}}%"></span></div>`;
+    }}
+
     function childTableHTML(ticker) {{
       const rows = data.details[ticker] || [];
       if (!rows.length) return '<div style="margin-left:32px;color:#6b7280;">No variable overlaps for this stock.</div>';
@@ -622,10 +628,11 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
         const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : r.d_vs_FT0.toFixed(2);
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
+        const pbar = positionBar(parseFloat(v), parseFloat(f0), parseFloat(f1));
         return `
           <tr>
             <td>${{r.Variable}}</td>
-            <td>${{v}}</td>
+            <td>${{v}}${{pbar?'<div style="margin-top:4px">'+pbar+'</div>':''}}</td>
             <td>${{f1}}</td>
             <td>${{f0}}</td>
             <td class="${{c1}}">${{d1}}</td>
@@ -636,8 +643,12 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
         <table class="child-table">
           <thead>
             <tr>
-              <th>Variable</th><th>Value</th><th>FT=1 median</th><th>FT=0 median</th>
-              <th>Δ vs FT=1</th><th>Δ vs FT=0</th>
+              <th>Variable</th>
+              <th>Value (with position vs FT medians)</th>
+              <th>FT=1 median</th>
+              <th>FT=0 median</th>
+              <th>Δ vs FT=1</th>
+              <th>Δ vs FT=0</th>
             </tr>
           </thead>
           <tbody>${{cells}}</tbody>
@@ -674,11 +685,9 @@ if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
 </body>
 </html>
         """
-        components.html(html, height=600, scrolling=True)
+        components.html(html, height=640, scrolling=True)
     else:
-        st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
-else:
-    st.info("Upload DB and click **Build model stocks** (to compute FT=1/FT=0 medians) first.")
+        st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
 
     # Clear
     st.markdown("---")
