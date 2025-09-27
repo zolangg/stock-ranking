@@ -456,75 +456,126 @@ with tab_tables:
                 st.info("Add at least one manual ticker to compare.")
         else:
             st.info("Need manual rows and built FT=1/FT=0 medians to run this comparison.")
+# ---------- Alignment Summary (manual stocks + model FT=1/FT=0) ----------
+st.markdown("### Alignment Summary (integrating model medians + manual stocks)")
 
-    # ---------- Alignment Summary (Manual vs FT=1 & FT=0) ----------
-    st.markdown("### Alignment Summary (manual stocks closest to FT=1 vs FT=0)")
-    def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
-        if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
-            return {}
-        groups_cols = ["FT=1","FT=0"]
-        cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
-        common_vars = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
-        counts = {g: 0 for g in groups_cols}
-        used = 0
-        for v in common_vars:
-            x = stock_row.get(v, None)
-            try:
-                xv = float(x)
-            except Exception:
-                xv = np.nan
-            if not np.isfinite(xv):
-                continue
-            med = models_tbl.loc[v, groups_cols].astype(float).dropna()
-            if med.empty:
-                continue
-            diffs = (med - xv).abs()
-            nearest = diffs.idxmin()
-            counts[nearest] = counts.get(nearest, 0) + 1
-            used += 1
-        counts["N_Vars_Used"] = used
-        return counts
+def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
+    if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
+        return {}
+    groups_cols = ["FT=1","FT=0"]
+    cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
+    common_vars = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
+    counts = {g: 0 for g in groups_cols}
+    used = 0
+    for v in common_vars:
+        x = stock_row.get(v, None)
+        try:
+            xv = float(x)
+        except Exception:
+            xv = np.nan
+        if not np.isfinite(xv):
+            continue
+        med = models_tbl.loc[v, groups_cols].astype(float).dropna()
+        if med.empty:
+            continue
+        diffs = (med - xv).abs()
+        nearest = diffs.idxmin()
+        counts[nearest] = counts.get(nearest, 0) + 1
+        used += 1
+    counts["N_Vars_Used"] = used
+    return counts
 
-    if st.session_state.rows and st.session_state.models and {"FT=1","FT=0"}.issubset(st.session_state.models["models_tbl"].columns):
-        models_tbl = st.session_state.models["models_tbl"]
-        summary_rows = []
-        for row in st.session_state.rows:
-            counts = compute_alignment_counts_vs_binary(row, models_tbl)
-            if not counts:
-                continue
-            out = {"Ticker": row.get("Ticker","—"), "N_Vars_Used": counts.pop("N_Vars_Used", 0)}
-            out["Like_FT=1"] = counts.get("FT=1", 0)
-            out["Like_FT=0"] = counts.get("FT=0", 0)
-            if out["Like_FT=1"] > out["Like_FT=0"]:
-                out["Lean"] = "FT=1"
-            elif out["Like_FT=0"] > out["Like_FT=1"]:
-                out["Lean"] = "FT=0"
-            else:
-                out["Lean"] = "Tie"
-            summary_rows.append(out)
+if st.session_state.models and {"FT=1","FT=0"}.issubset(st.session_state.models["models_tbl"].columns):
+    models_tbl = st.session_state.models["models_tbl"]
 
-        if summary_rows:
-            sum_df = pd.DataFrame(summary_rows)
-            cfg = {
-                "Ticker": st.column_config.TextColumn("Ticker"),
-                "N_Vars_Used": st.column_config.NumberColumn("N Vars Used", format="%.2f"),
-                "Like_FT=1": st.column_config.NumberColumn("Like FT=1", format="%.2f"),
-                "Like_FT=0": st.column_config.NumberColumn("Like FT=0", format="%.2f"),
-                "Lean": st.column_config.TextColumn("Lean"),
-            }
-            st.dataframe(sum_df, use_container_width=True, hide_index=True, column_config=cfg)
+    # 1. start with the two model “stocks” themselves
+    model_rows = []
+    for g in ["FT=1","FT=0"]:
+        vals = models_tbl[g].to_dict()
+        vals.update({"Ticker": g})
+        model_rows.append(vals)
 
-            st.markdown("**Markdown**")
-            st.code(df_to_markdown_table(sum_df, list(sum_df.columns)), language="markdown")
+    # 2. add manual stocks
+    manual_rows = st.session_state.rows if "rows" in st.session_state else []
 
-            st.download_button("Download Alignment CSV",
-                               sum_df.to_csv(index=False).encode("utf-8"),
-                               "alignment_summary.csv", "text/csv",
-                               use_container_width=True)
+    all_rows = model_rows + manual_rows
+
+    summary = []
+    detail_data = {}  # ticker -> df with variable deltas
+    for row in all_rows:
+        ticker = row.get("Ticker","—")
+
+        # build dict form (for models it's already a dict, for manual we have row dict)
+        if isinstance(row, dict):
+            stock_dict = row.copy()
         else:
-            st.info("Add at least one manual stock to compute alignment.")
-    else:
-        st.info("Upload DB (to build FT=1/FT=0 medians) and add manual stocks to see alignment.")
+            stock_dict = dict(row)
+
+        counts = compute_alignment_counts_vs_binary(stock_dict, models_tbl)
+        if not counts:
+            continue
+        like1, like0 = counts.get("FT=1",0), counts.get("FT=0",0)
+        n_used = counts.get("N_Vars_Used",0)
+
+        lean_score = (like1-like0)/n_used if n_used>0 else 0
+        lean01 = (lean_score+1)/2
+
+        summary.append({
+            "Ticker": ticker,
+            "FT1_pct": like1/n_used if n_used>0 else 0,
+            "FT0_pct": like0/n_used if n_used>0 else 0,
+            "Lean01": lean01,
+            "Lean": "FT=1" if like1>like0 else "FT=0" if like0>like1 else "Tie"
+        })
+
+        # detail table
+        num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+                    "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
+        rows = []
+        for v in num_vars:
+            va = pd.to_numeric(stock_dict.get(v), errors="coerce")
+            v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
+            v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
+            if pd.notna(va):
+                rows.append({
+                    "Variable": v,
+                    f"{ticker}": va,
+                    "FT=1": v1,
+                    "FT=0": v0,
+                    "Δ vs FT=1": va-v1 if pd.notna(v1) else np.nan,
+                    "Δ vs FT=0": va-v0 if pd.notna(v0) else np.nan,
+                })
+        detail_data[ticker] = pd.DataFrame(rows)
+
+    if summary:
+        sum_df = pd.DataFrame(summary)
+
+        # config with only progress bars + lean label
+        cfg = {
+            "Ticker": st.column_config.TextColumn("Ticker"),
+            "FT1_pct": st.column_config.ProgressColumn("FT=1 %", format="%.0f%%", min_value=0.0, max_value=1.0),
+            "FT0_pct": st.column_config.ProgressColumn("FT=0 %", format="%.0f%%", min_value=0.0, max_value=1.0),
+            "Lean01":  st.column_config.ProgressColumn("Lean (0%=FT=0, 50%=tie, 100%=FT=1)",
+                                                       format="%.0f%%", min_value=0.0, max_value=1.0),
+            "Lean": st.column_config.TextColumn("Lean"),
+        }
+
+        st.data_editor(sum_df, hide_index=True, use_container_width=True,
+                       column_config=cfg, disabled=True, key="align_table")
+
+        # expanders per row for detail
+        for tkr, df in detail_data.items():
+            with st.expander(f"Details for {tkr}", expanded=False):
+                if df.empty:
+                    st.info("No variable overlaps for this stock.")
+                else:
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.markdown("**Markdown**")
+                    st.code(df_to_markdown_table(df, list(df.columns)), language="markdown")
+
+else:
+    st.info("Upload DB (to build FT=1/FT=0 medians) and/or add manual stocks to see alignment.")
 
     # Clear
     st.markdown("---")
