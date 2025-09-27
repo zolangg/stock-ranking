@@ -1,4 +1,4 @@
-st-tabulator>=1.0.3
+streamlit-tabulator>=1.0.3
 pandas
 numpy
 openpyxl
