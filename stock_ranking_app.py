@@ -84,34 +84,33 @@ def _to_float(s):
 if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "mad_tbl": DataFrame, "var_list": [...]}
-    
+
 # ---------- Handle delete via query param (st.query_params) ----------
 try:
+    # Read once and normalize
     del_tkr = st.query_params.get("del_ticker", None)
     if isinstance(del_tkr, list):
         del_tkr = del_tkr[0] if del_tkr else None
+    del_tkr = (str(del_tkr).strip().upper()) if del_tkr else None
 
     if del_tkr:
+        # Delete exactly one ticker (case-insensitive match)
         before = len(st.session_state.rows)
-        # case-insensitive + trimmed match
-        key = str(del_tkr).strip().upper()
         st.session_state.rows = [
             r for r in st.session_state.rows
-            if str(r.get("Ticker", "")).strip().upper() != key
+            if str(r.get("Ticker", "")).strip().upper() != del_tkr
         ]
         after = len(st.session_state.rows)
-
         if before != after:
             st.success(f"Deleted {del_tkr}")
 
-        # clear query params used for deletion
-        if "del_ticker" in st.query_params:
-            del st.query_params["del_ticker"]
-        if "ts" in st.query_params:
-            del st.query_params["ts"]
+        # Clear params via reassignment (most reliable across versions)
+        kept = {k: v for k, v in dict(st.query_params).items()
+                if k not in ("del_ticker", "ts", "del_nonce")}
+        st.query_params = kept  # updates the URL immediately
 
-        # refresh UI
-        do_rerun()
+        # Stop this run so it won't apply deletion logic again
+        st.stop()
 except Exception as e:
     st.error(f"Error handling delete: {e}")
 # --------------------------------------------------------------------
@@ -473,7 +472,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
   /* Delete column styles */
   .del-btn {
-    background: transparent; border: none; cursor: pointer; font-size: 16px; line-height: 1;
+    background: transparent; border: none; cursor: pointer; font-size: 16px; line-height: 1; text-decoration: none;
   }
   .del-col, th.del-col { text-align: center !important; width: 48px; }
 </style>
@@ -592,7 +591,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             render: (data, type, row) => {
               const t = encodeURIComponent(String(row.Ticker || '').trim());
               const ts = Date.now();
-              // Use a normal link with target="_top" so navigation escapes the iframe
               return `<a class="del-btn" title="Delete ${row.Ticker}"
                         href="?del_ticker=${t}&ts=${ts}"
                         target="_top"
@@ -600,19 +598,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             }
           },
         ]
-      });
-
-      // DELETE handler (stop row toggle)
-      $('#align tbody').on('click', '.del-btn', function (e) {
-        e.stopPropagation();
-        const t = $(this).data('ticker');
-        if (!t) return;
-        if (!confirm(`Delete ${t}?`)) return;
-        // set query param and reload parent to inform Streamlit
-        const url = new URL(window.parent.location.href);
-        url.searchParams.set('del_ticker', t);
-        url.searchParams.set('ts', Date.now()); // bust cache
-        window.parent.location.href = url.toString();
       });
 
       // whole-row toggle child (except when clicking delete)
