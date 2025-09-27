@@ -211,7 +211,7 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
         mad_tbl: pd.DataFrame = models_data.get("mad_tbl", pd.DataFrame())
 
         # User control for what we call "significant"
-        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
+        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 5.0, 0.1,
                                help="Highlight rows where |FT=1 − FT=0| / (MAD₁ + MAD₀) ≥ σ")
         st.session_state["sig_thresh"] = float(sig_thresh)
 
@@ -467,9 +467,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .col-var { width: 18%; }
   .col-val { width: 12%; }
   .col-ft1 { width: 18%; }
-  .col-ft0 { width: 15%; }
-  .col-d1  { width: 15%; }
-  .col-d0  { width: 15%; }
+  .col-ft0 { width: 18%; }
+  .col-d1  { width: 17%; }
+  .col-d0  { width: 17%; }
 
   .pos { color:#059669; } 
   .neg { color:#dc2626; }
