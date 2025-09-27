@@ -69,631 +69,287 @@ def _to_float(s):
     except Exception:
         return np.nan
 
-# Qualitative config (full text + short labels for table)
-QUAL_CRITERIA = [
-    {
-        "name": "GapStruct",
-        "question": "Gap & Trend Development:",
-        "options": [
-            "Gap fully reversed: price loses >80% of gap.",
-            "Choppy reversal: price loses 50–80% of gap.",
-            "Partial retracement: price loses 25–50% of gap.",
-            "Sideways consolidation: gap holds, price within top 25% of gap.",
-            "Uptrend with deep pullbacks (>30% retrace).",
-            "Uptrend with moderate pullbacks (10–30% retrace).",
-            "Clean uptrend, only minor pullbacks (<10%).",
-        ],
-        "short": [
-            "Full reverse",
-            "Choppy rev",
-            "Partial retrace",
-            "Sideways top 25%",
-            "Uptrend deep PB",
-            "Uptrend mod PB",
-            "Clean uptrend",
-        ],
-    },
-    {
-        "name": "LevelStruct",
-        "question": "Key Price Levels:",
-        "options": [
-            "Fails at all major support/resistance; cannot hold any key level.",
-            "Briefly holds/reclaims a level but loses it quickly; repeated failures.",
-            "Holds one support but unable to break resistance; capped below a key level.",
-            "Breaks above resistance but cannot stay; dips below reclaimed level.",
-            "Breaks and holds one major level; most resistance remains above.",
-            "Breaks and holds several major levels; clears most overhead resistance.",
-            "Breaks and holds above all resistance; blue sky.",
-        ],
-        "short": [
-            "Fails levels",
-            "Brief reclaim → fail",
-            "Holds support only",
-            "Breaks then loses",
-            "Holds 1 major",
-            "Holds several",
-            "Blue sky",
-        ],
-    },
-    {
-        "name": "Monthly",
-        "question": "Monthly/Weekly Chart Context:",
-        "options": [
-            "Sharp, accelerating downtrend; new lows repeatedly.",
-            "Persistent downtrend; still lower lows.",
-            "Downtrend losing momentum; flattening.",
-            "Clear base; sideways consolidation.",
-            "Bottom confirmed; higher low after base.",
-            "Uptrend begins; breaks out of base.",
-            "Sustained uptrend; higher highs, blue sky.",
-        ],
-        "short": [
-            "Accel down",
-            "Downtrend",
-            "Flattening",
-            "Base",
-            "Bottomed",
-            "Uptrend start",
-            "Uptrend sustained",
-        ],
-    },
-]
-
-def _short_qual(name: str, idx1_based: int) -> str:
-    for crit in QUAL_CRITERIA:
-        if crit["name"] == name:
-            i = max(1, min(idx1_based, len(crit["short"]))) - 1
-            return crit["short"][i]
-    return "—"
-
 # ============================== Session State ==============================
 if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "var_list": [...]}
 
-# ============================== Tabs ==============================
-tab_input, tab_tables = st.tabs(["➕ Manual Input", "📊 Tables & Models"])
+# ============================== Upload DB → Build Medians ==============================
+st.subheader("Upload Database → Build Model Stocks (FT=1 and FT=0 medians)")
+uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
+build_btn = st.button("Build model stocks (medians for FT=1 and FT=0)", use_container_width=True, key="db_build_btn")
 
-# ============================== ➕ Manual Input ==============================
-with tab_input:
-    # ----------- (Moved here) Upload Database — no group field, fixed to 'FT' -----------
-    st.markdown("### Upload Database (Excel) → Build Model Stocks (FT=1 & FT=0 medians only)")
-    uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl", label_visibility="collapsed")
-    build_btn = st.button("Build model stocks (medians for FT=1 and FT=0)", use_container_width=True, key="db_build_btn")
-
-    if build_btn:
-        if not uploaded:
-            st.error("Please upload an Excel workbook first.")
-        else:
-            try:
-                xls = pd.ExcelFile(uploaded)
-                # choose first non-legend sheet
-                sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
-                sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
-                raw = pd.read_excel(xls, sheet)
-
-                group_field = "FT"  # fixed (no input)
-
-                # map columns
-                col_group = _pick(raw, [group_field])
-                if col_group is None:
-                    st.error(f"Group field '{group_field}' not found in sheet '{sheet}'.")
-                else:
-                    df = pd.DataFrame()
-                    df["GroupRaw"] = raw[col_group]
-
-                    def add_num(df, name, src_candidates):
-                        src = _pick(raw, src_candidates)
-                        if src:
-                            df[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
-
-                    add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
-                    add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
-                    add_num(df, "ShortInt_%",   ["shortint %","short interest %","short float %","si","short interest (float) %"])
-                    add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
-                    add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
-                    add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
-                    add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
-                    add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
-
-                    # derived
-                    if {"PM_Vol_M","Float_M"}.issubset(df.columns):
-                        df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
-                    if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
-                        df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
-
-                    # reduce to binary groups FT=1 vs FT=0 (or general 1 vs 0)
-                    def _to_binary(v):
-                        sv = str(v).strip().lower()
-                        if sv in {"1","true","yes","y","t"}: return 1
-                        if sv in {"0","false","no","n","f"}: return 0
-                        try:
-                            fv = float(sv)
-                            return 1 if fv >= 0.5 else 0
-                        except:
-                            return np.nan
-
-                    df["FT01"] = df["GroupRaw"].map(_to_binary)
-                    df = df[df["FT01"].isin([0,1])]
-                    if df.empty or df["FT01"].nunique() < 2:
-                        st.error("Could not find both FT=1 and FT=0 rows in the DB. Please check the group column.")
-                    else:
-                        df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
-
-                        # medians per group
-                        var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
-                        gmed = df.groupby("Group")[var_list].median(numeric_only=True).T  # variables as rows, columns FT=0/FT=1
-
-                        st.session_state.models = {"models_tbl": gmed, "var_list": var_list}
-                        st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
-                        do_rerun()
-
-            except Exception as e:
-                st.error("Loading/processing failed.")
-                st.exception(e)
-
-    # ----------- Manual Add Form -----------
-    st.markdown("### Add Stock")
-    with st.form("add_form", clear_on_submit=True):
-        c1, c2, c3 = st.columns([1.2, 1.2, 1.0])
-
-        with c1:
-            ticker  = st.text_input("Ticker", "").strip().upper()
-            mc_m    = st.number_input("Market Cap (M$)", 0.0, step=0.01, format="%.2f")
-            float_m = st.number_input("Public Float (M)", 0.0, step=0.01, format="%.2f")
-            si_pct  = st.number_input("Short Interest (%)", 0.0, step=0.01, format="%.2f")
-            gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")  # real percent e.g. 100 = +100%
-
-        with c2:
-            atr_usd = st.number_input("ATR ($)", 0.0, step=0.01, format="%.2f")
-            rvol    = st.number_input("RVOL", 0.0, step=0.01, format="%.2f")
-            pm_vol  = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
-            pm_dol  = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
-
-        with c3:
-            # Probability sliders (as requested)
-            catalyst = st.slider("Catalyst (−1.0 … +1.0)", -1.0, 1.0, 0.0, 0.1)
-            dilution = st.slider("Dilution (0.0 … 1.0)", 0.0, 1.0, 0.0, 0.1)
-
-        st.markdown("---")
-        st.subheader("Qualitative Context")
-        q_cols = st.columns(3)
-        qual_selected = {}
-        for i, crit in enumerate(QUAL_CRITERIA):
-            with q_cols[i % 3]:
-                choice = st.radio(
-                    crit["question"],
-                    options=list(enumerate(crit["options"], 1)),
-                    format_func=lambda x: x[1],
-                    key=f"qual_{crit['name']}"
-                )
-                q_idx = choice[0] if isinstance(choice, tuple) else int(choice)
-                qual_selected[crit["name"]] = q_idx
-
-        submitted = st.form_submit_button("Add to Table", use_container_width=True)
-
-    if submitted and ticker:
-        # Derived metrics
-        fr = (pm_vol / float_m) if float_m > 0 else 0.0
-        pmmc = (pm_dol / mc_m * 100.0) if mc_m > 0 else 0.0
-
-        # Short qualitative labels for table
-        q_gap   = _short_qual("GapStruct",   qual_selected.get("GapStruct", 1))
-        q_level = _short_qual("LevelStruct", qual_selected.get("LevelStruct", 1))
-        q_mtf   = _short_qual("Monthly",     qual_selected.get("Monthly", 1))
-
-        row = {
-            "Ticker": ticker,
-            # Numeric
-            "MarketCap_M$": mc_m,
-            "Float_M": float_m,
-            "ShortInt_%": si_pct,
-            "Gap_%": gap_pct,
-            "ATR_$": atr_usd,
-            "RVOL": rvol,
-            "PM_Vol_M": pm_vol,
-            "PM_$Vol_M$": pm_dol,
-            "FR_x": fr,
-            "PM$Vol/MC_%": pmmc,
-            # Sliders
-            "Catalyst": catalyst,
-            "Dilution": dilution,
-            # Qualitative (short)
-            "Q_GapStruct": q_gap,
-            "Q_LevelStruct": q_level,
-            "Q_Monthly": q_mtf,
-            # raw idx (optional)
-            "_Q_GapStruct_idx": qual_selected.get("GapStruct", 1),
-            "_Q_LevelStruct_idx": qual_selected.get("LevelStruct", 1),
-            "_Q_Monthly_idx": qual_selected.get("Monthly", 1),
-        }
-        st.session_state.rows.append(row)
-        st.session_state.last = row
-        st.success(f"Saved {ticker}.")
-        do_rerun()
-
-# ============================== 📊 Tables & Models ==============================
-with tab_tables:
-    # ---------- Manual Table (editable; ONLY manual rows) ----------
-    st.markdown("### Manual Table (editable)")
-    
-    if st.session_state.rows:
-        df_rows = pd.DataFrame(st.session_state.rows)
-        show_cols = [
-            "Ticker",
-            "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-            "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%",
-            "Catalyst","Dilution",
-            "Q_GapStruct","Q_LevelStruct","Q_Monthly",
-        ]
-        # pad missing columns so editor stays stable
-        for c in show_cols:
-            if c not in df_rows.columns:
-                df_rows[c] = ""
-    
-        # column configs
-        num_cols_cfg = {
-            c: st.column_config.NumberColumn(c, format="%.2f")
-            for c in show_cols
-            if c not in ["Ticker","Q_GapStruct","Q_LevelStruct","Q_Monthly"]
-        }
-        text_cols_cfg = {
-            "Ticker": st.column_config.TextColumn("Ticker"),
-            "Q_GapStruct": st.column_config.TextColumn("Q_GapStruct"),
-            "Q_LevelStruct": st.column_config.TextColumn("Q_LevelStruct"),
-            "Q_Monthly": st.column_config.TextColumn("Q_Monthly"),
-        }
-    
-        edited_df = st.data_editor(
-            df_rows[show_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={**num_cols_cfg, **text_cols_cfg},
-            num_rows="dynamic",  # allows adding/removing rows
-            key="manual_editor",
-        )
-    
-        c_save, c_dl = st.columns([1,1])
-        with c_save:
-            if st.button("Save Changes", use_container_width=True, key="save_manual_changes"):
-                st.session_state.rows = edited_df.to_dict(orient="records")
-                st.success("Manual table updated.")
-                do_rerun()
-    
-        with c_dl:
-            st.download_button(
-                "Download Manual Table CSV",
-                edited_df.to_csv(index=False).encode("utf-8"),
-                "manual_table.csv",
-                "text/csv",
-                use_container_width=True,
-            )
-    
-        st.markdown("**Markdown**")
-        st.code(df_to_markdown_table(edited_df, show_cols), language="markdown")
-    
+if build_btn:
+    if not uploaded:
+        st.error("Please upload an Excel workbook first.")
     else:
-        st.info("No manual rows yet. Add a stock in **Manual Input**.")
+        try:
+            xls = pd.ExcelFile(uploaded)
+            # choose first non-legend sheet
+            sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
+            sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
+            raw = pd.read_excel(xls, sheet)
 
-    # ---------- Divergence (FT=1 vs FT=0 only) ----------
-    with st.expander("Divergence (FT=1 vs FT=0 medians)", expanded=False):
-        models_data = st.session_state.models
-        if models_data:
-            models_tbl: pd.DataFrame = models_data["models_tbl"]  # rows=variables, cols=FT=0/FT=1
-            needed = {"FT=1","FT=0"}.issubset(models_tbl.columns)
-            if not needed:
-                st.warning("Need both FT=1 and FT=0 medians from DB to show divergence.")
+            # map columns
+            col_group = _pick(raw, ["FT"])
+            if col_group is None:
+                st.error(f"Group field 'FT' not found in sheet '{sheet}'. It must have 0/1 values.")
             else:
-                diffs = models_tbl.copy()
-                diffs["Δ |FT=1 − FT=0|"] = (models_tbl["FT=1"] - models_tbl["FT=0"])
-                dfd = diffs.sort_values("Δ |FT=1 − FT=0|", ascending=False)
-                TOP_K = st.slider("Top-K divergent variables", 3, min(12, len(dfd)), min(8, len(dfd)), 1, key="topk_div")
-                show_df = dfd.head(TOP_K).reset_index().rename(columns={"index":"Variable"})
+                df = pd.DataFrame()
+                df["GroupRaw"] = raw[col_group]
 
-                cfg = {
-                    "Variable": st.column_config.TextColumn("Variable"),
-                    "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
-                    "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
-                    "Δ |FT=1 − FT=0|": st.column_config.NumberColumn("Δ |FT=1 − FT=0|", format="%.2f"),
-                }
-                st.dataframe(show_df, use_container_width=True, hide_index=True, column_config=cfg)
+                def add_num(df, name, src_candidates):
+                    src = _pick(raw, src_candidates)
+                    if src:
+                        df[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-                st.markdown("**Markdown**")
-                st.code(df_to_markdown_table(show_df, list(show_df.columns)), language="markdown")
-        else:
-            st.info("Upload DB and build FT=1/FT=0 medians to see divergence.")
+                add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
+                add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
+                add_num(df, "ShortInt_%",   ["shortint %","short interest %","short float %","si","short interest (float) %"])
+                add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
+                add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
+                add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
+                add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
+                add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
 
-    # ---------- Pairwise Differences: Manual vs Model Stocks ----------
-    with st.expander("Pairwise Differences (Manual Ticker vs FT=1 & FT=0 medians)", expanded=False):
-        if st.session_state.rows and st.session_state.models and {"FT=1","FT=0"}.issubset(st.session_state.models["models_tbl"].columns):
-            base = pd.DataFrame(st.session_state.rows)
-            tickers = base["Ticker"].dropna().astype(str).unique().tolist() if "Ticker" in base.columns else []
-            tickers = [t for t in tickers if t != ""]
-            if tickers:
-                tA = st.selectbox("Manual Ticker", tickers, index=0, key="pair_manual_vs_models")
-                a = base[base["Ticker"] == tA].iloc[-1]
+                # derived
+                if {"PM_Vol_M","Float_M"}.issubset(df.columns):
+                    df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
+                if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
+                    df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-                models_tbl = st.session_state.models["models_tbl"]  # rows=variables
-                num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
+                # reduce to binary groups FT=1 vs FT=0 (or general 1 vs 0)
+                def _to_binary(v):
+                    sv = str(v).strip().lower()
+                    if sv in {"1","true","yes","y","t"}: return 1
+                    if sv in {"0","false","no","n","f"}: return 0
+                    try:
+                        fv = float(sv)
+                        return 1 if fv >= 0.5 else 0
+                    except:
+                        return np.nan
 
-                rows = []
-                for v in num_vars:
-                    va = pd.to_numeric(a.get(v), errors="coerce")
-                    v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) and ("FT=1" in models_tbl.columns) else np.nan
-                    v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) and ("FT=0" in models_tbl.columns) else np.nan
-                    if pd.notna(va) and (pd.notna(v1) or pd.notna(v0)):
-                        rows.append({
-                            "Variable": v,
-                            f"{tA}": va,
-                            "FT=1": v1 if pd.notna(v1) else np.nan,
-                            "FT=0": v0 if pd.notna(v0) else np.nan,
-                            "Δ vs FT=1": (va - v1) if pd.notna(v1) else np.nan,
-                            "Δ vs FT=0": (va - v0) if pd.notna(v0) else np.nan,
-                        })
-                if rows:
-                    dd = pd.DataFrame(rows)
-                    # Order by whichever absolute delta is larger per row
-                    dd["_max_abs"] = np.nanmax(np.vstack([
-                        dd["Δ vs FT=1"].abs().fillna(-np.inf).to_numpy(),
-                        dd["Δ vs FT=0"].abs().fillna(-np.inf).to_numpy()
-                    ]), axis=0)
-                    dd = dd.sort_values("_max_abs", ascending=False).drop(columns=["_max_abs"])
-
-                    cfg = {
-                        "Variable": st.column_config.TextColumn("Variable"),
-                        f"{tA}":   st.column_config.NumberColumn(f"{tA}",   format="%.2f"),
-                        "FT=1":    st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
-                        "FT=0":    st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
-                        "Δ vs FT=1": st.column_config.NumberColumn("Δ vs FT=1", format="%.2f"),
-                        "Δ vs FT=0": st.column_config.NumberColumn("Δ vs FT=0", format="%.2f"),
-                    }
-                    st.dataframe(dd, use_container_width=True, hide_index=True, column_config=cfg)
-                    st.markdown("**Markdown**")
-                    st.code(df_to_markdown_table(dd, list(dd.columns)), language="markdown")
+                df["FT01"] = df["GroupRaw"].map(_to_binary)
+                df = df[df["FT01"].isin([0,1])]
+                if df.empty or df["FT01"].nunique() < 2:
+                    st.error("Could not find both FT=1 and FT=0 rows in the DB. Please check the FT column.")
                 else:
-                    st.info("No overlapping variables between manual ticker and model medians.")
-            else:
-                st.info("Add at least one manual ticker to compare.")
-        else:
-            st.info("Need manual rows and built FT=1/FT=0 medians to run this comparison.")
+                    df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-# ---------- Alignment Summary (DataTables child-rows; blue FT=1 bar, red FT=0 bar; compact child table) ----------
-st.markdown("### Alignment Summary (model medians + manual stocks — expandable child rows)")
+                    # medians per group
+                    var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
+                    gmed = df.groupby("Group")[var_list].median(numeric_only=True).T  # variables as rows, columns FT=0/FT=1
 
-import json
-import streamlit.components.v1 as components
+                    st.session_state.models = {"models_tbl": gmed, "var_list": var_list}
+                    st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
+                    do_rerun()
 
-def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
+        except Exception as e:
+            st.error("Loading/processing failed.")
+            st.exception(e)
+
+# Show medians table right after the button (when available)
+models_data = st.session_state.models
+if models_data and isinstance(models_data, dict) and not models_data.get("models_tbl", pd.DataFrame()).empty:
+    st.markdown("#### Model Medians (FT=1 vs FT=0)")
+    med_tbl: pd.DataFrame = models_data["models_tbl"]
+    cfg = {
+        "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
+        "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
+    }
+    st.dataframe(med_tbl, use_container_width=True, column_config=cfg, hide_index=False)
+
+# ============================== ➕ Manual Input (simplified) ==============================
+st.markdown("---")
+st.subheader("Add Stock")
+
+with st.form("add_form", clear_on_submit=True):
+    c1, c2, c3 = st.columns([1.2, 1.2, 1.0])
+
+    with c1:
+        ticker  = st.text_input("Ticker", "").strip().upper()
+        mc_m    = st.number_input("Market Cap (M$)", 0.0, step=0.01, format="%.2f")
+        float_m = st.number_input("Public Float (M)", 0.0, step=0.01, format="%.2f")
+        si_pct  = st.number_input("Short Interest (%)", 0.0, step=0.01, format="%.2f")
+        gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")  # real percent e.g. 100 = +100%
+
+    with c2:
+        atr_usd = st.number_input("ATR ($)", 0.0, step=0.01, format="%.2f")
+        rvol    = st.number_input("RVOL", 0.0, step=0.01, format="%.2f")
+        pm_vol  = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
+        pm_dol  = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
+
+    with c3:
+        catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
+
+    st.form_submit_button.disabled = False
+    submitted = st.form_submit_button("Add to Table", use_container_width=True)
+
+if submitted and ticker:
+    # Derived metrics
+    fr = (pm_vol / float_m) if float_m > 0 else 0.0
+    pmmc = (pm_dol / mc_m * 100.0) if mc_m > 0 else 0.0
+
+    row = {
+        "Ticker": ticker,
+        # Numeric
+        "MarketCap_M$": mc_m,
+        "Float_M": float_m,
+        "ShortInt_%": si_pct,
+        "Gap_%": gap_pct,
+        "ATR_$": atr_usd,
+        "RVOL": rvol,
+        "PM_Vol_M": pm_vol,
+        "PM_$Vol_M$": pm_dol,
+        "FR_x": fr,
+        "PM$Vol/MC_%": pmmc,
+        # Catalyst as 1/0 plus label
+        "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
+        "CatalystYN": catalyst_yn,
+    }
+    st.session_state.rows.append(row)
+    st.session_state.last = row
+    st.success(f"Saved {ticker}.")
+    do_rerun()
+
+# ============================== Added Stocks (editable) ==============================
+st.markdown("### Added Stocks (editable)")
+if st.session_state.rows:
+    df_rows = pd.DataFrame(st.session_state.rows)
+    show_cols = [
+        "Ticker",
+        "MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+        "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%",
+        "CatalystYN","Catalyst",
+    ]
+    for c in show_cols:
+        if c not in df_rows.columns:
+            df_rows[c] = ""
+
+    num_cols_cfg = {
+        c: st.column_config.NumberColumn(c, format="%.2f")
+        for c in show_cols
+        if c not in ["Ticker","CatalystYN"]
+    }
+    text_cols_cfg = {
+        "Ticker": st.column_config.TextColumn("Ticker"),
+        "CatalystYN": st.column_config.SelectboxColumn("Catalyst?",
+                                                       options=["No","Yes"])
+    }
+
+    edited_df = st.data_editor(
+        df_rows[show_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={**num_cols_cfg, **text_cols_cfg},
+        num_rows="dynamic",
+        key="manual_editor",
+    )
+
+    # Convert CatalystYN back to numeric Catalyst consistently
+    edited_df["Catalyst"] = edited_df["CatalystYN"].map({"Yes":1.0,"No":0.0}).fillna(0.0)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Save Changes", use_container_width=True, key="save_manual_changes"):
+            st.session_state.rows = edited_df.to_dict(orient="records")
+            st.success("Manual table updated.")
+            do_rerun()
+    with c2:
+        st.download_button(
+            "Download Added Stocks CSV",
+            edited_df.to_csv(index=False).encode("utf-8"),
+            "added_stocks.csv", "text/csv",
+            use_container_width=True,
+        )
+else:
+    st.info("No manual rows yet. Add a stock above.")
+
+# ============================== Alignment (only added stocks; FT=1 / FT=0 bars) ==============================
+st.markdown("### Alignment (only added stocks)")
+
+def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
     if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
         return {}
-    groups = ["FT=1","FT=0"]
+    groups_cols = ["FT=1","FT=0"]
     cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
-    common = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
-    counts = {g: 0 for g in groups}; used = 0
-    for v in common:
-        xv = pd.to_numeric(stock_row.get(v), errors="coerce")
-        if not np.isfinite(xv): 
+                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
+    common_vars = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
+    counts = {g: 0 for g in groups_cols}
+    used = 0
+    for v in common_vars:
+        x = stock_row.get(v, None)
+        try:
+            xv = float(x)
+        except Exception:
+            xv = np.nan
+        if not np.isfinite(xv):
             continue
-        med = models_tbl.loc[v, groups].astype(float).dropna()
-        if med.empty: 
+        med = models_tbl.loc[v, groups_cols].astype(float).dropna()
+        if med.empty:
             continue
         diffs = (med - xv).abs()
-        counts[diffs.idxmin()] += 1
+        nearest = diffs.idxmin()
+        counts[nearest] = counts.get(nearest, 0) + 1
         used += 1
     counts["N_Vars_Used"] = used
     return counts
 
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
-
-if not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
-    # two model “stocks”
-    model_rows = []
-    for g in ["FT=1","FT=0"]:
-        vals = models_tbl[g].to_dict()
-        vals.update({"Ticker": g})
-        model_rows.append(vals)
-
-    # manual rows (if any)
-    manual_rows = st.session_state.get("rows", [])
-    all_rows = model_rows + manual_rows
-
-    num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
-                "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst","Dilution"]
-
+if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
+    # Build alignment summary ONLY for added stocks (no model rows)
     summary_rows = []
-    detail_map = {}
-
-    for row in all_rows:
-        stock = dict(row)
-        tkr = stock.get("Ticker") or "—"
-        counts = _compute_alignment_counts(stock, models_tbl)
+    for row in st.session_state.rows:
+        counts = compute_alignment_counts_vs_binary(row, models_tbl)
         if not counts: 
             continue
-        like1, like0 = counts.get("FT=1",0), counts.get("FT=0",0)
-        n_used = counts.get("N_Vars_Used",0)
-
-        # keep same math, but display WITHOUT the % symbol
-        ft1_val = round((like1 / n_used * 100.0), 0) if n_used>0 else 0.0
-        ft0_val = round((like0 / n_used * 100.0), 0) if n_used>0 else 0.0
-
+        like1, like0 = counts.get("FT=1", 0), counts.get("FT=0", 0)
+        n_used = counts.get("N_Vars_Used", 0)
+        ft1_val = (like1 / n_used) if n_used > 0 else 0.0
+        ft0_val = (like0 / n_used) if n_used > 0 else 0.0
         summary_rows.append({
-            "Ticker": tkr,
-            "FT1_val": ft1_val,  # 0..100 number (no % sign)
-            "FT0_val": ft0_val,  # 0..100 number (no % sign)
+            "Ticker": row.get("Ticker","—"),
+            "FT1": ft1_val,   # 0..1 for ProgressColumn
+            "FT0": ft0_val,   # 0..1 for ProgressColumn
         })
 
-        # child table rows (extra-compact; no colors on text)
-        drows = []
-        for v in num_vars:
-            va = pd.to_numeric(stock.get(v), errors="coerce")
-            v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
-            v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
-            if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
-                continue
-            drows.append({
-                "Variable": v,
-                "Value": None if pd.isna(va) else float(va),
-                "FT1":   None if pd.isna(v1) else float(v1),
-                "FT0":   None if pd.isna(v0) else float(v0),
-                "d_vs_FT1": None if (pd.isna(va) or pd.isna(v1)) else float(va - v1),
-                "d_vs_FT0": None if (pd.isna(va) or pd.isna(v0)) else float(va - v0),
-            })
-        detail_map[tkr] = drows
-
     if summary_rows:
-        payload = {"rows": summary_rows, "details": detail_map}
-        html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
-<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
-<style>
-  body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }}
-  table.dataTable tbody tr {{ cursor: pointer; }}
+        sum_df = pd.DataFrame(summary_rows)
+        # Order columns to feel centered visually: Ticker | (spacer via narrow col?) Not possible directly,
+        # but we can at least put FT=1 and FT=0 beside each other and keep ticker narrow.
+        cfg = {
+            "Ticker": st.column_config.TextColumn("Ticker"),
+            "FT1": st.column_config.ProgressColumn("FT=1", format="%.0f%%", min_value=0.0, max_value=1.0, help="Share of variables closer to FT=1"),
+            "FT0": st.column_config.ProgressColumn("FT=0", format="%.0f%%", min_value=0.0, max_value=1.0, help="Share of variables closer to FT=0"),
+        }
+        # Small trick to visually center: use empty text column left & right (narrow). Commented out by default.
+        st.data_editor(
+            sum_df[["Ticker","FT1","FT0"]],
+            hide_index=True,
+            use_container_width=True,
+            column_config=cfg,
+            disabled=True,
+            key="align_only_added",
+        )
 
-  /* Parent row bars */
-  .bar {{ height: 12px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }}
-  .bar > span {{ position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }}
-  .bar-label {{ font-size: 11px; margin-left: 6px; white-space: nowrap; color:#374151; }}
-  .bar-wrap {{ display:flex; align-items:center; gap:6px; }}
-  .blue > span {{ background:#3b82f6; }}  /* FT=1 = blue */
-  .red  > span {{ background:#ef4444; }}  /* FT=0 = red  */
-
-  /* Child table: extra compact & fixed layout */
-  .child-table {{ width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }}
-  .child-table th, .child-table td {{ font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-  .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
-
-  /* Tighter column widths (Value very narrow) */
-  .col-var {{ width: 26%; }}
-  .col-val {{ width: 10%; }}  /* very tight per your request */
-  .col-ft1 {{ width: 16%; }}
-  .col-ft0 {{ width: 16%; }}
-  .col-d1  {{ width: 16%; }}
-  .col-d0  {{ width: 16%; }}
-
-  .pos {{ color:#059669; }} 
-  .neg {{ color:#dc2626; }}
-</style>
-</head>
-<body>
-  <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead>
-      <tr>
-        <th>Ticker</th>
-        <th>FT=1</th>
-        <th>FT=0</th>
-      </tr>
-    </thead>
-  </table>
-
-  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-  <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
-  <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
-  <script>
-    const data = {json.dumps(payload)};
-
-    function barCellBlue(val) {{
-      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
-      return `
-        <div class="bar-wrap">
-          <div class="bar blue" style="width:110px"><span style="width:${{v}}%"></span></div>
-          <div class="bar-label">${{v.toFixed(0)}}</div>
-        </div>`;
-    }}
-    function barCellRed(val) {{
-      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
-      return `
-        <div class="bar-wrap">
-          <div class="bar red" style="width:110px"><span style="width:${{v}}%"></span></div>
-          <div class="bar-label">${{v.toFixed(0)}}</div>
-        </div>`;
-    }}
-
-    function childTableHTML(ticker) {{
-      const rows = data.details[ticker] || [];
-      if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
-      const cells = rows.map(r => {{
-        const v  = (r.Value==null||isNaN(r.Value)) ? '' : r.Value.toFixed(2);
-        const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
-        const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
-        const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : r.d_vs_FT1.toFixed(2);
-        const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : r.d_vs_FT0.toFixed(2);
-        const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
-        const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
-        return `
-          <tr>
-            <td class="col-var">${{r.Variable}}</td>
-            <td class="col-val">${{v}}</td>
-            <td class="col-ft1">${{f1}}</td>
-            <td class="col-ft0">${{f0}}</td>
-            <td class="col-d1 ${{c1}}">${{d1}}</td>
-            <td class="col-d0 ${{c0}}">${{d0}}</td>
-          </tr>`;
-      }}).join('');
-      return `
-        <table class="child-table">
-          <colgroup>
-            <col class="col-var"/><col class="col-val"/><col class="col-ft1"/><col class="col-ft0"/><col class="col-d1"/><col class="col-d0"/>
-          </colgroup>
-          <thead>
-            <tr>
-              <th class="col-var">Variable</th>
-              <th class="col-val">Value</th>
-              <th class="col-ft1">FT=1 median</th>
-              <th class="col-ft0">FT=0 median</th>
-              <th class="col-d1">Δ vs FT=1</th>
-              <th class="col-d0">Δ vs FT=0</th>
-            </tr>
-          </thead>
-          <tbody>${{cells}}</tbody>
-        </table>`;
-    }}
-
-    $(function() {{
-      const table = $('#align').DataTable({{
-        data: data.rows,
-        responsive: true,
-        paging: false, info: false, searching: false,
-        order: [[0,'asc']],
-        columns: [
-          {{ data: 'Ticker' }},
-          {{ data: 'FT1_val', render: (d)=>barCellBlue(d) }},  // blue bar
-          {{ data: 'FT0_val', render: (d)=>barCellRed(d) }},   // red bar
-        ]
-      }});
-
-      // whole-row toggle child
-      $('#align tbody').on('click', 'tr', function () {{
-        const row = table.row(this);
-        if (row.child.isShown()) {{
-          row.child.hide(); $(this).removeClass('shown');
-        }} else {{
-          const ticker = row.data().Ticker;
-          row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
-        }}
-      }});
-    }});
-  </script>
-</body>
-</html>
-        """
-        components.html(html, height=620, scrolling=True)
+        # Markdown copy if needed
+        st.markdown("**Markdown**")
+        st.code(df_to_markdown_table(sum_df, list(sum_df.columns)), language="markdown")
     else:
-        st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
+        st.info("No overlapping variables between added stocks and model medians yet.")
+elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
+    st.info("Upload DB and build FT=1/FT=0 medians to compute alignment.")
+else:
+    st.info("Add at least one stock above to compute alignment.")
 
-    # Clear
-    st.markdown("---")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Clear Manual Rows", use_container_width=True):
-            st.session_state.rows = []
-            do_rerun()
-    with c2:
-        if st.button("Clear Model Medians (FT=1/FT=0)", use_container_width=True):
-            st.session_state.models = {}
-            do_rerun()
+# ============================== Clear ==============================
+st.markdown("---")
+c1, c2 = st.columns(2)
+with c1:
+    if st.button("Clear Added Stocks", use_container_width=True):
+        st.session_state.rows = []
+        do_rerun()
+with c2:
+    if st.button("Clear Model Medians (FT=1/FT=0)", use_container_width=True):
+        st.session_state.models = {}
+        do_rerun()
