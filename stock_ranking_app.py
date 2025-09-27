@@ -76,7 +76,6 @@ def _to_float(s):
             ss = ss.replace(",", ".")
         else:
             ss = ss.replace(",", "")
-        ss = ss.replace("%", "")  # <-- minimal fix: strip percent signs
         return float(ss)
     except Exception:
         return np.nan
@@ -85,6 +84,23 @@ def _to_float(s):
 if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "mad_tbl": DataFrame, "var_list": [...]}
+
+# ---------- Minimal addition: handle delete via query param ----------
+try:
+    qp = st.experimental_get_query_params()
+    del_tkr = qp.get("del_ticker", [None])[0]
+    if del_tkr:
+        before = len(st.session_state.rows)
+        st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker")) != str(del_tkr)]
+        after = len(st.session_state.rows)
+        if before != after:
+            st.success(f"Deleted {del_tkr}")
+        # clear the param to avoid repeat deletions on rerun
+        qp.pop("del_ticker", None)
+        st.experimental_set_query_params(**qp)
+except Exception:
+    pass
+# --------------------------------------------------------------------
 
 # ============================== Upload DB → Build Medians ==============================
 st.subheader("Upload Database")
@@ -440,6 +456,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
   .pos { color:#059669; } 
   .neg { color:#dc2626; }
+
+  /* Delete column styles */
+  .del-btn {
+    background: transparent; border: none; cursor: pointer; font-size: 16px; line-height: 1;
+  }
+  .del-col, th.del-col { text-align: center !important; width: 48px; }
 </style>
 </head>
 <body>
@@ -449,6 +471,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         <th>Ticker</th>
         <th>FT=1</th>
         <th>FT=0</th>
+        <th class="del-col">Delete</th>
       </tr>
     </thead>
   </table>
@@ -548,11 +571,29 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
           { data: 'Ticker' },
           { data: 'FT1_val', render: (d)=>barCellBlue(d) },
           { data: 'FT0_val', render: (d)=>barCellRed(d) },
+          { data: null, className: 'del-col',
+            orderable: false,
+            render: (data, type, row) => `<button class="del-btn" title="Delete ${row.Ticker}" data-ticker="${row.Ticker}">🗑️</button>`
+          },
         ]
       });
 
-      // whole-row toggle child
-      $('#align tbody').on('click', 'tr', function () {
+      // DELETE handler (stop row toggle)
+      $('#align tbody').on('click', '.del-btn', function (e) {
+        e.stopPropagation();
+        const t = $(this).data('ticker');
+        if (!t) return;
+        if (!confirm(`Delete ${t}?`)) return;
+        // set query param and reload parent to inform Streamlit
+        const url = new URL(window.parent.location.href);
+        url.searchParams.set('del_ticker', t);
+        url.searchParams.set('ts', Date.now()); // bust cache
+        window.parent.location.href = url.toString();
+      });
+
+      // whole-row toggle child (except when clicking delete)
+      $('#align tbody').on('click', 'tr', function (e) {
+        if ($(e.target).closest('.del-btn').length) return; // already handled
         const row = table.row(this);
         if (row.child.isShown()) {
           row.child.hide(); $(this).removeClass('shown');
