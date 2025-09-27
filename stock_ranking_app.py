@@ -150,18 +150,18 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# Show medians table right after the button (when available)
+# Show medians table INSIDE AN EXPANDER (when available)
 models_data = st.session_state.models
 if models_data and isinstance(models_data, dict) and not models_data.get("models_tbl", pd.DataFrame()).empty:
-    st.markdown("#### Model Medians (FT=1 vs FT=0)")
-    med_tbl: pd.DataFrame = models_data["models_tbl"]
-    cfg = {
-        "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
-        "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
-    }
-    st.dataframe(med_tbl, use_container_width=True, column_config=cfg, hide_index=False)
+    with st.expander("Model Medians (FT=1 vs FT=0)", expanded=False):
+        med_tbl: pd.DataFrame = models_data["models_tbl"]
+        cfg = {
+            "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
+            "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
+        }
+        st.dataframe(med_tbl, use_container_width=True, column_config=cfg, hide_index=False)
 
-# ============================== ➕ Manual Input (simplified) ==============================
+# ============================== ➕ Manual Input (simplified: NO dilution, NO qualitative) ==============================
 st.markdown("---")
 st.subheader("Add Stock")
 
@@ -204,7 +204,7 @@ if submitted and ticker:
         "PM_$Vol_M$": pm_dol,
         "FR_x": fr,
         "PM$Vol/MC_%": pmmc,
-        # Catalyst (Yes/No -> 1/0 stored + label for UI)
+        # Catalyst (Yes/No -> 1/0 stored + label for UI if you ever need it)
         "CatalystYN": catalyst_yn,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
@@ -213,32 +213,27 @@ if submitted and ticker:
     st.success(f"Saved {ticker}.")
     do_rerun()
 
-# ============================== Alignment (only added stocks; editable ticker/catalyst) ==============================
-st.markdown("### Alignment (only added stocks)")
-def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
+# ============================== Alignment (DataTables child-rows; ONLY added stocks) ==============================
+st.markdown("### Alignment (added stocks; click row to expand details)")
+
+def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
     if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
         return {}
-    groups_cols = ["FT=1","FT=0"]
-    # Only numeric variables present in both manual row & models medians
+    groups = ["FT=1","FT=0"]
+    # numeric vars (Catalyst is not included here unless present in models medians)
     cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
                  "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
-    common_vars = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
-    counts = {g: 0 for g in groups_cols}
-    used = 0
-    for v in common_vars:
-        x = stock_row.get(v, None)
-        try:
-            xv = float(x)
-        except Exception:
-            xv = np.nan
+    common = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
+    counts = {g: 0 for g in groups}; used = 0
+    for v in common:
+        xv = pd.to_numeric(stock_row.get(v), errors="coerce")
         if not np.isfinite(xv):
             continue
-        med = models_tbl.loc[v, groups_cols].astype(float).dropna()
+        med = models_tbl.loc[v, groups].astype(float).dropna()
         if med.empty:
             continue
-        diffs = (med - xv).abs()
-        nearest = diffs.idxmin()
-        counts[nearest] = counts.get(nearest, 0) + 1
+        nearest = (med - xv).abs().idxmin()
+        counts[nearest] += 1
         used += 1
     counts["N_Vars_Used"] = used
     return counts
@@ -246,74 +241,201 @@ def compute_alignment_counts_vs_binary(stock_row: dict, models_tbl: pd.DataFrame
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
-    # Build alignment summary ONLY for added stocks
-    summary_rows = []
-    base_rows = []
+    # Build summary for ADDED stocks only (no model rows)
+    summary_rows, detail_map = [], {}
+    num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+                "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%"]
 
     for row in st.session_state.rows:
-        counts = compute_alignment_counts_vs_binary(row, models_tbl)
-        if not counts:
+        stock = dict(row)
+        tkr = stock.get("Ticker") or "—"
+        counts = _compute_alignment_counts(stock, models_tbl)
+        if not counts: 
             continue
-        like1, like0 = counts.get("FT=1", 0), counts.get("FT=0", 0)
-        n_used = counts.get("N_Vars_Used", 0)
-        ft1 = (like1 / n_used) if n_used > 0 else 0.0
-        ft0 = (like0 / n_used) if n_used > 0 else 0.0
+        like1, like0 = counts.get("FT=1",0), counts.get("FT=0",0)
+        n_used = counts.get("N_Vars_Used",0)
+        ft1_val = round((like1 / n_used * 100.0), 0) if n_used > 0 else 0.0
+        ft0_val = round((like0 / n_used * 100.0), 0) if n_used > 0 else 0.0
 
-        # Keep editable fields in the same row (Ticker, CatalystYN) + computed bars (FT1/FT0)
         summary_rows.append({
-            "Ticker": row.get("Ticker","—"),
-            "CatalystYN": row.get("CatalystYN","No"),
-            "FT1": ft1,   # 0..1 for ProgressColumn
-            "FT0": ft0,   # 0..1 for ProgressColumn
+            "Ticker": tkr,
+            "FT1_val": ft1_val,  # number 0..100 (no % sign)
+            "FT0_val": ft0_val,  # number 0..100 (no % sign)
         })
-        # keep a copy to map edits back
-        base_rows.append(row)
+
+        # child details
+        drows = []
+        for v in num_vars:
+            va = pd.to_numeric(stock.get(v), errors="coerce")
+            v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
+            v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
+            if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
+                continue
+            drows.append({
+                "Variable": v,
+                "Value": None if pd.isna(va) else float(va),
+                "FT1":   None if pd.isna(v1) else float(v1),
+                "FT0":   None if pd.isna(v0) else float(v0),
+                "d_vs_FT1": None if (pd.isna(va) or pd.isna(v1)) else float(va - v1),
+                "d_vs_FT0": None if (pd.isna(va) or pd.isna(v0)) else float(va - v0),
+            })
+        detail_map[tkr] = drows
 
     if summary_rows:
-        sum_df = pd.DataFrame(summary_rows)
+        import json, streamlit.components.v1 as components
+        payload = {"rows": summary_rows, "details": detail_map}
 
-        # Visual layout: Ticker | Catalyst? | FT=1 | FT=0
-        cfg = {
-            "Ticker":      st.column_config.TextColumn("Ticker"),
-            "CatalystYN":  st.column_config.SelectboxColumn("Catalyst?", options=["No","Yes"]),
-            "FT1":         st.column_config.ProgressColumn("FT=1", format="%.0f%%", min_value=0.0, max_value=1.0, help="Share of variables closer to FT=1"),
-            "FT0":         st.column_config.ProgressColumn("FT=0", format="%.0f%%", min_value=0.0, max_value=1.0, help="Share of variables closer to FT=0"),
-        }
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
+<style>
+  body {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }}
+  table.dataTable tbody tr {{ cursor: pointer; }}
 
-        # Make the table editable so you can correct Ticker/Catalyst; FT1/FT0 will recompute on save.
-        edited_df = st.data_editor(
-            sum_df[["Ticker","CatalystYN","FT1","FT0"]],
-            hide_index=True,
-            use_container_width=True,
-            column_config=cfg,
-            num_rows="dynamic",
-            key="align_editor",
-        )
+  /* Parent bars: centered look with fixed width and centered container */
+  .bar-wrap {{ display:flex; justify-content:center; align-items:center; gap:6px; }}
+  .bar {{ height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }}
+  .bar > span {{ position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }}
+  .bar-label {{ font-size: 11px; white-space: nowrap; color:#374151; min-width: 24px; text-align:center; }}
+  .blue > span {{ background:#3b82f6; }}  /* FT=1 = blue */
+  .red  > span {{ background:#ef4444; }}  /* FT=0 = red  */
 
-        # ---- Persist edits back to manual rows (Ticker, CatalystYN -> Catalyst) ----
-        if st.button("Save Alignment Changes", use_container_width=True, key="save_align_changes"):
-            # Build a map from old tickers to edited rows (by index)
-            # We align by index here; if you add/remove rows in the alignment editor,
-            # we'll just overwrite session rows with edited table values for these two fields.
-            new_rows = []
-            for i, old in enumerate(st.session_state.rows):
-                if i < len(edited_df):
-                    upd = edited_df.iloc[i]
-                    old["Ticker"] = str(upd.get("Ticker", old.get("Ticker",""))).strip().upper()
-                    yn = str(upd.get("CatalystYN", old.get("CatalystYN","No")))
-                    old["CatalystYN"] = "Yes" if yn == "Yes" else "No"
-                    old["Catalyst"] = 1.0 if old["CatalystYN"] == "Yes" else 0.0
-                new_rows.append(old)
-            st.session_state.rows = new_rows
-            st.success("Alignment edits saved. Recomputing…")
-            do_rerun()
+  /* Force center alignment for FT columns */
+  #align td:nth-child(2), #align th:nth-child(2),
+  #align td:nth-child(3), #align th:nth-child(3) {{ text-align: center; }}
 
-        st.markdown("**Markdown**")
-        st.code(df_to_markdown_table(edited_df, list(edited_df.columns)), language="markdown")
+  /* Child table: compact & fixed layout */
+  .child-table {{ width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }}
+  .child-table th, .child-table td {{
+    font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb;
+    text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }}
+  .child-table th:first-child, .child-table td:first-child {{ text-align:left; }}
+
+  /* Narrower Value column as requested */
+  .col-var {{ width: 28%; }}
+  .col-val {{ width: 12%; }}
+  .col-ft1 {{ width: 18%; }}
+  .col-ft0 {{ width: 18%; }}
+  .col-d1  {{ width: 12%; }}
+  .col-d0  {{ width: 12%; }}
+
+  .pos {{ color:#059669; }} 
+  .neg {{ color:#dc2626; }}
+</style>
+</head>
+<body>
+  <table id="align" class="display nowrap stripe" style="width:100%">
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>FT=1</th>
+        <th>FT=0</th>
+      </tr>
+    </thead>
+  </table>
+
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
+  <script>
+    const data = {json.dumps(payload)};
+
+    function barCellBlue(val) {{
+      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
+      return `
+        <div class="bar-wrap">
+          <div class="bar blue"><span style="width:${{v}}%"></span></div>
+          <div class="bar-label">${{v.toFixed(0)}}</div>
+        </div>`;
+    }}
+    function barCellRed(val) {{
+      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
+      return `
+        <div class="bar-wrap">
+          <div class="bar red"><span style="width:${{v}}%"></span></div>
+          <div class="bar-label">${{v.toFixed(0)}}</div>
+        </div>`;
+    }}
+
+    function childTableHTML(ticker) {{
+      const rows = data.details[ticker] || [];
+      if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
+      const cells = rows.map(r => {{
+        const v  = (r.Value==null||isNaN(r.Value)) ? '' : r.Value.toFixed(2);
+        const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : r.FT1.toFixed(2);
+        const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : r.FT0.toFixed(2);
+        const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : r.d_vs_FT1.toFixed(2);
+        const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : r.d_vs_FT0.toFixed(2);
+        const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
+        const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
+        return `
+          <tr>
+            <td class="col-var">${{r.Variable}}</td>
+            <td class="col-val">${{v}}</td>
+            <td class="col-ft1">${{f1}}</td>
+            <td class="col-ft0">${{f0}}</td>
+            <td class="col-d1 ${{c1}}">${{d1}}</td>
+            <td class="col-d0 ${{c0}}">${{d0}}</td>
+          </tr>`;
+      }}).join('');
+      return `
+        <table class="child-table">
+          <colgroup>
+            <col class="col-var"/><col class="col-val"/><col class="col-ft1"/><col class="col-ft0"/><col class="col-d1"/><col class="col-d0"/>
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="col-var">Variable</th>
+              <th class="col-val">Value</th>
+              <th class="col-ft1">FT=1 median</th>
+              <th class="col-ft0">FT=0 median</th>
+              <th class="col-d1">Δ vs FT=1</th>
+              <th class="col-d0">Δ vs FT=0</th>
+            </tr>
+          </thead>
+          <tbody>${{cells}}</tbody>
+        </table>`;
+    }}
+
+    $(function() {{
+      const table = $('#align').DataTable({{
+        data: data.rows,
+        responsive: true,
+        paging: false, info: false, searching: false,
+        order: [[0,'asc']],
+        columns: [
+          {{ data: 'Ticker' }},
+          {{ data: 'FT1_val', render: (d)=>barCellBlue(d) }},
+          {{ data: 'FT0_val', render: (d)=>barCellRed(d) }},
+        ]
+      }});
+
+      // whole-row toggle child
+      $('#align tbody').on('click', 'tr', function () {{
+        const row = table.row(this);
+        if (row.child.isShown()) {{
+          row.child.hide(); $(this).removeClass('shown');
+        }} else {{
+          const ticker = row.data().Ticker;
+          row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
+        }}
+      }});
+    }});
+  </script>
+</body>
+</html>
+        """
+        components.html(html, height=620, scrolling=True)
     else:
-        st.info("No overlapping variables between added stocks and model medians yet.")
+        st.info("No eligible rows yet. Add manual stocks and/or ensure FT=1/FT=0 medians are built.")
 elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
-    st.info("Upload DB and build FT=1/FT=0 medians to compute alignment.")
+    st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 medians first.")
 else:
     st.info("Add at least one stock above to compute alignment.")
 
