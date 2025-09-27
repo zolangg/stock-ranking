@@ -457,7 +457,7 @@ with tab_tables:
         else:
             st.info("Need manual rows and built FT=1/FT=0 medians to run this comparison.")
 
-        # ---------- Alignment Summary (DataTables.net child rows inside Streamlit) ----------
+    # ---------- Alignment Summary (DataTables.net child rows inside Streamlit) ----------
         st.markdown("### Alignment Summary (model medians + manual stocks — expandable child rows)")
         
         import json
@@ -710,7 +710,7 @@ with tab_tables:
             else:
                 st.info("Add at least one manual stock to compute alignment.")
         else:
-            st.info("Upload DB (to build FT=1/FT=0 medians) and add manual stocks to see alignment.")
+            st.info("Upload DB (to build FT=1/FT=0 medians) and add manual stocks to see alignment.") 
 
     # Clear
     st.markdown("---")
