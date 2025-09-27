@@ -1,4 +1,4 @@
-st-tabulator>=1.0.3
+st-tabulator
 pandas
 numpy
 openpyxl
