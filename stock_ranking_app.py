@@ -471,6 +471,27 @@ with tcol_sel:
         label_visibility="collapsed"
     )
 
+# --- Auto-recompute PredVol and % of Pred for existing rows if LASSO is loaded ---
+info = (st.session_state.get("models") or {}).get("lasso", {})
+pipe = info.get("pipeline"); feats = info.get("features", [])
+if pipe and feats and st.session_state.rows:
+    changed = False
+    new_rows = []
+    for r in st.session_state.rows:
+        r2 = dict(r)
+        predv = _predict_predvol_for_manual(r2)
+        if predv and np.isfinite(predv) and predv > 0:
+            if r2.get("PredVol_M") != float(predv):
+                r2["PredVol_M"] = float(predv); changed = True
+            pmv = float(r2.get("PM_Vol_M", 0.0) or 0.0)
+            pct = float(pmv / predv * 100.0) if predv > 0 else np.nan
+            if r2.get("PM_Vol_%_of_Pred") != pct:
+                r2["PM_Vol_%_of_Pred"] = pct; changed = True
+        new_rows.append(r2)
+    if changed:
+        st.session_state.rows = new_rows
+        do_rerun()
+
 # ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
 
