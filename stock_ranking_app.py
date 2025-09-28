@@ -10,25 +10,6 @@ st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
 
 # ============================== Helpers ==============================
-def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
-    """Convert dataframe to markdown with 2 decimals for numerics."""
-    keep = [c for c in cols if c in df.columns]
-    if not keep:
-        return "| (no data) |\n| --- |"
-    sub = df.loc[:, keep].copy()
-    for c in keep:
-        if pd.api.types.is_numeric_dtype(sub[c]):
-            sub[c] = sub[c].astype(float).map(lambda v: f"{v:.2f}")
-        else:
-            sub[c] = sub[c].astype(str)
-    header = "| " + " | ".join(keep) + " |"
-    sep    = "| " + " | ".join(["---"] * len(keep)) + " |"
-    lines = [header, sep]
-    for _, row in sub.iterrows():
-        cells = [str(row[c]) for c in keep]
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
 def do_rerun():
     if hasattr(st, "rerun"):
         st.rerun()
@@ -45,14 +26,14 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
 
-    # 1) RAW case-insensitive exact match first (preserves '$' distinction)
+    # 1) RAW case-insensitive exact match (preserves $)
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
             if cols_lc[c] == lc:
                 return c
 
-    # 2) Normalized exact match
+    # 2) Normalized exact
     nm = {c: _norm(c) for c in cols}
     for cand in candidates:
         n = _norm(cand)
@@ -60,7 +41,7 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
             if nm[c] == n:
                 return c
 
-    # 3) Normalized 'contains' fallback
+    # 3) Normalized contains
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
@@ -83,7 +64,12 @@ def _to_float(s):
 # ============================== Session State ==============================
 if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
-if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl": DataFrame, "mad_tbl": DataFrame, "var_list": [...]}
+if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl":..., "mad_tbl":..., "var_core":[...], "var_moderate":[...]}
+
+# ============================== Core & Moderate sets ==============================
+VAR_CORE = ["Gap_%", "RVOL", "FR_x", "PM$Vol/MC_%", "Catalyst"]
+VAR_MODERATE = ["MarketCap_M$", "Float_M", "PM_Vol_M", "PM_$Vol_M$", "ATR_$"]
+VAR_ALL = VAR_CORE + VAR_MODERATE
 
 # ============================== Upload DB → Build Medians ==============================
 st.subheader("Upload Database")
@@ -106,7 +92,7 @@ if build_btn:
             possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
             col_group = possible[0] if possible else None
             if col_group is None:
-                # fallback: look for binary column
+                # fallback: any binary-like col
                 for c in raw.columns:
                     vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
                     if vals.isin(["0","1","true","false","yes","no"]).all():
@@ -129,7 +115,7 @@ if build_btn:
                 add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
                 add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
                 add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
-                add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
+                add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo","rvol at bo"])
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
                 add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
 
@@ -153,15 +139,9 @@ if build_btn:
                 if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
                     df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-                # ===== SMART Gap_% scaler (no double-scaling) =====
+                # IMPORTANT: force Gap_% into percent for medians by multiplying *100
                 if "Gap_%" in df.columns:
-                    g = pd.to_numeric(df["Gap_%"], errors="coerce")
-                    finite = g.replace([np.inf, -np.inf], np.nan).dropna()
-                    if not finite.empty:
-                        # If ≥80% of values are in [-2, 2], they look like fractions → convert to percent
-                        if (finite.abs() <= 2).mean() >= 0.8:
-                            g = g * 100.0
-                    df["Gap_%"] = g
+                    df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
 
                 # Normalize to binary for FT groups
                 def _to_binary(v):
@@ -181,12 +161,13 @@ if build_btn:
                 else:
                     df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-                    # medians per group (NO ShortInt_%)
-                    var_list = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
-                                "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
-                    var_list = [v for v in var_list if v in df.columns]
+                    # Limit medians/MADs to available vars
+                    var_core = [v for v in VAR_CORE if v in df.columns]
+                    var_mod  = [v for v in VAR_MODERATE if v in df.columns]
+                    var_all  = var_core + var_mod
 
-                    gmed = df.groupby("Group")[var_list].median(numeric_only=True).T  # rows=variables, cols=FT=0/FT=1
+                    # medians per group
+                    gmed = df.groupby("Group")[var_all].median(numeric_only=True).T  # rows=variables, cols=FT=0/FT=1
 
                     # robust spread: MAD per group
                     def _mad(series: pd.Series) -> float:
@@ -196,13 +177,14 @@ if build_btn:
                         med = float(np.median(s))
                         return float(np.median(np.abs(s - med)))
 
-                    gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T
+                    gmads = df.groupby("Group")[var_all].apply(lambda g: g.apply(_mad)).T
 
-                    # Quick sanity readout for Gap_% medians (if present)
-                    if "Gap_%" in gmed.index and {"FT=1","FT=0"}.issubset(gmed.columns):
-                        st.success(f"Gap_% medians → FT=1: {gmed.loc['Gap_%','FT=1']:.2f}, FT=0: {gmed.loc['Gap_%','FT=0']:.2f}")
-
-                    st.session_state.models = {"models_tbl": gmed, "mad_tbl": gmads, "var_list": var_list}
+                    st.session_state.models = {
+                        "models_tbl": gmed,
+                        "mad_tbl": gmads,
+                        "var_core": var_core,
+                        "var_moderate": var_mod
+                    }
                     st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
                     do_rerun()
 
@@ -210,45 +192,53 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# Show medians table INSIDE AN EXPANDER (when available)
+# ============================== Medians tables (grouped) ==============================
 models_data = st.session_state.models
 if models_data and isinstance(models_data, dict) and not models_data.get("models_tbl", pd.DataFrame()).empty:
-    with st.expander("Model Medians (FT=1 vs FT=0)", expanded=False):
+    with st.expander("Model Medians (FT=1 vs FT=0) — grouped", expanded=False):
         med_tbl: pd.DataFrame = models_data["models_tbl"]
         mad_tbl: pd.DataFrame = models_data.get("mad_tbl", pd.DataFrame())
+        var_core = models_data.get("var_core", [])
+        var_mod  = models_data.get("var_moderate", [])
 
         # User control for what we call "significant"
         sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
                                help="Highlight rows where |FT=1 − FT=0| / (MAD₁ + MAD₀) ≥ σ")
         st.session_state["sig_thresh"] = float(sig_thresh)
 
-        if not mad_tbl.empty and {"FT=1","FT=0"}.issubset(mad_tbl.columns):
-            eps = 1e-9
-            diff = (med_tbl["FT=1"] - med_tbl["FT=0"]).abs()
-            spread = (mad_tbl["FT=1"].fillna(0.0) + mad_tbl["FT=0"].fillna(0.0))
-            sig = diff / (spread.replace(0.0, np.nan) + eps)
+        def show_grouped_table(title, vars_list):
+            if not vars_list:
+                st.info(f"No variables available for {title}.")
+                return
+            sub_med = med_tbl.loc[[v for v in vars_list if v in med_tbl.index]].copy()
+            if not mad_tbl.empty and {"FT=1","FT=0"}.issubset(mad_tbl.columns):
+                eps = 1e-9
+                diff = (sub_med["FT=1"] - sub_med["FT=0"]).abs()
+                spread = (mad_tbl.loc[diff.index, "FT=1"].fillna(0.0) + mad_tbl.loc[diff.index, "FT=0"].fillna(0.0))
+                sig = diff / (spread.replace(0.0, np.nan) + eps)
+                sig_flag = sig >= st.session_state["sig_thresh"]
 
-            sig_flag = sig >= sig_thresh
+                def _style_sig(col: pd.Series):
+                    return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
+                            for idx in col.index]
 
-            def _style_sig(col: pd.Series):
-                return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
-                        for idx in col.index]
+                st.markdown(f"**{title}**")
+                styled = (sub_med
+                          .style
+                          .apply(_style_sig, subset=["FT=1"])
+                          .apply(_style_sig, subset=["FT=0"])
+                          .format("{:.2f}"))
+                st.dataframe(styled, use_container_width=True)
+            else:
+                st.markdown(f"**{title}**")
+                cfg = {
+                    "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
+                    "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
+                }
+                st.dataframe(sub_med, use_container_width=True, column_config=cfg, hide_index=False)
 
-            styled = (med_tbl
-                      .style
-                      .apply(_style_sig, subset=["FT=1"])
-                      .apply(_style_sig, subset=["FT=0"])
-                      .format("{:.2f}"))
-
-            st.dataframe(styled, use_container_width=True)
-            st.caption("Highlighted where |median(FT=1)−median(FT=0)| ≥ σ × (MAD₁ + MAD₀).")
-        else:
-            st.info("Not enough info to compute significance (MADs missing). Rebuild models with the current DB.")
-            cfg = {
-                "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
-                "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
-            }
-            st.dataframe(med_tbl, use_container_width=True, column_config=cfg, hide_index=False)
+        show_grouped_table("Core variables", var_core)
+        show_grouped_table("Moderate variables", var_mod)
 
 # ============================== ➕ Manual Input (NO Short Interest) ==============================
 st.markdown("---")
@@ -329,17 +319,14 @@ with tcol_sel:
         label_visibility="collapsed"
     )
 
-# ============================== Alignment (DataTables child-rows; ONLY added stocks) ==============================
+# ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
 
-def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
+def _compute_alignment_counts_core(stock_row: dict, models_tbl: pd.DataFrame, var_core: list[str]) -> dict:
     if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
         return {}
     groups = ["FT=1","FT=0"]
-    # NO ShortInt_% anymore
-    cand_vars = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
-                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
-    common = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
+    common = [v for v in var_core if (v in stock_row) and (v in models_tbl.index)]
     counts = {g: 0 for g in groups}; used = 0
     for v in common:
         xv = pd.to_numeric(stock_row.get(v), errors="coerce")
@@ -355,18 +342,22 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
     return counts
 
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
-SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
+var_core = (st.session_state.get("models") or {}).get("var_core", [])
+var_mod  = (st.session_state.get("models") or {}).get("var_moderate", [])
+SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
+    # Build summary using CORE variables only
     summary_rows, detail_map = [], {}
-    num_vars = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
-                "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
+
+    # Order for details: core group first, then moderate
+    detail_order = [("Core variables", var_core), ("Moderate variables", var_mod)]
 
     for row in st.session_state.rows:
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
-        counts = _compute_alignment_counts(stock, models_tbl)
+        counts = _compute_alignment_counts_core(stock, models_tbl, var_core)
         if not counts:
             continue
 
@@ -377,49 +368,58 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
         summary_rows.append({"Ticker": tkr, "FT1_val": ft1_val, "FT0_val": ft0_val})
 
-        # ---- child details WITH significance flags vs FT=1 / FT=0 ----
-        drows = []
-        for v in num_vars:
-            va = pd.to_numeric(stock.get(v), errors="coerce")
-            v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
-            v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
-            m1 = mad_tbl.loc[v, "FT=1"] if (not mad_tbl.empty and v in mad_tbl.index and "FT=1" in mad_tbl.columns) else np.nan
-            m0 = mad_tbl.loc[v, "FT=0"] if (not mad_tbl.empty and v in mad_tbl.index and "FT=0" in mad_tbl.columns) else np.nan
+        # ---- child details: group headers + rows ----
+        drows_grouped = []
+        for grp_label, grp_vars in detail_order:
+            # add a header marker row (handled in JS)
+            drows_grouped.append({"__group__": grp_label})
+            for v in grp_vars:
+                va = pd.to_numeric(stock.get(v), errors="coerce")
+                v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
+                v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
+                m1 = mad_tbl.loc[v, "FT=1"] if (not mad_tbl.empty and v in mad_tbl.index and "FT=1" in mad_tbl.columns) else np.nan
+                m0 = mad_tbl.loc[v, "FT=0"] if (not mad_tbl.empty and v in mad_tbl.index and "FT=0" in mad_tbl.columns) else np.nan
 
-            if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
-                continue
+                if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
+                    continue
 
-            def _sig(delta, mad):
-                if pd.isna(delta): return np.nan
-                if pd.isna(mad):   return np.nan
-                if mad == 0:
-                    return np.inf if abs(delta) > 0 else 0.0
-                return abs(delta) / abs(mad)
+                def _sig(delta, mad):
+                    if pd.isna(delta): return np.nan
+                    if pd.isna(mad):   return np.nan
+                    if mad == 0:
+                        return np.inf if abs(delta) > 0 else 0.0
+                    return abs(delta) / abs(mad)
 
-            d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
-            d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
-            s1 = _sig(d1, float(m1) if pd.notna(m1) else np.nan)
-            s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
+                d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
+                d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
+                s1 = _sig(d1, float(m1) if pd.notna(m1) else np.nan)
+                s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
 
-            sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
-            sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
+                # For child-row coloring: only CORE get significance colors; MODERATE get light gray background.
+                is_core = v in var_core
+                sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR) if is_core else False
+                sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR) if is_core else False
 
-            drows.append({
-                "Variable": v,
-                "Value": None if pd.isna(va) else float(va),
-                "FT1":   None if pd.isna(v1) else float(v1),
-                "FT0":   None if pd.isna(v0) else float(v0),
-                "d_vs_FT1": None if d1 is None else d1,
-                "d_vs_FT0": None if d0 is None else d0,
-                "sig1": sig1,
-                "sig0": sig0,
-            })
+                drows_grouped.append({
+                    "Variable": v,
+                    "Value": None if pd.isna(va) else float(va),
+                    "FT1":   None if pd.isna(v1) else float(v1),
+                    "FT0":   None if pd.isna(v0) else float(v0),
+                    "d_vs_FT1": None if d1 is None else d1,
+                    "d_vs_FT0": None if d0 is None else d0,
+                    "sig1": sig1,
+                    "sig0": sig0,
+                    "is_core": is_core
+                })
 
-        detail_map[tkr] = drows
+        detail_map[tkr] = drows_grouped
 
     if summary_rows:
         import streamlit.components.v1 as components
-        payload = {"rows": summary_rows, "details": detail_map}
+        payload = {
+            "rows": summary_rows,
+            "details": detail_map
+        }
 
         html = """
 <!DOCTYPE html>
@@ -433,7 +433,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
   table.dataTable tbody tr { cursor: pointer; }
 
-  /* Parent bars: centered look with fixed width and centered container */
+  /* Parent bars: centered look */
   .bar-wrap { display:flex; justify-content:center; align-items:center; gap:6px; }
   .bar { height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }
   .bar > span { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }
@@ -441,11 +441,11 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .blue > span { background:#3b82f6; }  /* FT=1 = blue */
   .red  > span { background:#ef4444; }  /* FT=0 = red  */
 
-  /* Force center alignment for FT columns */
+  /* Align FT columns */
   #align td:nth-child(2), #align th:nth-child(2),
   #align td:nth-child(3), #align th:nth-child(3) { text-align: center; }
 
-  /* Child table: compact & fixed layout */
+  /* Child table */
   .child-table { width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }
   .child-table th, .child-table td {
     font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb;
@@ -453,11 +453,20 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   }
   .child-table th:first-child, .child-table td:first-child { text-align:left; }
 
-  /* significance row highlights (directional) */
-  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }
-  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }
+  /* Group header row */
+  tr.group-row td {
+    background: #f3f4f6 !important; color:#374151; font-weight:600; text-transform:uppercase; letter-spacing:.02em;
+    border-top: 1px solid #e5e7eb; border-bottom: 1px solid #e5e7eb;
+  }
 
-  /* Column widths */
+  /* Moderate rows get light gray background */
+  tr.moderate td { background: #f9fafb !important; }
+
+  /* Significance for CORE rows only (directional) */
+  tr.sig_up td   { background: rgba(253, 230, 138, 0.9) !important; }  /* yellow-ish */
+  tr.sig_down td { background: rgba(254, 202, 202, 0.9) !important; }  /* red-ish */
+
+  /* Column widths for child table */
   .col-var { width: 18%; }
   .col-val { width: 12%; }
   .col-ft1 { width: 18%; }
@@ -503,37 +512,47 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         </div>`;
     }
 
+    function formatVal(x){ return (x==null || isNaN(x)) ? '' : Number(x).toFixed(2); }
+
     function childTableHTML(ticker) {
       const rows = data.details[ticker] || [];
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
+
       const cells = rows.map(r => {
-        const v  = (r.Value==null||isNaN(r.Value)) ? '' : Number(r.Value).toFixed(2);
-        const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : Number(r.FT1).toFixed(2);
-        const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : Number(r.FT0).toFixed(2);
-        const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : Number(r.d_vs_FT1).toFixed(2);
-        const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : Number(r.d_vs_FT0).toFixed(2);
+        if (r.__group__) {
+          return `<tr class="group-row"><td colspan="6">${r.__group__}</td></tr>`;
+        }
+        const v  = formatVal(r.Value);
+        const f1 = formatVal(r.FT1);
+        const f0 = formatVal(r.FT0);
+        const d1 = formatVal(r.d_vs_FT1);
+        const d0 = formatVal(r.d_vs_FT0);
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
 
-        // significance flags from payload
-        const s1 = !!r.sig1, s0 = !!r.sig0;
+        // significance flags for CORE only
+        const isCore = !!r.is_core;
+        const s1 = isCore && !!r.sig1;
+        const s0 = isCore && !!r.sig0;
 
         // numeric deltas for direction
         const d1num = (r.d_vs_FT1==null || isNaN(r.d_vs_FT1)) ? NaN : Number(r.d_vs_FT1);
         const d0num = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? NaN : Number(r.d_vs_FT0);
 
+        // class resolution: for CORE, use sig_up/sig_down; for MODERATE use gray background
         let rowClass = '';
-        if (s1 || s0) {
-          // choose the delta with larger absolute value if both significant
+        if (isCore && (s1 || s0)) {
           let delta = NaN;
           if (s1 && s0) {
             const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
             const abs0 = isNaN(d0num) ? -Infinity : Math.abs(d0num);
             delta = (abs1 >= abs0) ? d1num : d0num;
           } else {
-            delta = !isNaN(d1num) && s1 ? d1num : d0num;
+            delta = (!isNaN(d1num) && s1) ? d1num : d0num;
           }
           rowClass = (delta >= 0) ? 'sig_up' : 'sig_down';
+        } else if (!isCore) {
+          rowClass = 'moderate';
         }
 
         return `
@@ -546,6 +565,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             <td class="col-d0 ${c0}">${d0}</td>
           </tr>`;
       }).join('');
+
       return `
         <table class="child-table">
           <colgroup>
@@ -578,7 +598,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         ]
       });
 
-      // whole-row toggle child
+      // Whole-row toggle child
       $('#align tbody').on('click', 'tr', function () {
         const row = table.row(this);
         if (row.child.isShown()) {
