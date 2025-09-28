@@ -72,9 +72,9 @@ if "models" not in st.session_state: st.session_state.models = {}  # {"models_tb
 if "vol_model" not in st.session_state: st.session_state.vol_model = None  # daily volume model (trained on DB)
 
 # ============================== Core & Moderate sets ==============================
-# PM_Vol_% is core; PM_Vol_M + PredVol_M are moderate.
+# PM_Vol_% is core; PM_Vol_M + Daily_Vol_M are moderate (PredVol_M removed from medians).
 VAR_CORE = ["Gap_%", "RVOL", "FR_x", "PM$Vol/MC_%", "PM_Vol_%", "Catalyst"]
-VAR_MODERATE = ["MarketCap_M$", "Float_M", "PM_Vol_M", "PredVol_M", "PM_$Vol_M$", "ATR_$"]
+VAR_MODERATE = ["MarketCap_M$", "Float_M", "PM_Vol_M", "Daily_Vol_M", "PM_$Vol_M$", "ATR_$"]
 VAR_ALL = VAR_CORE + VAR_MODERATE
 
 # ============================== Upload DB → Build Medians + Train LASSO Volume Model ==============================
@@ -125,6 +125,7 @@ if build_btn:
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
                 add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollar vol (m)","pm $vol (m)"])
                 add_num(df, "PM_Vol_%",     ["pm vol (%)","pm_vol_percent","pm vol %","pm% vol","pm_vol_%","pm_vol_percent_2"])
+                add_num(df, "Daily_Vol_M",  ["daily vol (m)","daily volume (m)","dvol m","daily_vol_m","daily volume m","daily_vol_m_2"])
 
                 # --- Catalyst (binary) ---
                 cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
@@ -203,8 +204,7 @@ if build_btn:
                         })
 
                         Y = pd.to_numeric(pd.Series(raw[col_dvol]).map(_to_float), errors="coerce")
-                        # KEEP AS SERIES (fixes .rename error)
-                        y_ln = pd.Series(_safe_log(Y), index=Y.index, name="y_ln")
+                        y_ln = pd.Series(_safe_log(Y), index=Y.index, name="y_ln")  # keep as Series
 
                         data = pd.concat([feats, y_ln], axis=1).dropna()
                         if len(data) >= 20:
@@ -213,7 +213,6 @@ if build_btn:
 
                             selected_idx = None
                             try:
-                                # Try sklearn LassoCV for selection
                                 from sklearn.linear_model import LassoCV
                                 lcv = LassoCV(cv=5, random_state=42)
                                 lcv.fit(X, y)
@@ -223,7 +222,7 @@ if build_btn:
                                 selected_idx = np.array([3, 2])  # fallback: ln_pm, ln_atr
 
                             if selected_idx.size == 0:
-                                selected_idx = np.array([3, 2])  # ensure at least 1–2 predictors
+                                selected_idx = np.array([3, 2])  # ensure at least some predictors
 
                             feat_names = list(feats.columns)
                             sel_names = [feat_names[i] for i in selected_idx]
@@ -243,9 +242,7 @@ if build_btn:
                     st.session_state.vol_model = vol_model
 
                     # =============== Build medians/MADs (NO predictions for DB) ===============
-                    if "PredVol_M" not in df.columns:
-                        df["PredVol_M"] = np.nan  # only filled for manual rows later
-
+                    # NOTE: We do NOT compute PredVol_M for DB; only manual rows use it for PM_Vol_% calc.
                     var_core = [v for v in VAR_CORE if v in df.columns]
                     var_mod  = [v for v in VAR_MODERATE if v in df.columns]
                     var_all  = var_core + var_mod
@@ -411,7 +408,7 @@ if submitted and ticker:
         "PM$Vol/MC_%": pmmc,
         "CatalystYN": catalyst_yn,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
-        "PredVol_M": pred_vol_m if pred_vol_m is not None else np.nan,
+        "PredVol_M": pred_vol_m if pred_vol_m is not None else np.nan,  # used only for PM_Vol_% calc
         "PM_Vol_%": pm_vol_pct
     }
     st.session_state.rows.append(row)
@@ -502,6 +499,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         # ---- child details: group headers + rows ----
         drows_grouped = []
         for grp_label, grp_vars in detail_order:
+            # add a header marker row (handled in JS)
             drows_grouped.append({"__group__": grp_label})
             for v in grp_vars:
                 va = pd.to_numeric(stock.get(v), errors="coerce")
@@ -525,6 +523,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 s1 = _sig(d1, float(m1) if pd.notna(m1) else np.nan)
                 s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
 
+                # For child-row coloring: CORE get significance colors; MODERATE get light gray background.
                 is_core = v in var_core
                 sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR) if is_core else False
                 sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR) if is_core else False
@@ -554,6 +553,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.responsive.min.css"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
 <style>
   body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
