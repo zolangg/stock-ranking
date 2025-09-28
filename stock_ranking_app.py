@@ -72,12 +72,12 @@ def _mad(series: pd.Series) -> float:
 if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl":..., "mad_tbl":..., "var_core":[...], "var_moderate":[...]}
-if "lassoA" not in st.session_state: st.session_state.lassoA = {}  # {"features":[...], "coef": array, "intercept": float, "eps":1e-6}
+if "lassoA" not in st.session_state: st.session_state.lassoA = {}  # {"terms":[...], "betas":..., "b0":..., "eps":1e-6}
 
 # ============================== Core & Moderate sets ==============================
-# Core: add PM_Vol_% (percent of predicted daily volume).
+# Core includes PM_Vol_% (PM volume as % of predicted daily volume).
 VAR_CORE = ["Gap_%", "RVOL", "FR_x", "PM$Vol/MC_%", "Catalyst", "PM_Vol_%"]
-# Moderate: keep PM_Vol_M and include Daily_Vol_M (for medians only; hidden in child row)
+# Moderate includes PM_Vol_M and Daily_Vol_M (Daily_Vol_M is used for medians; hidden in child rows)
 VAR_MODERATE = ["MarketCap_M$", "Float_M", "PM_Vol_M", "PM_$Vol_M$", "ATR_$", "Daily_Vol_M"]
 VAR_ALL = VAR_CORE + VAR_MODERATE
 
@@ -90,19 +90,20 @@ def _kfold_indices(n, k=5, seed=42):
     return folds
 
 def _lasso_cd_std(Xs, y, lam, max_iter=1000, tol=1e-6):
-    # Xs standardized; y mean-centered not required for OLS refit later
+    # Xs standardized; coordinate descent
     n, p = Xs.shape
     w = np.zeros(p)
     for _ in range(max_iter):
         w_old = w.copy()
-        # coordinate updates
+        y_hat = Xs @ w
         for j in range(p):
-            r_j = y - (Xs @ w) + Xs[:, j] * w[j]
+            r_j = y - y_hat + Xs[:, j] * w[j]
             rho = (Xs[:, j] @ r_j) / n
-            # soft-threshold (lambda here corresponds to sklearn's 2*alpha convention-ish)
+            # soft-threshold (lambda ~ 2*alpha convention-ish)
             if   rho < -lam/2: w[j] = rho + lam/2
             elif rho >  lam/2: w[j] = rho - lam/2
             else:              w[j] = 0.0
+            y_hat = Xs @ w
         if np.linalg.norm(w - w_old) < tol:
             break
     return w
@@ -129,8 +130,7 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
     ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"],   errors="coerce").values, eps, None))
     ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"],         errors="coerce").values, eps, None))
     catalyst  = np.clip(pd.to_numeric(df["Catalyst"], errors="coerce").fillna(0).values, 0, 1).astype(float)
-
-    y_ln = np.log(np.clip(pd.to_numeric(df["Daily_Vol_M"], errors="coerce").values, eps, None))
+    y_ln      = np.log(np.clip(pd.to_numeric(df["Daily_Vol_M"],  errors="coerce").values, eps, None))
 
     X_orig = np.column_stack([ln_mcap, ln_gapf, ln_atr, ln_pm, ln_pm_dol, ln_fr, catalyst])
     terms  = ["ln_mcap","ln_gapf","ln_atr","ln_pm","ln_pm_dol","ln_fr","catalyst"]
@@ -157,7 +157,7 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
             te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(k) if j != vi])
             Xtr, ytr = Xs[tr_idx], y[tr_idx]
             Xte, yte = Xs[te_idx], y[te_idx]
-            w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1000)
+            w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1200)
             yhat = Xte @ w
             errs.append(np.mean((yhat - yte)**2))
         cv_mse.append(np.mean(errs))
@@ -177,7 +177,6 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
     X_design = np.column_stack([np.ones(X_sel.shape[0]), X_sel])
     coef_ols, *_ = np.linalg.lstsq(X_design, y, rcond=None)  # coef_ols[0]=b0
 
-    # Package results
     selected_terms = [terms[i] for i in sel]
     return {
         "b0": float(coef_ols[0]),
@@ -333,7 +332,6 @@ if build_btn:
                     }
 
                     # ===== Train LASSO→OLS on DB (Daily_Vol_M) ONLY to use for manual predictions =====
-                    # Use only rows that have all needed for training
                     lasso_model = train_lasso_on_db(df)
                     st.session_state.lassoA = lasso_model or {}
 
@@ -485,39 +483,6 @@ with tcol_sel:
 # ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
 
-def _compute_alignment_counts_core(stock_row: dict, models_tbl: pd.DataFrame, var_core: list[str]) -> dict:
-    if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
-        return {}
-    groups = ["FT=1","FT=0"]
-    common = [v for v in var_core if (v in stock_row) and (v in models_tbl.index)]
-    counts = {g: 0 for g in groups}
-    used = 0
-    TOL = 1e-9  # treat almost-equal distances as a tie
-
-    for v in common:
-        xv = pd.to_numeric(stock_row.get(v), errors="coerce")
-        if not np.isfinite(xv):
-            continue
-        med = models_tbl.loc[v, groups].astype(float).dropna()
-        if med.empty or len(med) < 2:
-            continue
-
-        d1 = abs(xv - med["FT=1"])
-        d0 = abs(xv - med["FT=0"])
-
-        # ignore ties (no vote, no used++)
-        if abs(d1 - d0) <= TOL:
-            continue
-
-        if d1 < d0:
-            counts["FT=1"] += 1
-        else:
-            counts["FT=0"] += 1
-        used += 1
-
-    counts["N_Vars_Used"] = used
-    return counts
-
 def _compute_alignment_counts_weighted(
     stock_row: dict,
     models_tbl: pd.DataFrame,
@@ -564,7 +529,6 @@ def _compute_alignment_counts_weighted(
     for v in var_core:
         vote_for(v, w_core)
     for v in var_mod:
-        # moderate vars can influence parent bars even if hidden in child rows
         vote_for(v, w_mod)
 
     total_weight = counts["FT=1"] + counts["FT=0"]
@@ -580,7 +544,6 @@ def _compute_alignment_counts_weighted(
         "N_mod_used": used_mod,
     }
 
-
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
 var_core = (st.session_state.get("models") or {}).get("var_core", [])
@@ -588,10 +551,10 @@ var_mod  = (st.session_state.get("models") or {}).get("var_moderate", [])
 SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
-    # Build summary using CORE variables only
+    # Build summary using weighted CORE+MODERATE variables
     summary_rows, detail_map = [], {}
 
-    # Order for details: core group first, then moderate (including PredVol_M proxying Daily_Vol_M medians)
+    # Order for details: core group first, then moderate (including PredVol_M row; hide Daily_Vol_M row)
     detail_order = [("Core variables", var_core), ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
 
     for row in st.session_state.rows:
@@ -617,7 +580,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
                 va = pd.to_numeric(stock.get(v), errors="coerce")
 
-                # Map PredVol_M medians to Daily_Vol_M medians (for FT columns + deltas)
+                # For PredVol_M, compare vs. Daily_Vol_M medians (FT columns + deltas)
                 med_var = "Daily_Vol_M" if v == "PredVol_M" else v
 
                 v1 = models_tbl.loc[med_var, "FT=1"] if (med_var in models_tbl.index) else np.nan
