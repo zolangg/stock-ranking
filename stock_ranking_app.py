@@ -513,7 +513,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 m1 = mad_tbl.loc[med_var, "FT=1"] if (not mad_tbl.empty and med_var in mad_tbl.index and "FT=1" in mad_tbl.columns) else np.nan
                 m0 = mad_tbl.loc[med_var, "FT=0"] if (not mad_tbl.empty and med_var in mad_tbl.index and "FT=0" in mad_tbl.columns) else np.nan
 
-                if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
+                # Always show PredVol_M row (even if Daily_Vol_M medians are missing),
+                # otherwise keep the old skip rule.
+                if v != "PredVol_M" and pd.isna(va) and pd.isna(v1) and pd.isna(v0):
                     continue
 
                 def _sig(delta, mad):
