@@ -97,120 +97,109 @@ st.subheader("Upload Database")
 
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
 build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
-
 if build_btn:
     if not uploaded:
         st.error("Please upload an Excel workbook first.")
     else:
         try:
             xls = pd.ExcelFile(uploaded)
-            # choose first non-legend sheet
-            sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
-            sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
-            raw = pd.read_excel(xls, sheet)
 
-            # --- auto-detect group column ---
-            possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
-            col_group = possible[0] if possible else None
-            if col_group is None:
-                # fallback: look for binary column
-                for c in raw.columns:
-                    vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
-                    if vals.isin(["0","1","true","false","yes","no"]).all():
-                        col_group = c
-                        break
+            # --- Helper: robust numeric + percent scaling ---
+            def to_num(s):
+                return pd.to_numeric(pd.Series(s).astype(str).str.replace(" ", "")
+                                     .str.replace(",", ".", regex=False)
+                                     .str.replace(r"(?<=\d)\.(?=\d{3}\b)", "", regex=True)  # "1.234" thousands → "1234"
+                                     .str.replace("%","", regex=False),
+                                     errors="coerce")
 
-            if col_group is None:
-                st.error("Could not detect FT column (0/1). Please ensure your sheet has an FT or binary column.")
-            else:
-                df = pd.DataFrame()
-                df["GroupRaw"] = raw[col_group]
+            def smart_scale_percent(col: pd.Series) -> pd.Series:
+                s = to_num(col)
+                if s.dropna().empty:
+                    return s
+                # If ≥80% of finite values are in [-2, 2], treat as fraction → %
+                mask = s.replace([np.inf, -np.inf], np.nan).dropna().abs() <= 2
+                frac_share = mask.mean() if len(mask) else 0.0
+                return s * 100.0 if frac_share >= 0.8 else s
 
-                # Map numeric columns (NO ShortInt_% anywhere)
-                def add_num(df, name, src_candidates):
-                    src = _pick(raw, src_candidates)
-                    if src:
-                        df[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
+            # --- Load exactly the two sheets and label groups by sheet ---
+            have_ft   = "PMH BO FT"   in xls.sheet_names
+            have_fail = "PMH BO Fail" in xls.sheet_names
+            if not (have_ft and have_fail):
+                st.error("Workbook must contain both sheets: 'PMH BO FT' and 'PMH BO Fail'.")
+                st.stop()
 
-                add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
-                add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
-                add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
-                add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
-                add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
-                add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
-                add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
+            raw_ft   = pd.read_excel(xls, "PMH BO FT")
+            raw_fail = pd.read_excel(xls, "PMH BO Fail")
 
-                # --- Catalyst (binary: Yes/No/1/0/True/False) from DB, if present ---
-                cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
-                def _to_binary_local(v):
+            raw_ft["__FT01__"]   = 1
+            raw_fail["__FT01__"] = 0
+            raw = pd.concat([raw_ft, raw_fail], ignore_index=True)
+
+            df = pd.DataFrame()
+            df["FT01"] = raw["__FT01__"]
+
+            def add_num(df_out, name, candidates, percent=False):
+                src = _pick(raw, candidates)
+                if src:
+                    s = to_num(raw[src])
+                    if percent:
+                        s = smart_scale_percent(s)
+                    df_out[name] = s
+
+            # Map numeric columns (no ShortInt_%)
+            add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
+            add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
+            add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"], percent=True)  # <- smart scaling
+            add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
+            add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
+            add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
+            add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
+
+            # Catalyst (binary)
+            cat_src = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
+            if cat_src:
+                def _bin(v):
                     sv = str(v).strip().lower()
                     if sv in {"1","true","yes","y","t"}: return 1.0
                     if sv in {"0","false","no","n","f"}: return 0.0
                     try:
-                        fv = float(sv)
-                        return 1.0 if fv >= 0.5 else 0.0
+                        return 1.0 if float(sv) >= 0.5 else 0.0
                     except:
                         return np.nan
-                if cand_catalyst:
-                    df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
+                df["Catalyst"] = raw[cat_src].map(_bin)
 
-                # Derived metrics
-                if {"PM_Vol_M","Float_M"}.issubset(df.columns):
-                    df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
-                if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
-                    df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
+            # Derived
+            if {"PM_Vol_M","Float_M"}.issubset(df.columns):
+                df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
+            if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
+                df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-                # IMPORTANT: force Gap_% into percent (DB can be 0.68 -> 68)
-                if "Gap_%" in df.columns:
-                    s = pd.to_numeric(df["Gap_%"], errors="coerce")
-                    # scale values that look like fractions
-                    df["Gap_%"] = np.where(s.notna() & (s.abs() <= 2), s * 100.0, s)
+            # Final var list for models (core only; no ShortInt_%)
+            var_list = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
+                        "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
+            var_list = [v for v in var_list if v in df.columns]
 
-                # Normalize to binary for FT groups
-                def _to_binary(v):
-                    sv = str(v).strip().lower()
-                    if sv in {"1","true","yes","y","t"}: return 1
-                    if sv in {"0","false","no","n","f"}: return 0
-                    try:
-                        fv = float(sv)
-                        return 1 if fv >= 0.5 else 0
-                    except:
-                        return np.nan
+            # Medians and MADs by group
+            df = df[df["FT01"].isin([0,1])].copy()
+            df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
+            gmed = df.groupby("Group")[var_list].median(numeric_only=True).T
 
-                df["FT01"] = df["GroupRaw"].map(_to_binary)
-                df = df[df["FT01"].isin([0,1])]
-                if df.empty or df["FT01"].nunique() < 2:
-                    st.error("Could not find both FT=1 and FT=0 rows in the DB. Please check the group column.")
-                else:
-                    df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
+            def _mad(series: pd.Series) -> float:
+                s = pd.to_numeric(series, errors="coerce").dropna()
+                if s.empty: return np.nan
+                med = float(np.median(s))
+                return float(np.median(np.abs(s - med)))
+            gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T
 
-                    # Compute medians/MADs for CORE + AUX (so child rows can show everything)
-                    all_candidates = [
-                        "MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
-                        "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"
-                    ]
-                    # ensure all exist
-                    AVAILABLE = [v for v in all_candidates if v in df.columns]
-                    gmed = df.groupby("Group")[AVAILABLE].median(numeric_only=True).T  # rows=variables, cols=FT=0/FT=1
+            st.session_state.models = {"models_tbl": gmed, "mad_tbl": gmads, "var_list": var_list}
 
-                    # robust spread: MAD per group
-                    def _mad(series: pd.Series) -> float:
-                        s2 = pd.to_numeric(series, errors="coerce").dropna()
-                        if s2.empty:
-                            return np.nan
-                        med = float(np.median(s2))
-                        return float(np.median(np.abs(s2 - med)))
+            # Quick sanity print for Gap_% so you can see 68/90 immediately
+            if "Gap_%" in gmed.index and {"FT=1","FT=0"}.issubset(gmed.columns):
+                g1 = float(gmed.loc["Gap_%","FT=1"])
+                g0 = float(gmed.loc["Gap_%","FT=0"])
+                st.success(f"Gap_% medians → FT=1: {g1:.2f}, FT=0: {g0:.2f}")
 
-                    gmads = df.groupby("Group")[AVAILABLE].apply(lambda g: g.apply(_mad)).T
-
-                    st.session_state.models = {
-                        "models_tbl": gmed,
-                        "mad_tbl": gmads,
-                        "var_list": AVAILABLE,
-                        "core_vars": [v for v in CORE_VARS if v in AVAILABLE]
-                    }
-                    st.success(f"Built model stocks (core = {st.session_state.models['core_vars']}).")
-                    do_rerun()
+            do_rerun()
 
         except Exception as e:
             st.error("Loading/processing failed.")
