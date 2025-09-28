@@ -9,13 +9,6 @@ import json
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
 
-# ============================== Configuration ==============================
-# Core variables used by the model (alignment counts & FT bars)
-CORE_VARS = ["Gap_%", "RVOL", "FR_x", "PM$Vol/MC_%", "Catalyst"]
-
-# Show deltas/significance for auxiliary variables in child rows
-INCLUDE_DELTAS_FOR_AUX = True
-
 # ============================== Helpers ==============================
 def df_to_markdown_table(df: pd.DataFrame, cols: list[str]) -> str:
     """Convert dataframe to markdown with 2 decimals for numerics."""
@@ -97,109 +90,121 @@ st.subheader("Upload Database")
 
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
 build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
+
 if build_btn:
     if not uploaded:
         st.error("Please upload an Excel workbook first.")
     else:
         try:
             xls = pd.ExcelFile(uploaded)
+            # choose first non-legend sheet
+            sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
+            sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
+            raw = pd.read_excel(xls, sheet)
 
-            # --- Helper: robust numeric + percent scaling ---
-            def to_num(s):
-                return pd.to_numeric(pd.Series(s).astype(str).str.replace(" ", "")
-                                     .str.replace(",", ".", regex=False)
-                                     .str.replace(r"(?<=\d)\.(?=\d{3}\b)", "", regex=True)  # "1.234" thousands → "1234"
-                                     .str.replace("%","", regex=False),
-                                     errors="coerce")
+            # --- auto-detect group column ---
+            possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
+            col_group = possible[0] if possible else None
+            if col_group is None:
+                # fallback: look for binary column
+                for c in raw.columns:
+                    vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
+                    if vals.isin(["0","1","true","false","yes","no"]).all():
+                        col_group = c
+                        break
 
-            def smart_scale_percent(col: pd.Series) -> pd.Series:
-                s = to_num(col)
-                if s.dropna().empty:
-                    return s
-                # If ≥80% of finite values are in [-2, 2], treat as fraction → %
-                mask = s.replace([np.inf, -np.inf], np.nan).dropna().abs() <= 2
-                frac_share = mask.mean() if len(mask) else 0.0
-                return s * 100.0 if frac_share >= 0.8 else s
+            if col_group is None:
+                st.error("Could not detect FT column (0/1). Please ensure your sheet has an FT or binary column.")
+            else:
+                df = pd.DataFrame()
+                df["GroupRaw"] = raw[col_group]
 
-            # --- Load exactly the two sheets and label groups by sheet ---
-            have_ft   = "PMH BO FT"   in xls.sheet_names
-            have_fail = "PMH BO Fail" in xls.sheet_names
-            if not (have_ft and have_fail):
-                st.error("Workbook must contain both sheets: 'PMH BO FT' and 'PMH BO Fail'.")
-                st.stop()
+                def add_num(df, name, src_candidates):
+                    src = _pick(raw, src_candidates)
+                    if src:
+                        df[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-            raw_ft   = pd.read_excel(xls, "PMH BO FT")
-            raw_fail = pd.read_excel(xls, "PMH BO Fail")
+                # Map numeric columns (NO ShortInt_% anywhere)
+                add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
+                add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
+                add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
+                add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
+                add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
+                add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
+                add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
 
-            raw_ft["__FT01__"]   = 1
-            raw_fail["__FT01__"] = 0
-            raw = pd.concat([raw_ft, raw_fail], ignore_index=True)
-
-            df = pd.DataFrame()
-            df["FT01"] = raw["__FT01__"]
-
-            def add_num(df_out, name, candidates, percent=False):
-                src = _pick(raw, candidates)
-                if src:
-                    s = to_num(raw[src])
-                    if percent:
-                        s = smart_scale_percent(s)
-                    df_out[name] = s
-
-            # Map numeric columns (no ShortInt_%)
-            add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
-            add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
-            add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"], percent=True)  # <- smart scaling
-            add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
-            add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
-            add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
-            add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)"])
-
-            # Catalyst (binary)
-            cat_src = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
-            if cat_src:
-                def _bin(v):
+                # --- Catalyst (binary: Yes/No/1/0/True/False) from DB, if present ---
+                cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
+                def _to_binary_local(v):
                     sv = str(v).strip().lower()
                     if sv in {"1","true","yes","y","t"}: return 1.0
                     if sv in {"0","false","no","n","f"}: return 0.0
                     try:
-                        return 1.0 if float(sv) >= 0.5 else 0.0
+                        fv = float(sv)
+                        return 1.0 if fv >= 0.5 else 0.0
                     except:
                         return np.nan
-                df["Catalyst"] = raw[cat_src].map(_bin)
+                if cand_catalyst:
+                    df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
 
-            # Derived
-            if {"PM_Vol_M","Float_M"}.issubset(df.columns):
-                df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
-            if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
-                df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
+                # Derived metrics
+                if {"PM_Vol_M","Float_M"}.issubset(df.columns):
+                    df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
+                if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
+                    df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-            # Final var list for models (core only; no ShortInt_%)
-            var_list = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
-                        "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
-            var_list = [v for v in var_list if v in df.columns]
+                # ===== SMART Gap_% scaler (no double-scaling) =====
+                if "Gap_%" in df.columns:
+                    g = pd.to_numeric(df["Gap_%"], errors="coerce")
+                    finite = g.replace([np.inf, -np.inf], np.nan).dropna()
+                    if not finite.empty:
+                        # If ≥80% of values are in [-2, 2], they look like fractions → convert to percent
+                        if (finite.abs() <= 2).mean() >= 0.8:
+                            g = g * 100.0
+                    df["Gap_%"] = g
 
-            # Medians and MADs by group
-            df = df[df["FT01"].isin([0,1])].copy()
-            df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
-            gmed = df.groupby("Group")[var_list].median(numeric_only=True).T
+                # Normalize to binary for FT groups
+                def _to_binary(v):
+                    sv = str(v).strip().lower()
+                    if sv in {"1","true","yes","y","t"}: return 1
+                    if sv in {"0","false","no","n","f"}: return 0
+                    try:
+                        fv = float(sv)
+                        return 1 if fv >= 0.5 else 0
+                    except:
+                        return np.nan
 
-            def _mad(series: pd.Series) -> float:
-                s = pd.to_numeric(series, errors="coerce").dropna()
-                if s.empty: return np.nan
-                med = float(np.median(s))
-                return float(np.median(np.abs(s - med)))
-            gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T
+                df["FT01"] = df["GroupRaw"].map(_to_binary)
+                df = df[df["FT01"].isin([0,1])]
+                if df.empty or df["FT01"].nunique() < 2:
+                    st.error("Could not find both FT=1 and FT=0 rows in the DB. Please check the group column.")
+                else:
+                    df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-            st.session_state.models = {"models_tbl": gmed, "mad_tbl": gmads, "var_list": var_list}
+                    # medians per group (NO ShortInt_%)
+                    var_list = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
+                                "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
+                    var_list = [v for v in var_list if v in df.columns]
 
-            # Quick sanity print for Gap_% so you can see 68/90 immediately
-            if "Gap_%" in gmed.index and {"FT=1","FT=0"}.issubset(gmed.columns):
-                g1 = float(gmed.loc["Gap_%","FT=1"])
-                g0 = float(gmed.loc["Gap_%","FT=0"])
-                st.success(f"Gap_% medians → FT=1: {g1:.2f}, FT=0: {g0:.2f}")
+                    gmed = df.groupby("Group")[var_list].median(numeric_only=True).T  # rows=variables, cols=FT=0/FT=1
 
-            do_rerun()
+                    # robust spread: MAD per group
+                    def _mad(series: pd.Series) -> float:
+                        s = pd.to_numeric(series, errors="coerce").dropna()
+                        if s.empty:
+                            return np.nan
+                        med = float(np.median(s))
+                        return float(np.median(np.abs(s - med)))
+
+                    gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T
+
+                    # Quick sanity readout for Gap_% medians (if present)
+                    if "Gap_%" in gmed.index and {"FT=1","FT=0"}.issubset(gmed.columns):
+                        st.success(f"Gap_% medians → FT=1: {gmed.loc['Gap_%','FT=1']:.2f}, FT=0: {gmed.loc['Gap_%','FT=0']:.2f}")
+
+                    st.session_state.models = {"models_tbl": gmed, "mad_tbl": gmads, "var_list": var_list}
+                    st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
+                    do_rerun()
 
         except Exception as e:
             st.error("Loading/processing failed.")
@@ -211,7 +216,6 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
     with st.expander("Model Medians (FT=1 vs FT=0)", expanded=False):
         med_tbl: pd.DataFrame = models_data["models_tbl"]
         mad_tbl: pd.DataFrame = models_data.get("mad_tbl", pd.DataFrame())
-        core_vars = models_data.get("core_vars", CORE_VARS)
 
         # User control for what we call "significant"
         sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
@@ -227,18 +231,8 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
             sig_flag = sig >= sig_thresh
 
             def _style_sig(col: pd.Series):
-                # emphasize only core vars in bold; aux keep normal
-                styles = []
-                for idx in col.index:
-                    base = ""
-                    if idx in core_vars:
-                        base += "font-weight: 700;"
-                    else:
-                        base += "opacity: 0.95;"
-                    if sig_flag.get(idx, False):
-                        base += " background-color: #fde68a;"
-                    styles.append(base)
-                return styles
+                return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
+                        for idx in col.index]
 
             styled = (med_tbl
                       .style
@@ -247,7 +241,7 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
                       .format("{:.2f}"))
 
             st.dataframe(styled, use_container_width=True)
-            st.caption("Core vars are bold. Highlighted where |median(FT=1)−median(FT=0)| ≥ σ × (MAD₁ + MAD₀).")
+            st.caption("Highlighted where |median(FT=1)−median(FT=0)| ≥ σ × (MAD₁ + MAD₀).")
         else:
             st.info("Not enough info to compute significance (MADs missing). Rebuild models with the current DB.")
             cfg = {
@@ -267,7 +261,7 @@ with st.form("add_form", clear_on_submit=True):
         ticker  = st.text_input("Ticker", "").strip().upper()
         mc_m    = st.number_input("Market Cap (M$)", 0.0, step=0.01, format="%.2f")
         float_m = st.number_input("Public Float (M)", 0.0, step=0.01, format="%.2f")
-        gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")  # percent
+        gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")  # real percent e.g. 100 = +100%
 
     with c2:
         atr_usd = st.number_input("ATR ($)", 0.0, step=0.01, format="%.2f")
@@ -289,7 +283,7 @@ if submitted and ticker:
         "Ticker": ticker,
         "MarketCap_M$": mc_m,
         "Float_M": float_m,
-        "Gap_%": gap_pct,         # manual already in percent (no extra scaling)
+        "Gap_%": gap_pct,         # manual already in percent (no scaling)
         "ATR_$": atr_usd,
         "RVOL": rvol,
         "PM_Vol_M": pm_vol,
@@ -338,11 +332,14 @@ with tcol_sel:
 # ============================== Alignment (DataTables child-rows; ONLY added stocks) ==============================
 st.markdown("### Alignment")
 
-def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame, core_vars: list[str]) -> dict:
+def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict:
     if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
         return {}
     groups = ["FT=1","FT=0"]
-    common = [v for v in core_vars if (v in stock_row) and (v in models_tbl.index)]
+    # NO ShortInt_% anymore
+    cand_vars = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
+                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
+    common = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
     counts = {g: 0 for g in groups}; used = 0
     for v in common:
         xv = pd.to_numeric(stock_row.get(v), errors="coerce")
@@ -360,16 +357,16 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame, core_va
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
 SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
-core_vars = (st.session_state.get("models") or {}).get("core_vars", [v for v in CORE_VARS if v in (st.session_state.get("models") or {}).get("var_list", [])])
-all_vars = (st.session_state.get("models") or {}).get("var_list", [])
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
     summary_rows, detail_map = [], {}
+    num_vars = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
+                "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
 
     for row in st.session_state.rows:
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
-        counts = _compute_alignment_counts(stock, models_tbl, core_vars)
+        counts = _compute_alignment_counts(stock, models_tbl)
         if not counts:
             continue
 
@@ -380,25 +377,18 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
         summary_rows.append({"Ticker": tkr, "FT1_val": ft1_val, "FT0_val": ft0_val})
 
-        # ---- child details (core + auxiliary) WITH significance flags ----
+        # ---- child details WITH significance flags vs FT=1 / FT=0 ----
         drows = []
-        # Show core vars first, then aux (that exist in models and/or stock row)
-        ordered_vars = [v for v in core_vars if v in all_vars] + [v for v in all_vars if v not in core_vars]
-
-        for v in ordered_vars:
-            # If we don't want aux deltas, skip aux entirely or keep value-only
-            is_core = v in core_vars
+        for v in num_vars:
             va = pd.to_numeric(stock.get(v), errors="coerce")
             v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
             v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
             m1 = mad_tbl.loc[v, "FT=1"] if (not mad_tbl.empty and v in mad_tbl.index and "FT=1" in mad_tbl.columns) else np.nan
             m0 = mad_tbl.loc[v, "FT=0"] if (not mad_tbl.empty and v in mad_tbl.index and "FT=0" in mad_tbl.columns) else np.nan
 
-            show_var = (pd.notna(va) or pd.notna(v1) or pd.notna(v0))
-            if not show_var:
+            if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
                 continue
 
-            # significance vs each group (use MAD)
             def _sig(delta, mad):
                 if pd.isna(delta): return np.nan
                 if pd.isna(mad):   return np.nan
@@ -406,19 +396,16 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                     return np.inf if abs(delta) > 0 else 0.0
                 return abs(delta) / abs(mad)
 
-            if is_core or INCLUDE_DELTAS_FOR_AUX:
-                d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
-                d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
-                s1 = _sig(d1, float(m1) if pd.notna(m1) else np.nan)
-                s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
-                sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
-                sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
-            else:
-                d1 = d0 = None
-                sig1 = sig0 = False
+            d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
+            d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
+            s1 = _sig(d1, float(m1) if pd.notna(m1) else np.nan)
+            s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
+
+            sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
+            sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
 
             drows.append({
-                "Variable": (v + " •" if is_core else v),
+                "Variable": v,
                 "Value": None if pd.isna(va) else float(va),
                 "FT1":   None if pd.isna(v1) else float(v1),
                 "FT0":   None if pd.isna(v0) else float(v0),
@@ -467,8 +454,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .child-table th:first-child, .child-table td:first-child { text-align:left; }
 
   /* significance row highlights (directional) */
-  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }  /* yellow */
-  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }  /* red */
+  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }
+  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }
 
   /* Column widths */
   .col-var { width: 18%; }
