@@ -518,6 +518,69 @@ def _compute_alignment_counts_core(stock_row: dict, models_tbl: pd.DataFrame, va
     counts["N_Vars_Used"] = used
     return counts
 
+def _compute_alignment_counts_weighted(
+    stock_row: dict,
+    models_tbl: pd.DataFrame,
+    var_core: list[str],
+    var_mod: list[str],
+    w_core: float = 1.0,
+    w_mod: float = 0.5,
+) -> dict:
+    """
+    Weighted nearest-median voting:
+      - Core vars vote with weight w_core (default 1.0)
+      - Moderate vars vote with weight w_mod (default 0.5)
+      - Ties (equidistant to FT=1 and FT=0 medians) cast no vote
+    Returns absolute weights and percentage shares for FT=1 and FT=0.
+    """
+    if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
+        return {}
+    groups = ["FT=1","FT=0"]
+    TOL = 1e-9
+
+    counts = {"FT=1": 0.0, "FT=0": 0.0}
+    used_core = used_mod = 0
+
+    def vote_for(var, weight):
+        nonlocal used_core, used_mod
+        xv = pd.to_numeric(stock_row.get(var), errors="coerce")
+        if not np.isfinite(xv) or var not in models_tbl.index:
+            return
+        med = models_tbl.loc[var, groups].astype(float)
+        if med.isna().any():
+            return
+        d1 = abs(xv - med["FT=1"]); d0 = abs(xv - med["FT=0"])
+        if abs(d1 - d0) <= TOL:
+            return  # ignore ties
+        if d1 < d0:
+            counts["FT=1"] += weight
+        else:
+            counts["FT=0"] += weight
+        if weight == w_core:
+            used_core += 1
+        else:
+            used_mod += 1
+
+    for v in var_core:
+        vote_for(v, w_core)
+    for v in var_mod:
+        # moderate vars can influence parent bars even if hidden in child rows
+        vote_for(v, w_mod)
+
+    total_weight = counts["FT=1"] + counts["FT=0"]
+    pct1 = round(100.0 * counts["FT=1"] / total_weight, 0) if total_weight > 0 else 0.0
+    pct0 = round(100.0 * counts["FT=0"] / total_weight, 0) if total_weight > 0 else 0.0
+
+    return {
+        "FT=1": counts["FT=1"],
+        "FT=0": counts["FT=0"],
+        "FT1_pct": pct1,
+        "FT0_pct": pct0,
+        "N_core_used": used_core,
+        "N_mod_used": used_mod,
+    }
+
+
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
 var_core = (st.session_state.get("models") or {}).get("var_core", [])
@@ -534,14 +597,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
     for row in st.session_state.rows:
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
-        counts = _compute_alignment_counts_core(stock, models_tbl, var_core)
+        counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
         if not counts:
             continue
 
-        like1, like0 = counts.get("FT=1",0), counts.get("FT=0",0)
-        n_used = counts.get("N_Vars_Used",0)
-        ft1_val = round((like1 / n_used * 100.0), 0) if n_used > 0 else 0.0
-        ft0_val = round((like0 / n_used * 100.0), 0) if n_used > 0 else 0.0
+        ft1_val = counts.get("FT1_pct", 0.0)
+        ft0_val = counts.get("FT0_pct", 0.0)
 
         summary_rows.append({"Ticker": tkr, "FT1_val": ft1_val, "FT0_val": ft0_val})
 
