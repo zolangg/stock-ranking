@@ -124,18 +124,10 @@ if build_btn:
                     if src:
                         df[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
+                # Map numeric columns (NO ShortInt_% anywhere)
                 add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap"])
                 add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares"])
-                add_num(df, "ShortInt_%",   ["shortint %","short interest %","short float %","si","short interest (float) %","SI"])
-                # Scale fractional short interest (e.g., 0.06 -> 6.0), keep already-in-% as-is
-                if "ShortInt_%" in df.columns:
-                    s_si = pd.to_numeric(df["ShortInt_%"], errors="coerce")
-                    df["ShortInt_%"] = np.where(s_si.notna() & (s_si.abs() <= 2), s_si * 100.0, s_si)
                 add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap"])
-                # Scale fractional gaps (e.g., 0.90 -> 90.0), keep already-in-% as-is
-                if "Gap_%" in df.columns:
-                    s = pd.to_numeric(df["Gap_%"], errors="coerce")
-                    df["Gap_%"] = np.where(s.notna() & (s.abs() <= 2), s * 100.0, s)
                 add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr"])
                 add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo"])
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)"])
@@ -155,13 +147,17 @@ if build_btn:
                 if cand_catalyst:
                     df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
 
-                # derived
+                # Derived metrics
                 if {"PM_Vol_M","Float_M"}.issubset(df.columns):
                     df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
                 if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
                     df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df["MarketCap_M$"] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-                # normalize to binary for FT groups
+                # IMPORTANT: per your request, force Gap_% into percent for medians by multiplying *100
+                if "Gap_%" in df.columns:
+                    df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
+
+                # Normalize to binary for FT groups
                 def _to_binary(v):
                     sv = str(v).strip().lower()
                     if sv in {"1","true","yes","y","t"}: return 1
@@ -179,12 +175,14 @@ if build_btn:
                 else:
                     df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-                    # medians per group
-                    var_list = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+                    # medians per group (NO ShortInt_%)
+                    var_list = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
                                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
+                    var_list = [v for v in var_list if v in df.columns]
+
                     gmed = df.groupby("Group")[var_list].median(numeric_only=True).T  # rows=variables, cols=FT=0/FT=1
 
-                    # --- robust spread: MAD (median absolute deviation) per group ---
+                    # robust spread: MAD per group
                     def _mad(series: pd.Series) -> float:
                         s = pd.to_numeric(series, errors="coerce").dropna()
                         if s.empty:
@@ -192,9 +190,8 @@ if build_btn:
                         med = float(np.median(s))
                         return float(np.median(np.abs(s - med)))
 
-                    gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T  # same shape as gmed
+                    gmads = df.groupby("Group")[var_list].apply(lambda g: g.apply(_mad)).T
 
-                    # store both
                     st.session_state.models = {"models_tbl": gmed, "mad_tbl": gmads, "var_list": var_list}
                     st.success(f"Built model stocks: columns in medians table = {list(gmed.columns)}")
                     do_rerun()
@@ -211,20 +208,19 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
         mad_tbl: pd.DataFrame = models_data.get("mad_tbl", pd.DataFrame())
 
         # User control for what we call "significant"
-        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 5.0, 0.1,
+        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
                                help="Highlight rows where |FT=1 − FT=0| / (MAD₁ + MAD₀) ≥ σ")
         st.session_state["sig_thresh"] = float(sig_thresh)
 
         if not mad_tbl.empty and {"FT=1","FT=0"}.issubset(mad_tbl.columns):
-            eps = 1e-9  # avoid /0
+            eps = 1e-9
             diff = (med_tbl["FT=1"] - med_tbl["FT=0"]).abs()
             spread = (mad_tbl["FT=1"].fillna(0.0) + mad_tbl["FT=0"].fillna(0.0))
-            sig = diff / (spread.replace(0.0, np.nan) + eps)  # NaN if no spread
+            sig = diff / (spread.replace(0.0, np.nan) + eps)
 
-            sig_flag = sig >= sig_thresh  # per-variable boolean
+            sig_flag = sig >= sig_thresh
 
             def _style_sig(col: pd.Series):
-                # color FT cells for rows deemed significant
                 return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
                         for idx in col.index]
 
@@ -244,7 +240,7 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
             }
             st.dataframe(med_tbl, use_container_width=True, column_config=cfg, hide_index=False)
 
-# ============================== ➕ Manual Input ==============================
+# ============================== ➕ Manual Input (NO Short Interest) ==============================
 st.markdown("---")
 st.subheader("Add Stock")
 
@@ -255,7 +251,6 @@ with st.form("add_form", clear_on_submit=True):
         ticker  = st.text_input("Ticker", "").strip().upper()
         mc_m    = st.number_input("Market Cap (M$)", 0.0, step=0.01, format="%.2f")
         float_m = st.number_input("Public Float (M)", 0.0, step=0.01, format="%.2f")
-        si_pct  = st.number_input("Short Interest (%)", 0.0, step=0.01, format="%.2f")
         gap_pct = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")  # real percent e.g. 100 = +100%
 
     with c2:
@@ -278,8 +273,7 @@ if submitted and ticker:
         "Ticker": ticker,
         "MarketCap_M$": mc_m,
         "Float_M": float_m,
-        "ShortInt_%": si_pct,
-        "Gap_%": gap_pct,
+        "Gap_%": gap_pct,         # manual already in percent (no scaling)
         "ATR_$": atr_usd,
         "RVOL": rvol,
         "PM_Vol_M": pm_vol,
@@ -294,47 +288,36 @@ if submitted and ticker:
     st.success(f"Saved {ticker}.")
     do_rerun()
 
-# ============================== Toolbar: Delete / Clear + Multiselect (FULL WIDTH) ==============================
-if st.session_state.rows:
-    tcol1, tcol2 = st.columns([1.6, 1.6])
-    with tcol1:
-        delete_clicked = st.button("Delete selected", use_container_width=True, type="primary", key="btn_delete")
-    with tcol2:
-        clear_disabled = len(st.session_state.rows) == 0
-        clear_clicked = st.button("Clear Added Stocks", use_container_width=True, disabled=clear_disabled, key="btn_clear")
-
-    # Full-width multiselect WITHOUT title, directly under buttons
-    current_tickers = [str(r.get("Ticker", "")) for r in st.session_state.rows if str(r.get("Ticker","")).strip() != ""]
-    selected_to_delete = st.multiselect(
-        label="",
-        options=current_tickers,
-        default=[],
-        placeholder="Select tickers to delete…",
-        label_visibility="collapsed",
-        key="ms_delete_fullwidth"
-    )
-
-    if clear_clicked:
-        st.session_state.rows = []
-        st.success("Cleared all added stocks.")
-        do_rerun()
-
-    if delete_clicked:
-        if not selected_to_delete:
-            st.info("No rows selected in the list.")
+# ============================== Toolbar: Delete + Multiselect (same row) ==============================
+tickers = [r.get("Ticker","").strip().upper() for r in st.session_state.rows if r.get("Ticker","")]
+tcol_btn, tcol_sel = st.columns([1, 3])
+with tcol_btn:
+    if st.button("Delete selected", use_container_width=True, type="primary"):
+        sel = st.session_state.get("to_delete", [])
+        if not sel:
+            st.info("No rows selected.")
         else:
             before = len(st.session_state.rows)
-            selset = set(map(str.upper, selected_to_delete))
+            sel_set = set([s.strip().upper() for s in sel])
             st.session_state.rows = [
                 r for r in st.session_state.rows
-                if str(r.get("Ticker", "")).strip().upper() not in selset
+                if str(r.get("Ticker","")).strip().upper() not in sel_set
             ]
             removed = before - len(st.session_state.rows)
             if removed > 0:
-                st.success(f"Removed {removed} row(s): {', '.join(sorted(selset))}")
+                st.success(f"Removed {removed} row(s): {', '.join(sorted(sel_set))}")
             else:
                 st.info("No rows removed.")
             do_rerun()
+with tcol_sel:
+    st.multiselect(
+        label="",
+        options=tickers,
+        default=[],
+        key="to_delete",
+        placeholder="Select tickers to delete…",
+        label_visibility="collapsed"
+    )
 
 # ============================== Alignment (DataTables child-rows; ONLY added stocks) ==============================
 st.markdown("### Alignment")
@@ -343,7 +326,8 @@ def _compute_alignment_counts(stock_row: dict, models_tbl: pd.DataFrame) -> dict
     if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
         return {}
     groups = ["FT=1","FT=0"]
-    cand_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+    # NO ShortInt_% anymore
+    cand_vars = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
                  "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
     common = [v for v in cand_vars if (v in stock_row) and (v in models_tbl.index)]
     counts = {g: 0 for g in groups}; used = 0
@@ -365,9 +349,8 @@ SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
-    # Build summary for ADDED stocks only (no model rows)
     summary_rows, detail_map = [], {}
-    num_vars = ["MarketCap_M$","Float_M","ShortInt_%","Gap_%","ATR_$","RVOL",
+    num_vars = ["MarketCap_M$","Float_M","Gap_%","ATR_$","RVOL",
                 "PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Catalyst"]
 
     for row in st.session_state.rows:
@@ -440,6 +423,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
   table.dataTable tbody tr { cursor: pointer; }
 
+  /* Parent bars: centered look with fixed width and centered container */
   .bar-wrap { display:flex; justify-content:center; align-items:center; gap:6px; }
   .bar { height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }
   .bar > span { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }
@@ -447,11 +431,11 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .blue > span { background:#3b82f6; }  /* FT=1 = blue */
   .red  > span { background:#ef4444; }  /* FT=0 = red  */
 
-  /* Align FT columns */
+  /* Force center alignment for FT columns */
   #align td:nth-child(2), #align th:nth-child(2),
   #align td:nth-child(3), #align th:nth-child(3) { text-align: center; }
 
-  /* Child table */
+  /* Child table: compact & fixed layout */
   .child-table { width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }
   .child-table th, .child-table td {
     font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb;
@@ -459,15 +443,15 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   }
   .child-table th:first-child, .child-table td:first-child { text-align:left; }
 
-  /* Significance backgrounds */
-  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }  /* yellow-ish */
-  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }  /* red-ish */
+  /* significance row highlights (directional) */
+  tr.sig_up td   { background: rgba(253, 230, 138, 0.85) !important; }
+  tr.sig_down td { background: rgba(254, 202, 202, 0.85) !important; }
 
-  /* Column widths for child table */
+  /* Column widths */
   .col-var { width: 18%; }
   .col-val { width: 12%; }
   .col-ft1 { width: 18%; }
-  .col-ft0 { width: 10%; }
+  .col-ft0 { width: 18%; }
   .col-d1  { width: 17%; }
   .col-d0  { width: 17%; }
 
@@ -509,20 +493,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         </div>`;
     }
 
-    // Build the DataTable (no checkbox column)
-    const table = $('#align').DataTable({
-      data: data.rows,
-      responsive: true,
-      paging: false, info: false, searching: false,
-      order: [[0,'asc']],
-      columns: [
-        { data: 'Ticker' },
-        { data: 'FT1_val', render: (d)=>barCellBlue(d) },
-        { data: 'FT0_val', render: (d)=>barCellRed(d) },
-      ]
-    });
-
-    // Child rows
     function childTableHTML(ticker) {
       const rows = data.details[ticker] || [];
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
@@ -531,16 +501,20 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const f1 = (r.FT1==null ||isNaN(r.FT1))  ? '' : Number(r.FT1).toFixed(2);
         const f0 = (r.FT0==null ||isNaN(r.FT0))  ? '' : Number(r.FT0).toFixed(2);
         const d1 = (r.d_vs_FT1==null||isNaN(r.d_vs_FT1)) ? '' : Number(r.d_vs_FT1).toFixed(2);
-        const d0 = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? '' : Number(r.d_vs_FT0).toFixed(2);
+        const d0 = (r.d_vs_FT0==null||isNaN(r.d_vs_FT0)) ? '' : Number(r.d_vs_FT0).toFixed(2);
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
 
+        // significance flags from payload
         const s1 = !!r.sig1, s0 = !!r.sig0;
+
+        // numeric deltas for direction
         const d1num = (r.d_vs_FT1==null || isNaN(r.d_vs_FT1)) ? NaN : Number(r.d_vs_FT1);
         const d0num = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? NaN : Number(r.d_vs_FT0);
 
         let rowClass = '';
         if (s1 || s0) {
+          // choose the delta with larger absolute value if both significant
           let delta = NaN;
           if (s1 && s0) {
             const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
@@ -581,14 +555,29 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         </table>`;
     }
 
-    $('#align tbody').on('click', 'tr', function () {
-      const row = table.row(this);
-      if (row.child.isShown()) {
-        row.child.hide(); $(this).removeClass('shown');
-      } else {
-        const ticker = row.data().Ticker;
-        row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
-      }
+    $(function() {
+      const table = $('#align').DataTable({
+        data: data.rows,
+        responsive: true,
+        paging: false, info: false, searching: false,
+        order: [[0,'asc']],
+        columns: [
+          { data: 'Ticker' },
+          { data: 'FT1_val', render: (d)=>barCellBlue(d) },
+          { data: 'FT0_val', render: (d)=>barCellRed(d) },
+        ]
+      });
+
+      // whole-row toggle child
+      $('#align tbody').on('click', 'tr', function () {
+        const row = table.row(this);
+        if (row.child.isShown()) {
+          row.child.hide(); $(this).removeClass('shown');
+        } else {
+          const ticker = row.data().Ticker;
+          row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
+        }
+      });
     });
   </script>
 </body>
