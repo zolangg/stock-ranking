@@ -72,7 +72,7 @@ if "models" not in st.session_state: st.session_state.models = {}  # {"models_tb
 if "vol_model" not in st.session_state: st.session_state.vol_model = None  # daily volume model (trained on DB)
 
 # ============================== Core & Moderate sets ==============================
-# NOTE: PM_Vol_% is now core; PM_Vol_M + PredVol_M are moderate (per your request).
+# PM_Vol_% is core; PM_Vol_M + PredVol_M are moderate.
 VAR_CORE = ["Gap_%", "RVOL", "FR_x", "PM$Vol/MC_%", "PM_Vol_%", "Catalyst"]
 VAR_MODERATE = ["MarketCap_M$", "Float_M", "PM_Vol_M", "PredVol_M", "PM_$Vol_M$", "ATR_$"]
 VAR_ALL = VAR_CORE + VAR_MODERATE
@@ -116,19 +116,17 @@ if build_btn:
                     if src:
                         df[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-                # Map numeric columns (NO ShortInt_% anywhere)
+                # Map numeric columns
                 add_num(df, "MarketCap_M$", ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
                 add_num(df, "Float_M",      ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
                 add_num(df, "Gap_%",        ["gap %","gap%","premarket gap","gap","gap percent","gap_percent"])
                 add_num(df, "ATR_$",        ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
                 add_num(df, "RVOL",         ["rvol","relative volume","rvol @ bo","rvol at bo","rvol_bo"])
                 add_num(df, "PM_Vol_M",     ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
-                add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollar vol (m)","pm $vol (m)","pm_vol_m"])  # if same as shares, harmless
-
-                # PM Vol % (from DB if present; already in percent most likely)
+                add_num(df, "PM_$Vol_M$",   ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollar vol (m)","pm $vol (m)"])
                 add_num(df, "PM_Vol_%",     ["pm vol (%)","pm_vol_percent","pm vol %","pm% vol","pm_vol_%","pm_vol_percent_2"])
 
-                # --- Catalyst (binary: Yes/No/1/0/True/False) from DB, if present ---
+                # --- Catalyst (binary) ---
                 cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
                 def _to_binary_local(v):
                     sv = str(v).strip().lower()
@@ -142,7 +140,7 @@ if build_btn:
                 if cand_catalyst:
                     df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
 
-                # Derived metrics (for medians, not predictions)
+                # Derived metrics (for medians display)
                 if {"PM_Vol_M","Float_M"}.issubset(df.columns):
                     df["FR_x"] = (df["PM_Vol_M"] / df["Float_M"]).replace([np.inf,-np.inf], np.nan)
                 if {"PM_$Vol_M$","MarketCap_M$"}.issubset(df.columns):
@@ -151,6 +149,17 @@ if build_btn:
                 # IMPORTANT: force Gap_% into percent for medians by multiplying *100
                 if "Gap_%" in df.columns:
                     df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
+
+                # If PM_Vol_% looks like fractions (≤ 1–1.5), convert to %
+                if "PM_Vol_%" in df.columns:
+                    pv = pd.to_numeric(df["PM_Vol_%"], errors="coerce")
+                    mask = pv.notna()
+                    if mask.any():
+                        frac_share = (pv[mask] <= 1.5).mean()
+                        if frac_share >= 0.8:
+                            df["PM_Vol_%"] = pv * 100.0
+                        else:
+                            df["PM_Vol_%"] = pv
 
                 # Normalize to binary for FT groups
                 def _to_binary(v):
@@ -171,8 +180,7 @@ if build_btn:
                     df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
                     # =============== Train Daily Volume model (LASSO -> OLS refit) ===============
-                    # We need target "Daily Vol (M)"
-                    col_dvol = _pick(raw, ["daily vol (m)","daily volume (m)","dvol m","daily_vol_m","daily volume m"])
+                    col_dvol = _pick(raw, ["daily vol (m)","daily volume (m)","dvol m","daily_vol_m","daily volume m","daily_vol_m_2"])
                     vol_model = None
                     if col_dvol:
                         # Build features from DB (log-space)
@@ -183,14 +191,8 @@ if build_btn:
                         FLT = df.get("Float_M")
                         CAT = df.get("Catalyst")
 
-                        # Need these to compute FR
-                        FR = None
-                        if PMM is not None and FLT is not None:
-                            FR = (PMM / FLT).replace([np.inf,-np.inf], np.nan)
-                        else:
-                            FR = pd.Series(np.nan, index=df.index)
+                        FR = (PMM / FLT).replace([np.inf,-np.inf], np.nan) if (PMM is not None and FLT is not None) else pd.Series(np.nan, index=df.index)
 
-                        # Build full candidate feature frame
                         feats = pd.DataFrame({
                             "catalyst": CAT if CAT is not None else np.nan,
                             "ln_mcap": _safe_log(MC) if MC is not None else np.nan,
@@ -201,9 +203,10 @@ if build_btn:
                         })
 
                         Y = pd.to_numeric(pd.Series(raw[col_dvol]).map(_to_float), errors="coerce")
-                        y_ln = _safe_log(Y)
+                        # KEEP AS SERIES (fixes .rename error)
+                        y_ln = pd.Series(_safe_log(Y), index=Y.index, name="y_ln")
 
-                        data = pd.concat([feats, y_ln.rename("y_ln")], axis=1).dropna()
+                        data = pd.concat([feats, y_ln], axis=1).dropna()
                         if len(data) >= 20:
                             X = data.drop(columns=["y_ln"]).values.astype(float)
                             y = data["y_ln"].values.astype(float)
@@ -212,24 +215,21 @@ if build_btn:
                             try:
                                 # Try sklearn LassoCV for selection
                                 from sklearn.linear_model import LassoCV
-                                lcv = LassoCV(cv=5, random_state=42, n_jobs=None)
+                                lcv = LassoCV(cv=5, random_state=42)
                                 lcv.fit(X, y)
                                 coef = lcv.coef_
                                 selected_idx = np.where(np.abs(coef) > 1e-8)[0]
                             except Exception:
-                                # Fallback: use canonical set (as per your R result)
-                                selected_idx = np.array([0,1,2,3,4,5])  # use all
+                                selected_idx = np.array([3, 2])  # fallback: ln_pm, ln_atr
 
-                            # Ensure at least one predictor
                             if selected_idx.size == 0:
-                                selected_idx = np.array([3, 2])  # ln_pm and ln_atr fallback
+                                selected_idx = np.array([3, 2])  # ensure at least 1–2 predictors
 
                             feat_names = list(feats.columns)
                             sel_names = [feat_names[i] for i in selected_idx]
 
                             # Refit plain OLS on selected features
                             X_sel = data[sel_names].values.astype(float)
-                            # add intercept
                             X_design = np.column_stack([np.ones(len(X_sel)), X_sel])
                             beta, *_ = np.linalg.lstsq(X_design, y, rcond=None)
 
@@ -242,23 +242,16 @@ if build_btn:
 
                     st.session_state.vol_model = vol_model
 
-                    # =============== Build medians/MADs (note: we DO NOT compute PredVol_M for DB) ===============
-                    # Add placeholders so tables can include them when present in added rows
+                    # =============== Build medians/MADs (NO predictions for DB) ===============
                     if "PredVol_M" not in df.columns:
                         df["PredVol_M"] = np.nan  # only filled for manual rows later
-                    if "PM_Vol_%" not in df.columns:
-                        # keep DB-provided PM_Vol_% if present; otherwise NaN (we don't compute from predictions here)
-                        pass
 
-                    # Limit medians/MADs to available vars
                     var_core = [v for v in VAR_CORE if v in df.columns]
                     var_mod  = [v for v in VAR_MODERATE if v in df.columns]
                     var_all  = var_core + var_mod
 
-                    # medians per group
                     gmed = df.groupby("Group")[var_all].median(numeric_only=True).T  # rows=variables, cols=FT=0/FT=1
 
-                    # robust spread: MAD per group
                     def _mad(series: pd.Series) -> float:
                         s = pd.to_numeric(series, errors="coerce").dropna()
                         if s.empty:
@@ -274,7 +267,7 @@ if build_btn:
                         "var_core": var_core,
                         "var_moderate": var_mod
                     }
-                    st.success(f"Built model stocks (medians) and trained Daily Volume model. Medians columns = {list(gmed.columns)}")
+                    st.success("Built medians and trained Daily Volume model.")
                     do_rerun()
 
         except Exception as e:
@@ -329,7 +322,7 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
         show_grouped_table("Core variables", var_core)
         show_grouped_table("Moderate variables", var_mod)
 
-# ============================== ➕ Manual Input (NO Short Interest) ==============================
+# ============================== ➕ Manual Input ==============================
 st.markdown("---")
 st.subheader("Add Stock")
 
@@ -360,19 +353,15 @@ def _predict_daily_vol_m(row: dict) -> float | None:
         return None
     eps = float(mdl.get("eps", 1e-6))
     feats = mdl["features"]
-    x = {}
 
-    # Build all potential features from row
     mcap = float(row.get("MarketCap_M$", 0.0))
     atr  = float(row.get("ATR_$", 0.0))
     pm   = float(row.get("PM_Vol_M", 0.0))
     pmd  = float(row.get("PM_$Vol_M$", 0.0))
     flt  = float(row.get("Float_M", 0.0))
     cat  = float(row.get("Catalyst", 0.0))
+    FR   = (pm / flt) if flt > 0 else 0.0
 
-    FR = (pm / flt) if flt > 0 else 0.0
-
-    # Compose feature dict (must match mdl feature names)
     all_features = {
         "catalyst": cat,
         "ln_mcap": np.log(max(mcap, eps)),
@@ -380,10 +369,8 @@ def _predict_daily_vol_m(row: dict) -> float | None:
         "ln_pm":   np.log(max(pm, eps)),
         "ln_pm_dol": np.log(max(pmd, eps)),
         "ln_FR":   np.log(max(FR, eps)),
-        # ln_gapf is intentionally omitted unless model selected it (not typical)
     }
 
-    # dot product
     yln = float(mdl["intercept"])
     for f in feats:
         yln += float(mdl["betas"].get(f, 0.0)) * float(all_features.get(f, 0.0))
@@ -396,8 +383,6 @@ if submitted and ticker:
     fr = (pm_vol / float_m) if float_m > 0 else 0.0
     pmmc = (pm_dol / mc_m * 100.0) if mc_m > 0 else 0.0
 
-    # Predict Daily Volume (M) if model exists
-    # Build a temp row to pass to predictor
     temp_row = {
         "MarketCap_M$": mc_m,
         "Float_M": float_m,
@@ -408,7 +393,7 @@ if submitted and ticker:
         "PM_$Vol_M$": pm_dol,
         "FR_x": fr,
         "PM$Vol/MC_%": pmmc,
-        "Catalyst": 1.0 if st.session_state.get("vol_model") and (catalyst_yn == "Yes") else (1.0 if catalyst_yn == "Yes" else 0.0),
+        "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
     pred_vol_m = _predict_daily_vol_m(temp_row)
     pm_vol_pct = (pm_vol / pred_vol_m * 100.0) if (pred_vol_m and pred_vol_m > 0) else np.nan
@@ -426,7 +411,6 @@ if submitted and ticker:
         "PM$Vol/MC_%": pmmc,
         "CatalystYN": catalyst_yn,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
-        # Prediction fields (for manual rows)
         "PredVol_M": pred_vol_m if pred_vol_m is not None else np.nan,
         "PM_Vol_%": pm_vol_pct
     }
@@ -435,7 +419,7 @@ if submitted and ticker:
     st.success(f"Saved {ticker}.")
     do_rerun()
 
-# ============================== Toolbar: Delete + Multiselect (same row) ==============================
+# ============================== Toolbar: Delete + Multiselect ==============================
 tickers = [r.get("Ticker","").strip().upper() for r in st.session_state.rows if r.get("Ticker","")]
 tcol_btn, tcol_sel = st.columns([1, 3])
 with tcol_btn:
@@ -518,7 +502,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         # ---- child details: group headers + rows ----
         drows_grouped = []
         for grp_label, grp_vars in detail_order:
-            # add a header marker row (handled in JS)
             drows_grouped.append({"__group__": grp_label})
             for v in grp_vars:
                 va = pd.to_numeric(stock.get(v), errors="coerce")
@@ -542,7 +525,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 s1 = _sig(d1, float(m1) if pd.notna(m1) else np.nan)
                 s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
 
-                # For child-row coloring: only CORE get significance colors; MODERATE get light gray background.
                 is_core = v in var_core
                 sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR) if is_core else False
                 sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR) if is_core else False
@@ -563,10 +545,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
     if summary_rows:
         import streamlit.components.v1 as components
-        payload = {
-            "rows": summary_rows,
-            "details": detail_map
-        }
+        payload = {"rows": summary_rows, "details": detail_map}
 
         html = """
 <!DOCTYPE html>
@@ -677,16 +656,13 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
 
-        // significance flags for CORE only
         const isCore = !!r.is_core;
         const s1 = isCore && !!r.sig1;
         const s0 = isCore && !!r.sig0;
 
-        // numeric deltas for direction
         const d1num = (r.d_vs_FT1==null || isNaN(r.d_vs_FT1)) ? NaN : Number(r.d_vs_FT1);
         const d0num = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? NaN : Number(r.d_vs_FT0);
 
-        // class resolution: for CORE, use sig_up/sig_down; for MODERATE use gray background
         let rowClass = '';
         if (isCore && (s1 || s0)) {
           let delta = NaN;
@@ -745,7 +721,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         ]
       });
 
-      // Whole-row toggle child
       $('#align tbody').on('click', 'tr', function () {
         const row = table.row(this);
         if (row.child.isShown()) {
