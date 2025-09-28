@@ -82,115 +82,144 @@ VAR_MODERATE = ["MarketCap_M$", "Float_M", "PM_Vol_M", "PM_$Vol_M$", "ATR_$", "D
 VAR_ALL = VAR_CORE + VAR_MODERATE
 
 # ============================== Simple LASSO (coordinate descent) ==============================
-def _standardize(X):
-    mu = np.nanmean(X, axis=0)
-    sd = np.nanstd(X, axis=0, ddof=0)
-    sd[sd == 0] = 1.0
-    return (X - mu) / sd, mu, sd
+def _kfold_indices(n, k=5, seed=42):
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    folds = np.array_split(idx, k)
+    return folds
 
-def _lasso_cd(X, y, lam=0.05, max_iter=200, tol=1e-6):
-    # X, y: standardized (no NaNs)
-    n, p = X.shape
+def _lasso_cd_std(Xs, y, lam, max_iter=1000, tol=1e-6):
+    # Xs standardized; y mean-centered not required for OLS refit later
+    n, p = Xs.shape
     w = np.zeros(p)
     for _ in range(max_iter):
         w_old = w.copy()
+        # coordinate updates
         for j in range(p):
-            r_j = y - (X @ w) + X[:, j] * w[j]
-            rho = np.dot(X[:, j], r_j) / n
-            if rho < -lam/2:
-                w[j] = (rho + lam/2)
-            elif rho > lam/2:
-                w[j] = (rho - lam/2)
-            else:
-                w[j] = 0.0
-        if np.linalg.norm(w - w_old, ord=2) < tol:
+            r_j = y - (Xs @ w) + Xs[:, j] * w[j]
+            rho = (Xs[:, j] @ r_j) / n
+            # soft-threshold (lambda here corresponds to sklearn's 2*alpha convention-ish)
+            if   rho < -lam/2: w[j] = rho + lam/2
+            elif rho >  lam/2: w[j] = rho - lam/2
+            else:              w[j] = 0.0
+        if np.linalg.norm(w - w_old) < tol:
             break
     return w
 
 def train_lasso_on_db(df: pd.DataFrame) -> dict:
     """
-    Train LASSO -> OLS on DB rows to predict ln(Daily_Vol_M).
-    Features: ln_mcap, ln_atr, ln_pm, ln_pm_dol, ln_FR, catalyst (0/1)
+    Match the R pipeline:
+      - candidates: ln_mcap, ln_gapf, ln_atr, ln_pm, ln_pm_dol, ln_fr, catalyst
+      - 5-fold CV to choose lambda
+      - LASSO selects subset
+      - Refit OLS on ORIGINAL (unstandardized) selected log-features
+    Returns dict with terms, coef (including b0) for use in prediction.
     """
     eps = 1e-6
-    need = {"MarketCap_M$","ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Catalyst","Daily_Vol_M"}
-    if not need.issubset(df.columns):
+    need_cols = {"MarketCap_M$","ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Catalyst","Daily_Vol_M","Gap_%"}
+    if not need_cols.issubset(df.columns):
         return {}
 
-    # Feature engineering (log)
-    ln_mcap   = np.log(np.clip(df["MarketCap_M$"].astype(float).values, eps, None))
-    ln_atr    = np.log(np.clip(df["ATR_$"].astype(float).values, eps, None))
-    ln_pm     = np.log(np.clip(df["PM_Vol_M"].astype(float).values, eps, None))
-    ln_pm_dol = np.log(np.clip(df["PM_$Vol_M$"].astype(float).values, eps, None))
-    ln_fr     = np.log(np.clip(df["FR_x"].astype(float).values, eps, None))
-    catalyst  = np.clip(pd.to_numeric(df["Catalyst"], errors="coerce").fillna(0).values, 0, 1)
+    # Build original (unstandardized) log features
+    ln_mcap   = np.log(np.clip(pd.to_numeric(df["MarketCap_M$"], errors="coerce").values, eps, None))
+    ln_gapf   = np.log(np.clip(pd.to_numeric(df["Gap_%"],        errors="coerce").values, 0, None) / 100.0 + eps)
+    ln_atr    = np.log(np.clip(pd.to_numeric(df["ATR_$"],        errors="coerce").values, eps, None))
+    ln_pm     = np.log(np.clip(pd.to_numeric(df["PM_Vol_M"],     errors="coerce").values, eps, None))
+    ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"],   errors="coerce").values, eps, None))
+    ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"],         errors="coerce").values, eps, None))
+    catalyst  = np.clip(pd.to_numeric(df["Catalyst"], errors="coerce").fillna(0).values, 0, 1).astype(float)
 
     y_ln = np.log(np.clip(pd.to_numeric(df["Daily_Vol_M"], errors="coerce").values, eps, None))
 
-    feats = np.column_stack([ln_mcap, ln_atr, ln_pm, ln_pm_dol, ln_fr, catalyst])
-    mask = np.isfinite(feats).all(axis=1) & np.isfinite(y_ln)
-    X = feats[mask]
-    y = y_ln[mask]
-    if X.shape[0] < 25:
+    X_orig = np.column_stack([ln_mcap, ln_gapf, ln_atr, ln_pm, ln_pm_dol, ln_fr, catalyst])
+    terms  = ["ln_mcap","ln_gapf","ln_atr","ln_pm","ln_pm_dol","ln_fr","catalyst"]
+
+    mask = np.isfinite(X_orig).all(axis=1) & np.isfinite(y_ln)
+    X_orig = X_orig[mask]; y = y_ln[mask]
+    if X_orig.shape[0] < 25:
         return {}
 
-    Xs, mu, sd = _standardize(X)
-    w_l1 = _lasso_cd(Xs, y, lam=0.05, max_iter=500)
+    # Standardize for LASSO only
+    mu = X_orig.mean(axis=0)
+    sd = X_orig.std(axis=0, ddof=0); sd[sd==0] = 1.0
+    Xs = (X_orig - mu) / sd
+
+    # K-fold CV over a lambda grid
+    k = 5
+    folds = _kfold_indices(len(y), k=k, seed=42)
+    lam_grid = np.geomspace(0.001, 1.0, 30)
+    cv_mse = []
+
+    for lam in lam_grid:
+        errs = []
+        for vi in range(k):
+            te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(k) if j != vi])
+            Xtr, ytr = Xs[tr_idx], y[tr_idx]
+            Xte, yte = Xs[te_idx], y[te_idx]
+            w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1000)
+            yhat = Xte @ w
+            errs.append(np.mean((yhat - yte)**2))
+        cv_mse.append(np.mean(errs))
+
+    lam_best = float(lam_grid[int(np.argmin(cv_mse))])
+
+    # Fit LASSO on full standardized data at lam_best
+    w_l1 = _lasso_cd_std(Xs, y, lam=lam_best, max_iter=2000)
 
     sel = np.flatnonzero(np.abs(w_l1) > 1e-8)
     if sel.size == 0:
         return {}
 
-    # Refit OLS on selected (still standardized)
-    Xs_sel = Xs[:, sel]
-    beta_std, *_ = np.linalg.lstsq(Xs_sel, y, rcond=None)
+    # Refit plain OLS on ORIGINAL (unstandardized) features with selected terms
+    X_sel = X_orig[:, sel]
+    # add intercept
+    X_design = np.column_stack([np.ones(X_sel.shape[0]), X_sel])
+    coef_ols, *_ = np.linalg.lstsq(X_design, y, rcond=None)  # coef_ols[0]=b0
 
-    # Map back to original scale
-    # y = b0 + sum_j beta_j * (x_j - mu_j)/sd_j  => intercept:
-    b = np.zeros(X.shape[1])
-    b[sel] = beta_std
-    intercept = float(np.mean(y) - np.sum(b * (-mu / sd)))  # alternative robust intercept
-    # Better compute exact intercept from means
-    intercept = float(np.mean(y) - np.dot(b, (-mu / sd)))
+    # Package results
+    selected_terms = [terms[i] for i in sel]
+    return {
+        "b0": float(coef_ols[0]),
+        "betas": coef_ols[1:].astype(float),
+        "terms": selected_terms,
+        "eps": eps
+    }
 
-    features = ["ln_mcap","ln_atr","ln_pm","ln_pm_dol","ln_fr","catalyst"]
-    return {"features": features, "coef": b, "intercept": intercept, "mu": mu, "sd": sd, "sel_idx": sel, "eps": eps}
-
-def predict_predvol_m(row: dict, lasso: dict) -> float:
-    """Predict PredVol_M for one manual row using trained LASSO→OLS (if available)."""
-    if not lasso or not lasso.get("coef") is not None:
+def predict_predvol_m(row: dict, model: dict) -> float:
+    """Use OLS (on unstandardized log-features) returned by train_lasso_on_db to predict PredVol_M."""
+    if not model or "betas" not in model: 
         return np.nan
-    eps = float(lasso.get("eps", 1e-6))
-    # Build feature vector in the same order
-    mc = float(row.get("MarketCap_M$", np.nan))
-    atr= float(row.get("ATR_$", np.nan))
-    pm = float(row.get("PM_Vol_M", np.nan))
-    pmd= float(row.get("PM_$Vol_M$", np.nan))
-    fr = float(row.get("FR_x", np.nan))
-    cat= float(row.get("Catalyst", 0.0))
+    eps = float(model.get("eps", 1e-6))
+    # Build a dict of all needed log features from the manual row
+    def safe_log(v): 
+        v = float(v) if v is not None else np.nan
+        return np.log(np.clip(v, eps, None)) if np.isfinite(v) else np.nan
 
-    ln_mcap   = np.log(np.clip(mc,  eps, None)) if np.isfinite(mc)  else np.nan
-    ln_atr    = np.log(np.clip(atr, eps, None)) if np.isfinite(atr) else np.nan
-    ln_pm     = np.log(np.clip(pm,  eps, None)) if np.isfinite(pm)  else np.nan
-    ln_pm_dol = np.log(np.clip(pmd, eps, None)) if np.isfinite(pmd) else np.nan
-    ln_fr     = np.log(np.clip(fr,  eps, None)) if np.isfinite(fr)  else np.nan
+    ln_mcap   = safe_log(row.get("MarketCap_M$"))
+    ln_gapf   = np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + eps, eps, None)) if row.get("Gap_%") is not None else np.nan
+    ln_atr    = safe_log(row.get("ATR_$"))
+    ln_pm     = safe_log(row.get("PM_Vol_M"))
+    ln_pm_dol = safe_log(row.get("PM_$Vol_M$"))
+    ln_fr     = safe_log(row.get("FR_x"))
     catalyst  = 1.0 if (str(row.get("CatalystYN","No")).lower()=="yes" or float(row.get("Catalyst",0))>=0.5) else 0.0
 
-    x = np.array([ln_mcap, ln_atr, ln_pm, ln_pm_dol, ln_fr, catalyst], dtype=float)
-    if not np.isfinite(x).all():
-        return np.nan
+    feat_map = {
+        "ln_mcap": ln_mcap, "ln_gapf": ln_gapf, "ln_atr": ln_atr,
+        "ln_pm": ln_pm, "ln_pm_dol": ln_pm_dol, "ln_fr": ln_fr, "catalyst": catalyst
+    }
 
-    # Project to standardized space that the OLS was fit on
-    sel = lasso["sel_idx"]
-    mu, sd = lasso["mu"], lasso["sd"]
-    x_std = (x - mu) / sd
-    # keep only selected columns in coef (others are zero)
-    b = lasso["coef"]
-    yhat_ln = float(lasso["intercept"] + np.dot(b, x_std))
+    X = []
+    for t in model["terms"]:
+        v = feat_map.get(t, np.nan)
+        if not np.isfinite(v): 
+            return np.nan
+        X.append(v)
+    X = np.array(X, dtype=float)
+
+    yhat_ln = model["b0"] + float(np.dot(model["betas"], X))
     pred = np.exp(yhat_ln)
-    if not np.isfinite(pred):
-        return np.nan
-    return max(pred, 0.0)
+    return max(pred, 0.0) if np.isfinite(pred) else np.nan
 
 # ============================== Upload DB → Build Medians & Train LASSO ==============================
 st.subheader("Upload Database")
