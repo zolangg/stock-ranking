@@ -490,17 +490,31 @@ def _compute_alignment_counts_core(stock_row: dict, models_tbl: pd.DataFrame, va
         return {}
     groups = ["FT=1","FT=0"]
     common = [v for v in var_core if (v in stock_row) and (v in models_tbl.index)]
-    counts = {g: 0 for g in groups}; used = 0
+    counts = {g: 0 for g in groups}
+    used = 0
+    TOL = 1e-9  # treat almost-equal distances as a tie
+
     for v in common:
         xv = pd.to_numeric(stock_row.get(v), errors="coerce")
         if not np.isfinite(xv):
             continue
         med = models_tbl.loc[v, groups].astype(float).dropna()
-        if med.empty:
+        if med.empty or len(med) < 2:
             continue
-        nearest = (med - xv).abs().idxmin()
-        counts[nearest] += 1
+
+        d1 = abs(xv - med["FT=1"])
+        d0 = abs(xv - med["FT=0"])
+
+        # ignore ties (no vote, no used++)
+        if abs(d1 - d0) <= TOL:
+            continue
+
+        if d1 < d0:
+            counts["FT=1"] += 1
+        else:
+            counts["FT=0"] += 1
         used += 1
+
     counts["N_Vars_Used"] = used
     return counts
 
@@ -599,7 +613,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
-<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.responsive.min.css"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
 <style>
   body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
   table.dataTable tbody tr { cursor: pointer; }
