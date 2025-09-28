@@ -72,10 +72,12 @@ if "models" not in st.session_state: st.session_state.models = {}  # {"models_tb
 if "vol_model" not in st.session_state: st.session_state.vol_model = None  # daily volume model (trained on DB)
 
 # ============================== Core & Moderate sets ==============================
-# PM_Vol_% is core; PM_Vol_M + Daily_Vol_M are moderate (PredVol_M removed from medians).
+# PM_Vol_% is core; PM_Vol_M + Daily_Vol_M are moderate (PredVol_M is NOT in medians; only shown in child rows)
 VAR_CORE = ["Gap_%", "RVOL", "FR_x", "PM$Vol/MC_%", "PM_Vol_%", "Catalyst"]
 VAR_MODERATE = ["MarketCap_M$", "Float_M", "PM_Vol_M", "Daily_Vol_M", "PM_$Vol_M$", "ATR_$"]
-VAR_ALL = VAR_CORE + VAR_MODERATE
+
+# For child-row display only (includes PredVol_M so user sees their prediction)
+VAR_MODERATE_DISPLAY = ["MarketCap_M$", "Float_M", "PM_Vol_M", "Daily_Vol_M", "PredVol_M", "PM_$Vol_M$", "ATR_$"]
 
 # ============================== Upload DB → Build Medians + Train LASSO Volume Model ==============================
 st.subheader("Upload Database")
@@ -204,7 +206,7 @@ if build_btn:
                         })
 
                         Y = pd.to_numeric(pd.Series(raw[col_dvol]).map(_to_float), errors="coerce")
-                        y_ln = pd.Series(_safe_log(Y), index=Y.index, name="y_ln")  # keep as Series
+                        y_ln = pd.Series(_safe_log(Y), index=Y.index, name="y_ln")
 
                         data = pd.concat([feats, y_ln], axis=1).dropna()
                         if len(data) >= 20:
@@ -222,7 +224,7 @@ if build_btn:
                                 selected_idx = np.array([3, 2])  # fallback: ln_pm, ln_atr
 
                             if selected_idx.size == 0:
-                                selected_idx = np.array([3, 2])  # ensure at least some predictors
+                                selected_idx = np.array([3, 2])
 
                             feat_names = list(feats.columns)
                             sel_names = [feat_names[i] for i in selected_idx]
@@ -242,10 +244,9 @@ if build_btn:
                     st.session_state.vol_model = vol_model
 
                     # =============== Build medians/MADs (NO predictions for DB) ===============
-                    # NOTE: We do NOT compute PredVol_M for DB; only manual rows use it for PM_Vol_% calc.
                     var_core = [v for v in VAR_CORE if v in df.columns]
-                    var_mod  = [v for v in VAR_MODERATE if v in df.columns]
-                    var_all  = var_core + var_mod
+                    var_mod_for_medians  = [v for v in VAR_MODERATE if v in df.columns]  # (PredVol_M not included)
+                    var_all  = var_core + var_mod_for_medians
 
                     gmed = df.groupby("Group")[var_all].median(numeric_only=True).T  # rows=variables, cols=FT=0/FT=1
 
@@ -262,7 +263,8 @@ if build_btn:
                         "models_tbl": gmed,
                         "mad_tbl": gmads,
                         "var_core": var_core,
-                        "var_moderate": var_mod
+                        "var_moderate": VAR_MODERATE,            # keep canonical order for display
+                        "var_moderate_display": VAR_MODERATE_DISPLAY
                     }
                     st.success("Built medians and trained Daily Volume model.")
                     do_rerun()
@@ -408,7 +410,7 @@ if submitted and ticker:
         "PM$Vol/MC_%": pmmc,
         "CatalystYN": catalyst_yn,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
-        "PredVol_M": pred_vol_m if pred_vol_m is not None else np.nan,  # used only for PM_Vol_% calc
+        "PredVol_M": pred_vol_m if pred_vol_m is not None else np.nan,  # used for PM_Vol_% calc & child-row display
         "PM_Vol_%": pm_vol_pct
     }
     st.session_state.rows.append(row)
@@ -473,14 +475,15 @@ models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFra
 mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
 var_core = (st.session_state.get("models") or {}).get("var_core", [])
 var_mod  = (st.session_state.get("models") or {}).get("var_moderate", [])
+var_mod_display = (st.session_state.get("models") or {}).get("var_moderate_display", VAR_MODERATE_DISPLAY)
 SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
     # Build summary using CORE variables only
     summary_rows, detail_map = [], {}
 
-    # Order for details: core group first, then moderate
-    detail_order = [("Core variables", var_core), ("Moderate variables", var_mod)]
+    # Order for details: core group first, then moderate (display list)
+    detail_order = [("Core variables", var_core), ("Moderate variables", var_mod_display)]
 
     for row in st.session_state.rows:
         stock = dict(row)
@@ -499,14 +502,16 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         # ---- child details: group headers + rows ----
         drows_grouped = []
         for grp_label, grp_vars in detail_order:
-            # add a header marker row (handled in JS)
             drows_grouped.append({"__group__": grp_label})
             for v in grp_vars:
+                # Special mapping: PredVol_M (manual) vs Daily_Vol_M medians
+                med_var = "Daily_Vol_M" if v == "PredVol_M" else v
+
                 va = pd.to_numeric(stock.get(v), errors="coerce")
-                v1 = models_tbl.loc[v, "FT=1"] if (v in models_tbl.index) else np.nan
-                v0 = models_tbl.loc[v, "FT=0"] if (v in models_tbl.index) else np.nan
-                m1 = mad_tbl.loc[v, "FT=1"] if (not mad_tbl.empty and v in mad_tbl.index and "FT=1" in mad_tbl.columns) else np.nan
-                m0 = mad_tbl.loc[v, "FT=0"] if (not mad_tbl.empty and v in mad_tbl.index and "FT=0" in mad_tbl.columns) else np.nan
+                v1 = models_tbl.loc[med_var, "FT=1"] if (med_var in models_tbl.index) else np.nan
+                v0 = models_tbl.loc[med_var, "FT=0"] if (med_var in models_tbl.index) else np.nan
+                m1 = mad_tbl.loc[med_var, "FT=1"] if (not mad_tbl.empty and med_var in mad_tbl.index and "FT=1" in mad_tbl.columns) else np.nan
+                m0 = mad_tbl.loc[med_var, "FT=0"] if (not mad_tbl.empty and med_var in mad_tbl.index and "FT=0" in mad_tbl.columns) else np.nan
 
                 if pd.isna(va) and pd.isna(v1) and pd.isna(v0):
                     continue
@@ -523,8 +528,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 s1 = _sig(d1, float(m1) if pd.notna(m1) else np.nan)
                 s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
 
-                # For child-row coloring: CORE get significance colors; MODERATE get light gray background.
                 is_core = v in var_core
+                # significance coloring only for CORE; MODERATE rows get gray
                 sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR) if is_core else False
                 sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR) if is_core else False
 
@@ -553,7 +558,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
-<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.responsive.min.css"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
 <style>
   body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
@@ -589,8 +593,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   tr.moderate td { background: #f9fafb !important; }
 
   /* Significance for CORE rows only (directional) */
-  tr.sig_up td   { background: rgba(253, 230, 138, 0.9) !important; }  /* yellow-ish */
-  tr.sig_down td { background: rgba(254, 202, 202, 0.9) !important; }  /* red-ish */
+  tr.sig_up td   { background: rgba(253, 230, 138, 0.9) !important; }
+  tr.sig_down td { background: rgba(254, 202, 202, 0.9) !important; }
 
   /* Column widths for child table */
   .col-var { width: 18%; }
