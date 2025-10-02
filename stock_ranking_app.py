@@ -116,7 +116,7 @@ if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "models" not in st.session_state: st.session_state.models = {}
 if "lassoA" not in st.session_state: st.session_state.lassoA = {}   # ratio model + winsor + calibrator
-if "ft_logit" not in st.session_state: st.session_state.ft_logit = {} # regression model for FT bars
+if "logit" not in st.session_state: st.session_state.logit = {}     # NEW: logistic model
 
 # ============================== Core & Moderate sets ==============================
 VAR_CORE = [
@@ -185,15 +185,15 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     if valid_pm.sum() < 50:
         return {}
 
-    ln_mcap   = np.log(np.clip(pd.to_numeric(mcap_series, errors="coerce").values,  eps, None))
-    ln_gapf   = np.log(np.clip(pd.to_numeric(df["Gap_%"], errors="coerce").values,  0,   None) / 100.0 + eps)
-    ln_atr    = np.log(np.clip(pd.to_numeric(df["ATR_$"], errors="coerce").values,  eps, None))
-    ln_pm     = np.log(np.clip(pd.to_numeric(df["PM_Vol_M"], errors="coerce").values, eps, None))
-    ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"], errors="coerce").values, eps, None))
-    ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"], errors="coerce").values,   eps, None))
-    ln_float_pmmax = np.log(np.clip(pd.to_numeric(float_series, errors="coerce").values, eps, None))
+    ln_mcap   = np.log(np.clip(pd.to_numeric(mcap_series, errors="coerce").values,  1e-6, None))
+    ln_gapf   = np.log(np.clip(pd.to_numeric(df["Gap_%"], errors="coerce").values, 0, None) / 100.0 + 1e-6)
+    ln_atr    = np.log(np.clip(pd.to_numeric(df["ATR_$"], errors="coerce").values, 1e-6, None))
+    ln_pm     = np.log(np.clip(pd.to_numeric(df["PM_Vol_M"], errors="coerce").values, 1e-6, None))
+    ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"], errors="coerce").values, 1e-6, None))
+    ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"], errors="coerce").values,   1e-6, None))
+    ln_float_pmmax = np.log(np.clip(pd.to_numeric(float_series, errors="coerce").values, 1e-6, None))
     maxpullpm      = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").values
-    ln_rvolmaxpm   = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum", np.nan), errors="coerce").values, eps, None))
+    ln_rvolmaxpm   = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum", np.nan), errors="coerce").values, 1e-6, None))
     pm_dol_over_mc = pd.to_numeric(df.get("PM$Vol/MC_%", np.nan), errors="coerce").values
 
     catalyst_raw   = df.get("Catalyst", np.nan)
@@ -218,7 +218,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     cols = [arr.reshape(-1,1) for _, arr in feats]
     X_all = np.hstack(cols)
 
-    mask = valid_pm & np.isfinite(y_ln) & np.isfinite(X_all).all(axis=1)
+    mask = np.isfinite(y_ln) & np.isfinite(X_all).all(axis=1) & valid_pm
     X_all = X_all[mask]; y_ln = y_ln[mask]; PMm = PM[mask]; mult_true = multiplier[mask]
 
     if X_all.shape[0] < 50:
@@ -298,7 +298,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
             winsor_bounds[nm] = (np.nan, np.nan)
 
     model = {
-        "eps": eps,
+        "eps": 1e-6,
         "terms": selected_terms,
         "b0": b0,
         "betas": bet,
@@ -315,6 +315,119 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
                         float(m_hi) if np.isfinite(m_hi) else np.nan)
     }
     return model
+
+# ============================== LOGIT (NEW) ==============================
+def _sigmoid(z):
+    # numerically safe
+    z = np.clip(z, -40.0, 40.0)
+    return 1.0 / (1.0 + np.exp(-z))
+
+def train_logit(df: pd.DataFrame, l2=1.0, max_iter=60, tol=1e-6) -> dict:
+    """
+    Binary logistic regression via IRLS (Newton-Raphson) with L2 penalty.
+    Uses numeric versions of the variables in VAR_ALL that exist in df.
+    Stores means/sds for standardization and the coefficient vector.
+    """
+    # label
+    if "FT01" not in df.columns:
+        return {}
+    y = pd.to_numeric(df["FT01"], errors="coerce").values
+    ymask = np.isfinite(y) & np.isin(y, [0,1])
+
+    # features present
+    feat_names = [v for v in VAR_ALL if v in df.columns]
+    if not feat_names:
+        return {}
+
+    X = np.column_stack([pd.to_numeric(df[v], errors="coerce").values for v in feat_names])
+    mask = ymask & np.isfinite(X).all(axis=1)
+    X = X[mask]; y = y[mask]
+
+    # need enough rows and class balance
+    if X.shape[0] < 40 or len(np.unique(y)) < 2:
+        return {}
+
+    # standardize
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0, ddof=0)
+    sd[sd == 0] = 1.0
+    Z = (X - mu) / sd
+
+    # IRLS with ridge
+    n, p = Z.shape
+    w = np.zeros(p + 1)  # intercept + betas
+    Z1 = np.column_stack([np.ones(n), Z])
+
+    # closed-form updates: (Z^T W Z + λI)^{-1}(Z^T W z)
+    for _ in range(max_iter):
+        z = Z1 @ w
+        p_hat = _sigmoid(z)
+        W = p_hat * (1.0 - p_hat)  # diag
+        # guard against degenerate weights
+        W = np.clip(W, 1e-6, None)
+
+        # gradient & Hessian (ridge on betas, not intercept)
+        # H = Z1^T W Z1 + diag([0, λ, λ, ...])
+        # g = Z1^T (y - p_hat) - [0, λ * w[1:]]
+        # Solve H * delta = g
+        H = (Z1.T * W) @ Z1
+        R = np.eye(p + 1); R[0,0] = 0.0
+        H += l2 * R
+        g = Z1.T @ (y - p_hat)
+        g[1:] -= l2 * w[1:]
+
+        try:
+            delta = np.linalg.solve(H, g)
+        except np.linalg.LinAlgError:
+            # damped step if ill-conditioned
+            delta = np.linalg.lstsq(H + 1e-6*np.eye(p+1), g, rcond=None)[0]
+
+        w_new = w + delta
+        if np.linalg.norm(w_new - w) < tol:
+            w = w_new
+            break
+        w = w_new
+
+    # store
+    model = {
+        "feat_names": feat_names,
+        "mu": mu.tolist(),
+        "sd": sd.tolist(),
+        "w0": float(w[0]),
+        "w": w[1:].astype(float).tolist(),
+        "l2": float(l2)
+    }
+    return model
+
+def predict_logit_proba(row: dict, model: dict) -> tuple[float, dict]:
+    """
+    Returns (p1, contrib_map) where p1 is P(FT=1), and contrib_map gives per-feature contributions
+    in standardized space: contrib = beta * z.
+    """
+    if not model:
+        return (np.nan, {})
+
+    fn = model["feat_names"]
+    mu = np.array(model["mu"], dtype=float)
+    sd = np.array(model["sd"], dtype=float)
+    w0 = float(model["w0"])
+    w  = np.array(model["w"], dtype=float)
+
+    # build x
+    x = []
+    for v in fn:
+        val = pd.to_numeric(row.get(v), errors="coerce")
+        if not np.isfinite(val):
+            return (np.nan, {})
+        x.append(float(val))
+    x = np.array(x, dtype=float)
+
+    z = (x - mu) / sd
+    contrib = w * z
+    score = w0 + contrib.sum()
+    p1 = float(_sigmoid(score))
+    contrib_map = {fn[i]: float(contrib[i]) for i in range(len(fn))}
+    return (p1, contrib_map)
 
 # ============================== Predict (calibrated ratio) ==============================
 def predict_daily_calibrated(row: dict, model: dict) -> float:
@@ -384,121 +497,6 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     if not np.isfinite(PM) or PM <= 0:
         return np.nan
     return float(PM * cal_mult)
-
-# ============================== FT Logistic Regression (probability of FT=1) ==============================
-def _sigmoid(z): 
-    z = np.clip(z, -50, 50)
-    return 1.0 / (1.0 + np.exp(-z))
-
-def train_ft_logit(df: pd.DataFrame) -> dict:
-    """
-    Predict P(FT=1) from PM-focused features via logistic regression (standardized).
-    """
-    if "FT01" not in df.columns:
-        return {}
-    y = pd.to_numeric(df["FT01"], errors="coerce").values
-    y_mask = np.isfinite(y) & ((y == 0) | (y == 1))
-
-    mcap_series  = df["MC_PM_Max_M"]    if "MC_PM_Max_M"    in df.columns else df.get("MarketCap_M$")
-    float_series = df["Float_PM_Max_M"] if "Float_PM_Max_M" in df.columns else df.get("Float_M")
-    if mcap_series is None or float_series is None:
-        return {}
-    eps = 1e-6
-
-    ln_mcap   = np.log(np.clip(pd.to_numeric(mcap_series, errors="coerce").values,  eps, None))
-    ln_gapf   = np.log(np.clip(pd.to_numeric(df.get("Gap_%"), errors="coerce").values, 0, None)/100.0 + eps)
-    ln_atr    = np.log(np.clip(pd.to_numeric(df.get("ATR_$"), errors="coerce").values, eps, None))
-    ln_pm     = np.log(np.clip(pd.to_numeric(df.get("PM_Vol_M"), errors="coerce").values, eps, None))
-    ln_pm_dol = np.log(np.clip(pd.to_numeric(df.get("PM_$Vol_M$"), errors="coerce").values, eps, None))
-    ln_fr     = np.log(np.clip(pd.to_numeric(df.get("FR_x"), errors="coerce").values, eps, None))
-    ln_float  = np.log(np.clip(pd.to_numeric(float_series, errors="coerce").values, eps, None))
-    maxpullpm = pd.to_numeric(df.get("Max_Pull_PM_%"), errors="coerce").values
-    ln_rvolpm = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum"), errors="coerce").values, eps, None))
-    pmmc      = pd.to_numeric(df.get("PM$Vol/MC_%"), errors="coerce").values
-    catalyst  = pd.to_numeric(df.get("Catalyst"), errors="coerce").fillna(0.0).clip(0,1).values
-
-    feats = [
-        ("ln_mcap_pmmax",  ln_mcap),
-        ("ln_gapf",        ln_gapf),
-        ("ln_atr",         ln_atr),
-        ("ln_pm",          ln_pm),
-        ("ln_pm_dol",      ln_pm_dol),
-        ("ln_fr",          ln_fr),
-        ("catalyst",       catalyst),
-        ("ln_float_pmmax", ln_float),
-        ("maxpullpm",      maxpullpm),     # linear %
-        ("ln_rvolmaxpm",   ln_rvolpm),
-        ("pm_dol_over_mc", pmmc),          # linear %
-    ]
-    X = np.column_stack([arr for _, arr in feats])
-    mask = y_mask & np.isfinite(X).all(axis=1)
-    X = X[mask]; y = y[mask]
-    if X.shape[0] < 50:
-        return {}
-
-    # Standardize & simple gradient descent (no CV for simplicity/stability)
-    mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0]=1.0
-    Xs = (X - mu) / sd
-    w = np.zeros(Xs.shape[1]); b = 0.0
-    lr = 0.05
-    for _ in range(4000):
-        z = Xs @ w + b
-        p = _sigmoid(z)
-        grad_w = Xs.T @ (p - y)/len(y)
-        grad_b = np.mean(p - y)
-        w -= lr * grad_w
-        b -= lr * grad_b
-
-    return {
-        "feat_order": [nm for nm,_ in feats],
-        "mu": mu.tolist(),
-        "sd": sd.tolist(),
-        "w": w.astype(float).tolist(),
-        "b": float(b),
-        "eps": eps,
-    }
-
-def predict_ft_prob(row: dict, model: dict) -> float:
-    """Return P(FT=1) using the logistic model."""
-    if not model or "w" not in model:
-        return np.nan
-    eps = float(model.get("eps", 1e-6))
-    def safe_log(v):
-        v = float(v) if v is not None else np.nan
-        return np.log(np.clip(v, eps, None)) if np.isfinite(v) else np.nan
-
-    ln_mcap   = safe_log(row.get("MC_PM_Max_M") or row.get("MarketCap_M$"))
-    ln_gapf   = np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + eps, eps, None)) if row.get("Gap_%") is not None else np.nan
-    ln_atr    = safe_log(row.get("ATR_$"))
-    ln_pm     = safe_log(row.get("PM_Vol_M"))
-    ln_pm_dol = safe_log(row.get("PM_$Vol_M$"))
-    ln_fr     = safe_log(row.get("FR_x"))
-    ln_float  = safe_log(row.get("Float_PM_Max_M") or row.get("Float_M"))
-    maxpullpm = float(row.get("Max_Pull_PM_%")) if row.get("Max_Pull_PM_%") is not None else np.nan
-    ln_rvolpm = safe_log(row.get("RVOL_Max_PM_cum"))
-    pmmc      = float(row.get("PM$Vol/MC_%")) if row.get("PM$Vol/MC_%") is not None else np.nan
-    catalyst  = 1.0 if (str(row.get("CatalystYN","No")).lower()=="yes" or float(row.get("Catalyst",0))>=0.5) else 0.0
-
-    feat_map = {
-        "ln_mcap_pmmax":  ln_mcap,
-        "ln_gapf":        ln_gapf,
-        "ln_atr":         ln_atr,
-        "ln_pm":          ln_pm,
-        "ln_pm_dol":      ln_pm_dol,
-        "ln_fr":          ln_fr,
-        "catalyst":       catalyst,
-        "ln_float_pmmax": ln_float,
-        "maxpullpm":      maxpullpm,
-        "ln_rvolmaxpm":   ln_rvolpm,
-        "pm_dol_over_mc": pmmc,
-    }
-    x = np.array([feat_map[nm] for nm in model["feat_order"]], dtype=float)
-    if not np.isfinite(x).all():
-        return np.nan
-    mu = np.array(model["mu"], dtype=float); sd = np.array(model["sd"], dtype=float); sd[sd==0] = 1.0
-    xs = (x - mu) / sd
-    z = float(np.dot(xs, np.array(model["w"], dtype=float)) + model["b"])
-    return float(_sigmoid(z))
 
 # ============================== Upload DB → Build Summaries & Train ==============================
 st.subheader("Upload Database")
@@ -612,30 +610,39 @@ if build_btn:
                         "var_moderate": var_mod
                     }
 
-                    # Train calibrated ratio model (PredVol_M)
+                    # Train calibrated ratio model
                     lasso_model = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99)
                     st.session_state.lassoA = lasso_model or {}
 
-                    # Train FT logistic model (for regression FT bars)
-                    ft_logit_model = train_ft_logit(df)
-                    st.session_state.ft_logit = ft_logit_model or {}
+                    # NEW: Train logistic regression (IRLS)
+                    logit_model = train_logit(df, l2=1.0, max_iter=60, tol=1e-6)
+                    st.session_state.logit = logit_model or {}
 
-                    have_ratio  = bool(lasso_model)
-                    have_logit  = bool(ft_logit_model)
-                    st.success(f"Built summaries. Models → PredVol (ratio): {have_ratio}, FT regression: {have_logit}")
+                    # Messaging
+                    msgs = []
+                    if lasso_model:
+                        msgs.append(f"Calibrated ratio terms: {st.session_state.lassoA.get('terms')}")
+                    else:
+                        msgs.append("Calibrated ratio: skipped")
+
+                    if logit_model:
+                        msgs.append(f"Logit: {len(logit_model.get('feat_names', []))} features")
+                        st.success("Built summaries + trained models. " + " | ".join(msgs))
+                    else:
+                        st.warning("Summaries built. Logistic model skipped (insufficient data). " + " | ".join(msgs))
                     do_rerun()
 
         except Exception as e:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# ============================== Summary tables (flip: robust vs classic) ==============================
+# ============================== Summary tables (flip: robust vs classic vs logit) ==============================
 models_data = st.session_state.models
 if models_data and isinstance(models_data, dict) and not models_data.get("med_tbl", pd.DataFrame()).empty:
-    with st.expander("Group summaries — flip between robust (Median+MAD) and classic (Mean+SD)", expanded=False):
+    with st.expander("Group summaries — flip between robust (Median+MAD), classic (Mean+SD), or Regression (logit)", expanded=False):
         view_mode = st.radio(
-            "Center/Spread view",
-            ["Median + MAD (robust)", "Mean + SD (classic)"],
+            "Center/Spread/Model view",
+            ["Median + MAD (robust)", "Mean + SD (classic)", "Regression (logit)"],
             index=0,
             horizontal=True
         )
@@ -643,36 +650,66 @@ if models_data and isinstance(models_data, dict) and not models_data.get("med_tb
         var_core = models_data.get("var_core", [])
         var_mod  = models_data.get("var_moderate", [])
 
-        if view_mode.startswith("Median"):
-            center_tbl = models_data["med_tbl"]
-            spread_tbl = models_data["mad_tbl"]
-            st.session_state["view_mode"] = "robust"
-        else:
-            center_tbl = models_data["mean_tbl"]
-            spread_tbl = models_data["sd_tbl"]
-            st.session_state["view_mode"] = "classic"
-
-        def show_grouped_table(title, vars_list):
-            if not vars_list:
-                st.info(f"No variables available for {title}.")
-                return
-            sub = center_tbl.loc[[v for v in vars_list if v in center_tbl.index]].copy()
-            if not spread_tbl.empty and {"FT=1","FT=0"}.issubset(spread_tbl.columns):
-                def _style_sig(col: pd.Series):
-                    # No inline significance styling in summaries anymore (single slider is below in Alignment)
-                    return ["" for _ in col.index]
-                st.markdown(f"**{title}**")
-                styled = (sub
-                          .style
-                          .apply(_style_sig, subset=["FT=1"])
-                          .apply(_style_sig, subset=["FT=0"])
-                          .format("{:.2f}"))
-                st.dataframe(styled, use_container_width=True)
+        if view_mode == "Regression (logit)":
+            logit = st.session_state.get("logit", {})
+            if not logit:
+                st.info("Logistic model not available. Upload DB and click **Build model stocks**.")
             else:
-                st.markdown(f"**{title}**")
-                cfg = {"FT=1": st.column_config.NumberColumn("FT=1 (center)", format="%.2f"),
-                       "FT=0": st.column_config.NumberColumn("FT=0 (center)", format="%.2f")}
-                st.dataframe(sub, use_container_width=True, column_config=cfg, hide_index=False)
+                coef_tbl = pd.DataFrame({
+                    "Feature": logit["feat_names"],
+                    "Beta":    np.array(logit["w"], dtype=float)
+                }).sort_values("Beta", key=lambda s: s.abs(), ascending=False)
+                st.markdown("**Logit coefficients (standardized features)** — positive pushes toward FT=1")
+                st.dataframe(
+                    coef_tbl,
+                    use_container_width=True,
+                    column_config={
+                        "Beta": st.column_config.NumberColumn(format="%.4f")
+                    }
+                )
+                st.caption(f"λ (L2) = {logit.get('l2', 1.0):.2f} — Contributions in Alignment are Beta × Z(feature).")
+        else:
+            if view_mode.startswith("Median"):
+                center_tbl = models_data["med_tbl"]
+                spread_tbl = models_data["mad_tbl"]
+                st.session_state["view_mode"] = "robust"
+            else:
+                center_tbl = models_data["mean_tbl"]
+                spread_tbl = models_data["sd_tbl"]
+                st.session_state["view_mode"] = "classic"
+
+            sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
+                                   help="Highlight rows where |FT=1 − FT=0| / (Spread₁ + Spread₀) ≥ σ")
+            st.session_state["sig_thresh"] = float(sig_thresh)
+
+            def show_grouped_table(title, vars_list):
+                if not vars_list:
+                    st.info(f"No variables available for {title}.")
+                    return
+                sub = center_tbl.loc[[v for v in vars_list if v in center_tbl.index]].copy()
+                if not spread_tbl.empty and {"FT=1","FT=0"}.issubset(spread_tbl.columns):
+                    eps = 1e-9
+                    diff = (sub["FT=1"] - sub["FT=0"]).abs()
+                    spread = (spread_tbl.loc[diff.index, "FT=1"].fillna(0.0) + spread_tbl.loc[diff.index, "FT=0"].fillna(0.0))
+                    sig = diff / (spread.replace(0.0, np.nan) + eps)
+                    sig_flag = sig >= st.session_state["sig_thresh"]
+
+                    def _style_sig(col: pd.Series):
+                        return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
+                                for idx in col.index]
+
+                    st.markdown(f"**{title}**")
+                    styled = (sub
+                              .style
+                              .apply(_style_sig, subset=["FT=1"])
+                              .apply(_style_sig, subset=["FT=0"])
+                              .format("{:.2f}"))
+                    st.dataframe(styled, use_container_width=True)
+                else:
+                    st.markdown(f"**{title}**")
+                    cfg = {"FT=1": st.column_config.NumberColumn("FT=1 (center)", format="%.2f"),
+                           "FT=0": st.column_config.NumberColumn("FT=0 (center)", format="%.2f")}
+                    st.dataframe(sub, use_container_width=True, column_config=cfg, hide_index=False)
 
 # ============================== ➕ Manual Input ==============================
 st.markdown("---")
@@ -762,52 +799,43 @@ with tcol_sel:
         label_visibility="collapsed"
     )
 
-# ============================== Alignment (FT model toggle + significance slider) ==============================
+# ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
 
-# FT model toggle (bars) and single global significance slider
-ft_mode_label = st.radio(
-    "FT model for the bars",
-    ["Median + MAD voting", "Mean + SD voting", "Regression (logit)"],
-    index=0,
-    horizontal=True
-)
-# Keep centers/spreads view_mode in sync with chosen voting mode
-if ft_mode_label.startswith("Median"):
-    st.session_state["view_mode"] = "robust"
-elif ft_mode_label.startswith("Mean"):
-    st.session_state["view_mode"] = "classic"
-st.session_state["ft_mode"] = "regression" if ft_mode_label.startswith("Regression") else (
-    "robust" if ft_mode_label.startswith("Median") else "classic"
-)
+# Choose which center/spread tables feed the alignment (flip)
+ui_view_mode = st.session_state.get("view_mode", "robust")  # from summaries expander for non-logit
+selected_view_label = st.session_state.get("selected_view_label", None)
 
-# Global significance threshold slider (only one in the app)
-sigma_val = st.slider(
-    "Significance threshold (σ)",
-    0.0, 5.0,
-    float(st.session_state.get("sig_thresh", 3.0)),
-    0.1,
-    help="Highlight rows where |Δ| / (Spread₁ + Spread₀) ≥ σ"
-)
-st.session_state["sig_thresh"] = float(sigma_val)
-SIG_THR = float(sigma_val)
+# Read the radio selection from the expander if it's still mounted
+# Fallback: if the radio was not interacted with this run, infer from presence of logit panel
+# (safe default: keep previous)
+# We'll keep a soft flag by saving it when the expander renders:
+# Not strictly necessary; we branch at runtime below.
 
-# Choose which center/spread tables feed the detail rows (flip)
-models_data = st.session_state.models
-view_mode = st.session_state.get("view_mode", "robust")
 if models_data:
-    if view_mode == "robust":
+    # default to robust/ classic path; logit handled below
+    if ui_view_mode == "robust":
         models_tbl = models_data.get("med_tbl", pd.DataFrame())
         spread_tbl = models_data.get("mad_tbl", pd.DataFrame())
     else:
         models_tbl = models_data.get("mean_tbl", pd.DataFrame())
         spread_tbl = models_data.get("sd_tbl", pd.DataFrame())
 else:
-    models_tbl = pd.DataFrame()
-    spread_tbl = pd.DataFrame()
+    models_tbl = pd.DataFrame(); spread_tbl = pd.DataFrame()
 
 var_core = (models_data or {}).get("var_core", [])
 var_mod  = (models_data or {}).get("var_moderate", [])
+SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
+
+# We'll determine if the user currently wants "Regression (logit)" by checking the presence of the
+# logit coefficients table flag in session state; simpler: expose a separate toggle here:
+align_mode = st.radio(
+    "Alignment mode",
+    ["Median/MAD or Mean/SD (from Summaries)", "Regression (logit)"],
+    index=0,
+    horizontal=True,
+    help="Pick how the alignment bars & detail rows are computed."
+)
 
 def _compute_alignment_counts_weighted(
     stock_row: dict,
@@ -849,103 +877,133 @@ def _compute_alignment_counts_weighted(
     return {"FT=1": counts["FT=1"], "FT=0": counts["FT=0"], "FT1_pct": pct1, "FT0_pct": pct0,
             "N_core_used": used_core, "N_mod_used": used_mod}
 
-if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
-    summary_rows, detail_map = [], {}
+def _compute_logit_alignment_and_details(stock_row: dict, logit_model: dict, var_core: list[str], var_mod: list[str]):
+    p1, contrib = predict_logit_proba(stock_row, logit_model)
+    if not np.isfinite(p1):
+        return None, None
+    # Build detail rows based on contributions
+    def rows_for(group_label, vars_list):
+        rows = [{"__group__": group_label}]
+        for v in vars_list:
+            if v not in logit_model["feat_names"]:
+                continue
+            val = pd.to_numeric(stock_row.get(v), errors="coerce")
+            if not np.isfinite(val):
+                continue
+            c = contrib.get(v, 0.0)
+            # mark significant if |contrib| ≥ 0.35 (tunable)
+            significant = abs(c) >= 0.35
+            sig_dir = 'up' if c >= 0 else 'down'
+            rows.append({
+                "Variable": v,
+                "Value": float(val),
+                "FT1": None, "FT0": None,           # not applicable in logit view
+                "d_vs_FT1": c, "d_vs_FT0": -c,      # use contrib as a signed "delta" proxy
+                "sig1": significant, "sig0": significant,
+                "is_core": v in var_core,
+                "sig_dir": sig_dir,
+                "significant": significant,
+            })
+        return rows
 
+    details = []
+    details += rows_for("Core variables (logit contributions)", var_core)
+    details += rows_for("Moderate variables (logit contributions)", var_mod)
+    return {"FT1_pct": round(100.0 * p1, 0), "FT0_pct": round(100.0 * (1.0 - p1), 0)}, details
+
+if st.session_state.rows:
+    summary_rows, detail_map = [], {}
     detail_order = [("Core variables", var_core),
                     ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
+
+    use_logit = (align_mode == "Regression (logit)")
+    logit_model = st.session_state.get("logit", {}) if use_logit else {}
 
     for row in st.session_state.rows:
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
 
-        # Bars: either regression (logit) or voting using current centers
-        ft_mode = st.session_state.get("ft_mode", "robust")
-        if ft_mode == "regression":
-            p = predict_ft_prob(stock, st.session_state.get("ft_logit", {}))
-            if np.isfinite(p):
-                ft1_val = round(100.0 * float(np.clip(p, 0.0, 1.0)), 0)
-                ft0_val = 100.0 - ft1_val
-            else:
-                # Fallback to voting
-                counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
-                ft1_val = counts.get("FT1_pct", 0.0); ft0_val = counts.get("FT0_pct", 0.0)
+        if use_logit:
+            if not logit_model:
+                continue
+            counts, drows_grouped = _compute_logit_alignment_and_details(stock, logit_model, var_core, var_mod)
+            if counts is None:
+                continue
+            summary_rows.append({"Ticker": tkr, "FT1_val": counts["FT1_pct"], "FT0_val": counts["FT0_pct"]})
+            detail_map[tkr] = drows_grouped
         else:
+            # Median/MAD or Mean/SD path
+            if models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
+                continue
             counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
-            ft1_val = counts.get("FT1_pct", 0.0); ft0_val = counts.get("FT0_pct", 0.0)
+            if not counts: 
+                continue
+            summary_rows.append({"Ticker": tkr, "FT1_val": counts.get("FT1_pct", 0.0), "FT0_val": counts.get("FT0_pct", 0.0)})
 
-        summary_rows.append({"Ticker": tkr, "FT1_val": ft1_val, "FT0_val": ft0_val})
+            drows_grouped = []
+            for grp_label, grp_vars in detail_order:
+                drows_grouped.append({"__group__": grp_label})
+                for v in grp_vars:
+                    if v == "Daily_Vol_M":  # hide
+                        continue
 
-        # ---- child details: group headers + rows ----
-        drows_grouped = []
-        for grp_label, grp_vars in detail_order:
-            drows_grouped.append({"__group__": grp_label})
-            for v in grp_vars:
-                # Hide Daily_Vol_M row in the child table
-                if v == "Daily_Vol_M":
-                    continue
+                    va = pd.to_numeric(stock.get(v), errors="coerce")
 
-                va = pd.to_numeric(stock.get(v), errors="coerce")
+                    med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
+                    v1 = models_tbl.loc[med_var, "FT=1"] if (med_var in models_tbl.index) else np.nan
+                    v0 = models_tbl.loc[med_var, "FT=0"] if (med_var in models_tbl.index) else np.nan
+                    s1 = spread_tbl.loc[med_var, "FT=1"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=1" in spread_tbl.columns) else np.nan
+                    s0 = spread_tbl.loc[med_var, "FT=0"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=0" in spread_tbl.columns) else np.nan
 
-                # For PredVol_M, compare vs. Daily_Vol_M centers (FT columns + deltas)
-                med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
+                    if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(v1) and pd.isna(v0):
+                        continue
 
-                v1 = models_tbl.loc[med_var, "FT=1"] if (med_var in models_tbl.index) else np.nan
-                v0 = models_tbl.loc[med_var, "FT=0"] if (med_var in models_tbl.index) else np.nan
-                s1 = spread_tbl.loc[med_var, "FT=1"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=1" in spread_tbl.columns) else np.nan
-                s0 = spread_tbl.loc[med_var, "FT=0"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=0" in spread_tbl.columns) else np.nan
+                    # Δ vs centers
+                    d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
+                    d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
 
-                # Always render PredVol_M row; others keep the normal skip rule
-                if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(v1) and pd.isna(v0):
-                    continue
+                    # significance for BOTH Core and Moderate: |Δ| / (spread1 + spread0)
+                    denom = 0.0
+                    denom += float(s1) if pd.notna(s1) else 0.0
+                    denom += float(s0) if pd.notna(s0) else 0.0
+                    if denom == 0.0:
+                        s1_val = np.nan
+                        s0_val = np.nan
+                    else:
+                        s1_val = (abs(d1) / denom) if d1 is not None else np.nan
+                        s0_val = (abs(d0) / denom) if d0 is not None else np.nan
 
-                # Δ vs centers
-                d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
-                d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
+                    sig1 = (not pd.isna(s1_val)) and (s1_val >= st.session_state.get("sig_thresh", 3.0))
+                    sig0 = (not pd.isna(s0_val)) and (s0_val >= st.session_state.get("sig_thresh", 3.0))
+                    significant = sig1 or sig0
 
-                # significance for BOTH Core and Moderate: |Δ| / (spread1 + spread0)
-                denom = 0.0
-                denom += float(s1) if pd.notna(s1) else 0.0
-                denom += float(s0) if pd.notna(s0) else 0.0
-                if denom == 0.0:
-                    s1_val = np.nan
-                    s0_val = np.nan
-                else:
-                    s1_val = (abs(d1) / denom) if d1 is not None else np.nan
-                    s0_val = (abs(d0) / denom) if d0 is not None else np.nan
+                    # dominant direction (larger |Δ|)
+                    dominant = None
+                    if significant:
+                        abs1 = -np.inf if (d1 is None or pd.isna(d1)) else abs(float(d1))
+                        abs0 = -np.inf if (d0 is None or pd.isna(d0)) else abs(float(d0))
+                        dominant = float(d1) if abs1 >= abs0 else float(d0)
+                    sig_dir = ''
+                    if dominant is not None and np.isfinite(dominant):
+                        sig_dir = 'up' if dominant >= 0 else 'down'
 
-                thr = st.session_state.get("sig_thresh", 3.0)
-                sig1 = (not pd.isna(s1_val)) and (s1_val >= thr)
-                sig0 = (not pd.isna(s0_val)) and (s0_val >= thr)
-                significant = sig1 or sig0
+                    is_core = v in var_core
 
-                # dominant direction (larger |Δ|)
-                dominant = None
-                if significant:
-                    abs1 = -np.inf if (d1 is None or pd.isna(d1)) else abs(float(d1))
-                    abs0 = -np.inf if (d0 is None or pd.isna(d0)) else abs(float(d0))
-                    dominant = float(d1) if abs1 >= abs0 else float(d0)
-                sig_dir = ''
-                if dominant is not None and np.isfinite(dominant):
-                    sig_dir = 'up' if dominant >= 0 else 'down'
+                    drows_grouped.append({
+                        "Variable": v,
+                        "Value": None if pd.isna(va) else float(va),
+                        "FT1":   None if pd.isna(v1) else float(v1),
+                        "FT0":   None if pd.isna(v0) else float(v0),
+                        "d_vs_FT1": None if d1 is None else d1,
+                        "d_vs_FT0": None if d0 is None else d0,
+                        "sig1": bool(sig1),
+                        "sig0": bool(sig0),
+                        "is_core": is_core,
+                        "sig_dir": sig_dir,
+                        "significant": bool(significant),
+                    })
 
-                is_core = v in var_core
-
-                drows_grouped.append({
-                    "Variable": v,
-                    "Value": None if pd.isna(va) else float(va),
-                    "FT1":   None if pd.isna(v1) else float(v1),
-                    "FT0":   None if pd.isna(v0) else float(v0),
-                    "d_vs_FT1": None if d1 is None else d1,
-                    "d_vs_FT0": None if d0 is None else d0,
-                    "sig1": bool(sig1),
-                    "sig0": bool(sig0),
-                    "is_core": is_core,
-                    "sig_dir": sig_dir,
-                    "significant": bool(significant),
-                })
-
-        detail_map[tkr] = drows_grouped
+            detail_map[tkr] = drows_grouped
 
     if summary_rows:
         import streamlit.components.v1 as components
@@ -1129,7 +1187,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         components.html(html, height=620, scrolling=True)
     else:
         st.info("No eligible rows yet. Add manual stocks and/or ensure group summaries are built.")
-elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
+elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)) and align_mode != "Regression (logit)":
     st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 summaries first.")
+elif st.session_state.rows and align_mode == "Regression (logit)" and not st.session_state.get("logit", {}):
+    st.info("Upload DB and click **Build model stocks** to train the logistic model.")
 else:
     st.info("Add at least one stock above to compute alignment.")
