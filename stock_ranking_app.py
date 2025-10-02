@@ -25,17 +25,20 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
         return None
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
+    # exact (case-insensitive)
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
             if cols_lc[c] == lc:
                 return c
+    # normalized exact
     nm = {c: _norm(c) for c in cols}
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n:
                 return c
+    # normalized contains
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
@@ -66,12 +69,12 @@ def _mad(series: pd.Series) -> float:
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "models" not in st.session_state: st.session_state.models = {}
-if "lassoA" not in st.session_state: st.session_state.lassoA = {}
+if "lassoA" not in st.session_state: st.session_state.lassoA = {}   # ratio model (ln multiplier)
 if "pred_settings" not in st.session_state:
     st.session_state.pred_settings = {
         "ci": 95.0,
-        "use_low_everywhere": True,   # NEW: conservative as primary
-        "use_low_for_pmfrac": True    # legacy (ignored if use_low_everywhere=True)
+        "use_low_everywhere": True,   # PredVol_Primary = lower band if possible
+        "floor_at_pm": True           # harmless with ratio model (guaranteed anyway), kept as safety
     }
 
 # ============================== Core & Moderate sets ==============================
@@ -106,6 +109,7 @@ def _kfold_indices(n, k=5, seed=42):
     return np.array_split(idx, k)
 
 def _lasso_cd_std(Xs, y, lam, max_iter=1000, tol=1e-6):
+    # Xs standardized; coordinate descent
     n, p = Xs.shape
     w = np.zeros(p)
     for _ in range(max_iter):
@@ -122,27 +126,39 @@ def _lasso_cd_std(Xs, y, lam, max_iter=1000, tol=1e-6):
             break
     return w
 
-def train_lasso_on_db(df: pd.DataFrame) -> dict:
+# ============================== Train ratio model: y = ln( max(Daily/PM, 1) ) ==============================
+def train_lasso_on_db_ratio(df: pd.DataFrame) -> dict:
     """
-    LASSO feature set (log domain unless noted), then refit OLS on original scale:
-      ln_mcap_pmmax, ln_gapf, ln_atr, ln_pm, ln_pm_dol, ln_fr, catalyst (0/1),
-      ln_float_pmmax, maxpullpm (linear %), ln_rvolmaxpm
-    Stores residual sigma for CI bands in log-space.
+    Predict ln(multiplier) where multiplier = max(Daily_Vol_M / PM_Vol_M, 1).
+    Features (log domain unless noted): ln_mcap_pmmax, ln_gapf, ln_atr, ln_pm, ln_pm_dol, ln_fr,
+    catalyst (0/1), ln_float_pmmax, maxpullpm (linear %), ln_rvolmaxpm
+    Returns dict: {b0, betas, terms, sigma, eps}
     """
     eps = 1e-6
-    mcap_series  = df["MC_PM_Max_M"]   if "MC_PM_Max_M"   in df.columns else df.get("MarketCap_M$")
+
+    # Prefer PM-Max columns; keep legacy fallbacks for older DBs
+    mcap_series  = df["MC_PM_Max_M"]    if "MC_PM_Max_M"    in df.columns else df.get("MarketCap_M$")
     float_series = df["Float_PM_Max_M"] if "Float_PM_Max_M" in df.columns else df.get("Float_M")
+
     need_min = {"ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Daily_Vol_M","Gap_%"}
     if mcap_series is None or float_series is None or not need_min.issubset(df.columns):
         return {}
 
+    PM  = pd.to_numeric(df["PM_Vol_M"],    errors="coerce").values
+    DV  = pd.to_numeric(df["Daily_Vol_M"], errors="coerce").values
+    # valid rows: PM > 0 and DV > 0
+    valid_pm = np.isfinite(PM) & np.isfinite(DV) & (PM > 0) & (DV > 0)
+
+    if valid_pm.sum() < 25:
+        return {}
+
+    # Build features
     ln_mcap   = np.log(np.clip(pd.to_numeric(mcap_series, errors="coerce").values,  eps, None))
     ln_gapf   = np.log(np.clip(pd.to_numeric(df["Gap_%"], errors="coerce").values,  0,   None) / 100.0 + eps)
     ln_atr    = np.log(np.clip(pd.to_numeric(df["ATR_$"], errors="coerce").values,  eps, None))
     ln_pm     = np.log(np.clip(pd.to_numeric(df["PM_Vol_M"], errors="coerce").values, eps, None))
     ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"], errors="coerce").values, eps, None))
     ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"], errors="coerce").values,   eps, None))
-    y_ln      = np.log(np.clip(pd.to_numeric(df["Daily_Vol_M"], errors="coerce").values, eps, None))
 
     ln_float_pmmax = np.log(np.clip(pd.to_numeric(float_series, errors="coerce").values, eps, None))
     maxpullpm      = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").values
@@ -150,7 +166,12 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
     catalyst_raw   = df.get("Catalyst", np.nan)
     catalyst       = pd.to_numeric(catalyst_raw, errors="coerce").fillna(0.0).clip(0,1).values
 
-    X_parts = [
+    # Target: ln(multiplier) with multiplier >= 1
+    multiplier = np.maximum(DV / PM, 1.0)
+    y_ln = np.log(multiplier)
+
+    # Keep rows that are valid in all used arrays
+    feats = [
         ("ln_mcap_pmmax", ln_mcap),
         ("ln_gapf",       ln_gapf),
         ("ln_atr",        ln_atr),
@@ -162,19 +183,23 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
         ("maxpullpm",     maxpullpm),
         ("ln_rvolmaxpm",  ln_rvolmaxpm),
     ]
+
+    # Assemble X matrix
     terms, cols = [], []
-    for name, arr in X_parts:
-        if np.isfinite(arr).sum() >= 10:
-            terms.append(name); cols.append(arr.reshape(-1,1))
-    if not terms: return {}
+    for name, arr in feats:
+        cols.append(arr.reshape(-1,1))
+        terms.append(name)
+    X_all = np.hstack(cols)
 
-    X_orig = np.hstack(cols)
-    mask = np.isfinite(X_orig).all(axis=1) & np.isfinite(y_ln)
-    X_orig = X_orig[mask]; y = y_ln[mask]
-    if X_orig.shape[0] < 25: return {}
+    mask = valid_pm & np.isfinite(y_ln) & np.isfinite(X_all).all(axis=1)
+    X_all = X_all[mask]; y = y_ln[mask]
+    if X_all.shape[0] < 25:
+        return {}
 
-    mu = X_orig.mean(axis=0); sd = X_orig.std(axis=0, ddof=0); sd[sd==0] = 1.0
-    Xs = (X_orig - mu) / sd
+    # Standardize for LASSO; then refit OLS on original features of selected terms
+    mu = X_all.mean(axis=0)
+    sd = X_all.std(axis=0, ddof=0); sd[sd==0] = 1.0
+    Xs = (X_all - mu) / sd
 
     folds = _kfold_indices(len(y), k=5, seed=42)
     lam_grid = np.geomspace(0.001, 1.0, 30)
@@ -185,25 +210,32 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
             te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(5) if j != vi])
             Xtr, ytr = Xs[tr_idx], y[tr_idx]
             Xte, yte = Xs[te_idx], y[te_idx]
-            w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1200)
+            w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1500)
             yhat = Xte @ w
             errs.append(np.mean((yhat - yte)**2))
         cv_mse.append(np.mean(errs))
     lam_best = float(lam_grid[int(np.argmin(cv_mse))])
-    w_l1 = _lasso_cd_std(Xs, y, lam=lam_best, max_iter=2000)
+    w_l1 = _lasso_cd_std(Xs, y, lam=lam_best, max_iter=2500)
 
     sel = np.flatnonzero(np.abs(w_l1) > 1e-8)
-    if sel.size == 0: return {}
+    if sel.size == 0:
+        return {}
 
-    X_sel = X_orig[:, sel]
+    X_sel = X_all[:, sel]
     X_design = np.column_stack([np.ones(X_sel.shape[0]), X_sel])
     coef_ols, *_ = np.linalg.lstsq(X_design, y, rcond=None)
     yhat = X_design @ coef_ols
     resid = y - yhat
-    sigma = float(np.sqrt(np.mean(resid**2)))  # log-space RMSE
+    sigma = float(np.sqrt(np.mean(resid**2)))  # RMSE in ln(multiplier)-space
 
     selected_terms = [terms[i] for i in sel]
-    return {"b0": float(coef_ols[0]), "betas": coef_ols[1:].astype(float), "terms": selected_terms, "sigma": sigma, "eps": eps}
+    return {
+        "b0": float(coef_ols[0]),
+        "betas": coef_ols[1:].astype(float),
+        "terms": selected_terms,
+        "sigma": sigma,
+        "eps": eps
+    }
 
 def _z_from_conf(conf: float) -> float:
     lut = {80.0: 1.2816, 85.0: 1.4395, 90.0: 1.6449, 95.0: 1.96, 97.5: 2.2414, 99.0: 2.5758}
@@ -211,13 +243,25 @@ def _z_from_conf(conf: float) -> float:
     c = max(80.0, min(99.0, float(conf)))
     return 1.6449 + (c - 90.0) * (2.5758 - 1.6449) / 9.0
 
-def predict_predvol_bands(row: dict, model: dict, ci: float = 95.0) -> dict:
+# ============================== Predict Daily volume from ratio model ==============================
+def predict_daily_from_ratio(row: dict, model: dict, ci: float = 95.0) -> dict:
+    """
+    Given manual row and trained ln(multiplier) model, return:
+      mean: PM * exp(yhat_ln)
+      low:  PM * exp(max(yhat_ln - z*sigma, 0))  # multiplier lower band floored at 1
+    """
     if not model or "betas" not in model:
         return {"mean": np.nan, "low": np.nan}
-    eps = float(model.get("eps", 1e-6)); sigma = float(model.get("sigma", np.nan)); z = _z_from_conf(ci)
+
+    eps = float(model.get("eps", 1e-6))
+    sigma = float(model.get("sigma", np.nan))
+    z = _z_from_conf(ci)
+
     def safe_log(v):
         v = float(v) if v is not None else np.nan
         return np.log(np.clip(v, eps, None)) if np.isfinite(v) else np.nan
+
+    # Features
     ln_mcap_pmmax  = safe_log(row.get("MC_PM_Max_M") or row.get("MarketCap_M$"))
     ln_gapf        = np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + eps, eps, None)) if row.get("Gap_%") is not None else np.nan
     ln_atr         = safe_log(row.get("ATR_$"))
@@ -228,25 +272,50 @@ def predict_predvol_bands(row: dict, model: dict, ci: float = 95.0) -> dict:
     maxpullpm      = float(row.get("Max_Pull_PM_%")) if row.get("Max_Pull_PM_%") is not None else np.nan
     ln_rvolmaxpm   = safe_log(row.get("RVOL_Max_PM_cum"))
     catalyst       = 1.0 if (str(row.get("CatalystYN","No")).lower()=="yes" or float(row.get("Catalyst",0))>=0.5) else 0.0
+
     feat_map = {
-        "ln_mcap_pmmax":ln_mcap_pmmax,"ln_gapf":ln_gapf,"ln_atr":ln_atr,"ln_pm":ln_pm,"ln_pm_dol":ln_pm_dol,
-        "ln_fr":ln_fr,"catalyst":catalyst,"ln_float_pmmax":ln_float_pmmax,"maxpullpm":maxpullpm,"ln_rvolmaxpm":ln_rvolmaxpm
+        "ln_mcap_pmmax":  ln_mcap_pmmax,
+        "ln_gapf":        ln_gapf,
+        "ln_atr":         ln_atr,
+        "ln_pm":          ln_pm,
+        "ln_pm_dol":      ln_pm_dol,
+        "ln_fr":          ln_fr,
+        "catalyst":       catalyst,
+        "ln_float_pmmax": ln_float_pmmax,
+        "maxpullpm":      maxpullpm,
+        "ln_rvolmaxpm":   ln_rvolmaxpm,
     }
+
     X = []
     for t in model["terms"]:
         v = feat_map.get(t, np.nan)
-        if not np.isfinite(v): return {"mean": np.nan, "low": np.nan}
+        if not np.isfinite(v):  # missing feature → cannot predict
+            return {"mean": np.nan, "low": np.nan}
         X.append(v)
     X = np.array(X, dtype=float)
-    yhat_ln = float(model["b0"] + float(np.dot(model["betas"], X)))
-    mean = np.exp(yhat_ln) if np.isfinite(yhat_ln) else np.nan
-    low  = np.exp(yhat_ln - z * sigma) if np.isfinite(yhat_ln) and np.isfinite(sigma) else np.nan
-    if np.isfinite(low) and low < 0: low = 0.0
-    return {"mean": float(mean) if np.isfinite(mean) else np.nan,
-            "low":  float(low)  if np.isfinite(low)  else np.nan}
 
-# ============================== Upload DB → Build Medians & Train LASSO ==============================
+    yhat_ln = float(model["b0"] + float(np.dot(model["betas"], X)))  # ln(multiplier)
+    PM = float(row.get("PM_Vol_M") or np.nan)
+
+    if not np.isfinite(PM) or PM <= 0 or not np.isfinite(yhat_ln):
+        return {"mean": np.nan, "low": np.nan}
+
+    mult_mean = np.exp(yhat_ln)
+    # Lower band in multiplier space, floored at 1 (so daily >= PM)
+    mult_low  = np.exp(yhat_ln - z * sigma) if np.isfinite(sigma) else np.nan
+    if np.isfinite(mult_low):
+        mult_low = max(mult_low, 1.0)  # structural floor
+    daily_mean = PM * mult_mean if np.isfinite(mult_mean) else np.nan
+    daily_low  = PM * mult_low  if np.isfinite(mult_low)  else np.nan
+
+    return {
+        "mean": float(daily_mean) if np.isfinite(daily_mean) else np.nan,
+        "low":  float(daily_low)  if np.isfinite(daily_low)  else np.nan
+    }
+
+# ============================== Upload DB → Build Medians & Train LASSO (ratio) ==============================
 st.subheader("Upload Database")
+
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
 build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
 
@@ -258,12 +327,13 @@ with st.expander("Prediction settings", expanded=False):
     use_low_everywhere = st.checkbox("Use lower-band PredVol EVERYWHERE (recommended)",
                                      value=st.session_state.pred_settings["use_low_everywhere"],
                                      help="If ON, PredVol_Primary = PredVol_lowCI; otherwise PredVol_Primary = mean.")
-    use_low_for_pmfrac = st.checkbox("Use lower-band PredVol for PM_Vol_% (legacy; ignored if above is ON)",
-                                     value=st.session_state.pred_settings["use_low_for_pmfrac"])
+    floor_at_pm = st.checkbox("Floor predicted Daily Vol at PM_Vol_M",
+                              value=st.session_state.pred_settings.get("floor_at_pm", True),
+                              help="Guaranteed by the ratio model; kept as extra guard.")
     st.session_state.pred_settings.update({
         "ci": float(ci),
         "use_low_everywhere": bool(use_low_everywhere),
-        "use_low_for_pmfrac": bool(use_low_for_pmfrac)
+        "floor_at_pm": bool(floor_at_pm),
     })
 
 if build_btn:
@@ -297,21 +367,18 @@ if build_btn:
                     if src:
                         dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-                # ====== MAP NUMERIC COLUMNS (with new names + legacy fallbacks) ======
+                # ===== Map columns (new names + legacy fallbacks) =====
                 add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","mc pm max m","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m"])
                 add_num(df, "Float_PM_Max_M",   ["float pm max (m)","float pm max m","float_pm_max_m","float pm max (m shares)"])
-                # Legacy fallbacks (kept for old workbooks)
-                add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
-                add_num(df, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
+                add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])  # fallback
+                add_num(df, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])                                   # fallback
 
                 add_num(df, "Gap_%",            ["gap %","gap%","premarket gap","gap","gap_percent"])
                 add_num(df, "ATR_$",            ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
-                # NOTE: legacy RVOL mapping removed on purpose
                 add_num(df, "PM_Vol_M",         ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
                 add_num(df, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
                 add_num(df, "PM_Vol_%",         ["pm vol (%)","pm_vol_%","pm vol percent","pm volume (%)","pm_vol_percent"])
                 add_num(df, "Daily_Vol_M",      ["daily vol (m)","daily_vol_m","day volume (m)","dvol_m"])
-                # NEW: Max Pull PM (%) + RVOL Max PM (cum)
                 add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
                 add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
 
@@ -327,7 +394,7 @@ if build_btn:
                 if cand_catalyst:
                     df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
 
-                # ====== DERIVED (prefer PM-Max columns when present) ======
+                # ===== Derived (prefer PM-Max fields) =====
                 float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
                 if {"PM_Vol_M", float_basis}.issubset(df.columns):
                     df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
@@ -336,12 +403,12 @@ if build_btn:
                 if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
                     df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-                # Percent-like fields stored as fractions → real %
-                if "Gap_%" in df.columns: df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
-                if "PM_Vol_%" in df.columns: df["PM_Vol_%"] = pd.to_numeric(df["PM_Vol_%"], errors="coerce") * 100.0
-                if "Max_Pull_PM_%" in df.columns: df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
+                # Percent-like fields as real %
+                if "Gap_%" in df.columns:            df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
+                if "PM_Vol_%" in df.columns:         df["PM_Vol_%"] = pd.to_numeric(df["PM_Vol_%"], errors="coerce") * 100.0
+                if "Max_Pull_PM_%" in df.columns:    df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
 
-                # Normalize to binary for FT groups
+                # FT groups
                 def _to_binary(v):
                     sv = str(v).strip().lower()
                     if sv in {"1","true","yes","y","t"}: return 1
@@ -361,15 +428,22 @@ if build_btn:
                     var_mod  = [v for v in VAR_MODERATE if v in df.columns]
                     var_all  = var_core + var_mod
 
+                    # Medians/MADs unchanged (still on original variables)
                     gmed  = df.groupby("Group")[var_all].median(numeric_only=True).T
                     gmads = df.groupby("Group")[var_all].apply(lambda g: g.apply(_mad)).T
 
-                    st.session_state.models = {"models_tbl": gmed, "mad_tbl": gmads, "var_core": var_core, "var_moderate": var_mod}
+                    st.session_state.models = {
+                        "models_tbl": gmed,
+                        "mad_tbl": gmads,
+                        "var_core": var_core,
+                        "var_moderate": var_mod
+                    }
 
-                    lasso_model = train_lasso_on_db(df)
+                    # Train ratio model
+                    lasso_model = train_lasso_on_db_ratio(df)
                     st.session_state.lassoA = lasso_model or {}
 
-                    st.success(f"Built medians and trained PredVol model. Medians columns = {list(gmed.columns)}")
+                    st.success(f"Built medians and trained ln(multiplier) model. Medians columns = {list(gmed.columns)}")
                     do_rerun()
 
         except Exception as e:
@@ -400,15 +474,24 @@ if models_data and isinstance(models_data, dict) and not models_data.get("models
                 spread = (mad_tbl.loc[diff.index, "FT=1"].fillna(0.0) + mad_tbl.loc[diff.index, "FT=0"].fillna(0.0))
                 sig = diff / (spread.replace(0.0, np.nan) + eps)
                 sig_flag = sig >= st.session_state["sig_thresh"]
+
                 def _style_sig(col: pd.Series):
-                    return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" for idx in col.index]
+                    return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
+                            for idx in col.index]
+
                 st.markdown(f"**{title}**")
-                styled = (sub_med.style.apply(_style_sig, subset=["FT=1"]).apply(_style_sig, subset=["FT=0"]).format("{:.2f}"))
+                styled = (sub_med
+                          .style
+                          .apply(_style_sig, subset=["FT=1"])
+                          .apply(_style_sig, subset=["FT=0"])
+                          .format("{:.2f}"))
                 st.dataframe(styled, use_container_width=True)
             else:
                 st.markdown(f"**{title}**")
-                cfg = {"FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
-                       "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f")}
+                cfg = {
+                    "FT=1": st.column_config.NumberColumn("FT=1 (median)", format="%.2f"),
+                    "FT=0": st.column_config.NumberColumn("FT=0 (median)", format="%.2f"),
+                }
                 st.dataframe(sub_med, use_container_width=True, column_config=cfg, hide_index=False)
 
         show_grouped_table("Core variables", var_core)
@@ -447,38 +530,52 @@ if submitted and ticker:
 
     row = {
         "Ticker": ticker,
+
+        # Canonical PM-max fields
         "MC_PM_Max_M": mc_pmmax,
         "Float_PM_Max_M": float_pm,
+
+        # Core/moderate basics
         "Gap_%": gap_pct,
         "ATR_$": atr_usd,
         "PM_Vol_M": pm_vol,
         "PM_$Vol_M$": pm_dol,
+
+        # Derived
         "FR_x": fr,                 # PM_Vol_M / Float_PM_Max_M
         "PM$Vol/MC_%": pmmc,        # PM_$Vol_M$ / MC_PM_Max_M * 100
+
+        # New CORE replacements
         "Max_Pull_PM_%": max_pull_pm,
         "RVOL_Max_PM_cum": rvol_pm_cum,
+
+        # Catalyst (binary + label)
         "CatalystYN": catalyst_yn,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
 
-    # Predict Daily Volume (M): mean + low band, then choose primary
+    # ===== Predict Daily Volume via ratio model (guarantees Pred ≥ PM) =====
     ci = float(st.session_state.pred_settings["ci"])
-    bands = predict_predvol_bands(row, st.session_state.get("lassoA", {}), ci=ci)
-    row["PredVol_M"] = float(bands.get("mean", np.nan))
-    row["PredVol_lowCI"] = float(bands.get("low", np.nan))
+    bands = predict_daily_from_ratio(row, st.session_state.get("lassoA", {}), ci=ci)
+    row["PredVol_M"] = float(bands.get("mean", np.nan))     # mean daily
+    row["PredVol_lowCI"] = float(bands.get("low",  np.nan)) # conservative daily
     row["PredVol_CI"] = ci
 
+    # Optional extra guard (kept though ratio model already floors at PM)
+    if st.session_state.pred_settings.get("floor_at_pm", True):
+        pm_floor = row.get("PM_Vol_M", np.nan)
+        if np.isfinite(pm_floor) and pm_floor > 0:
+            if np.isfinite(row["PredVol_M"]):     row["PredVol_M"]     = max(row["PredVol_M"],     pm_floor)
+            if np.isfinite(row["PredVol_lowCI"]): row["PredVol_lowCI"] = max(row["PredVol_lowCI"], pm_floor)
+
+    # Primary PredVol used across the app
     use_low_everywhere = bool(st.session_state.pred_settings["use_low_everywhere"])
-    use_low_for_pmfrac = bool(st.session_state.pred_settings["use_low_for_pmfrac"])
     row["PredVol_Primary"] = (
         row["PredVol_lowCI"] if use_low_everywhere and np.isfinite(row["PredVol_lowCI"]) else row["PredVol_M"]
     )
 
-    # PM_Vol_% denominator: use the primary; if user disabled global switch, optionally use legacy toggle
+    # PM_Vol_% uses the primary; with ratio model this will be ≤ 100% by design
     denom = row["PredVol_Primary"]
-    if not use_low_everywhere and use_low_for_pmfrac and np.isfinite(row.get("PredVol_lowCI", np.nan)) and row["PredVol_lowCI"] > 0:
-        denom = row["PredVol_lowCI"]
-
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
 
     st.session_state.rows.append(row)
@@ -497,7 +594,10 @@ with tcol_btn:
         else:
             before = len(st.session_state.rows)
             sel_set = set([s.strip().upper() for s in sel])
-            st.session_state.rows = [r for r in st.session_state.rows if str(r.get("Ticker","")).strip().upper() not in sel_set]
+            st.session_state.rows = [
+                r for r in st.session_state.rows
+                if str(r.get("Ticker","")).strip().upper() not in sel_set
+            ]
             removed = before - len(st.session_state.rows)
             if removed > 0:
                 st.success(f"Removed {removed} row(s): {', '.join(sorted(sel_set))}")
@@ -505,49 +605,89 @@ with tcol_btn:
                 st.info("No rows removed.")
             do_rerun()
 with tcol_sel:
-    st.multiselect(label="", options=tickers, default=[], key="to_delete",
-                   placeholder="Select tickers to delete…", label_visibility="collapsed")
+    st.multiselect(
+        label="",
+        options=tickers,
+        default=[],
+        key="to_delete",
+        placeholder="Select tickers to delete…",
+        label_visibility="collapsed"
+    )
 
 # ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
 
 def _compute_alignment_counts_weighted(
-    stock_row: dict, models_tbl: pd.DataFrame, var_core: list[str], var_mod: list[str],
-    w_core: float = 1.0, w_mod: float = 0.5,
+    stock_row: dict,
+    models_tbl: pd.DataFrame,
+    var_core: list[str],
+    var_mod: list[str],
+    w_core: float = 1.0,
+    w_mod: float = 0.5,
 ) -> dict:
+    """
+    Weighted nearest-median voting:
+      - Core vars vote with weight w_core (default 1.0)
+      - Moderate vars vote with weight w_mod (default 0.5)
+      - Ties (equidistant to FT=1 and FT=0 medians) cast no vote
+    Returns absolute weights and percentage shares for FT=1 and FT=0.
+    """
     if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
         return {}
-    groups = ["FT=1","FT=0"]; TOL = 1e-9
-    counts = {"FT=1": 0.0, "FT=0": 0.0}; used_core = used_mod = 0
+    groups = ["FT=1","FT=0"]
+    TOL = 1e-9
+
+    counts = {"FT=1": 0.0, "FT=0": 0.0}
+    used_core = used_mod = 0
+
     def vote_for(var, weight):
         nonlocal used_core, used_mod
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
-        if not np.isfinite(xv) or var not in models_tbl.index: return
+        if not np.isfinite(xv) or var not in models_tbl.index:
+            return
         med = models_tbl.loc[var, groups].astype(float)
-        if med.isna().any(): return
+        if med.isna().any():
+            return
         d1 = abs(xv - med["FT=1"]); d0 = abs(xv - med["FT=0"])
-        if abs(d1 - d0) <= TOL: return
-        if d1 < d0: counts["FT=1"] += weight
-        else:       counts["FT=0"] += weight
-        if weight == w_core: used_core += 1
-        else:                used_mod  += 1
-    for v in var_core: vote_for(v, w_core)
-    for v in var_mod:  vote_for(v, w_mod)
+        if abs(d1 - d0) <= TOL:
+            return  # ignore ties
+        if d1 < d0:
+            counts["FT=1"] += weight
+        else:
+            counts["FT=0"] += weight
+        if weight == w_core:
+            used_core += 1
+        else:
+            used_mod += 1
+
+    for v in var_core:
+        vote_for(v, w_core)
+    for v in var_mod:
+        vote_for(v, w_mod)
+
     total_weight = counts["FT=1"] + counts["FT=0"]
     pct1 = round(100.0 * counts["FT=1"] / total_weight, 0) if total_weight > 0 else 0.0
     pct0 = round(100.0 * counts["FT=0"] / total_weight, 0) if total_weight > 0 else 0.0
-    return {"FT=1": counts["FT=1"], "FT=0": counts["FT=0"], "FT1_pct": pct1, "FT0_pct": pct0,
-            "N_core_used": used_core, "N_mod_used": used_mod}
+
+    return {
+        "FT=1": counts["FT=1"],
+        "FT=0": counts["FT=0"],
+        "FT1_pct": pct1,
+        "FT0_pct": pct0,
+        "N_core_used": used_core,
+        "N_mod_used": used_mod,
+    }
 
 models_tbl = (st.session_state.get("models") or {}).get("models_tbl", pd.DataFrame())
-mad_tbl    = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
-var_core   = (st.session_state.get("models") or {}).get("var_core", [])
-var_mod    = (st.session_state.get("models") or {}).get("var_moderate", [])
-SIG_THR    = float(st.session_state.get("sig_thresh", 2.0))
+mad_tbl = (st.session_state.get("models") or {}).get("mad_tbl", pd.DataFrame())
+var_core = (st.session_state.get("models") or {}).get("var_core", [])
+var_mod  = (st.session_state.get("models") or {}).get("var_moderate", [])
+SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
     summary_rows, detail_map = [], {}
-    # Show primary + both bands under Moderate section (compared to Daily_Vol_M medians)
+
+    # Show the PredVols under Moderate section (compared vs. Daily_Vol_M medians)
     extra_pred_rows = ["PredVol_Primary", "PredVol_M", "PredVol_lowCI"]
     detail_order = [("Core variables", var_core),
                     ("Moderate variables", var_mod + [r for r in extra_pred_rows if r not in var_mod])]
@@ -556,14 +696,19 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
         counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
-        if not counts: continue
+        if not counts:
+            continue
+
         summary_rows.append({"Ticker": tkr, "FT1_val": counts.get("FT1_pct", 0.0), "FT0_val": counts.get("FT0_pct", 0.0)})
 
+        # ---- child details: group headers + rows ----
         drows_grouped = []
         for grp_label, grp_vars in detail_order:
             drows_grouped.append({"__group__": grp_label})
             for v in grp_vars:
-                if v == "Daily_Vol_M": continue
+                if v == "Daily_Vol_M":
+                    continue
+
                 va = pd.to_numeric(stock.get(v), errors="coerce")
                 med_var = "Daily_Vol_M" if v in ("PredVol_Primary","PredVol_M","PredVol_lowCI") else v
 
@@ -572,12 +717,15 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 m1 = mad_tbl.loc[med_var, "FT=1"] if (not mad_tbl.empty and med_var in mad_tbl.index and "FT=1" in mad_tbl.columns) else np.nan
                 m0 = mad_tbl.loc[med_var, "FT=0"] if (not mad_tbl.empty and med_var in mad_tbl.index and "FT=0" in mad_tbl.columns) else np.nan
 
+                # always render PredVol_* rows; others can skip empty
                 if v not in ("PredVol_Primary","PredVol_M","PredVol_lowCI") and pd.isna(va) and pd.isna(v1) and pd.isna(v0):
                     continue
 
                 def _sig(delta, mad):
-                    if pd.isna(delta) or pd.isna(mad): return np.nan
-                    if mad == 0: return np.inf if abs(delta) > 0 else 0.0
+                    if pd.isna(delta): return np.nan
+                    if pd.isna(mad):   return np.nan
+                    if mad == 0:
+                        return np.inf if abs(delta) > 0 else 0.0
                     return abs(delta) / abs(mad)
 
                 d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
@@ -596,18 +744,28 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                     "FT0":   None if pd.isna(v0) else float(v0),
                     "d_vs_FT1": None if d1 is None else d1,
                     "d_vs_FT0": None if d0 is None else d0,
-                    "sig1": sig1, "sig0": sig0, "is_core": is_core
+                    "sig1": sig1,
+                    "sig0": sig0,
+                    "is_core": is_core
                 })
 
         detail_map[tkr] = drows_grouped
 
     if summary_rows:
         import streamlit.components.v1 as components
-        payload = {"rows": summary_rows, "details": detail_map}
+        payload = {
+            "rows": summary_rows,
+            "details": detail_map
+        }
+
         html = """
-<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
-<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.responsive.min.css"/>
 <style>
   body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
   table.dataTable tbody tr { cursor: pointer; }
@@ -632,66 +790,126 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .col-var { width: 18%; } .col-val { width: 12%; } .col-ft1 { width: 18%; } .col-ft0 { width: 18%; } .col-d1  { width: 17%; } .col-d0  { width: 17%; }
   .pos { color:#059669; } .neg { color:#dc2626; }
 </style>
-</head><body>
+</head>
+<body>
   <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead><tr><th>Ticker</th><th>FT=1</th><th>FT=0</th></tr></thead>
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>FT=1</th>
+        <th>FT=0</th>
+      </tr>
+    </thead>
   </table>
+
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
   <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
   <script>
     const data = %%PAYLOAD%%;
+
     function barCellBlue(val){ const v=(val==null||isNaN(val))?0:Math.max(0,Math.min(100,val)); return `
       <div class="bar-wrap"><div class="bar blue"><span style="width:${v}%"></span></div><div class="bar-label">${v.toFixed(0)}</div></div>`;}
     function barCellRed(val){ const v=(val==null||isNaN(val))?0:Math.max(0,Math.min(100,val)); return `
       <div class="bar-wrap"><div class="bar red"><span style="width:${v}%"></span></div><div class="bar-label">${v.toFixed(0)}</div></div>`;}
+
     function formatVal(x){ return (x==null || isNaN(x)) ? '' : Number(x).toFixed(2); }
+
     function childTableHTML(ticker){
       const rows = data.details[ticker] || [];
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
-      const cells = rows.map(r=>{
-        if (r.__group__) return '<tr class="group-row"><td colspan="6">'+r.__group__+'</td></tr>';
-        const v=formatVal(r.Value), f1=formatVal(r.FT1), f0=formatVal(r.FT0);
-        const d1=formatVal(r.d_vs_FT1), d0=formatVal(r.d_vs_FT0);
-        const c1=(!d1)?'':(parseFloat(d1)>=0?'pos':'neg');
-        const c0=(!d0)?'':(parseFloat(d0)>=0?'pos':'neg');
-        const isCore=!!r.is_core, s1=isCore&&!!r.sig1, s0=isCore&&!!r.sig0;
-        const d1num=(r.d_vs_FT1==null||isNaN(r.d_vs_FT1))?NaN:Number(r.d_vs_FT1);
-        const d0num=(r.d_vs_FT0==null||isNaN(r.d_vs_FT0))?NaN:Number(r.d_vs_FT0);
-        let rowClass='';
-        if (isCore && (s1||s0)){
-          let delta=NaN;
-          if (s1&&s0){ const abs1=isNaN(d1num)?-Infinity:Math.abs(d1num); const abs0=isNaN(d0num)?-Infinity:Math.abs(d0num); delta=(abs1>=abs0)?d1num:d0num; }
-          else { delta=(!isNaN(d1num)&&s1)?d1num:d0num; }
-          rowClass=(delta>=0)?'sig_up':'sig_down';
-        } else if (!isCore){ rowClass='moderate'; }
-        return `<tr class="${rowClass}">
-          <td class="col-var">${r.Variable}</td>
-          <td class="col-val">${v}</td>
-          <td class="col-ft1">${f1}</td>
-          <td class="col-ft0">${f0}</td>
-          <td class="col-d1 ${c1}">${d1}</td>
-          <td class="col-d0 ${c0}">${d0}</td>
-        </tr>`;
+
+      const cells = rows.map(r => {
+        if (r.__group__) {
+          return '<tr class="group-row"><td colspan="6">' + r.__group__ + '</td></tr>';
+        }
+        const v  = formatVal(r.Value);
+        const f1 = formatVal(r.FT1);
+        const f0 = formatVal(r.FT0);
+        const d1 = formatVal(r.d_vs_FT1);
+        const d0 = formatVal(r.d_vs_FT0);
+        const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
+        const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
+
+        const isCore = !!r.is_core;
+        const s1 = isCore && !!r.sig1;
+        const s0 = isCore && !!r.sig0;
+
+        const d1num = (r.d_vs_FT1==null || isNaN(r.d_vs_FT1)) ? NaN : Number(r.d_vs_FT1);
+        const d0num = (r.d_vs_FT0==null || isNaN(r.d_vs_FT0)) ? NaN : Number(r.d_vs_FT0);
+
+        let rowClass = '';
+        if (isCore && (s1 || s0)) {
+          let delta = NaN;
+          if (s1 && s0) {
+            const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
+            const abs0 = isNaN(d0num) ? -Infinity : Math.abs(d0num);
+            delta = (abs1 >= abs0) ? d1num : d0num;
+          } else {
+            delta = (!isNaN(d1num) && s1) ? d1num : d0num;
+          }
+          rowClass = (delta >= 0) ? 'sig_up' : 'sig_down';
+        } else if (!isCore) {
+          rowClass = 'moderate';
+        }
+
+        return `
+          <tr class="${rowClass}">
+            <td class="col-var">${r.Variable}</td>
+            <td class="col-val">${v}</td>
+            <td class="col-ft1">${f1}</td>
+            <td class="col-ft0">${f0}</td>
+            <td class="col-d1 ${c1}">${d1}</td>
+            <td class="col-d0 ${c0}">${d0}</td>
+          </tr>`;
       }).join('');
-      return `<table class="child-table">
-        <colgroup><col class="col-var"/><col class="col-val"/><col class="col-ft1"/><col class="col-ft0"/><col class="col-d1"/><col class="col-d0"/></colgroup>
-        <thead><tr><th class="col-var">Variable</th><th class="col-val">Value</th><th class="col-ft1">FT=1 median</th><th class="col-ft0">FT=0 median</th><th class="col-d1">Δ vs FT=1</th><th class="col-d0">Δ vs FT=0</th></tr></thead>
-        <tbody>${cells}</tbody></table>`;
+
+      return `
+        <table class="child-table">
+          <colgroup>
+            <col class="col-var"/><col class="col-val"/><col class="col-ft1"/><col class="col-ft0"/><col class="col-d1"/><col class="col-d0"/>
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="col-var">Variable</th>
+              <th class="col-val">Value</th>
+              <th class="col-ft1">FT=1 median</th>
+              <th class="col-ft0">FT=0 median</th>
+              <th class="col-d1">Δ vs FT=1</th>
+              <th class="col-d0">Δ vs FT=0</th>
+            </tr>
+          </thead>
+          <tbody>${cells}</tbody>
+        </table>`;
     }
-    $(function(){
+
+    $(function() {
       const table = $('#align').DataTable({
-        data: data.rows, responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
-        columns:[ {data:'Ticker'}, {data:'FT1_val', render:(d)=>barCellBlue(d)}, {data:'FT0_val', render:(d)=>barCellRed(d)} ]
+        data: data.rows,
+        responsive: true,
+        paging: false, info: false, searching: false,
+        order: [[0,'asc']],
+        columns: [
+          { data: 'Ticker' },
+          { data: 'FT1_val', render: (d)=>barCellBlue(d) },
+          { data: 'FT0_val', render: (d)=>barCellRed(d) },
+        ]
       });
-      $('#align tbody').on('click','tr',function(){
-        const row=table.row(this);
-        if(row.child.isShown()){ row.child.hide(); $(this).removeClass('shown'); }
-        else { const ticker=row.data().Ticker; row.child(childTableHTML(ticker)).show(); $(this).addClass('shown'); }
+
+      // Whole-row toggle child
+      $('#align tbody').on('click', 'tr', function () {
+        const row = table.row(this);
+        if (row.child.isShown()) {
+          row.child.hide(); $(this).removeClass('shown');
+        } else {
+          const ticker = row.data().Ticker;
+          row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
+        }
       });
     });
   </script>
-</body></html>
+</body>
+</html>
         """
         html = html.replace("%%PAYLOAD%%", json.dumps(payload))
         import streamlit.components.v1 as components
