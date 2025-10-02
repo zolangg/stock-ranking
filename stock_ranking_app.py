@@ -531,9 +531,15 @@ if models_data and isinstance(models_data, dict) and not models_data.get("med_tb
             center_tbl = models_data["mean_tbl"]
             spread_tbl = models_data["sd_tbl"]
 
-        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
-                               help="Highlight rows where |FT=1 − FT=0| / (Spread₁ + Spread₀) ≥ σ")
-        st.session_state["sig_thresh"] = float(sig_thresh)
+        sig_thresh = st.slider(
+            "Significance threshold (σ)",
+            0.0, 5.0,
+            float(st.session_state.get("sig_thresh", 3.0)),  # show the current global value
+            0.1,
+            key="sig_thresh_summary",
+            help="Highlight rows where |FT=1 − FT=0| / (Spread₁ + Spread₀) ≥ σ",
+        )
+        st.session_state["sig_thresh"] = float(sig_thresh)  # write back to the global setting
         st.session_state["view_mode"] = "robust" if view_mode.startswith("Median") else "classic"
 
         def show_grouped_table(title, vars_list):
@@ -667,6 +673,17 @@ vm_local = st.radio(
     horizontal=True
 )
 st.session_state["view_mode"] = "robust" if vm_local.startswith("Median") else "classic"
+
+# Local (Alignment) significance slider — synced with the global key
+sigma_align = st.slider(
+    "Significance threshold (σ)",
+    0.0, 5.0,
+    float(st.session_state.get("sig_thresh", 3.0)),
+    0.1,
+    key="sig_thresh_align",
+    help="Used for both coloring and FT voting details below.",
+)
+st.session_state["sig_thresh"] = float(sigma_align)
 
 # Choose which center/spread tables feed the alignment (flip)
 view_mode = st.session_state.get("view_mode", "robust")
