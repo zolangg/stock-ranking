@@ -72,7 +72,9 @@ def _mad(series: pd.Series) -> float:
 if "rows" not in st.session_state: st.session_state.rows = []      # manual rows ONLY
 if "last" not in st.session_state: st.session_state.last = {}      # last manual row
 if "models" not in st.session_state: st.session_state.models = {}  # {"models_tbl":..., "mad_tbl":..., "var_core":[...], "var_moderate":[...]}
-if "lassoA" not in st.session_state: st.session_state.lassoA = {}  # {"terms":[...], "betas":..., "b0":..., "eps":1e-6}
+if "lassoA" not in st.session_state: st.session_state.lassoA = {}  # {"terms":[...], "betas":..., "b0":..., "sigma":..., "eps":1e-6}
+if "pred_settings" not in st.session_state:
+    st.session_state.pred_settings = {"ci": 95.0, "use_low_for_pmfrac": True}
 
 # ============================== Core & Moderate sets ==============================
 # CORE (legacy RVOL removed). New PM features added.
@@ -130,6 +132,7 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
     LASSO feature set (log domain unless noted), then refit OLS on original scale:
       ln_mcap_pmmax, ln_gapf, ln_atr, ln_pm, ln_pm_dol, ln_fr, catalyst (0/1),
       ln_float_pmmax, maxpullpm (linear %), ln_rvolmaxpm
+    Stores residual sigma for CI bands in log-space.
     """
     eps = 1e-6
 
@@ -189,7 +192,6 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
     folds = _kfold_indices(len(y), k=5, seed=42)
     lam_grid = np.geomspace(0.001, 1.0, 30)
     cv_mse = []
-
     for lam in lam_grid:
         errs = []
         for vi in range(5):
@@ -211,20 +213,42 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
     X_sel = X_orig[:, sel]
     X_design = np.column_stack([np.ones(X_sel.shape[0]), X_sel])
     coef_ols, *_ = np.linalg.lstsq(X_design, y, rcond=None)
-    selected_terms = [terms[i] for i in sel]
+    yhat = X_design @ coef_ols
+    resid = y - yhat
+    sigma = float(np.sqrt(np.mean(resid**2)))  # log-space residual std (RMSE)
 
+    selected_terms = [terms[i] for i in sel]
     return {
         "b0": float(coef_ols[0]),
         "betas": coef_ols[1:].astype(float),
         "terms": selected_terms,
+        "sigma": sigma,
         "eps": eps
     }
 
-def predict_predvol_m(row: dict, model: dict) -> float:
-    """Use OLS (on unstandardized features) returned by train_lasso_on_db to predict PredVol_M."""
+def _z_from_conf(conf: float) -> float:
+    # Common two-sided quantiles mapped to lower-band z
+    lut = {
+        80.0: 1.2816,
+        85.0: 1.4395,
+        90.0: 1.6449,
+        95.0: 1.96,
+        97.5: 2.2414,
+        99.0: 2.5758
+    }
+    if conf in lut: return lut[conf]
+    # clamp to [80,99]
+    c = max(80.0, min(99.0, float(conf)))
+    # simple linear between 90 and 99 as fallback
+    return 1.6449 + (c - 90.0) * (2.5758 - 1.6449) / 9.0
+
+def predict_predvol_bands(row: dict, model: dict, ci: float = 95.0) -> dict:
+    """Return {'mean': PredVol_M, 'low': PredVol_lowCI} using log-space sigma."""
     if not model or "betas" not in model:
-        return np.nan
+        return {"mean": np.nan, "low": np.nan}
     eps = float(model.get("eps", 1e-6))
+    sigma = float(model.get("sigma", np.nan))
+    z = _z_from_conf(ci)
 
     def safe_log(v):
         v = float(v) if v is not None else np.nan
@@ -258,19 +282,33 @@ def predict_predvol_m(row: dict, model: dict) -> float:
     for t in model["terms"]:
         v = feat_map.get(t, np.nan)
         if not np.isfinite(v):
-            return np.nan
+            return {"mean": np.nan, "low": np.nan}
         X.append(v)
     X = np.array(X, dtype=float)
 
-    yhat_ln = model["b0"] + float(np.dot(model["betas"], X))
-    pred = np.exp(yhat_ln)
-    return max(pred, 0.0) if np.isfinite(pred) else np.nan
+    yhat_ln = float(model["b0"] + float(np.dot(model["betas"], X)))
+    mean = np.exp(yhat_ln) if np.isfinite(yhat_ln) else np.nan
+    low = np.exp(yhat_ln - z * sigma) if np.isfinite(yhat_ln) and np.isfinite(sigma) else np.nan
+    # guard
+    if np.isfinite(low) and low < 0: low = 0.0
+    return {"mean": float(mean) if np.isfinite(mean) else np.nan,
+            "low":  float(low)  if np.isfinite(low)  else np.nan}
 
 # ============================== Upload DB → Build Medians & Train LASSO ==============================
 st.subheader("Upload Database")
 
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
 build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
+
+# Prediction settings
+with st.expander("Prediction settings", expanded=False):
+    ci = st.selectbox("Conservative CI for PredVol lower band",
+                      options=[80.0, 85.0, 90.0, 95.0, 97.5, 99.0],
+                      index=[80.0,85.0,90.0,95.0,97.5,99.0].index(st.session_state.pred_settings["ci"]))
+    use_low_for_pmfrac = st.checkbox("Use lower-band PredVol for PM_Vol_%", value=st.session_state.pred_settings["use_low_for_pmfrac"],
+                                     help="If ON, PM_Vol_% = PM_Vol_M / PredVol_lowCI × 100. Safer and more conservative.")
+    st.session_state.pred_settings["ci"] = float(ci)
+    st.session_state.pred_settings["use_low_for_pmfrac"] = bool(use_low_for_pmfrac)
 
 if build_btn:
     if not uploaded:
@@ -306,7 +344,6 @@ if build_btn:
                 # ====== MAP NUMERIC COLUMNS (with new names + legacy fallbacks) ======
                 add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","mc pm max m","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m"])
                 add_num(df, "Float_PM_Max_M",   ["float pm max (m)","float pm max m","float_pm_max_m","float pm max (m shares)"])
-
                 # Legacy fallbacks (kept for old workbooks)
                 add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
                 add_num(df, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
@@ -318,7 +355,6 @@ if build_btn:
                 add_num(df, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
                 add_num(df, "PM_Vol_%",         ["pm vol (%)","pm_vol_%","pm vol percent","pm volume (%)","pm_vol_percent"])
                 add_num(df, "Daily_Vol_M",      ["daily vol (m)","daily_vol_m","day volume (m)","dvol_m"])
-
                 # NEW: Max Pull PM (%) + RVOL Max PM (cum)
                 add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
                 add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
@@ -500,16 +536,21 @@ if submitted and ticker:
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
 
-    # Predict Daily Volume (M) with the updated model (uses ln_rvolmaxpm; no legacy RVOL)
-    pred = predict_predvol_m(row, st.session_state.get("lassoA", {}))
-    row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
+    # Predict Daily Volume (M) with bands (uses ln_rvolmaxpm; no legacy RVOL)
+    ci = float(st.session_state.pred_settings["ci"])
+    bands = predict_predvol_bands(row, st.session_state.get("lassoA", {}), ci=ci)
+    row["PredVol_M"] = float(bands.get("mean", np.nan))
+    row["PredVol_lowCI"] = float(bands.get("low", np.nan))
+    row["PredVol_CI"] = ci
 
-    # PM_Vol_% = PM_Vol_M / PredVol_M × 100
-    row["PM_Vol_%"] = (row["PM_Vol_M"] / row["PredVol_M"]) * 100.0 if np.isfinite(row.get("PredVol_M", np.nan)) and row["PredVol_M"] > 0 else np.nan
+    # PM_Vol_% = PM_Vol_M / PredVol × 100  (choose mean or lower band)
+    use_low = bool(st.session_state.pred_settings["use_low_for_pmfrac"])
+    denom = row["PredVol_lowCI"] if use_low and np.isfinite(row["PredVol_lowCI"]) and row["PredVol_lowCI"] > 0 else row["PredVol_M"]
+    row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
 
     st.session_state.rows.append(row)
     st.session_state.last = row
-    st.success(f"Saved {ticker}.")
+    st.success(f"Saved {ticker} (CI {ci:.1f}% lower band used for PM%: {'Yes' if use_low else 'No'}).")
     do_rerun()
 
 # ============================== Toolbar: Delete + Multiselect (same row) ==============================
@@ -615,7 +656,10 @@ SIG_THR = float(st.session_state.get("sig_thresh", 2.0))
 
 if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
     summary_rows, detail_map = [], {}
-    detail_order = [("Core variables", var_core), ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
+    # Add PredVol_lowCI to the detail rows (compared vs. Daily_Vol_M medians)
+    extra_pred_rows = ["PredVol_M", "PredVol_lowCI"]
+    detail_order = [("Core variables", var_core),
+                    ("Moderate variables", var_mod + [r for r in extra_pred_rows if r not in var_mod])]
 
     for row in st.session_state.rows:
         stock = dict(row)
@@ -636,14 +680,14 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 if v == "Daily_Vol_M":
                     continue
                 va = pd.to_numeric(stock.get(v), errors="coerce")
-                med_var = "Daily_Vol_M" if v == "PredVol_M" else v
+                med_var = "Daily_Vol_M" if v in ("PredVol_M","PredVol_lowCI") else v
 
                 v1 = models_tbl.loc[med_var, "FT=1"] if (med_var in models_tbl.index) else np.nan
                 v0 = models_tbl.loc[med_var, "FT=0"] if (med_var in models_tbl.index) else np.nan
                 m1 = mad_tbl.loc[med_var, "FT=1"] if (not mad_tbl.empty and med_var in mad_tbl.index and "FT=1" in mad_tbl.columns) else np.nan
                 m0 = mad_tbl.loc[med_var, "FT=0"] if (not mad_tbl.empty and med_var in mad_tbl.index and "FT=0" in mad_tbl.columns) else np.nan
 
-                if v != "PredVol_M" and pd.isna(va) and pd.isna(v1) and pd.isna(v0):
+                if v not in ("PredVol_M","PredVol_lowCI") and pd.isna(va) and pd.isna(v1) and pd.isna(v0):
                     continue
 
                 def _sig(delta, mad):
