@@ -116,10 +116,7 @@ if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "models" not in st.session_state: st.session_state.models = {}
 if "lassoA" not in st.session_state: st.session_state.lassoA = {}   # ratio model + winsor + calibrator
-if "ft_logit" not in st.session_state: st.session_state.ft_logit = {}  # FT regression (logit)
-if "view_mode" not in st.session_state: st.session_state.view_mode = "robust"  # robust/classic for centers
-if "ft_mode" not in st.session_state: st.session_state.ft_mode = "robust"      # robust/classic/regression
-if "sig_thresh" not in st.session_state: st.session_state.sig_thresh = 3.0
+if "ft_logit" not in st.session_state: st.session_state.ft_logit = {} # regression model for FT bars
 
 # ============================== Core & Moderate sets ==============================
 VAR_CORE = [
@@ -389,19 +386,16 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     return float(PM * cal_mult)
 
 # ============================== FT Logistic Regression (probability of FT=1) ==============================
-def _sigmoid(z):
+def _sigmoid(z): 
     z = np.clip(z, -50, 50)
     return 1.0 / (1.0 + np.exp(-z))
 
 def train_ft_logit(df: pd.DataFrame) -> dict:
     """
-    Predict P(FT=1) from PM-focused features via logistic regression with L2 regularization.
-    Standardize → CV for lambda → fit on all data.
+    Predict P(FT=1) from PM-focused features via logistic regression (standardized).
     """
-    eps = 1e-6
     if "FT01" not in df.columns:
         return {}
-
     y = pd.to_numeric(df["FT01"], errors="coerce").values
     y_mask = np.isfinite(y) & ((y == 0) | (y == 1))
 
@@ -409,6 +403,7 @@ def train_ft_logit(df: pd.DataFrame) -> dict:
     float_series = df["Float_PM_Max_M"] if "Float_PM_Max_M" in df.columns else df.get("Float_M")
     if mcap_series is None or float_series is None:
         return {}
+    eps = 1e-6
 
     ln_mcap   = np.log(np.clip(pd.to_numeric(mcap_series, errors="coerce").values,  eps, None))
     ln_gapf   = np.log(np.clip(pd.to_numeric(df.get("Gap_%"), errors="coerce").values, 0, None)/100.0 + eps)
@@ -431,9 +426,9 @@ def train_ft_logit(df: pd.DataFrame) -> dict:
         ("ln_fr",          ln_fr),
         ("catalyst",       catalyst),
         ("ln_float_pmmax", ln_float),
-        ("maxpullpm",      maxpullpm),
+        ("maxpullpm",      maxpullpm),     # linear %
         ("ln_rvolmaxpm",   ln_rvolpm),
-        ("pm_dol_over_mc", pmmc),
+        ("pm_dol_over_mc", pmmc),          # linear %
     ]
     X = np.column_stack([arr for _, arr in feats])
     mask = y_mask & np.isfinite(X).all(axis=1)
@@ -441,41 +436,18 @@ def train_ft_logit(df: pd.DataFrame) -> dict:
     if X.shape[0] < 50:
         return {}
 
-    mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0] = 1.0
+    # Standardize & simple gradient descent (no CV for simplicity/stability)
+    mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0]=1.0
     Xs = (X - mu) / sd
-
-    folds = _kfold_indices(len(y), k=min(5, max(2, len(y)//10)), seed=42)
-    lam_grid = np.geomspace(1e-4, 1.0, 12)
-
-    def _fit_logit(Xtr, ytr, lam, lr=0.05, iters=4000):
-        n, p = Xtr.shape
-        w = np.zeros(p); b = 0.0
-        for _ in range(iters):
-            z = Xtr @ w + b
-            p_hat = _sigmoid(z)
-            grad_w = (Xtr.T @ (p_hat - ytr))/n + lam * w
-            grad_b = np.mean(p_hat - ytr)
-            w -= lr * grad_w
-            b -= lr * grad_b
-        return w, b
-
-    def _logloss(Xt, yt, w, b, lam):
-        z = Xt @ w + b
+    w = np.zeros(Xs.shape[1]); b = 0.0
+    lr = 0.05
+    for _ in range(4000):
+        z = Xs @ w + b
         p = _sigmoid(z)
-        eps2 = 1e-9
-        return -np.mean(yt*np.log(p+eps2) + (1-yt)*np.log(1-p+eps2)) + 0.5*lam*np.sum(w*w)
-
-    cv_scores = []
-    for lam in lam_grid:
-        errs = []
-        for vi in range(len(folds)):
-            te = folds[vi]; tr = np.hstack([folds[j] for j in range(len(folds)) if j!=vi])
-            w,b = _fit_logit(Xs[tr], y[tr], lam)
-            errs.append(_logloss(Xs[te], y[te], w, b, lam))
-        cv_scores.append(np.mean(errs))
-    lam_best = float(lam_grid[int(np.argmin(cv_scores))])
-
-    w,b = _fit_logit(Xs, y, lam_best, lr=0.05, iters=6000)
+        grad_w = Xs.T @ (p - y)/len(y)
+        grad_b = np.mean(p - y)
+        w -= lr * grad_w
+        b -= lr * grad_b
 
     return {
         "feat_order": [nm for nm,_ in feats],
@@ -488,7 +460,8 @@ def train_ft_logit(df: pd.DataFrame) -> dict:
 
 def predict_ft_prob(row: dict, model: dict) -> float:
     """Return P(FT=1) using the logistic model."""
-    if not model or "w" not in model: return np.nan
+    if not model or "w" not in model:
+        return np.nan
     eps = float(model.get("eps", 1e-6))
     def safe_log(v):
         v = float(v) if v is not None else np.nan
@@ -520,8 +493,9 @@ def predict_ft_prob(row: dict, model: dict) -> float:
         "pm_dol_over_mc": pmmc,
     }
     x = np.array([feat_map[nm] for nm in model["feat_order"]], dtype=float)
-    if not np.isfinite(x).all(): return np.nan
-    mu = np.array(model["mu"], dtype=float); sd = np.array(model["sd"], dtype=float); sd[sd==0]=1.0
+    if not np.isfinite(x).all():
+        return np.nan
+    mu = np.array(model["mu"], dtype=float); sd = np.array(model["sd"], dtype=float); sd[sd==0] = 1.0
     xs = (x - mu) / sd
     z = float(np.dot(xs, np.array(model["w"], dtype=float)) + model["b"])
     return float(_sigmoid(z))
@@ -638,17 +612,17 @@ if build_btn:
                         "var_moderate": var_mod
                     }
 
-                    # Train calibrated ratio model (PredVol)
+                    # Train calibrated ratio model (PredVol_M)
                     lasso_model = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99)
                     st.session_state.lassoA = lasso_model or {}
 
-                    # Train FT logistic model (for regression FT mode)
-                    ft_logit = train_ft_logit(df)
-                    st.session_state.ft_logit = ft_logit or {}
+                    # Train FT logistic model (for regression FT bars)
+                    ft_logit_model = train_ft_logit(df)
+                    st.session_state.ft_logit = ft_logit_model or {}
 
                     have_ratio  = bool(lasso_model)
-                    have_ftreg  = bool(ft_logit)
-                    st.success(f"Built summaries. PredVol model ready: {have_ratio}. FT regression ready: {have_ftreg}.")
+                    have_logit  = bool(ft_logit_model)
+                    st.success(f"Built summaries. Models → PredVol (ratio): {have_ratio}, FT regression: {have_logit}")
                     do_rerun()
 
         except Exception as e:
@@ -659,19 +633,24 @@ if build_btn:
 models_data = st.session_state.models
 if models_data and isinstance(models_data, dict) and not models_data.get("med_tbl", pd.DataFrame()).empty:
     with st.expander("Group summaries — flip between robust (Median+MAD) and classic (Mean+SD)", expanded=False):
-        view_choice = st.radio(
-            "Center/Spread view (affects detail rows below)",
+        view_mode = st.radio(
+            "Center/Spread view",
             ["Median + MAD (robust)", "Mean + SD (classic)"],
-            index=0 if st.session_state.get("view_mode","robust")=="robust" else 1,
+            index=0,
             horizontal=True
         )
-        st.session_state["view_mode"] = "robust" if view_choice.startswith("Median") else "classic"
 
         var_core = models_data.get("var_core", [])
         var_mod  = models_data.get("var_moderate", [])
 
-        center_tbl = models_data["med_tbl"] if st.session_state.view_mode=="robust" else models_data["mean_tbl"]
-        spread_tbl = models_data["mad_tbl"] if st.session_state.view_mode=="robust" else models_data["sd_tbl"]
+        if view_mode.startswith("Median"):
+            center_tbl = models_data["med_tbl"]
+            spread_tbl = models_data["mad_tbl"]
+            st.session_state["view_mode"] = "robust"
+        else:
+            center_tbl = models_data["mean_tbl"]
+            spread_tbl = models_data["sd_tbl"]
+            st.session_state["view_mode"] = "classic"
 
         def show_grouped_table(title, vars_list):
             if not vars_list:
@@ -679,16 +658,9 @@ if models_data and isinstance(models_data, dict) and not models_data.get("med_tb
                 return
             sub = center_tbl.loc[[v for v in vars_list if v in center_tbl.index]].copy()
             if not spread_tbl.empty and {"FT=1","FT=0"}.issubset(spread_tbl.columns):
-                eps = 1e-9
-                diff = (sub["FT=1"] - sub["FT=0"]).abs()
-                spread = (spread_tbl.loc[diff.index, "FT=1"].fillna(0.0) + spread_tbl.loc[diff.index, "FT=0"].fillna(0.0))
-                sig = diff / (spread.replace(0.0, np.nan) + eps)
-                sig_flag = sig >= float(st.session_state.get("sig_thresh", 3.0))
-
                 def _style_sig(col: pd.Series):
-                    return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
-                            for idx in col.index]
-
+                    # No inline significance styling in summaries anymore (single slider is below in Alignment)
+                    return ["" for _ in col.index]
                 st.markdown(f"**{title}**")
                 styled = (sub
                           .style
@@ -702,14 +674,12 @@ if models_data and isinstance(models_data, dict) and not models_data.get("med_tb
                        "FT=0": st.column_config.NumberColumn("FT=0 (center)", format="%.2f")}
                 st.dataframe(sub, use_container_width=True, column_config=cfg, hide_index=False)
 
-        show_grouped_table("Core variables", var_core)
-        show_grouped_table("Moderate variables", var_mod)
-
 # ============================== ➕ Manual Input ==============================
 st.markdown("---")
 st.subheader("Add Stock")
 
 with st.form("add_form", clear_on_submit=True):
+    # Two columns of inputs, third just Catalyst
     c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
 
     with c1:
@@ -792,10 +762,26 @@ with tcol_sel:
         label_visibility="collapsed"
     )
 
-# ============================== Alignment (DataTables child-rows) ==============================
+# ============================== Alignment (FT model toggle + significance slider) ==============================
 st.markdown("### Alignment")
 
-# --- Single global Significance slider (ONLY here) ---
+# FT model toggle (bars) and single global significance slider
+ft_mode_label = st.radio(
+    "FT model for the bars",
+    ["Median + MAD voting", "Mean + SD voting", "Regression (logit)"],
+    index=0,
+    horizontal=True
+)
+# Keep centers/spreads view_mode in sync with chosen voting mode
+if ft_mode_label.startswith("Median"):
+    st.session_state["view_mode"] = "robust"
+elif ft_mode_label.startswith("Mean"):
+    st.session_state["view_mode"] = "classic"
+st.session_state["ft_mode"] = "regression" if ft_mode_label.startswith("Regression") else (
+    "robust" if ft_mode_label.startswith("Median") else "classic"
+)
+
+# Global significance threshold slider (only one in the app)
 sigma_val = st.slider(
     "Significance threshold (σ)",
     0.0, 5.0,
@@ -806,34 +792,19 @@ sigma_val = st.slider(
 st.session_state["sig_thresh"] = float(sigma_val)
 SIG_THR = float(sigma_val)
 
-# --- FT model toggle for the whole datatable ---
-ft_mode_label = st.radio(
-    "FT model for the blue/red bars",
-    ["Median + MAD voting", "Mean + SD voting", "Regression (logit)"],
-    index={"robust":0, "classic":1, "regression":2}[st.session_state.get("ft_mode","robust")],
-    horizontal=True
-)
-if ft_mode_label.startswith("Median"):
-    st.session_state["ft_mode"] = "robust"
-    st.session_state["view_mode"] = "robust"  # keep centers consistent if you want
-elif ft_mode_label.startswith("Mean"):
-    st.session_state["ft_mode"] = "classic"
-    st.session_state["view_mode"] = "classic"
-else:
-    st.session_state["ft_mode"] = "regression"
-    # keep view_mode as-is; user can flip centers in the expander
-
-# Choose which center/spread tables feed the detail rows (based on view_mode)
+# Choose which center/spread tables feed the detail rows (flip)
 models_data = st.session_state.models
+view_mode = st.session_state.get("view_mode", "robust")
 if models_data:
-    if st.session_state.view_mode == "robust":
+    if view_mode == "robust":
         models_tbl = models_data.get("med_tbl", pd.DataFrame())
         spread_tbl = models_data.get("mad_tbl", pd.DataFrame())
     else:
         models_tbl = models_data.get("mean_tbl", pd.DataFrame())
         spread_tbl = models_data.get("sd_tbl", pd.DataFrame())
 else:
-    models_tbl = pd.DataFrame(); spread_tbl = pd.DataFrame()
+    models_tbl = pd.DataFrame()
+    spread_tbl = pd.DataFrame()
 
 var_core = (models_data or {}).get("var_core", [])
 var_mod  = (models_data or {}).get("var_moderate", [])
@@ -858,10 +829,10 @@ def _compute_alignment_counts_weighted(
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
         if not np.isfinite(xv) or var not in models_tbl.index:
             return
-        ctr = models_tbl.loc[var, groups].astype(float)
-        if ctr.isna().any():
+        med = models_tbl.loc[var, groups].astype(float)
+        if med.isna().any():
             return
-        d1 = abs(xv - ctr["FT=1"]); d0 = abs(xv - ctr["FT=0"])
+        d1 = abs(xv - med["FT=1"]); d0 = abs(xv - med["FT=0"])
         if abs(d1 - d0) <= TOL:
             return
         if d1 < d0: counts["FT=1"] += weight
@@ -888,14 +859,15 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
 
-        # Bars: based on ft_mode (regression or voting)
+        # Bars: either regression (logit) or voting using current centers
         ft_mode = st.session_state.get("ft_mode", "robust")
         if ft_mode == "regression":
             p = predict_ft_prob(stock, st.session_state.get("ft_logit", {}))
             if np.isfinite(p):
-                ft1_val = round(100.0 * np.clip(p, 0.0, 1.0), 0)
+                ft1_val = round(100.0 * float(np.clip(p, 0.0, 1.0)), 0)
                 ft0_val = 100.0 - ft1_val
             else:
+                # Fallback to voting
                 counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
                 ft1_val = counts.get("FT1_pct", 0.0); ft0_val = counts.get("FT0_pct", 0.0)
         else:
@@ -909,23 +881,29 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         for grp_label, grp_vars in detail_order:
             drows_grouped.append({"__group__": grp_label})
             for v in grp_vars:
+                # Hide Daily_Vol_M row in the child table
                 if v == "Daily_Vol_M":
                     continue
 
                 va = pd.to_numeric(stock.get(v), errors="coerce")
 
+                # For PredVol_M, compare vs. Daily_Vol_M centers (FT columns + deltas)
                 med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
+
                 v1 = models_tbl.loc[med_var, "FT=1"] if (med_var in models_tbl.index) else np.nan
                 v0 = models_tbl.loc[med_var, "FT=0"] if (med_var in models_tbl.index) else np.nan
                 s1 = spread_tbl.loc[med_var, "FT=1"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=1" in spread_tbl.columns) else np.nan
                 s0 = spread_tbl.loc[med_var, "FT=0"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=0" in spread_tbl.columns) else np.nan
 
+                # Always render PredVol_M row; others keep the normal skip rule
                 if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(v1) and pd.isna(v0):
                     continue
 
+                # Δ vs centers
                 d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
                 d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
 
+                # significance for BOTH Core and Moderate: |Δ| / (spread1 + spread0)
                 denom = 0.0
                 denom += float(s1) if pd.notna(s1) else 0.0
                 denom += float(s0) if pd.notna(s0) else 0.0
@@ -936,11 +914,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                     s1_val = (abs(d1) / denom) if d1 is not None else np.nan
                     s0_val = (abs(d0) / denom) if d0 is not None else np.nan
 
-                thr = float(st.session_state.get("sig_thresh", 3.0))
+                thr = st.session_state.get("sig_thresh", 3.0)
                 sig1 = (not pd.isna(s1_val)) and (s1_val >= thr)
                 sig0 = (not pd.isna(s0_val)) and (s0_val >= thr)
                 significant = sig1 or sig0
 
+                # dominant direction (larger |Δ|)
                 dominant = None
                 if significant:
                     abs1 = -np.inf if (d1 is None or pd.isna(d1)) else abs(float(d1))
@@ -1105,4 +1084,52 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
           </colgroup>
           <thead>
             <tr>
-              <
+              <th class="col-var">Variable</th>
+              <th class="col-val">Value</th>
+              <th class="col-ft1">FT=1 center</th>
+              <th class="col-ft0">FT=0 center</th>
+              <th class="col-d1">Δ vs FT=1</th>
+              <th class="col-d0">Δ vs FT=0</th>
+            </tr>
+          </thead>
+          <tbody>${cells}</tbody>
+        </table>`;
+    }
+
+    $(function() {
+      const table = $('#align').DataTable({
+        data: data.rows,
+        responsive: true,
+        paging: false, info: false, searching: false,
+        order: [[0,'asc']],
+        columns: [
+          { data: 'Ticker' },
+          { data: 'FT1_val', render: (d)=>barCellBlue(d) },
+          { data: 'FT0_val', render: (d)=>barCellRed(d) },
+        ]
+      });
+
+      // Whole-row toggle child
+      $('#align tbody').on('click', 'tr', function () {
+        const row = table.row(this);
+        if (row.child.isShown()) {
+          row.child.hide(); $(this).removeClass('shown');
+        } else {
+          const ticker = row.data().Ticker;
+          row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
+        }
+      });
+    });
+  </script>
+</body>
+</html>
+        """
+        html = html.replace("%%PAYLOAD%%", json.dumps(payload))
+        import streamlit.components.v1 as components
+        components.html(html, height=620, scrolling=True)
+    else:
+        st.info("No eligible rows yet. Add manual stocks and/or ensure group summaries are built.")
+elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
+    st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 summaries first.")
+else:
+    st.info("Add at least one stock above to compute alignment.")
