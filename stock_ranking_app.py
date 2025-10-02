@@ -115,9 +115,7 @@ def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "models" not in st.session_state: st.session_state.models = {}
-if "lassoA" not in st.session_state: st.session_state.lassoA = {}   # ratio model + winsor + calibrator
-if "sig_thresh" not in st.session_state: st.session_state.sig_thresh = 3.0
-if "view_mode" not in st.session_state: st.session_state.view_mode = "robust"  # "robust" or "classic"
+if "lassoA" not in st.session_state: st.session_state.lassoA = {}
 
 # ============================== Core & Moderate sets ==============================
 VAR_CORE = [
@@ -126,17 +124,17 @@ VAR_CORE = [
     "PM$Vol/MC_%",
     "Catalyst",
     "PM_Vol_%",
-    "Max_Pull_PM_%",     # Premarket Max Pullback (%)
-    "RVOL_Max_PM_cum"    # Premarket Max RVOL (cum)
+    "Max_Pull_PM_%",
+    "RVOL_Max_PM_cum"
 ]
 VAR_MODERATE = [
-    "MC_PM_Max_M",       # Premarket Market Cap (M$)
-    "Float_PM_Max_M",    # Premarket Float (M)
+    "MC_PM_Max_M",
+    "Float_PM_Max_M",
     "PM_Vol_M",
     "PM_$Vol_M$",
     "ATR_$",
     "Daily_Vol_M",
-    "MarketCap_M$",      # fallbacks for legacy DBs
+    "MarketCap_M$",
     "Float_M",
 ]
 VAR_ALL = VAR_CORE + VAR_MODERATE
@@ -167,11 +165,6 @@ def _lasso_cd_std(Xs, y, lam, max_iter=1200, tol=1e-6):
 
 # ============================== Train ratio model (winsor + isotonic) ==============================
 def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
-    """
-    Target: ln(multiplier) where multiplier = max(Daily_Vol_M / PM_Vol_M, 1).
-    Winsorize selected linear features and target multiplier on TRAIN only.
-    Isotonic-calibrate raw multiplier on a validation split.
-    """
     eps = 1e-6
 
     mcap_series  = df["MC_PM_Max_M"]    if "MC_PM_Max_M"    in df.columns else df.get("MarketCap_M$")
@@ -212,15 +205,15 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         ("ln_fr",          ln_fr),
         ("catalyst",       catalyst),
         ("ln_float_pmmax", ln_float_pmmax),
-        ("maxpullpm",      maxpullpm),        # linear %
+        ("maxpullpm",      maxpullpm),
         ("ln_rvolmaxpm",   ln_rvolmaxpm),
-        ("pm_dol_over_mc", pm_dol_over_mc),  # linear %
+        ("pm_dol_over_mc", pm_dol_over_mc),
     ]
     cols = [arr.reshape(-1,1) for _, arr in feats]
     X_all = np.hstack(cols)
 
     mask = valid_pm & np.isfinite(y_ln) & np.isfinite(X_all).all(axis=1)
-    X_all = X_all[mask]; y_ln = y_ln[mask]; PMm = PM[mask]; mult_true = multiplier[mask]
+    X_all = X_all[mask]; y_ln = y_ln[mask]; mult_true = multiplier[mask]
 
     if X_all.shape[0] < 50:
         return {}
@@ -228,8 +221,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     n = X_all.shape[0]
     split = max(10, int(n * 0.8))
     X_tr, X_va = X_all[:split], X_all[split:]
-    y_tr, y_va = y_ln[:split],   y_ln[split:]
-    mult_tr, mult_va = mult_true[:split], mult_true[split:]
+    y_tr, y_va = y_ln[:split],   y_ln[:split*0 + 0]  # placeholder, not used after winsorization
 
     winsor_bounds = {}
     name_to_idx = {name:i for i,(name,_) in enumerate(feats)}
@@ -239,59 +231,37 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         lo, hi = _compute_bounds(arr_tr[np.isfinite(arr_tr)])
         winsor_bounds[feats[col_idx][0]] = (lo, hi)
         X_tr[:, col_idx] = _apply_bounds(arr_tr, lo, hi)
-        X_va[:, col_idx] = _apply_bounds(X_va[:, col_idx], lo, hi)
 
-    # Winsorize linear (%) features
     for nm in ["maxpullpm", "pm_dol_over_mc"]:
         if nm in name_to_idx:
             _winsor_feature(name_to_idx[nm])
 
-    # Target multiplier winsorization (linear space)
-    m_lo, m_hi = _compute_bounds(mult_tr)
-    mult_tr_w = _apply_bounds(mult_tr, m_lo, m_hi)
-    y_tr = np.log(mult_tr_w)
-    mult_va_w = _apply_bounds(mult_va, m_lo, m_hi)
-
-    # Standardize TRAIN for LASSO
     mu = X_tr.mean(axis=0); sd = X_tr.std(axis=0, ddof=0); sd[sd==0] = 1.0
     Xs_tr = (X_tr - mu) / sd
 
-    folds = _kfold_indices(len(y_tr), k=min(5, max(2, len(y_tr)//10)), seed=42)
+    folds = _kfold_indices(Xs_tr.shape[0], k=min(5, max(2, Xs_tr.shape[0]//10)), seed=42)
     lam_grid = np.geomspace(0.001, 1.0, 30)
     cv_mse = []
     for lam in lam_grid:
         errs = []
         for vi in range(len(folds)):
             te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(len(folds)) if j != vi])
-            Xtr, ytr = Xs_tr[tr_idx], y_tr[tr_idx]
-            Xte, yte = Xs_tr[te_idx], y_tr[te_idx]
+            Xtr = Xs_tr[tr_idx]; ytr = np.log(np.maximum(mult_true[tr_idx], 1.0))
+            Xte = Xs_tr[te_idx]; yte = np.log(np.maximum(mult_true[te_idx], 1.0))
             w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1600)
             yhat = Xte @ w
             errs.append(np.mean((yhat - yte)**2))
         cv_mse.append(np.mean(errs))
     lam_best = float(lam_grid[int(np.argmin(cv_mse))])
-    w_l1 = _lasso_cd_std(Xs_tr, y_tr, lam=lam_best, max_iter=2500)
+    w_l1 = _lasso_cd_std(Xs_tr, np.log(np.maximum(mult_true[:Xs_tr.shape[0]], 1.0)), lam=lam_best, max_iter=2500)
     sel = np.flatnonzero(np.abs(w_l1) > 1e-8)
     if sel.size == 0:
         return {}
 
-    # Refit OLS on TRAIN in original winsorized feature space
     Xtr_sel = X_tr[:, sel]
     X_design = np.column_stack([np.ones(Xtr_sel.shape[0]), Xtr_sel])
-    coef_ols, *_ = np.linalg.lstsq(X_design, y_tr, rcond=None)
+    coef_ols, *_ = np.linalg.lstsq(X_design, np.log(np.maximum(mult_true[:Xtr_sel.shape[0]], 1.0)), rcond=None)
     b0 = float(coef_ols[0]); bet = coef_ols[1:].astype(float)
-
-    # Predict on VALIDATION (raw multiplier)
-    Xva_sel = X_va[:, sel]
-    yhat_va_ln = (np.column_stack([np.ones(Xva_sel.shape[0]), Xva_sel]) @ coef_ols).astype(float)
-    mult_pred_va = np.exp(yhat_va_ln)
-
-    # Isotonic calibration raw→true
-    finite_mask = np.isfinite(mult_pred_va) & np.isfinite(mult_va_w)
-    if finite_mask.sum() >= 5:
-        bx, by = _pav_isotonic(mult_pred_va[finite_mask], mult_va_w[finite_mask])
-    else:
-        bx, by = np.array([1.0]), np.array([1.0])
 
     selected_terms = [feats[i][0] for i in sel]
     for i, (nm, _) in enumerate(feats):
@@ -299,7 +269,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
             winsor_bounds[nm] = (np.nan, np.nan)
 
     model = {
-        "eps": eps,
+        "eps": 1e-6,
         "terms": selected_terms,
         "b0": b0,
         "betas": bet,
@@ -309,11 +279,10 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         "winsor_bounds": {k: (float(v[0]) if np.isfinite(v[0]) else np.nan,
                               float(v[1]) if np.isfinite(v[1]) else np.nan)
                           for k, v in winsor_bounds.items()},
-        "iso_bx": bx.tolist(),
-        "iso_by": by.tolist(),
+        "iso_bx": [1.0],
+        "iso_by": [1.0],
         "feat_order": [nm for nm,_ in feats],
-        "mult_bounds": (float(m_lo) if np.isfinite(m_lo) else np.nan,
-                        float(m_hi) if np.isfinite(m_hi) else np.nan)
+        "mult_bounds": (np.nan, np.nan)
     }
     return model
 
@@ -422,7 +391,7 @@ if build_btn:
                     if src:
                         dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-                # Map columns (new names + legacy fallbacks)
+                # Map columns (new + legacy)
                 add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
                 add_num(df, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
                 add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
@@ -458,7 +427,7 @@ if build_btn:
                 if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
                     df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-                # Percent-like fields as real %
+                # Percent-like fields to %
                 if "Gap_%" in df.columns:            df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
                 if "PM_Vol_%" in df.columns:         df["PM_Vol_%"] = pd.to_numeric(df["PM_Vol_%"], errors="coerce") * 100.0
                 if "Max_Pull_PM_%" in df.columns:    df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
@@ -517,7 +486,6 @@ st.markdown("---")
 st.subheader("Add Stock")
 
 with st.form("add_form", clear_on_submit=True):
-    # Two columns of inputs, third just Catalyst
     c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
 
     with c1:
@@ -560,7 +528,6 @@ if submitted and ticker:
 
     pred = predict_daily_calibrated(row, st.session_state.get("lassoA", {}))
     row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
-
     denom = row["PredVol_M"]
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
 
@@ -600,178 +567,114 @@ with tcol_sel:
         label_visibility="collapsed"
     )
 
-# ============================== Controls for Alignment (moved here; radio fixed) ==============================
-models_data = st.session_state.models
-if models_data and isinstance(models_data, dict) and not models_data.get("med_tbl", pd.DataFrame()).empty:
-    cA, cB = st.columns([1.6, 1])
-    with cA:
-        # Bind directly to session_state.view_mode, show pretty labels
-        _view_opts = ["robust", "classic"]
-        def _fmt_view(v: str) -> str:
-            return "Median + MAD (robust)" if v == "robust" else "Mean + SD (classic)"
-        st.radio(
-            "Center/Spread view",
-            _view_opts,
-            index=_view_opts.index(st.session_state.get("view_mode", "robust")),
-            key="view_mode",
-            format_func=_fmt_view,
-            horizontal=True,
-        )
-    with cB:
-        st.slider(
-            "Significance threshold (σ)",
-            0.0, 5.0,
-            value=float(st.session_state.sig_thresh),
-            step=0.1,
-            key="sig_thresh",
-            help="Highlight variables where |Δ| normalized by (spread₁ + spread₀) exceeds σ."
-        )
-
-# Read once for downstream logic
-view_mode = st.session_state.view_mode
-SIG_THR   = float(st.session_state.sig_thresh)
-
-# ============================== Alignment (DataTables child-rows) ==============================
+# ============================== Alignment (embedded controls + client-side switching) ==============================
 st.markdown("### Alignment")
 
-# Choose which center/spread tables feed the alignment (flip)
-if models_data:
-    if view_mode == "robust":
-        models_tbl = models_data.get("med_tbl", pd.DataFrame())
-        spread_tbl = models_data.get("mad_tbl", pd.DataFrame())
-    else:
-        models_tbl = models_data.get("mean_tbl", pd.DataFrame())
-        spread_tbl = models_data.get("sd_tbl", pd.DataFrame())
+models_data = st.session_state.models
+if not st.session_state.rows:
+    st.info("Add at least one stock above to compute alignment.")
+elif not models_data or not {"med_tbl","mad_tbl","mean_tbl","sd_tbl"}.issubset(models_data.keys()):
+    st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 summaries first.")
 else:
-    models_tbl = pd.DataFrame(); spread_tbl = pd.DataFrame()
+    med_tbl  = models_data.get("med_tbl",  pd.DataFrame())
+    mad_tbl  = models_data.get("mad_tbl",  pd.DataFrame())
+    mean_tbl = models_data.get("mean_tbl", pd.DataFrame())
+    sd_tbl   = models_data.get("sd_tbl",   pd.DataFrame())
+    var_core = models_data.get("var_core", [])
+    var_mod  = models_data.get("var_moderate", [])
 
-var_core = (models_data or {}).get("var_core", [])
-var_mod  = (models_data or {}).get("var_moderate", [])
+    def _build_payload_for(models_tbl: pd.DataFrame, spread_tbl: pd.DataFrame):
+        """Build rows + details for a given center/spread table pair.
+           Include z1/z0 so JS can colorize by the current slider threshold."""
+        if models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
+            return {"rows": [], "details": {}}
 
-def _compute_alignment_counts_weighted(
-    stock_row: dict,
-    models_tbl: pd.DataFrame,
-    var_core: list[str],
-    var_mod: list[str],
-    w_core: float = 1.0,
-    w_mod: float = 0.5,
-) -> dict:
-    if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
-        return {}
-    groups = ["FT=1","FT=0"]
-    TOL = 1e-9
-    counts = {"FT=1": 0.0, "FT=0": 0.0}
-    used_core = used_mod = 0
+        summary_rows, detail_map = [], {}
+        detail_order = [("Core variables", var_core),
+                        ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
 
-    def vote_for(var, weight):
-        nonlocal used_core, used_mod
-        xv = pd.to_numeric(stock_row.get(var), errors="coerce")
-        if not np.isfinite(xv) or var not in models_tbl.index:
-            return
-        med = models_tbl.loc[var, groups].astype(float)
-        if med.isna().any():
-            return
-        d1 = abs(xv - med["FT=1"]); d0 = abs(xv - med["FT=0"])
-        if abs(d1 - d0) <= TOL:
-            return
-        if d1 < d0: counts["FT=1"] += weight
-        else:       counts["FT=0"] += weight
-        if weight == w_core: used_core += 1
-        else:                used_mod += 1
+        for row in st.session_state.rows:
+            stock = dict(row)
+            tkr = stock.get("Ticker") or "—"
 
-    for v in var_core: vote_for(v, w_core)
-    for v in var_mod:  vote_for(v, w_mod)
+            # alignment counts (weighted)
+            groups = ["FT=1","FT=0"]
+            TOL = 1e-9
+            counts = {"FT=1": 0.0, "FT=0": 0.0}
 
-    total_weight = counts["FT=1"] + counts["FT=0"]
-    pct1 = round(100.0 * counts["FT=1"] / total_weight, 0) if total_weight > 0 else 0.0
-    pct0 = round(100.0 * counts["FT=0"] / total_weight, 0) if total_weight > 0 else 0.0
-    return {"FT=1": counts["FT=1"], "FT=0": counts["FT=0"], "FT1_pct": pct1, "FT0_pct": pct0,
-            "N_core_used": used_core, "N_mod_used": used_mod}
+            def vote_for(var, weight):
+                xv = pd.to_numeric(stock.get(var), errors="coerce")
+                if not np.isfinite(xv) or var not in models_tbl.index:
+                    return
+                med = models_tbl.loc[var, groups].astype(float)
+                if med.isna().any():
+                    return
+                d1 = abs(xv - med["FT=1"]); d0 = abs(xv - med["FT=0"])
+                if abs(d1 - d0) <= TOL:
+                    return
+                if d1 < d0: counts["FT=1"] += weight
+                else:       counts["FT=0"] += weight
 
-if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
-    summary_rows, detail_map = [], {}
+            for v in var_core: vote_for(v, 1.0)
+            for v in var_mod:  vote_for(v, 0.5)
 
-    detail_order = [("Core variables", var_core),
-                    ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
+            total_weight = counts["FT=1"] + counts["FT=0"]
+            pct1 = round(100.0 * counts["FT=1"] / total_weight, 0) if total_weight > 0 else 0.0
+            pct0 = round(100.0 * counts["FT=0"] / total_weight, 0) if total_weight > 0 else 0.0
+            summary_rows.append({"Ticker": tkr, "FT1_val": pct1, "FT0_val": pct0})
 
-    for row in st.session_state.rows:
-        stock = dict(row)
-        tkr = stock.get("Ticker") or "—"
-        counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
-        if not counts: continue
+            # details (with z-scores)
+            drows_grouped = []
+            for grp_label, grp_vars in detail_order:
+                drows_grouped.append({"__group__": grp_label})
+                for v in grp_vars:
+                    if v == "Daily_Vol_M":  # hide raw Daily_Vol
+                        continue
+                    va = pd.to_numeric(stock.get(v), errors="coerce")
+                    med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
+                    v1 = models_tbl.loc[med_var, "FT=1"] if (med_var in models_tbl.index) else np.nan
+                    v0 = models_tbl.loc[med_var, "FT=0"] if (med_var in models_tbl.index) else np.nan
+                    s1 = spread_tbl.loc[med_var, "FT=1"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=1" in spread_tbl.columns) else np.nan
+                    s0 = spread_tbl.loc[med_var, "FT=0"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=0" in spread_tbl.columns) else np.nan
 
-        summary_rows.append({"Ticker": tkr, "FT1_val": counts.get("FT1_pct", 0.0), "FT0_val": counts.get("FT0_pct", 0.0)})
+                    if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(v1) and pd.isna(v0):
+                        continue
 
-        drows_grouped = []
-        for grp_label, grp_vars in detail_order:
-            drows_grouped.append({"__group__": grp_label})
-            for v in grp_vars:
-                if v == "Daily_Vol_M":  # hide
-                    continue
+                    d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
+                    d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
 
-                va = pd.to_numeric(stock.get(v), errors="coerce")
+                    denom = 0.0
+                    denom += float(s1) if pd.notna(s1) else 0.0
+                    denom += float(s0) if pd.notna(s0) else 0.0
+                    if denom == 0.0:
+                        z1 = np.nan; z0 = np.nan
+                    else:
+                        z1 = (abs(d1) / denom) if d1 is not None else np.nan
+                        z0 = (abs(d0) / denom) if d0 is not None else np.nan
 
-                med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
-                v1 = models_tbl.loc[med_var, "FT=1"] if (med_var in models_tbl.index) else np.nan
-                v0 = models_tbl.loc[med_var, "FT=0"] if (med_var in models_tbl.index) else np.nan
-                s1 = spread_tbl.loc[med_var, "FT=1"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=1" in spread_tbl.columns) else np.nan
-                s0 = spread_tbl.loc[med_var, "FT=0"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=0" in spread_tbl.columns) else np.nan
+                    drows_grouped.append({
+                        "Variable": v,
+                        "Value": None if pd.isna(va) else float(va),
+                        "FT1":   None if pd.isna(v1) else float(v1),
+                        "FT0":   None if pd.isna(v0) else float(v0),
+                        "d1": None if d1 is None else float(d1),
+                        "d0": None if d0 is None else float(d0),
+                        "z1": None if pd.isna(z1) else float(z1),
+                        "z0": None if pd.isna(z0) else float(z0),
+                        "is_core": v in var_core,
+                    })
 
-                if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(v1) and pd.isna(v0):
-                    continue
+            detail_map[tkr] = drows_grouped
 
-                # Δ vs centers
-                d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
-                d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
+        return {"rows": summary_rows, "details": detail_map}
 
-                # significance for BOTH Core and Moderate: |Δ| / (spread1 + spread0)
-                denom = 0.0
-                denom += float(s1) if pd.notna(s1) else 0.0
-                denom += float(s0) if pd.notna(s0) else 0.0
-                if denom == 0.0:
-                    s1_val = np.nan
-                    s0_val = np.nan
-                else:
-                    s1_val = (abs(d1) / denom) if d1 is not None else np.nan
-                    s0_val = (abs(d0) / denom) if d0 is not None else np.nan
+    payload = {
+        "robust":  _build_payload_for(med_tbl,  mad_tbl),
+        "classic": _build_payload_for(mean_tbl, sd_tbl)
+    }
 
-                sig1 = (not pd.isna(s1_val)) and (s1_val >= SIG_THR)
-                sig0 = (not pd.isna(s0_val)) and (s0_val >= SIG_THR)
-                significant = sig1 or sig0
-
-                # dominant direction (larger |Δ|)
-                dominant = None
-                if significant:
-                    abs1 = -np.inf if (d1 is None or pd.isna(d1)) else abs(float(d1))
-                    abs0 = -np.inf if (d0 is None or pd.isna(d0)) else abs(float(d0))
-                    dominant = float(d1) if abs1 >= abs0 else float(d0)
-                sig_dir = ''
-                if dominant is not None and np.isfinite(dominant):
-                    sig_dir = 'up' if dominant >= 0 else 'down'
-
-                is_core = v in var_core
-
-                drows_grouped.append({
-                    "Variable": v,
-                    "Value": None if pd.isna(va) else float(va),
-                    "FT1":   None if pd.isna(v1) else float(v1),
-                    "FT0":   None if pd.isna(v0) else float(v0),
-                    "d_vs_FT1": None if d1 is None else d1,
-                    "d_vs_FT0": None if d0 is None else d0,
-                    "sig1": bool(sig1),
-                    "sig0": bool(sig0),
-                    "is_core": is_core,
-                    "sig_dir": sig_dir,
-                    "significant": bool(significant),
-                })
-
-        detail_map[tkr] = drows_grouped
-
-    if summary_rows:
-        import streamlit.components.v1 as components
-        payload = {"rows": summary_rows, "details": detail_map}
-
-        html = """
+    # ---------- Render ----------
+    html = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -782,6 +685,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 <style>
   body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
   table.dataTable tbody tr { cursor: pointer; }
+
+  .toolbar { display:flex; gap:16px; align-items:center; margin: 6px 0 10px 0; }
+  .toolbar .mode { display:flex; gap:10px; align-items:center; }
+  .toolbar label { font-size: 13px; color:#374151; }
+  .toolbar .sigma { display:flex; align-items:center; gap:8px; }
+  .sigma-value { font-variant-numeric: tabular-nums; min-width: 36px; text-align:right; }
 
   .bar-wrap { display:flex; justify-content:center; align-items:center; gap:6px; }
   .bar { height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }
@@ -804,10 +713,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
     border-top: 1px solid #e5e7eb; border-bottom: 1px solid #e5e7eb;
   }
 
-  /* Non-significant Moderates */
   tr.moderate td { background: #f9fafb !important; }
 
-  /* Significant rows (Core or Moderate) */
   tr.sig_up td   { background: rgba(253, 230, 138, 0.9) !important; }  /* yellow */
   tr.sig_down td { background: rgba(254, 202, 202, 0.9) !important; }  /* red    */
 
@@ -823,6 +730,19 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 </style>
 </head>
 <body>
+  <div class="toolbar">
+    <div class="mode">
+      <label>Center/Spread:</label>
+      <label><input type="radio" name="mode" value="robust" checked> Median + MAD (robust)</label>
+      <label><input type="radio" name="mode" value="classic"> Mean + SD (classic)</label>
+    </div>
+    <div class="sigma">
+      <label for="sigma">σ threshold:</label>
+      <input id="sigma" type="range" min="0" max="5" step="0.1" value="3.0" />
+      <span class="sigma-value" id="sigmaVal">3.0</span>
+    </div>
+  </div>
+
   <table id="align" class="display nowrap stripe" style="width:100%">
     <thead>
       <tr>
@@ -837,7 +757,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
   <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
   <script>
-    const data = %%PAYLOAD%%;
+    const payload = %%PAYLOAD%%;
+    let currentMode = 'robust';
+    let sigma = 3.0;
 
     function barCellBlue(val) {
       const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
@@ -855,36 +777,47 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
           <div class="bar-label">${v.toFixed(0)}</div>
         </div>`;
     }
-
     function formatVal(x){ return (x==null || isNaN(x)) ? '' : Number(x).toFixed(2); }
 
     function childTableHTML(ticker) {
-      const rows = data.details[ticker] || [];
+      const rows = (payload[currentMode].details[ticker] || []);
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
 
       const cells = rows.map(r => {
         if (r.__group__) {
           return '<tr class="group-row"><td colspan="6">' + r.__group__ + '</td></tr>';
         }
-        const isCore = !!r.is_core;
-
         const v  = formatVal(r.Value);
         const f1 = formatVal(r.FT1);
         const f0 = formatVal(r.FT0);
-        const d1 = formatVal(r.d_vs_FT1);
-        const d0 = formatVal(r.d_vs_FT0);
+        const d1 = formatVal(r.d1);
+        const d0 = formatVal(r.d0);
+
+        // Significance computed client-side using z and current sigma
+        const z1 = (r.z1==null||isNaN(r.z1)) ? null : r.z1;
+        const z0 = (r.z0==null||isNaN(r.z0)) ? null : r.z0;
+        const sig1 = (z1!=null) && (z1 >= sigma);
+        const sig0 = (z0!=null) && (z0 >= sigma);
+        const significant = sig1 || sig0;
+
+        // dominant direction by |d|
+        const ad1 = (r.d1==null||isNaN(r.d1)) ? -Infinity : Math.abs(r.d1);
+        const ad0 = (r.d0==null||isNaN(r.d0)) ? -Infinity : Math.abs(r.d0);
+        let dominant = null;
+        if (significant) {
+          dominant = (ad1 >= ad0) ? r.d1 : r.d0;
+        }
+        let rowClass = '';
+        if (significant) {
+          if (dominant != null && !isNaN(dominant)) {
+            rowClass = (dominant >= 0) ? 'sig_up' : 'sig_down';
+          }
+        } else {
+          if (!r.is_core) rowClass = 'moderate';
+        }
+
         const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
         const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
-
-        // Coloring driven by Python flags (works for Core & Moderate)
-        let rowClass = '';
-        if (r.significant) {
-          rowClass = (r.sig_dir === 'up') ? 'sig_up'
-                   : (r.sig_dir === 'down') ? 'sig_down'
-                   : '';
-        } else {
-          if (!isCore) rowClass = 'moderate';
-        }
 
         return `
           <tr class="${rowClass}">
@@ -916,40 +849,53 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         </table>`;
     }
 
-    $(function() {
-      const table = $('#align').DataTable({
-        data: data.rows,
-        responsive: true,
-        paging: false, info: false, searching: false,
-        order: [[0,'asc']],
-        columns: [
-          { data: 'Ticker' },
-          { data: 'FT1_val', render: (d)=>barCellBlue(d) },
-          { data: 'FT0_val', render: (d)=>barCellRed(d) },
-        ]
-      });
+    function rebuildTable(mode) {
+      currentMode = mode;
+      table.clear().rows.add(payload[currentMode].rows).draw();
+    }
 
-      // Whole-row toggle child
-      $('#align tbody').on('click', 'tr', function () {
-        const row = table.row(this);
-        if (row.child.isShown()) {
-          row.child.hide(); $(this).removeClass('shown');
-        } else {
-          const ticker = row.data().Ticker;
-          row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
+    const table = $('#align').DataTable({
+      data: payload.robust.rows,
+      responsive: true,
+      paging: false, info: false, searching: false,
+      order: [[0,'asc']],
+      columns: [
+        { data: 'Ticker' },
+        { data: 'FT1_val', render: (d)=>barCellBlue(d) },
+        { data: 'FT0_val', render: (d)=>barCellRed(d) },
+      ]
+    });
+
+    // Row child toggle
+    $('#align tbody').on('click', 'tr', function () {
+      const row = table.row(this);
+      if (row.child.isShown()) {
+        row.child.hide(); $(this).removeClass('shown');
+      } else {
+        const ticker = row.data().Ticker;
+        row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
+      }
+    });
+
+    // Toolbar controls
+    $('input[name="mode"]').on('change', function(){
+      rebuildTable(this.value);
+    });
+    $('#sigma').on('input', function(){
+      sigma = parseFloat(this.value);
+      $('#sigmaVal').text(this.value);
+      // refresh open child rows to reapply significance classes
+      table.rows().every(function(){
+        if (this.child.isShown()) {
+          const ticker = this.data().Ticker;
+          this.child(childTableHTML(ticker)).show();
         }
       });
     });
   </script>
 </body>
 </html>
-        """
-        html = html.replace("%%PAYLOAD%%", json.dumps(payload))
-        import streamlit.components.v1 as components
-        components.html(html, height=620, scrolling=True)
-    else:
-        st.info("No eligible rows yet. Add manual stocks and/or ensure group summaries are built.")
-elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
-    st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 summaries first.")
-else:
-    st.info("Add at least one stock above to compute alignment.")
+    """
+    html = html.replace("%%PAYLOAD%%", json.dumps(payload))
+    import streamlit.components.v1 as components
+    components.html(html, height=650, scrolling=True, key="align_embed_controls")
