@@ -848,10 +848,11 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
                 s1 = _sig(d1, float(m1) if pd.notna(m1) else np.nan)
                 s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
-
+                
                 is_core = v in var_core
-                sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR) if is_core else False
-                sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR) if is_core else False
+                # Now flag significance for BOTH Core and Moderate
+                sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
+                sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
 
                 drows_grouped.append({
                     "Variable": v,
@@ -924,13 +925,22 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const isCore=!!r.is_core, s1=isCore&&!!r.sig1, s0=isCore&&!!r.sig0;
         const d1num=(r.d_vs_FT1==null||isNaN(r.d_vs_FT1))?NaN:Number(r.d_vs_FT1);
         const d0num=(r.d_vs_FT0==null||isNaN(r.d_vs_FT0))?NaN:Number(r.d_vs_FT0);
-        let rowClass='';
-        if (isCore && (s1||s0)){
-          let delta=NaN;
-          if (s1&&s0){ const abs1=isNaN(d1num)?-Infinity:Math.abs(d1num); const abs0=isNaN(d0num)?-Infinity:Math.abs(d0num); delta=(abs1>=abs0)?d1num:d0num; }
-          else { delta=(!isNaN(d1num)&&s1)?d1num:d0num; }
-          rowClass=(delta>=0)?'sig_up':'sig_down';
-        } else if (!isCore){ rowClass='moderate'; }
+        let rowClass = '';
+        if (s1 || s0) {
+          // significant for BOTH Core and Moderate
+          let delta = NaN;
+          if (s1 && s0) {
+            const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
+            const abs0 = isNaN(d0num) ? -Infinity : Math.abs(d0num);
+            delta = (abs1 >= abs0) ? d1num : d0num;
+          } else {
+            delta = (!isNaN(d1num) && s1) ? d1num : d0num;
+          }
+          rowClass = (delta >= 0) ? 'sig_up' : 'sig_down';
+        } else if (!isCore) {
+          // non-significant Moderate rows keep the light-gray background
+          rowClass = 'moderate';
+        }
         return `<tr class="${rowClass}">
           <td class="col-var">${r.Variable}</td>
           <td class="col-val">${v}</td>
