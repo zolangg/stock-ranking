@@ -495,7 +495,6 @@ with st.form("add_form", clear_on_submit=True):
         atr_usd   = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
         pm_vol    = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
         pm_dol    = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
-        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.1, format="%.1f")  # NEW CORE
         rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f") # NEW CORE
 
     with c3:
