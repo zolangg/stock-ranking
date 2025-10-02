@@ -850,9 +850,26 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
                 
                 is_core = v in var_core
+                # Flag significance for BOTH Core and Moderate
                 sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
                 sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
-
+                significant = sig1 or sig0
+                
+                # Choose a dominant side (the larger |Δ| among significant sides)
+                dominant = None
+                if significant:
+                    abs1 = -np.inf if (d1 is None or pd.isna(d1) or not sig1) else abs(float(d1))
+                    abs0 = -np.inf if (d0 is None or pd.isna(d0) or not sig0) else abs(float(d0))
+                    if abs1 >= abs0:
+                        dominant = float(d1) if d1 is not None and pd.notna(d1) else None
+                    else:
+                        dominant = float(d0) if d0 is not None and pd.notna(d0) else None
+                
+                # Direction string for JS: 'up' | 'down' | ''
+                sig_dir = ''
+                if dominant is not None and np.isfinite(dominant):
+                    sig_dir = 'up' if dominant >= 0 else 'down'
+                
                 drows_grouped.append({
                     "Variable": v,
                     "Value": None if pd.isna(va) else float(va),
@@ -860,9 +877,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                     "FT0":   None if pd.isna(v0) else float(v0),
                     "d_vs_FT1": None if d1 is None else d1,
                     "d_vs_FT0": None if d0 is None else d0,
-                    "sig1": sig1,
-                    "sig0": sig0,
-                    "is_core": is_core
+                    "sig1": bool(sig1),
+                    "sig0": bool(sig0),
+                    "is_core": is_core,
+                    # NEW: single, authoritative significance-direction flag for JS
+                    "sig_dir": sig_dir,
+                    "significant": bool(significant),
                 })
 
         detail_map[tkr] = drows_grouped
@@ -892,9 +912,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   .child-table th:first-child, .child-table td:first-child { text-align:left; }
   tr.group-row td { background: #f3f4f6 !important; color:#374151; font-weight:600; text-transform:uppercase; letter-spacing:.02em;
     border-top: 1px solid #e5e7eb; border-bottom: 1px solid #e5e7eb; }
-  tr.moderate td { background: #f9fafb !important; }
-  tr.sig_up td   { background: rgba(253, 230, 138, 0.9) !important; }
-  tr.sig_down td { background: rgba(254, 202, 202, 0.9) !important; }
+    /* Non-significant Moderates */
+    tr.moderate td { background: #f9fafb !important; }
+    
+    /* Significant rows, Core or Moderate */
+    tr.sig_up td   { background: rgba(253, 230, 138, 0.9) !important; }  /* yellow */
+    tr.sig_down td { background: rgba(254, 202, 202, 0.9) !important; }  /* red    */
   .col-var { width: 18%; } .col-val { width: 12%; } .col-ft1 { width: 18%; } .col-ft0 { width: 18%; } .col-d1  { width: 17%; } .col-d0  { width: 17%; }
   .pos { color:#059669; } .neg { color:#dc2626; }
 </style>
@@ -925,19 +948,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const d1num=(r.d_vs_FT1==null||isNaN(r.d_vs_FT1))?NaN:Number(r.d_vs_FT1);
         const d0num=(r.d_vs_FT0==null||isNaN(r.d_vs_FT0))?NaN:Number(r.d_vs_FT0);
         let rowClass = '';
-        if (s1 || s0) {
-          // Significant for BOTH Core and Moderate
-          let delta = NaN;
-          if (s1 && s0) {
-            const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
-            const abs0 = isNaN(d0num) ? -Infinity : Math.abs(d0num);
-            delta = (abs1 >= abs0) ? d1num : d0num;
-          } else {
-            delta = (!isNaN(d1num) && s1) ? d1num : d0num;
-          }
-          rowClass = (delta >= 0) ? 'sig_up' : 'sig_down';
+        if (r.significant) {
+          rowClass = (r.sig_dir === 'up') ? 'sig_up'
+                   : (r.sig_dir === 'down') ? 'sig_down'
+                   : ''; // fallback, should rarely happen
         } else {
-          // Non-significant Moderates stay gray; Core stays default
+          // non-significant Moderate rows stay gray; Core stays default
           if (!isCore) rowClass = 'moderate';
         }
         return `<tr class="${rowClass}">
