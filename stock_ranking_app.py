@@ -926,7 +926,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const d0num=(r.d_vs_FT0==null||isNaN(r.d_vs_FT0))?NaN:Number(r.d_vs_FT0);
         let rowClass = '';
         if (s1 || s0) {
-          // significant for BOTH Core and Moderate
+          // Significant for BOTH Core and Moderate
           let delta = NaN;
           if (s1 && s0) {
             const abs1 = isNaN(d1num) ? -Infinity : Math.abs(d1num);
@@ -936,9 +936,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             delta = (!isNaN(d1num) && s1) ? d1num : d0num;
           }
           rowClass = (delta >= 0) ? 'sig_up' : 'sig_down';
-        } else if (!isCore) {
-          // non-significant Moderate rows keep the light-gray background
-          rowClass = 'moderate';
+        } else {
+          // Non-significant Moderates stay gray; Core stays default
+          if (!isCore) rowClass = 'moderate';
         }
         return `<tr class="${rowClass}">
           <td class="col-var">${r.Variable}</td>
