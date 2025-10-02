@@ -116,6 +116,8 @@ if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "models" not in st.session_state: st.session_state.models = {}
 if "lassoA" not in st.session_state: st.session_state.lassoA = {}   # ratio model + winsor + calibrator
+if "sig_thresh" not in st.session_state: st.session_state.sig_thresh = 3.0
+if "view_mode" not in st.session_state: st.session_state.view_mode = "robust"
 
 # ============================== Core & Moderate sets ==============================
 VAR_CORE = [
@@ -333,7 +335,7 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
         return np.log(np.clip(v, eps, None)) if np.isfinite(v) else np.nan
 
     ln_mcap_pmmax  = safe_log(row.get("MC_PM_Max_M") or row.get("MarketCap_M$"))
-    ln_gapf        = np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + eps, eps, None)) if row.get("Gap_%") is not None else np.nan
+    ln_gapf        = np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + float(eps), float(eps), None)) if row.get("Gap_%") is not None else np.nan
     ln_atr         = safe_log(row.get("ATR_$"))
     ln_pm          = safe_log(row.get("PM_Vol_M"))
     ln_pm_dol      = safe_log(row.get("PM_$Vol_M$"))
@@ -510,64 +512,6 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# ============================== Summary tables (flip: robust vs classic) ==============================
-models_data = st.session_state.models
-if models_data and isinstance(models_data, dict) and not models_data.get("med_tbl", pd.DataFrame()).empty:
-    with st.expander("Group summaries — flip between robust (Median+MAD) and classic (Mean+SD)", expanded=False):
-        view_mode = st.radio(
-            "Center/Spread view",
-            ["Median + MAD (robust)", "Mean + SD (classic)"],
-            index=0,
-            horizontal=True
-        )
-
-        var_core = models_data.get("var_core", [])
-        var_mod  = models_data.get("var_moderate", [])
-
-        if view_mode.startswith("Median"):
-            center_tbl = models_data["med_tbl"]
-            spread_tbl = models_data["mad_tbl"]
-        else:
-            center_tbl = models_data["mean_tbl"]
-            spread_tbl = models_data["sd_tbl"]
-
-        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
-                               help="Highlight rows where |FT=1 − FT=0| / (Spread₁ + Spread₀) ≥ σ")
-        st.session_state["sig_thresh"] = float(sig_thresh)
-        st.session_state["view_mode"] = "robust" if view_mode.startswith("Median") else "classic"
-
-        def show_grouped_table(title, vars_list):
-            if not vars_list:
-                st.info(f"No variables available for {title}.")
-                return
-            sub = center_tbl.loc[[v for v in vars_list if v in center_tbl.index]].copy()
-            if not spread_tbl.empty and {"FT=1","FT=0"}.issubset(spread_tbl.columns):
-                eps = 1e-9
-                diff = (sub["FT=1"] - sub["FT=0"]).abs()
-                spread = (spread_tbl.loc[diff.index, "FT=1"].fillna(0.0) + spread_tbl.loc[diff.index, "FT=0"].fillna(0.0))
-                sig = diff / (spread.replace(0.0, np.nan) + eps)
-                sig_flag = sig >= st.session_state["sig_thresh"]
-
-                def _style_sig(col: pd.Series):
-                    return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
-                            for idx in col.index]
-
-                st.markdown(f"**{title}**")
-                styled = (sub
-                          .style
-                          .apply(_style_sig, subset=["FT=1"])
-                          .apply(_style_sig, subset=["FT=0"])
-                          .format("{:.2f}"))
-                st.dataframe(styled, use_container_width=True)
-            else:
-                st.markdown(f"**{title}**")
-                cfg = {"FT=1": st.column_config.NumberColumn("FT=1 (center)", format="%.2f"),
-                       "FT=0": st.column_config.NumberColumn("FT=0 (center)", format="%.2f")}
-                st.dataframe(sub, use_container_width=True, column_config=cfg, hide_index=False)
-
-        show_grouped_table("Core variables", var_core)
-        show_grouped_table("Moderate variables", var_mod)
-
 # ============================== ➕ Manual Input ==============================
 st.markdown("---")
 st.subheader("Add Stock")
@@ -655,6 +599,26 @@ with tcol_sel:
         placeholder="Select tickers to delete…",
         label_visibility="collapsed"
     )
+
+# ============================== Controls for Alignment (moved here) ==============================
+models_data = st.session_state.models
+if models_data and isinstance(models_data, dict) and not models_data.get("med_tbl", pd.DataFrame()).empty:
+    cA, cB = st.columns([1.6, 1])
+    with cA:
+        view_mode_choice = st.radio(
+            "Center/Spread view",
+            ["Median + MAD (robust)", "Mean + SD (classic)"],
+            index=0 if st.session_state.get("view_mode","robust")=="robust" else 1,
+            horizontal=True
+        )
+        st.session_state["view_mode"] = "robust" if view_mode_choice.startswith("Median") else "classic"
+    with cB:
+        sig_thresh = st.slider(
+            "Significance threshold (σ)",
+            0.0, 5.0, float(st.session_state.get("sig_thresh", 3.0)), 0.1,
+            help="Highlight variables where |Δ| normalized by (spread₁ + spread₀) exceeds σ."
+        )
+        st.session_state["sig_thresh"] = float(sig_thresh)
 
 # ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
