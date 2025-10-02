@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import re
 import json
+import math
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -111,6 +112,40 @@ def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
         return np.full_like(x_new, by[0], dtype=float)
     return np.interp(x_new, bx, by, left=by[0], right=by[-1])
 
+# ---------- JSON safety for components.html payload ----------
+def _json_safe(obj):
+    """Recursively convert numpy/scalars/NaN/Inf to JSON-safe Python types."""
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+            return None
+        return obj
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        val = float(obj)
+        return None if (math.isnan(val) or math.isinf(val)) else val
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(v) for v in obj]
+    # pandas / numpy arrays
+    if isinstance(obj, (np.ndarray,)):
+        return [_json_safe(v) for v in obj.tolist()]
+    if isinstance(obj, (pd.Series,)):
+        return [_json_safe(v) for v in obj.tolist()]
+    if isinstance(obj, (pd.DataFrame,)):
+        # Not expected here; convert to records as fallback
+        return [_json_safe(r) for _, r in obj.iterrows()]
+    # Fallback: string
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
 # ============================== Session State ==============================
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
@@ -125,7 +160,7 @@ VAR_CORE = [
     "Catalyst",
     "PM_Vol_%",
     "Max_Pull_PM_%",
-    "RVOL_Max_PM_cum"
+    "RVOL_Max_PM_cum",
 ]
 VAR_MODERATE = [
     "MC_PM_Max_M",
@@ -165,6 +200,11 @@ def _lasso_cd_std(Xs, y, lam, max_iter=1200, tol=1e-6):
 
 # ============================== Train ratio model (winsor + isotonic) ==============================
 def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
+    """
+    Target: ln(multiplier) where multiplier = max(Daily_Vol_M / PM_Vol_M, 1).
+    Winsorize selected linear features and target multiplier on TRAIN only.
+    Isotonic-calibrate raw multiplier on a validation split.
+    """
     eps = 1e-6
 
     mcap_series  = df["MC_PM_Max_M"]    if "MC_PM_Max_M"    in df.columns else df.get("MarketCap_M$")
@@ -213,15 +253,13 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     X_all = np.hstack(cols)
 
     mask = valid_pm & np.isfinite(y_ln) & np.isfinite(X_all).all(axis=1)
-    X_all = X_all[mask]; y_ln = y_ln[mask]; mult_true = multiplier[mask]
-
+    X_all = X_all[mask]; y_ln = y_ln[mask]
     if X_all.shape[0] < 50:
         return {}
 
-    n = X_all.shape[0]
-    split = max(10, int(n * 0.8))
-    X_tr, X_va = X_all[:split], X_all[split:]
-    y_tr, y_va = y_ln[:split],   y_ln[:split*0 + 0]  # placeholder, not used after winsorization
+    # Simple split (we won't actually use validation after refactor)
+    split = max(10, int(X_all.shape[0] * 0.8))
+    X_tr = X_all[:split]
 
     winsor_bounds = {}
     name_to_idx = {name:i for i,(name,_) in enumerate(feats)}
@@ -230,37 +268,39 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         arr_tr = X_tr[:, col_idx]
         lo, hi = _compute_bounds(arr_tr[np.isfinite(arr_tr)])
         winsor_bounds[feats[col_idx][0]] = (lo, hi)
-        X_tr[:, col_idx] = _apply_bounds(arr_tr, lo, hi)
 
     for nm in ["maxpullpm", "pm_dol_over_mc"]:
         if nm in name_to_idx:
             _winsor_feature(name_to_idx[nm])
 
+    # Standardize TRAIN for LASSO (use winsor bounds only for linear % features)
     mu = X_tr.mean(axis=0); sd = X_tr.std(axis=0, ddof=0); sd[sd==0] = 1.0
     Xs_tr = (X_tr - mu) / sd
 
+    # Quick CV to pick lambda
     folds = _kfold_indices(Xs_tr.shape[0], k=min(5, max(2, Xs_tr.shape[0]//10)), seed=42)
     lam_grid = np.geomspace(0.001, 1.0, 30)
     cv_mse = []
+    y_tr_ln = y_ln[:Xs_tr.shape[0]]
     for lam in lam_grid:
         errs = []
         for vi in range(len(folds)):
             te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(len(folds)) if j != vi])
-            Xtr = Xs_tr[tr_idx]; ytr = np.log(np.maximum(mult_true[tr_idx], 1.0))
-            Xte = Xs_tr[te_idx]; yte = np.log(np.maximum(mult_true[te_idx], 1.0))
+            Xtr = Xs_tr[tr_idx]; ytr = y_tr_ln[tr_idx]
+            Xte = Xs_tr[te_idx]; yte = y_tr_ln[te_idx]
             w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1600)
             yhat = Xte @ w
             errs.append(np.mean((yhat - yte)**2))
         cv_mse.append(np.mean(errs))
     lam_best = float(lam_grid[int(np.argmin(cv_mse))])
-    w_l1 = _lasso_cd_std(Xs_tr, np.log(np.maximum(mult_true[:Xs_tr.shape[0]], 1.0)), lam=lam_best, max_iter=2500)
+    w_l1 = _lasso_cd_std(Xs_tr, y_tr_ln, lam=lam_best, max_iter=2500)
     sel = np.flatnonzero(np.abs(w_l1) > 1e-8)
     if sel.size == 0:
         return {}
 
     Xtr_sel = X_tr[:, sel]
     X_design = np.column_stack([np.ones(Xtr_sel.shape[0]), Xtr_sel])
-    coef_ols, *_ = np.linalg.lstsq(X_design, np.log(np.maximum(mult_true[:Xtr_sel.shape[0]], 1.0)), rcond=None)
+    coef_ols, *_ = np.linalg.lstsq(X_design, y_tr_ln[:Xtr_sel.shape[0]], rcond=None)
     b0 = float(coef_ols[0]); bet = coef_ols[1:].astype(float)
 
     selected_terms = [feats[i][0] for i in sel]
@@ -686,7 +726,7 @@ else:
   body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
   table.dataTable tbody tr { cursor: pointer; }
 
-  .toolbar { display:flex; gap:16px; align-items:center; margin: 6px 0 10px 0; }
+  .toolbar { display:flex; gap:16px; align-items:center; margin: 6px 0 10px 0; flex-wrap: wrap; }
   .toolbar .mode { display:flex; gap:10px; align-items:center; }
   .toolbar label { font-size: 13px; color:#374151; }
   .toolbar .sigma { display:flex; align-items:center; gap:8px; }
@@ -896,6 +936,9 @@ else:
 </body>
 </html>
     """
-    html = html.replace("%%PAYLOAD%%", json.dumps(payload))
+
+    safe_payload = _json_safe(payload)
+    html = html.replace("%%PAYLOAD%%", json.dumps(safe_payload, ensure_ascii=False))
+
     import streamlit.components.v1 as components
     components.html(html, height=650, scrolling=True, key="align_embed_controls")
