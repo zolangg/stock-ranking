@@ -486,19 +486,19 @@ with st.form("add_form", clear_on_submit=True):
 
     with c1:
         ticker   = st.text_input("Ticker", "").strip().upper()
-        mc_pmmax = st.number_input("MC PM Max (M$)", 0.0, step=0.01, format="%.2f")      # RENAMED
-        float_pm = st.number_input("Float PM Max (M)", 0.0, step=0.01, format="%.2f")   # RENAMED
+        mc_pmmax = st.number_input("Premarket Market Cap (M)", 0.0, step=0.01, format="%.2f")      # RENAMED
+        float_pm = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")   # RENAMED
         gap_pct  = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")               # real %
+        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.1, format="%.1f")  # NEW CORE
 
     with c2:
-        atr_usd   = st.number_input("ATR ($)", 0.0, step=0.01, format="%.2f")
-        rvol      = st.number_input("RVOL", 0.0, step=0.01, format="%.2f")
+        atr_usd   = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
         pm_vol    = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
         pm_dol    = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
+        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.1, format="%.1f")  # NEW CORE
+        rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f") # NEW CORE
 
     with c3:
-        max_pull_pm = st.number_input("Max Pull PM (%)", 0.0, step=0.1, format="%.1f")  # NEW CORE
-        rvol_pm_cum = st.number_input("RVOL Max PM (cum)", 0.0, step=0.01, format="%.2f") # NEW CORE
         catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
 
     submitted = st.form_submit_button("Add to Table", use_container_width=True)
@@ -514,7 +514,6 @@ if submitted and ticker:
         "Float_PM_Max_M": float_pm,        # NEW canonical
         "Gap_%": gap_pct,
         "ATR_$": atr_usd,
-        "RVOL": rvol,
         "PM_Vol_M": pm_vol,
         "PM_$Vol_M$": pm_dol,
         "FR_x": fr,                        # uses Float_PM_Max_M
