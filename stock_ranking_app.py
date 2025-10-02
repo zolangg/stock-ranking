@@ -384,6 +384,152 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
         return np.nan
     return float(PM * cal_mult)
 
+# ============================== FT Logistic Regression (probability of FT=1) ==============================
+def _sigmoid(z): 
+    z = np.clip(z, -50, 50)
+    return 1.0 / (1.0 + np.exp(-z))
+
+def train_ft_logit(df: pd.DataFrame) -> dict:
+    """
+    Predict P(FT=1) from PM-focused features via logistic regression with L2 regularization.
+    - Standardize features
+    - 5-fold CV to choose lambda
+    - Return mu/sd, weights, intercept and feature order
+    """
+    # Build features (match transforms in your predictors)
+    eps = 1e-6
+    if "FT01" not in df.columns:
+        return {}
+
+    y = pd.to_numeric(df["FT01"], errors="coerce").values
+    y_mask = np.isfinite(y) & ((y == 0) | (y == 1))
+
+    mcap_series  = df["MC_PM_Max_M"]    if "MC_PM_Max_M"    in df.columns else df.get("MarketCap_M$")
+    float_series = df["Float_PM_Max_M"] if "Float_PM_Max_M" in df.columns else df.get("Float_M")
+    if mcap_series is None or float_series is None:
+        return {}
+
+    # Feature engineering (logs for scales; linear for %)
+    ln_mcap   = np.log(np.clip(pd.to_numeric(mcap_series, errors="coerce").values,  eps, None))
+    ln_gapf   = np.log(np.clip(pd.to_numeric(df.get("Gap_%"), errors="coerce").values, 0, None)/100.0 + eps)
+    ln_atr    = np.log(np.clip(pd.to_numeric(df.get("ATR_$"), errors="coerce").values, eps, None))
+    ln_pm     = np.log(np.clip(pd.to_numeric(df.get("PM_Vol_M"), errors="coerce").values, eps, None))
+    ln_pm_dol = np.log(np.clip(pd.to_numeric(df.get("PM_$Vol_M$"), errors="coerce").values, eps, None))
+    ln_fr     = np.log(np.clip(pd.to_numeric(df.get("FR_x"), errors="coerce").values, eps, None))
+    ln_float  = np.log(np.clip(pd.to_numeric(float_series, errors="coerce").values, eps, None))
+    maxpullpm = pd.to_numeric(df.get("Max_Pull_PM_%"), errors="coerce").values
+    ln_rvolpm = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum"), errors="coerce").values, eps, None))
+    pmmc      = pd.to_numeric(df.get("PM$Vol/MC_%"), errors="coerce").values
+    catalyst  = pd.to_numeric(df.get("Catalyst"), errors="coerce").fillna(0.0).clip(0,1).values
+
+    feats = [
+        ("ln_mcap_pmmax",  ln_mcap),
+        ("ln_gapf",        ln_gapf),
+        ("ln_atr",         ln_atr),
+        ("ln_pm",          ln_pm),
+        ("ln_pm_dol",      ln_pm_dol),
+        ("ln_fr",          ln_fr),
+        ("catalyst",       catalyst),
+        ("ln_float_pmmax", ln_float),
+        ("maxpullpm",      maxpullpm),     # linear %
+        ("ln_rvolmaxpm",   ln_rvolpm),
+        ("pm_dol_over_mc", pmmc),          # linear %
+    ]
+    X = np.column_stack([arr for _, arr in feats])
+    mask = y_mask & np.isfinite(X).all(axis=1)
+    X = X[mask]; y = y[mask]
+    if X.shape[0] < 50:
+        return {}
+
+    # Standardize
+    mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0] = 1.0
+    Xs = (X - mu) / sd
+
+    # Logistic regression with L2 via gradient descent; CV on lambda
+    folds = _kfold_indices(len(y), k=min(5, max(2, len(y)//10)), seed=42)
+    lam_grid = np.geomspace(1e-4, 1.0, 12)  # L2 strength
+    def _fit_logit(Xtr, ytr, lam, lr=0.05, iters=4000):
+        n, p = Xtr.shape
+        w = np.zeros(p); b = 0.0
+        for _ in range(iters):
+            z = Xtr @ w + b
+            p_hat = _sigmoid(z)
+            # gradients (add L2 on w only)
+            grad_w = (Xtr.T @ (p_hat - ytr))/n + lam * w
+            grad_b = np.mean(p_hat - ytr)
+            w -= lr * grad_w
+            b -= lr * grad_b
+        return w, b
+
+    def _logloss(Xt, yt, w, b, lam):
+        z = Xt @ w + b
+        p = _sigmoid(z)
+        eps2 = 1e-9
+        ll = -np.mean(yt*np.log(p+eps2) + (1-yt)*np.log(1-p+eps2)) + 0.5*lam*np.sum(w*w)
+        return ll
+
+    cv_scores = []
+    for lam in lam_grid:
+        errs = []
+        for vi in range(len(folds)):
+            te = folds[vi]; tr = np.hstack([folds[j] for j in range(len(folds)) if j!=vi])
+            w,b = _fit_logit(Xs[tr], y[tr], lam)
+            errs.append(_logloss(Xs[te], y[te], w, b, lam))
+        cv_scores.append(np.mean(errs))
+    lam_best = float(lam_grid[int(np.argmin(cv_scores))])
+
+    w,b = _fit_logit(Xs, y, lam_best, lr=0.05, iters=6000)
+
+    return {
+        "feat_order": [nm for nm,_ in feats],
+        "mu": mu.tolist(),
+        "sd": sd.tolist(),
+        "w": w.astype(float).tolist(),
+        "b": float(b),
+        "eps": eps,
+    }
+
+def predict_ft_prob(row: dict, model: dict) -> float:
+    """Return P(FT=1) using the logistic model."""
+    if not model or "w" not in model: return np.nan
+    eps = float(model.get("eps", 1e-6))
+    def safe_log(v):
+        v = float(v) if v is not None else np.nan
+        return np.log(np.clip(v, eps, None)) if np.isfinite(v) else np.nan
+
+    # Map features same as training
+    ln_mcap   = safe_log(row.get("MC_PM_Max_M") or row.get("MarketCap_M$"))
+    ln_gapf   = np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + eps, eps, None)) if row.get("Gap_%") is not None else np.nan
+    ln_atr    = safe_log(row.get("ATR_$"))
+    ln_pm     = safe_log(row.get("PM_Vol_M"))
+    ln_pm_dol = safe_log(row.get("PM_$Vol_M$"))
+    ln_fr     = safe_log(row.get("FR_x"))
+    ln_float  = safe_log(row.get("Float_PM_Max_M") or row.get("Float_M"))
+    maxpullpm = float(row.get("Max_Pull_PM_%")) if row.get("Max_Pull_PM_%") is not None else np.nan
+    ln_rvolpm = safe_log(row.get("RVOL_Max_PM_cum"))
+    pmmc      = float(row.get("PM$Vol/MC_%")) if row.get("PM$Vol/MC_%") is not None else np.nan
+    catalyst  = 1.0 if (str(row.get("CatalystYN","No")).lower()=="yes" or float(row.get("Catalyst",0))>=0.5) else 0.0
+
+    feat_map = {
+        "ln_mcap_pmmax":  ln_mcap,
+        "ln_gapf":        ln_gapf,
+        "ln_atr":         ln_atr,
+        "ln_pm":          ln_pm,
+        "ln_pm_dol":      ln_pm_dol,
+        "ln_fr":          ln_fr,
+        "catalyst":       catalyst,
+        "ln_float_pmmax": ln_float,
+        "maxpullpm":      maxpullpm,
+        "ln_rvolmaxpm":   ln_rvolpm,
+        "pm_dol_over_mc": pmmc,
+    }
+    x = np.array([feat_map[nm] for nm in model["feat_order"]], dtype=float)
+    if not np.isfinite(x).all(): return np.nan
+    mu = np.array(model["mu"], dtype=float); sd = np.array(model["sd"], dtype=float); sd[sd==0]=1.0
+    xs = (x - mu) / sd
+    z = float(np.dot(xs, np.array(model["w"], dtype=float)) + model["b"])
+    return float(_sigmoid(z))
+    
 # ============================== Upload DB → Build Summaries & Train ==============================
 st.subheader("Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
@@ -505,6 +651,10 @@ if build_btn:
                     else:
                         st.warning("Training skipped (insufficient or incompatible data). Summaries built; predictions disabled.")
                     do_rerun()
+
+                    # Train FT logistic model (for regression FT mode)
+                    ft_logit = train_ft_logit(df)
+                    st.session_state["ft_logit"] = ft_logit or {}
 
         except Exception as e:
             st.error("Loading/processing failed.")
@@ -657,6 +807,20 @@ with tcol_sel:
     )
 
 # ============================== Alignment (DataTables child-rows) ==============================
+# ============================== FT model toggle (drives the blue/red bars) ==============================
+ft_mode = st.radio(
+    "FT model",
+    ["Median + MAD voting", "Mean + SD voting", "Regression (logit)"],
+    index={"robust":0, "classic":1}.get(st.session_state.get("view_mode","robust"), 0),  # default aligns with your current view
+    horizontal=True
+)
+# Keep your existing view_mode for centers/spreads used in child-rows
+if ft_mode.startswith("Median"):
+    st.session_state["view_mode"] = "robust"
+elif ft_mode.startswith("Mean"):
+    st.session_state["view_mode"] = "classic"
+st.session_state["ft_mode"] = "regression" if ft_mode.startswith("Regression") else ("robust" if ft_mode.startswith("Median") else "classic")
+
 st.markdown("### Alignment")
 
 # Choose which center/spread tables feed the alignment (flip)
@@ -724,10 +888,23 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
     for row in st.session_state.rows:
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
-        counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
-        if not counts: continue
-
-        summary_rows.append({"Ticker": tkr, "FT1_val": counts.get("FT1_pct", 0.0), "FT0_val": counts.get("FT0_pct", 0.0)})
+        ft_mode_sel = st.session_state.get("ft_mode", "robust")
+        if ft_mode_sel == "regression":
+            # Use logistic probability for bars
+            p = predict_ft_prob(stock, st.session_state.get("ft_logit", {}))
+            if not np.isfinite(p): 
+                # Fallback to voting if regression can't score
+                counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
+                ft1_val = counts.get("FT1_pct", 0.0); ft0_val = counts.get("FT0_pct", 0.0)
+            else:
+                ft1_val = round(100.0 * np.clip(p, 0.0, 1.0), 0)
+                ft0_val = 100.0 - ft1_val
+        else:
+            # Voting (robust/classic depending on models_tbl passed in)
+            counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
+            ft1_val = counts.get("FT1_pct", 0.0); ft0_val = counts.get("FT0_pct", 0.0)
+        
+        summary_rows.append({"Ticker": tkr, "FT1_val": ft1_val, "FT0_val": ft0_val})
 
         drows_grouped = []
         for grp_label, grp_vars in detail_order:
