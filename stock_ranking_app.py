@@ -75,29 +75,27 @@ if "models" not in st.session_state: st.session_state.models = {}  # {"models_tb
 if "lassoA" not in st.session_state: st.session_state.lassoA = {}  # {"terms":[...], "betas":..., "b0":..., "eps":1e-6}
 
 # ============================== Core & Moderate sets ==============================
-# NEW core vars: Max Pull PM (%), RVOL Max PM (cum)
+# CORE (legacy RVOL removed). New PM features added.
 VAR_CORE = [
     "Gap_%",
-    "RVOL",
     "FR_x",
     "PM$Vol/MC_%",
     "Catalyst",
     "PM_Vol_%",
-    "Max_Pull_PM_%",      # NEW
-    "RVOL_Max_PM_cum"     # NEW
+    "Max_Pull_PM_%",     # Premarket Max Pullback (%)
+    "RVOL_Max_PM_cum"    # Premarket Max RVOL (cum)
 ]
-# NEW moderate vars: MC PM Max (M), Float PM Max (M)
-# (We keep legacy MarketCap_M$ / Float_M for backward-compat; the new names are canonical.)
+
+# MODERATE — canonical PM-max bases + legacy fallbacks (for old files)
 VAR_MODERATE = [
-    "MC_PM_Max_M",        # NEW canonical
-    "Float_PM_Max_M",     # NEW canonical
+    "MC_PM_Max_M",       # Premarket Market Cap (M$)
+    "Float_PM_Max_M",    # Premarket Float (M)
     "PM_Vol_M",
     "PM_$Vol_M$",
     "ATR_$",
     "Daily_Vol_M",
-    # Backward-compat fallbacks if an older workbook is uploaded:
-    "MarketCap_M$",
-    "Float_M",
+    "MarketCap_M$",      # fallback
+    "Float_M",           # fallback
 ]
 VAR_ALL = VAR_CORE + VAR_MODERATE
 
@@ -119,7 +117,6 @@ def _lasso_cd_std(Xs, y, lam, max_iter=1000, tol=1e-6):
         for j in range(p):
             r_j = y - y_hat + Xs[:, j] * w[j]
             rho = (Xs[:, j] @ r_j) / n
-            # soft-threshold (lambda ~ 2*alpha convention-ish)
             if   rho < -lam/2: w[j] = rho + lam/2
             elif rho >  lam/2: w[j] = rho - lam/2
             else:              w[j] = 0.0
@@ -130,34 +127,20 @@ def _lasso_cd_std(Xs, y, lam, max_iter=1000, tol=1e-6):
 
 def train_lasso_on_db(df: pd.DataFrame) -> dict:
     """
-    LASSO feature set (log domain unless noted):
+    LASSO feature set (log domain unless noted), then refit OLS on original scale:
       ln_mcap_pmmax, ln_gapf, ln_atr, ln_pm, ln_pm_dol, ln_fr, catalyst (0/1),
-      ln_float_pmmax, maxpullpm (percent, linear), ln_rvolmaxpmcum  [all optional if present]
-    Refit OLS on ORIGINAL (unstandardized) selected features.
+      ln_float_pmmax, maxpullpm (linear %), ln_rvolmaxpm
     """
     eps = 1e-6
 
-    # --- build canonical columns with graceful fallbacks ---
-    # Market cap PM max (M): prefer new, else legacy MarketCap_M$
-    mcap_series = None
-    if "MC_PM_Max_M" in df.columns:
-        mcap_series = df["MC_PM_Max_M"]
-    elif "MarketCap_M$" in df.columns:
-        mcap_series = df["MarketCap_M$"]
+    # Canonical PM max mcap/float with legacy fallbacks
+    mcap_series = df["MC_PM_Max_M"] if "MC_PM_Max_M" in df.columns else df.get("MarketCap_M$")
+    float_series = df["Float_PM_Max_M"] if "Float_PM_Max_M" in df.columns else df.get("Float_M")
 
-    # Float PM max (M): prefer new, else legacy Float_M
-    float_series = None
-    if "Float_PM_Max_M" in df.columns:
-        float_series = df["Float_PM_Max_M"]
-    elif "Float_M" in df.columns:
-        float_series = df["Float_M"]
-
-    # Required minimum to do anything meaningful
     need_min = {"ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Daily_Vol_M","Gap_%"}
     if mcap_series is None or float_series is None or not need_min.issubset(df.columns):
         return {}
 
-    # Core numeric extracts
     ln_mcap   = np.log(np.clip(pd.to_numeric(mcap_series, errors="coerce").values, eps, None))
     ln_gapf   = np.log(np.clip(pd.to_numeric(df["Gap_%"],        errors="coerce").values, 0, None) / 100.0 + eps)
     ln_atr    = np.log(np.clip(pd.to_numeric(df["ATR_$"],        errors="coerce").values, eps, None))
@@ -166,16 +149,13 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
     ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"],         errors="coerce").values, eps, None))
     y_ln      = np.log(np.clip(pd.to_numeric(df["Daily_Vol_M"],  errors="coerce").values, eps, None))
 
-    # Optional NEW features
     ln_float_pmmax = np.log(np.clip(pd.to_numeric(float_series, errors="coerce").values, eps, None))
-    maxpullpm      = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").values  # use as linear %
+    maxpullpm      = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").values
     ln_rvolmaxpm   = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum", np.nan), errors="coerce").values, eps, None))
 
-    # Catalyst binary
     catalyst_raw = df.get("Catalyst", np.nan)
     catalyst = pd.to_numeric(catalyst_raw, errors="coerce").fillna(0.0).clip(0,1).values
 
-    # Assemble with masking for NaNs later (we'll drop rows that have NaNs in used columns)
     X_parts = [
         ("ln_mcap_pmmax", ln_mcap),
         ("ln_gapf",       ln_gapf),
@@ -186,13 +166,12 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
         ("catalyst",      catalyst),
         ("ln_float_pmmax",ln_float_pmmax),
         ("maxpullpm",     maxpullpm),
-        ("ln_rvolmaxpm",  ln_rvolmaxpm)
+        ("ln_rvolmaxpm",  ln_rvolmaxpm),
     ]
 
-    # Keep only columns that have at least some finite values
     terms, cols = [], []
     for name, arr in X_parts:
-        if np.isfinite(arr).sum() >= 10:  # heuristic: at least 10 usable
+        if np.isfinite(arr).sum() >= 10:
             terms.append(name); cols.append(arr.reshape(-1,1))
     if not terms:
         return {}
@@ -203,21 +182,18 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
     if X_orig.shape[0] < 25:
         return {}
 
-    # Standardize for LASSO only
     mu = X_orig.mean(axis=0)
     sd = X_orig.std(axis=0, ddof=0); sd[sd==0] = 1.0
     Xs = (X_orig - mu) / sd
 
-    # K-fold CV over a lambda grid
-    k = 5
-    folds = _kfold_indices(len(y), k=k, seed=42)
+    folds = _kfold_indices(len(y), k=5, seed=42)
     lam_grid = np.geomspace(0.001, 1.0, 30)
     cv_mse = []
 
     for lam in lam_grid:
         errs = []
-        for vi in range(k):
-            te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(k) if j != vi])
+        for vi in range(5):
+            te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(5) if j != vi])
             Xtr, ytr = Xs[tr_idx], y[tr_idx]
             Xte, yte = Xs[te_idx], y[te_idx]
             w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1200)
@@ -226,18 +202,15 @@ def train_lasso_on_db(df: pd.DataFrame) -> dict:
         cv_mse.append(np.mean(errs))
 
     lam_best = float(lam_grid[int(np.argmin(cv_mse))])
-
-    # Fit LASSO on full standardized data at lam_best
     w_l1 = _lasso_cd_std(Xs, y, lam=lam_best, max_iter=2000)
 
     sel = np.flatnonzero(np.abs(w_l1) > 1e-8)
     if sel.size == 0:
         return {}
 
-    # Refit plain OLS on ORIGINAL (unstandardized) features with selected terms
     X_sel = X_orig[:, sel]
     X_design = np.column_stack([np.ones(X_sel.shape[0]), X_sel])
-    coef_ols, *_ = np.linalg.lstsq(X_design, y, rcond=None)  # coef_ols[0]=b0
+    coef_ols, *_ = np.linalg.lstsq(X_design, y, rcond=None)
     selected_terms = [terms[i] for i in sel]
 
     return {
@@ -257,7 +230,6 @@ def predict_predvol_m(row: dict, model: dict) -> float:
         v = float(v) if v is not None else np.nan
         return np.log(np.clip(v, eps, None)) if np.isfinite(v) else np.nan
 
-    # Map row → feature space
     ln_mcap_pmmax  = safe_log(row.get("MC_PM_Max_M") or row.get("MarketCap_M$"))
     ln_gapf        = np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + eps, eps, None)) if row.get("Gap_%") is not None else np.nan
     ln_atr         = safe_log(row.get("ATR_$"))
@@ -332,18 +304,16 @@ if build_btn:
                         dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
                 # ====== MAP NUMERIC COLUMNS (with new names + legacy fallbacks) ======
-                # PM Max market cap & float (canonical)
                 add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","mc pm max m","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m"])
                 add_num(df, "Float_PM_Max_M",   ["float pm max (m)","float pm max m","float_pm_max_m","float pm max (m shares)"])
 
-                # Legacy fallbacks (kept in df for backward-compat; not used when PM-Max present)
+                # Legacy fallbacks (kept for old workbooks)
                 add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
                 add_num(df, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
 
-                # Core/other
                 add_num(df, "Gap_%",            ["gap %","gap%","premarket gap","gap","gap_percent"])
                 add_num(df, "ATR_$",            ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
-                add_num(df, "RVOL",             ["rvol","relative volume","rvol @ bo","rvol at bo","rvol_bo"])
+                # NOTE: legacy RVOL mapping removed on purpose (we only use RVOL_Max_PM_cum)
                 add_num(df, "PM_Vol_M",         ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
                 add_num(df, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
                 add_num(df, "PM_Vol_%",         ["pm vol (%)","pm_vol_%","pm vol percent","pm volume (%)","pm_vol_percent"])
@@ -351,9 +321,9 @@ if build_btn:
 
                 # NEW: Max Pull PM (%) + RVOL Max PM (cum)
                 add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
-                add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum"])
+                add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
 
-                # Catalyst (binary)
+                # Catalyst (binary/YN/0-1)
                 cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
                 def _to_binary_local(v):
                     sv = str(v).strip().lower()
@@ -368,12 +338,10 @@ if build_btn:
                     df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
 
                 # ====== DERIVED METRICS (prefer PM-Max columns when present) ======
-                # FR_x = PM_Vol_M / Float_PM_Max_M (else Float_M)
                 float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
                 if {"PM_Vol_M", float_basis}.issubset(df.columns):
                     df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
 
-                # PM$Vol/MC_% = PM_$Vol_M$ / MC_PM_Max_M (else MarketCap_M$) * 100
                 mcap_basis = "MC_PM_Max_M" if "MC_PM_Max_M" in df.columns and df["MC_PM_Max_M"].notna().any() else "MarketCap_M$"
                 if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
                     df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
@@ -404,7 +372,6 @@ if build_btn:
                 else:
                     df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-                    # Medians/MADs limited to available vars
                     var_core = [v for v in VAR_CORE if v in df.columns]
                     var_mod  = [v for v in VAR_MODERATE if v in df.columns]
                     var_all  = var_core + var_mod
@@ -419,7 +386,6 @@ if build_btn:
                         "var_moderate": var_mod
                     }
 
-                    # Train LASSO→OLS with new candidates
                     lasso_model = train_lasso_on_db(df)
                     st.session_state.lassoA = lasso_model or {}
 
@@ -482,20 +448,21 @@ st.markdown("---")
 st.subheader("Add Stock")
 
 with st.form("add_form", clear_on_submit=True):
-    c1, c2, c3 = st.columns([1.2, 1.2, 1.0])
+    # Two columns of inputs, third just Catalyst
+    c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
 
     with c1:
-        ticker   = st.text_input("Ticker", "").strip().upper()
-        mc_pmmax = st.number_input("Premarket Market Cap (M)", 0.0, step=0.01, format="%.2f")      # RENAMED
-        float_pm = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")   # RENAMED
-        gap_pct  = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")               # real %
-        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.1, format="%.1f")  # NEW CORE
+        ticker      = st.text_input("Ticker", "").strip().upper()
+        mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
+        float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
+        gap_pct     = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")
+        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.1, format="%.1f")
 
     with c2:
-        atr_usd   = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
-        pm_vol    = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
-        pm_dol    = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
-        rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f") # NEW CORE
+        atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
+        pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
+        pm_dol      = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
+        rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
 
     with c3:
         catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
@@ -503,35 +470,42 @@ with st.form("add_form", clear_on_submit=True):
     submitted = st.form_submit_button("Add to Table", use_container_width=True)
 
 if submitted and ticker:
-    # Derived metrics using PM-Max bases
-    fr = (pm_vol / float_pm) if float_pm > 0 else 0.0
+    # Derived using PM-Max bases
+    fr   = (pm_vol / float_pm) if float_pm > 0 else 0.0
     pmmc = (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else 0.0
 
     row = {
         "Ticker": ticker,
-        "MC_PM_Max_M": mc_pmmax,           # NEW canonical
-        "Float_PM_Max_M": float_pm,        # NEW canonical
+
+        # Canonical PM-max fields
+        "MC_PM_Max_M": mc_pmmax,
+        "Float_PM_Max_M": float_pm,
+
+        # Core/moderate basics
         "Gap_%": gap_pct,
         "ATR_$": atr_usd,
         "PM_Vol_M": pm_vol,
         "PM_$Vol_M$": pm_dol,
-        "FR_x": fr,                        # uses Float_PM_Max_M
-        "PM$Vol/MC_%": pmmc,               # uses MC_PM_Max_M
-        "Max_Pull_PM_%": max_pull_pm,      # NEW core
-        "RVOL_Max_PM_cum": rvol_pm_cum,    # NEW core
+
+        # Derived
+        "FR_x": fr,                 # PM_Vol_M / Float_PM_Max_M
+        "PM$Vol/MC_%": pmmc,        # PM_$Vol_M$ / MC_PM_Max_M * 100
+
+        # New CORE replacements
+        "Max_Pull_PM_%": max_pull_pm,
+        "RVOL_Max_PM_cum": rvol_pm_cum,
+
+        # Catalyst (binary + label)
         "CatalystYN": catalyst_yn,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
 
-    # Predict Daily Volume (M) for this stock (using updated LASSO→OLS trained on DB)
+    # Predict Daily Volume (M) with the updated model (uses ln_rvolmaxpm; no legacy RVOL)
     pred = predict_predvol_m(row, st.session_state.get("lassoA", {}))
     row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
 
-    # Compute PM_Vol_% = PM_Vol_M / PredVol_M × 100 (if PredVol_M available)
-    if np.isfinite(row.get("PredVol_M", np.nan)) and row["PredVol_M"] > 0:
-        row["PM_Vol_%"] = (row["PM_Vol_M"] / row["PredVol_M"]) * 100.0
-    else:
-        row["PM_Vol_%"] = np.nan
+    # PM_Vol_% = PM_Vol_M / PredVol_M × 100
+    row["PM_Vol_%"] = (row["PM_Vol_M"] / row["PredVol_M"]) * 100.0 if np.isfinite(row.get("PredVol_M", np.nan)) and row["PredVol_M"] > 0 else np.nan
 
     st.session_state.rows.append(row)
     st.session_state.last = row
@@ -605,7 +579,7 @@ def _compute_alignment_counts_weighted(
             return
         d1 = abs(xv - med["FT=1"]); d0 = abs(xv - med["FT=0"])
         if abs(d1 - d0) <= TOL:
-            return  # ignore ties
+            return  # tie: no vote
         if d1 < d0:
             counts["FT=1"] += weight
         else:
@@ -654,7 +628,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         ft0_val = counts.get("FT0_pct", 0.0)
         summary_rows.append({"Ticker": tkr, "FT1_val": ft1_val, "FT0_val": ft0_val})
 
-        # ---- child details ----
+        # Child details
         drows_grouped = []
         for grp_label, grp_vars in detail_order:
             drows_grouped.append({"__group__": grp_label})
