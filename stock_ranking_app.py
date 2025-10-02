@@ -602,29 +602,52 @@ with tcol_sel:
 
 # ============================== Controls for Alignment (moved here) ==============================
 models_data = st.session_state.models
+
+# one-time defaults
+if "view_mode" not in st.session_state:
+    st.session_state.view_mode = "robust"   # "robust" or "classic"
+if "sig_thresh" not in st.session_state:
+    st.session_state.sig_thresh = 3.0
+
 if models_data and isinstance(models_data, dict) and not models_data.get("med_tbl", pd.DataFrame()).empty:
+    # map labels <-> internal values
+    _opts = {
+        "Median + MAD (robust)": "robust",
+        "Mean + SD (classic)": "classic",
+    }
+    _labels = list(_opts.keys())
+    _default_label = next(lbl for lbl, val in _opts.items() if val == st.session_state.view_mode)
+
     cA, cB = st.columns([1.6, 1])
     with cA:
-        view_mode_choice = st.radio(
+        # store the chosen label in a dedicated key; don't overwrite view_mode yet
+        st.radio(
             "Center/Spread view",
-            ["Median + MAD (robust)", "Mean + SD (classic)"],
-            index=0 if st.session_state.get("view_mode","robust")=="robust" else 1,
-            horizontal=True
+            _labels,
+            index=_labels.index(_default_label),
+            horizontal=True,
+            key="view_choice"
         )
-        st.session_state["view_mode"] = "robust" if view_mode_choice.startswith("Median") else "classic"
     with cB:
-        sig_thresh = st.slider(
+        # bind the slider directly to session_state with a key
+        st.slider(
             "Significance threshold (σ)",
-            0.0, 5.0, float(st.session_state.get("sig_thresh", 3.0)), 0.1,
+            0.0, 5.0,
+            value=float(st.session_state.sig_thresh),
+            step=0.1,
+            key="sig_thresh",
             help="Highlight variables where |Δ| normalized by (spread₁ + spread₀) exceeds σ."
         )
-        st.session_state["sig_thresh"] = float(sig_thresh)
+
+    # derive the internal value from the chosen label WITHOUT resetting the widget
+    st.session_state.view_mode = _opts[st.session_state.view_choice]
 
 # ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
 
 # Choose which center/spread tables feed the alignment (flip)
-view_mode = st.session_state.get("view_mode", "robust")
+view_mode = st.session_state.view_mode
+SIG_THR   = float(st.session_state.sig_thresh)
 if models_data:
     if view_mode == "robust":
         models_tbl = models_data.get("med_tbl", pd.DataFrame())
@@ -637,7 +660,6 @@ else:
 
 var_core = (models_data or {}).get("var_core", [])
 var_mod  = (models_data or {}).get("var_moderate", [])
-SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
 
 def _compute_alignment_counts_weighted(
     stock_row: dict,
@@ -726,8 +748,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                     s1_val = (abs(d1) / denom) if d1 is not None else np.nan
                     s0_val = (abs(d0) / denom) if d0 is not None else np.nan
 
-                sig1 = (not pd.isna(s1_val)) and (s1_val >= st.session_state.get("sig_thresh", 3.0))
-                sig0 = (not pd.isna(s0_val)) and (s0_val >= st.session_state.get("sig_thresh", 3.0))
+                sig1 = (not pd.isna(s1_val)) and (s1_val >= SIG_THR)
+                sig0 = (not pd.isna(s0_val)) and (s0_val >= SIG_THR)
                 significant = sig1 or sig0
 
                 # dominant direction (larger |Δ|)
