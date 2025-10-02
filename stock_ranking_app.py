@@ -531,6 +531,9 @@ if models_data and isinstance(models_data, dict) and not models_data.get("med_tb
             center_tbl = models_data["mean_tbl"]
             spread_tbl = models_data["sd_tbl"]
 
+        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
+                               help="Highlight rows where |FT=1 − FT=0| / (Spread₁ + Spread₀) ≥ σ")
+        st.session_state["sig_thresh"] = float(sig_thresh)
         st.session_state["view_mode"] = "robust" if view_mode.startswith("Median") else "classic"
 
         def show_grouped_table(title, vars_list):
@@ -655,26 +658,6 @@ with tcol_sel:
 
 # ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
-
-# (Place just above the "Choose which center/spread..." block)
-vm_local = st.radio(
-    "Alignment view",
-    ["Median + MAD (robust)", "Mean + SD (classic)"],
-    index=0 if st.session_state.get("view_mode","robust")=="robust" else 1,
-    horizontal=True
-)
-st.session_state["view_mode"] = "robust" if vm_local.startswith("Median") else "classic"
-
-# Global significance threshold slider
-sigma_val = st.slider(
-    "Significance threshold (σ)",
-    0.0, 5.0,
-    float(st.session_state.get("sig_thresh", 3.0)),
-    0.1,
-    help="Highlight rows where |Δ| / (Spread₁ + Spread₀) ≥ σ"
-)
-st.session_state["sig_thresh"] = float(sigma_val)
-SIG_THR = float(sigma_val)
 
 # Choose which center/spread tables feed the alignment (flip)
 view_mode = st.session_state.get("view_mode", "robust")
