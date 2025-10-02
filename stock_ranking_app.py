@@ -659,6 +659,15 @@ with tcol_sel:
 # ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
 
+# (Place just above the "Choose which center/spread..." block)
+vm_local = st.radio(
+    "Alignment view",
+    ["Median + MAD (robust)", "Mean + SD (classic)"],
+    index=0 if st.session_state.get("view_mode","robust")=="robust" else 1,
+    horizontal=True
+)
+st.session_state["view_mode"] = "robust" if vm_local.startswith("Median") else "classic"
+
 # Choose which center/spread tables feed the alignment (flip)
 view_mode = st.session_state.get("view_mode", "robust")
 if models_data:
