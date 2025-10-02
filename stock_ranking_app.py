@@ -850,7 +850,6 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 s0 = _sig(d0, float(m0) if pd.notna(m0) else np.nan)
                 
                 is_core = v in var_core
-                # Now flag significance for BOTH Core and Moderate
                 sig1 = (not pd.isna(s1)) and (s1 >= SIG_THR)
                 sig0 = (not pd.isna(s0)) and (s0 >= SIG_THR)
 
