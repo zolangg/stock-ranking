@@ -117,7 +117,7 @@ if "last" not in st.session_state: st.session_state.last = {}
 if "models" not in st.session_state: st.session_state.models = {}
 if "lassoA" not in st.session_state: st.session_state.lassoA = {}   # ratio model + winsor + calibrator
 if "sig_thresh" not in st.session_state: st.session_state.sig_thresh = 3.0
-if "view_mode" not in st.session_state: st.session_state.view_mode = "robust"
+if "view_mode" not in st.session_state: st.session_state.view_mode = "robust"  # "robust" or "classic"
 
 # ============================== Core & Moderate sets ==============================
 VAR_CORE = [
@@ -600,36 +600,24 @@ with tcol_sel:
         label_visibility="collapsed"
     )
 
-# ============================== Controls for Alignment (moved here) ==============================
+# ============================== Controls for Alignment (moved here; radio fixed) ==============================
 models_data = st.session_state.models
-
-# one-time defaults
-if "view_mode" not in st.session_state:
-    st.session_state.view_mode = "robust"   # "robust" or "classic"
-if "sig_thresh" not in st.session_state:
-    st.session_state.sig_thresh = 3.0
-
 if models_data and isinstance(models_data, dict) and not models_data.get("med_tbl", pd.DataFrame()).empty:
-    # map labels <-> internal values
-    _opts = {
-        "Median + MAD (robust)": "robust",
-        "Mean + SD (classic)": "classic",
-    }
-    _labels = list(_opts.keys())
-    _default_label = next(lbl for lbl, val in _opts.items() if val == st.session_state.view_mode)
-
     cA, cB = st.columns([1.6, 1])
     with cA:
-        # store the chosen label in a dedicated key; don't overwrite view_mode yet
+        # Bind directly to session_state.view_mode, show pretty labels
+        _view_opts = ["robust", "classic"]
+        def _fmt_view(v: str) -> str:
+            return "Median + MAD (robust)" if v == "robust" else "Mean + SD (classic)"
         st.radio(
             "Center/Spread view",
-            _labels,
-            index=_labels.index(_default_label),
+            _view_opts,
+            index=_view_opts.index(st.session_state.get("view_mode", "robust")),
+            key="view_mode",
+            format_func=_fmt_view,
             horizontal=True,
-            key="view_choice"
         )
     with cB:
-        # bind the slider directly to session_state with a key
         st.slider(
             "Significance threshold (σ)",
             0.0, 5.0,
@@ -639,15 +627,14 @@ if models_data and isinstance(models_data, dict) and not models_data.get("med_tb
             help="Highlight variables where |Δ| normalized by (spread₁ + spread₀) exceeds σ."
         )
 
-    # derive the internal value from the chosen label WITHOUT resetting the widget
-    st.session_state.view_mode = _opts[st.session_state.view_choice]
+# Read once for downstream logic
+view_mode = st.session_state.view_mode
+SIG_THR   = float(st.session_state.sig_thresh)
 
 # ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
 
 # Choose which center/spread tables feed the alignment (flip)
-view_mode = st.session_state.view_mode
-SIG_THR   = float(st.session_state.sig_thresh)
 if models_data:
     if view_mode == "robust":
         models_tbl = models_data.get("med_tbl", pd.DataFrame())
