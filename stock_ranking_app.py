@@ -545,67 +545,74 @@ if build_btn:
 models_data = st.session_state.models
 if models_data and isinstance(models_data, dict) and (not models_data.get("ft_med_tbl", pd.DataFrame()).empty
                                                      or not models_data.get("t10_med_tbl", pd.DataFrame()).empty):
-    with st.expander("Group summaries — FT vs Top 10% (flip center/spread)", expanded=False):
-        # Map stable internal keys <-> labels
-        OPTIONS = [
-            ("ft_robust", "FT: Median + MAD"),
-            ("ft_classic","FT: Mean + SD"),
-            ("t10_robust","Top 10%: Median + MAD"),
-            ("t10_classic","Top 10%: Mean + SD"),
-        ]
-        key2label = {k: lbl for k, lbl in OPTIONS}
-        label2key = {lbl: k for k, lbl in OPTIONS}
+with st.expander("Group summaries — FT vs Top 10% (flip center/spread)", expanded=False):
+    # 1) Define options and persistent “view key” ↔ label maps
+    OPTIONS = [
+        ("ft_robust", "FT: Median + MAD"),
+        ("ft_classic","FT: Mean + SD"),
+        ("t10_robust","Top 10%: Median + MAD"),
+        ("t10_classic","Top 10%: Mean + SD"),
+    ]
+    key2label = {k: lbl for k, lbl in OPTIONS}
+    label2key = {lbl: k for k, lbl in OPTIONS}
+    labels     = [lbl for _, lbl in OPTIONS]
 
-        # Ensure a default only once
-        if "view_mode_key" not in st.session_state:
-            st.session_state.view_mode_key = "ft_robust"
+    # 2) One-time init of your persistent logical key
+    if "view_mode_key" not in st.session_state:
+        st.session_state.view_mode_key = "ft_robust"  # default once
 
-        # Compute the radio index from the persisted key
-        current_key = st.session_state.view_mode_key
-        try:
-            current_index = [k for k, _ in OPTIONS].index(current_key)
-        except ValueError:
-            current_index = 0
+    # 3) One-time init of the widget’s own state (don’t keep resetting it!)
+    if "view_choice_radio" not in st.session_state:
+        # seed the widget value from your persistent logical key
+        st.session_state.view_choice_radio = key2label[st.session_state.view_mode_key]
 
-        # Give the radio a STABLE key so Streamlit binds it to state
-        chosen_label = st.radio(
-            "View",
-            options=[lbl for _, lbl in OPTIONS],
-            index=current_index,
-            horizontal=True,
-            key="view_choice_radio",   # <-- stable widget key
-        )
-        chosen_key = label2key[chosen_label]
+    # 4) Compute index ONLY from the already-saved widget value (not from scratch)
+    try:
+        idx = labels.index(st.session_state.view_choice_radio)
+    except ValueError:
+        idx = 0
 
-        # Persist only if it actually changed
-        if chosen_key != st.session_state.view_mode_key:
-            st.session_state.view_mode_key = chosen_key
+    # 5) Give the radio a unique, stable key; do not change its key later
+    chosen_label = st.radio(
+        "View",
+        options=labels,
+        index=idx,                     # safe now; aligns with widget value we control
+        horizontal=True,
+        key="view_choice_radio",       # stable widget key
+    )
 
-        var_core = models_data.get("var_core", [])
-        var_mod  = models_data.get("var_moderate", [])
+    # 6) Update the persistent logical key only if the user changed the widget
+    chosen_key = label2key[chosen_label]
+    if chosen_key != st.session_state.view_mode_key:
+        st.session_state.view_mode_key = chosen_key
 
-        # Pick tables per selection
-        if chosen_key == "ft_robust":
-            center_tbl = models_data["ft_med_tbl"];  spread_tbl = models_data["ft_mad_tbl"]
-        elif chosen_key == "ft_classic":
-            center_tbl = models_data["ft_mean_tbl"]; spread_tbl = models_data["ft_sd_tbl"]
-        elif chosen_key == "t10_robust":
-            center_tbl = models_data["t10_med_tbl"]; spread_tbl = models_data["t10_mad_tbl"]
-        else:  # "t10_classic"
-            center_tbl = models_data["t10_mean_tbl"]; spread_tbl = models_data["t10_sd_tbl"]
+    # 7) Use the chosen_key to pick the center/spread tables
+    models = st.session_state.models
+    if chosen_key == "ft_robust":
+        center_tbl = models["ft_med_tbl"];  spread_tbl = models["ft_mad_tbl"]
+    elif chosen_key == "ft_classic":
+        center_tbl = models["ft_mean_tbl"]; spread_tbl = models["ft_sd_tbl"]
+    elif chosen_key == "t10_robust":
+        center_tbl = models["t10_med_tbl"]; spread_tbl = models["t10_mad_tbl"]
+    else:  # "t10_classic"
+        center_tbl = models["t10_mean_tbl"]; spread_tbl = models["t10_sd_tbl"]
 
-        # Save current basis for Alignment
-        st.session_state["models_tbl_current"] = center_tbl
-        st.session_state["spread_tbl_current"] = spread_tbl
+    # 8) Save basis for Alignment (don’t overwrite elsewhere)
+    st.session_state["models_tbl_current"] = center_tbl
+    st.session_state["spread_tbl_current"] = spread_tbl
 
-        # Give the slider a stable key too (prevents jumps)
-        sig_thresh = st.slider(
-            "Significance threshold (σ)",
-            0.0, 5.0, st.session_state.get("sig_thresh", 3.0), 0.1,
-            key="sig_thresh_slider",
-            help="Highlight rows where |GroupA − GroupB| / (SpreadA + SpreadB) ≥ σ"
-        )
-        st.session_state["sig_thresh"] = float(sig_thresh)
+    # 9) Slider should also have a stable key; don’t reset its default each run
+    if "sig_thresh" not in st.session_state:
+        st.session_state["sig_thresh"] = 3.0
+    sig_thresh = st.slider(
+        "Significance threshold (σ)",
+        0.0, 5.0, st.session_state["sig_thresh"], 0.1,
+        key="sig_thresh_slider",
+        help="Highlight rows where |GroupA − GroupB| / (SpreadA + SpreadB) ≥ σ"
+    )
+    st.session_state["sig_thresh"] = float(sig_thresh)
+
+    # … then render your Core/Moderate tables as usual using center_tbl/spread_tbl
 
         # Utility to draw group tables for core/moderate
         def show_grouped_table(title, vars_list, center_tbl, spread_tbl):
