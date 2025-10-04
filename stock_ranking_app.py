@@ -93,9 +93,9 @@ def _pav_isotonic(x: np.ndarray, y: np.ndarray):
             new_n = level_n[i] + level_n[i+1]
             level_y[i] = new_y
             level_n[i] = new_n
+            xs = np.delete(xs, i+1)
             level_y = np.delete(level_y, i+1)
             level_n = np.delete(level_n, i+1)
-            xs = np.delete(xs, i+1)
             if i > 0: i -= 1
         else:
             i += 1
@@ -116,7 +116,7 @@ if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "models" not in st.session_state: st.session_state.models = {}
 if "lassoA" not in st.session_state: st.session_state.lassoA = {}   # ratio model + winsor + calibrator
-if "view_mode_basis" not in st.session_state: st.session_state.view_mode_basis = "robust"  # tracks last center/spread basis used by alignment
+if "view_mode_key" not in st.session_state: st.session_state.view_mode_key = "ft_robust"
 
 # ============================== Core & Moderate sets ==============================
 VAR_CORE = [
@@ -166,6 +166,10 @@ def _lasso_cd_std(Xs, y, lam, max_iter=1200, tol=1e-6):
 
 # ============================== Train ratio model (winsor + isotonic) ==============================
 def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
+    """
+    Target: ln(multiplier) where multiplier = max(Daily_Vol_M / PM_Vol_M, 1).
+    Winsorize selected linear features and target multiplier on TRAIN only.
+    """
     eps = 1e-6
 
     mcap_series  = df["MC_PM_Max_M"]    if "MC_PM_Max_M"    in df.columns else df.get("MarketCap_M$")
@@ -206,9 +210,9 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         ("ln_fr",          ln_fr),
         ("catalyst",       catalyst),
         ("ln_float_pmmax", ln_float_pmmax),
-        ("maxpullpm",      maxpullpm),
+        ("maxpullpm",      maxpullpm),        # linear %
         ("ln_rvolmaxpm",   ln_rvolmaxpm),
-        ("pm_dol_over_mc", pm_dol_over_mc),
+        ("pm_dol_over_mc", pm_dol_over_mc),  # linear %
     ]
     cols = [arr.reshape(-1,1) for _, arr in feats]
     X_all = np.hstack(cols)
@@ -222,7 +226,8 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     n = X_all.shape[0]
     split = max(10, int(n * 0.8))
     X_tr, X_va = X_all[:split], X_all[split:]
-    y_tr, y_va = y_ln[:split],   y_ln[:split][0:0] + y_ln[split:]  # keep shape; just clearer
+    y_tr = y_ln[:split]
+    y_va = y_ln[split:]   # fixed clean split
 
     winsor_bounds = {}
     name_to_idx = {name:i for i,(name,_) in enumerate(feats)}
@@ -234,14 +239,17 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         X_tr[:, col_idx] = _apply_bounds(arr_tr, lo, hi)
         X_va[:, col_idx] = _apply_bounds(X_va[:, col_idx], lo, hi)
 
+    # Winsorize linear (%) features
     for nm in ["maxpullpm", "pm_dol_over_mc"]:
         if nm in name_to_idx:
             _winsor_feature(name_to_idx[nm])
 
+    # Target multiplier winsorization (linear space)
     m_lo, m_hi = _compute_bounds(np.exp(y_tr))
     mult_tr_w = _apply_bounds(np.exp(y_tr), m_lo, m_hi)
     y_tr = np.log(mult_tr_w)
 
+    # Standardize TRAIN for LASSO
     mu = X_tr.mean(axis=0); sd = X_tr.std(axis=0, ddof=0); sd[sd==0] = 1.0
     Xs_tr = (X_tr - mu) / sd
 
@@ -264,6 +272,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     if sel.size == 0:
         return {}
 
+    # Refit OLS on TRAIN in original winsorized feature space
     Xtr_sel = X_tr[:, sel]
     X_design = np.column_stack([np.ones(Xtr_sel.shape[0]), Xtr_sel])
     coef_ols, *_ = np.linalg.lstsq(X_design, y_tr, rcond=None)
@@ -280,7 +289,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         "winsor_bounds": {k: (float(v[0]) if np.isfinite(v[0]) else np.nan,
                               float(v[1]) if np.isfinite(v[1]) else np.nan)
                           for k, v in winsor_bounds.items()},
-        "iso_bx": [1.0], "iso_by": [1.0],  # stub if you later re-enable calibration split
+        "iso_bx": [1.0], "iso_by": [1.0],
         "feat_order": [nm for nm,_ in feats],
         "mult_bounds": (float(m_lo) if np.isfinite(m_lo) else np.nan,
                         float(m_hi) if np.isfinite(m_hi) else np.nan)
@@ -357,22 +366,33 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     return float(PM * cal_mult)
 
 # ============================== Utility ==============================
-def _summaries_for(df_in: pd.DataFrame, var_all: list[str]) -> dict:
+def _summaries_for(df_in: pd.DataFrame, var_all: list[str], group_col: str, labels_map=None) -> dict:
+    """Build center/spread tables for a given group column; optionally relabel columns."""
     avail = [v for v in var_all if v in df_in.columns]
-    med_tbl  = df_in.groupby("Group")[avail].median(numeric_only=True).T
-    mean_tbl = df_in.groupby("Group")[avail].mean(numeric_only=True).T
-    mad_tbl  = df_in.groupby("Group")[avail].apply(lambda g: g.apply(_mad)).T
-    sd_tbl   = df_in.groupby("Group")[avail].std(numeric_only=True).T
+    if not avail: 
+        return {"med_tbl": pd.DataFrame(), "mad_tbl": pd.DataFrame(),
+                "mean_tbl": pd.DataFrame(), "sd_tbl": pd.DataFrame(), "avail": []}
+    g = df_in.groupby(group_col)[avail]
+    med_tbl  = g.median(numeric_only=True).T
+    mean_tbl = g.mean(numeric_only=True).T
+    mad_tbl  = df_in.groupby(group_col)[avail].apply(lambda gg: gg.apply(_mad)).T
+    sd_tbl   = g.std(numeric_only=True).T
+    if labels_map is not None:
+        med_tbl  = med_tbl.rename(columns=labels_map)
+        mean_tbl = mean_tbl.rename(columns=labels_map)
+        mad_tbl  = mad_tbl.rename(columns=labels_map)
+        sd_tbl   = sd_tbl.rename(columns=labels_map)
     return {"med_tbl": med_tbl, "mad_tbl": mad_tbl, "mean_tbl": mean_tbl, "sd_tbl": sd_tbl, "avail": avail}
 
-def _make_pmh_bins(series_pct: pd.Series) -> tuple[pd.Series, list[str]]:
-    max_val = float(np.nanmax(series_pct.values)) if series_pct.notna().any() else 0.0
-    base_edges = [0, 10, 25, 50, 100, 200, 500, 1000]
-    last_edge = max_val + 1 if max_val >= base_edges[-1] else base_edges[-1]
-    edges = base_edges + ([last_edge] if last_edge > base_edges[-1] else [])
-    labels = [f"{edges[i]}-{edges[i+1]}%" for i in range(len(edges)-1)]
-    sbin = pd.cut(series_pct, bins=edges, labels=labels, include_lowest=True, right=True)
-    return sbin, labels
+def _make_top10_flag(series_pct: pd.Series) -> tuple[pd.Series, float]:
+    """Return boolean Top10 flag and threshold (percentile=90) on a % series."""
+    s = pd.to_numeric(series_pct, errors="coerce")
+    mask = s.notna()
+    if not mask.any():
+        return pd.Series(False, index=series_pct.index), np.nan
+    thr = float(np.nanpercentile(s[mask].values, 90))
+    flag = (s >= thr) & mask
+    return flag, thr
 
 # ============================== Upload DB → Build Summaries & Train ==============================
 st.subheader("Upload Database")
@@ -395,7 +415,7 @@ if build_btn:
             if col_group is None:
                 for c in raw.columns:
                     vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
-                    if vals.isin(["0","1","true","false","yes","no"]).all():
+                    if len(vals) and vals.isin(["0","1","true","false","yes","no"]).all():
                         col_group = c
                         break
 
@@ -465,158 +485,133 @@ if build_btn:
                 if df.empty or df["FT01"].nunique() < 2:
                     st.error("Could not find both FT=1 and FT=0 rows in the DB. Please check the group column.")
                 else:
-                    df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
+                    df["GroupFT"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-                    # ---------- Max Push Daily (%) scaling + PMH bins ----------
-                    pmh_push_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
-                    pmh_counts_tbl = pd.DataFrame()
-                    pmh_winners_tbl = pd.DataFrame()
-                    pmh_bin_labels = []
-                    if pmh_push_col is not None:
-                        pmh_raw = pd.to_numeric(raw[pmh_push_col].map(_to_float), errors="coerce")
-                        df["Max_Push_Daily_%"] = pmh_raw * 100.0  # FRACTIONED → convert to %
-                        mask_pmh = df["Max_Push_Daily_%"].notna()
-                        if mask_pmh.any():
-                            sbin, labels = _make_pmh_bins(df.loc[mask_pmh, "Max_Push_Daily_%"])
-                            pmh_bin_labels = labels
-                            df.loc[mask_pmh, "PMH_Bin"] = sbin
-                            # counts for all groups
-                            pmh_counts_tbl = (df.loc[mask_pmh, ["PMH_Bin", "Group"]]
-                                                .groupby(["PMH_Bin","Group"]).size()
-                                                .unstack("Group", fill_value=0)
-                                                .reindex(labels, axis=0)
-                                                .rename_axis(index=None)
-                                                .rename(columns={"FT=1":"FT=1 (n)", "FT=0":"FT=0 (n)"}))
-                            # winners-only table (counts, share %, cumulative share %)
-                            winners = df.loc[mask_pmh & (df["Group"]=="FT=1"), ["PMH_Bin"]].copy()
-                            if not winners.empty:
-                                w_counts = winners.value_counts().reindex(labels, fill_value=0)
-                                w_counts.index.name = None
-                                tot = int(w_counts.sum()) if w_counts.sum() else 0
-                                if tot > 0:
-                                    share = (w_counts / tot * 100.0).round(1)
-                                    cum_share = share.cumsum()
-                                else:
-                                    share = w_counts*0
-                                    cum_share = share
-                                pmh_winners_tbl = pd.DataFrame({
-                                    "FT=1 (n)": w_counts.values,
-                                    "FT=1 (share %)": share.values,
-                                    "FT=1 (cum %)": cum_share.values
-                                }, index=labels)
+                    # ---------- Top-10% flag from Max Push Daily (%) (fraction → % ×100) ----------
+                    pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
+                    top10_thr = np.nan
+                    if pmh_col is not None:
+                        pmh_raw = pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce")
+                        df["Max_Push_Daily_%"] = pmh_raw * 100.0
+                        top10_flag, top10_thr = _make_top10_flag(df["Max_Push_Daily_%"])
+                        df["GroupTop10"] = np.where(top10_flag, "Top10", "Rest")
+                    else:
+                        df["Max_Push_Daily_%"] = np.nan
+                        df["GroupTop10"] = "Rest"  # fallback
 
-                    # ---------- Summaries (overall) ----------
+                    # ---------- Collect variable lists ----------
                     var_core = [v for v in VAR_CORE if v in df.columns]
                     var_mod  = [v for v in VAR_MODERATE if v in df.columns]
                     var_all  = var_core + var_mod
 
-                    overall = _summaries_for(df, var_all)
+                    # ---------- Summaries for FT (kept as before) ----------
+                    ft_summ = _summaries_for(df, var_all, group_col="GroupFT")
 
-                    # ---------- Persist in session ----------
+                    # ---------- Summaries for Top10 vs Rest ----------
+                    top_labels = {"Top10":"Top10", "Rest":"Rest"}
+                    top_summ = _summaries_for(df, var_all, group_col="GroupTop10", labels_map=top_labels)
+
+                    # ---------- Stash models/summaries ----------
                     st.session_state.models = {
-                        # overall centers/spreads
-                        "med_tbl": overall["med_tbl"],
-                        "mad_tbl": overall["mad_tbl"],
-                        "mean_tbl": overall["mean_tbl"],
-                        "sd_tbl": overall["sd_tbl"],
+                        # FT summaries
+                        "ft_med_tbl":  ft_summ["med_tbl"],
+                        "ft_mad_tbl":  ft_summ["mad_tbl"],
+                        "ft_mean_tbl": ft_summ["mean_tbl"],
+                        "ft_sd_tbl":   ft_summ["sd_tbl"],
+                        # Top10 summaries
+                        "t10_med_tbl":  top_summ["med_tbl"],
+                        "t10_mad_tbl":  top_summ["mad_tbl"],
+                        "t10_mean_tbl": top_summ["mean_tbl"],
+                        "t10_sd_tbl":   top_summ["sd_tbl"],
+                        # Vars
                         "var_core": var_core,
                         "var_moderate": var_mod,
-                        # pmh artifacts
-                        "pmh_labels": pmh_bin_labels,
-                        "pmh_counts_all": pmh_counts_tbl,  # FT=1 and FT=0 counts (informational)
-                        "pmh_winners": pmh_winners_tbl     # FT=1-only bins (counts/share/cum)
+                        # Threshold info (optional for display)
+                        "top10_threshold": float(top10_thr) if np.isfinite(top10_thr) else np.nan,
                     }
 
-                    # Train calibrated ratio model (unchanged)
+                    # ---------- Train calibrated ratio model (unchanged) ----------
                     lasso_model = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99)
                     st.session_state.lassoA = lasso_model or {}
 
-                    if lasso_model:
-                        st.success(f"Built summaries and trained calibrated ratio model. Selected terms: {st.session_state.lassoA.get('terms')}")
-                    else:
-                        st.warning("Training skipped (insufficient or incompatible data). Summaries built; predictions disabled.")
+                    st.success("Built FT and Top10 summaries. Ratio model: " + ("trained" if lasso_model else "skipped"))
                     do_rerun()
 
         except Exception as e:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# ============================== Summary tables (3-way radio; winners=FT=1 bins) ==============================
+# ============================== Summary tables (4-way radio) ==============================
 models_data = st.session_state.models
-if models_data and isinstance(models_data, dict) and not models_data.get("med_tbl", pd.DataFrame()).empty:
-    with st.expander("Group summaries — Median+MAD, Mean+SD, or Winners (FT=1) bins", expanded=False):
+if models_data and isinstance(models_data, dict) and (not models_data.get("ft_med_tbl", pd.DataFrame()).empty
+                                                     or not models_data.get("t10_med_tbl", pd.DataFrame()).empty):
+    with st.expander("Group summaries — FT vs Top 10% (flip center/spread)", expanded=False):
         view_choice = st.radio(
             "View",
-            ["Median + MAD (robust)", "Mean + SD (classic)", "Winners (FT=1) — PMH Gainer Bins"],
-            index=0, horizontal=True
+            [
+                "FT: Median + MAD",
+                "FT: Mean + SD",
+                "Top 10%: Median + MAD",
+                "Top 10%: Mean + SD",
+            ],
+            index={"ft_robust":0, "ft_classic":1, "t10_robust":2, "t10_classic":3}.get(st.session_state.view_mode_key, 0),
+            horizontal=True
         )
 
         var_core = models_data.get("var_core", [])
         var_mod  = models_data.get("var_moderate", [])
 
-        # Defaults (robust)
-        center_tbl = models_data["med_tbl"]
-        spread_tbl = models_data["mad_tbl"]
-
-        if view_choice.startswith("Median"):
-            center_tbl = models_data["med_tbl"]
-            spread_tbl = models_data["mad_tbl"]
-            st.session_state.view_mode_basis = "robust"
-
-        elif view_choice.startswith("Mean"):
-            center_tbl = models_data["mean_tbl"]
-            spread_tbl = models_data["sd_tbl"]
-            st.session_state.view_mode_basis = "classic"
-
+        # Pick tables per selection
+        if view_choice == "FT: Median + MAD":
+            center_tbl = models_data["ft_med_tbl"]; spread_tbl = models_data["ft_mad_tbl"]
+            st.session_state.view_mode_key = "ft_robust"
+        elif view_choice == "FT: Mean + SD":
+            center_tbl = models_data["ft_mean_tbl"]; spread_tbl = models_data["ft_sd_tbl"]
+            st.session_state.view_mode_key = "ft_classic"
+        elif view_choice == "Top 10%: Median + MAD":
+            center_tbl = models_data["t10_med_tbl"]; spread_tbl = models_data["t10_mad_tbl"]
+            st.session_state.view_mode_key = "t10_robust"
         else:
-            # Winners bins view: show only the FT=1 gainer bin distribution
-            pmh_winners_tbl = models_data.get("pmh_winners", pd.DataFrame())
-            st.caption("Bins: 0–10, 10–25, 25–50, 50–100, 100–200, 200–500, 500–1000, 1000%+")
-            if pmh_winners_tbl is None or pmh_winners_tbl.empty:
-                st.info("No FT=1 winners or missing `Max Push Daily (%)` in the DB.")
-            else:
-                st.dataframe(
-                    pmh_winners_tbl.style.format({
-                        "FT=1 (share %)": "{:.1f}",
-                        "FT=1 (cum %)": "{:.1f}",
-                    }),
-                    use_container_width=True
-                )
-                st.caption("Tip: This is distribution-only. Alignment below continues to use your last chosen center/spread basis.")
-            # IMPORTANT: Do NOT override alignment inputs when on winners view
-            center_tbl = None
-            spread_tbl = None
+            center_tbl = models_data["t10_mean_tbl"]; spread_tbl = models_data["t10_sd_tbl"]
+            st.session_state.view_mode_key = "t10_classic"
 
-        # Persist current tables for alignment *only* when a center/spread basis is active
-        if center_tbl is not None and spread_tbl is not None:
-            st.session_state["models_tbl_current"] = center_tbl
-            st.session_state["spread_tbl_current"] = spread_tbl
+        # Save current basis for Alignment
+        st.session_state["models_tbl_current"] = center_tbl
+        st.session_state["spread_tbl_current"] = spread_tbl
 
-        # Significance slider (applies when we have a basis)
         sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
-                               help="Highlight rows where |FT=1 − FT=0| / (Spread₁ + Spread₀) ≥ σ")
+                               help="Highlight rows where |GroupA − GroupB| / (SpreadA + SpreadB) ≥ σ")
         st.session_state["sig_thresh"] = float(sig_thresh)
 
+        # Utility to draw group tables for core/moderate
         def show_grouped_table(title, vars_list, center_tbl, spread_tbl):
             if center_tbl is None or center_tbl.empty:
-                st.info(f"No variables available for {title} (select Median or Mean view above).")
+                st.info(f"No variables available for {title}.")
                 return
             if not vars_list:
                 st.info(f"No variables selected for {title}.")
                 return
+
+            # Detect current group column names dynamically (supports FT and Top10 views)
+            cols = list(center_tbl.columns)
+            if len(cols) != 2:
+                st.info(f"{title}: expected two group columns, got {cols}.")
+                return
+            gA, gB = cols[0], cols[1]
+
             sub_idx = [v for v in vars_list if v in center_tbl.index]
             if not sub_idx:
                 st.info(f"No overlapping variables for {title}.")
                 return
             sub = center_tbl.loc[sub_idx].copy()
 
-            if not spread_tbl.empty and {"FT=1","FT=0"}.issubset(spread_tbl.columns):
+            if not spread_tbl.empty and {gA,gB}.issubset(spread_tbl.columns):
                 eps = 1e-9
-                diff = (sub["FT=1"] - sub["FT=0"]).abs()
+                diff = (sub[gA] - sub[gB]).abs()
                 common = [r for r in diff.index if r in spread_tbl.index]
                 sub = sub.loc[common]
                 diff = diff.loc[common]
-                spread = (spread_tbl.loc[common, "FT=1"].fillna(0.0) + spread_tbl.loc[common, "FT=0"].fillna(0.0))
+                spread = (spread_tbl.loc[common, gA].fillna(0.0) + spread_tbl.loc[common, gB].fillna(0.0))
                 sig = diff / (spread.replace(0.0, np.nan) + eps)
                 sig_flag = sig >= st.session_state["sig_thresh"]
 
@@ -627,20 +622,24 @@ if models_data and isinstance(models_data, dict) and not models_data.get("med_tb
                 st.markdown(f"**{title}**")
                 styled = (sub
                           .style
-                          .apply(_style_sig, subset=["FT=1"])
-                          .apply(_style_sig, subset=["FT=0"])
+                          .apply(_style_sig, subset=[gA])
+                          .apply(_style_sig, subset=[gB])
                           .format("{:.2f}"))
                 st.dataframe(styled, use_container_width=True)
             else:
-                st.info(f"Select a center/spread view (Median or Mean) to see {title}.")
+                st.info(f"Select a center/spread view to see {title}.")
 
-        # Only render Core/Moderate tables when the basis is Median or Mean
-        if center_tbl is not None and spread_tbl is not None:
-            show_grouped_table("Core variables", var_core, center_tbl, spread_tbl)
-            show_grouped_table("Moderate variables", var_mod, center_tbl, spread_tbl)
+        show_grouped_table("Core variables", var_core, center_tbl, spread_tbl)
+        show_grouped_table("Moderate variables", var_mod, center_tbl, spread_tbl)
+
+        # Optional: show current Top-10 threshold beneath (without listing any bins)
+        if st.session_state.view_mode_key.startswith("t10"):
+            thr = models_data.get("top10_threshold", np.nan)
+            if np.isfinite(thr):
+                st.caption(f"Current Top-10% cutoff (Max Push Daily %): {thr:.2f}%")
 
 else:
-    st.info("Upload DB and click **Build model stocks** to compute FT summaries.")
+    st.info("Upload DB and click **Build model stocks** to compute FT and Top10 summaries.")
 
 # ============================== ➕ Manual Input ==============================
 st.markdown("---")
@@ -667,6 +666,10 @@ with st.form("add_form", clear_on_submit=True):
 
     submitted = st.form_submit_button("Add to Table", use_container_width=True)
 
+def predict_daily_wrap(row):
+    pred = predict_daily_calibrated(row, st.session_state.get("lassoA", {}))
+    return float(pred) if np.isfinite(pred) else np.nan
+
 if submitted and ticker:
     fr   = (pm_vol / float_pm) if float_pm > 0 else 0.0
     pmmc = (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else 0.0
@@ -687,9 +690,7 @@ if submitted and ticker:
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
 
-    pred = predict_daily_calibrated(row, st.session_state.get("lassoA", {}))
-    row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
-
+    row["PredVol_M"] = predict_daily_wrap(row)
     denom = row["PredVol_M"]
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
 
@@ -732,21 +733,8 @@ with tcol_sel:
 # ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
 
-# Alignment uses the latest *center/spread basis* (Median or Mean).
-# If the user is on "Winners bins" view, we *do not* overwrite these tables.
 models_tbl = st.session_state.get("models_tbl_current", pd.DataFrame())
 spread_tbl = st.session_state.get("spread_tbl_current", pd.DataFrame())
-if models_tbl is None or models_tbl.empty:
-    # Fallback to last explicit basis
-    view_basis = st.session_state.get("view_mode_basis", "robust")
-    md = st.session_state.models
-    if view_basis == "classic":
-        models_tbl = md.get("mean_tbl") or pd.DataFrame()
-        spread_tbl = md.get("sd_tbl") or pd.DataFrame()
-    else:
-        models_tbl = md.get("med_tbl") or pd.DataFrame()
-        spread_tbl = md.get("mad_tbl") or pd.DataFrame()
-
 var_core = (st.session_state.models or {}).get("var_core", [])
 var_mod  = (st.session_state.models or {}).get("var_moderate", [])
 SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
@@ -759,11 +747,12 @@ def _compute_alignment_counts_weighted(
     w_core: float = 1.0,
     w_mod: float = 0.5,
 ) -> dict:
-    if models_tbl is None or models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns):
+    if models_tbl is None or models_tbl.empty or len(models_tbl.columns) != 2:
         return {}
-    groups = ["FT=1","FT=0"]
+    groups = list(models_tbl.columns)  # e.g., ["FT=1","FT=0"] OR ["Top10","Rest"]
+    gA, gB = groups[0], groups[1]
     TOL = 1e-9
-    counts = {"FT=1": 0.0, "FT=0": 0.0}
+    counts = {gA: 0.0, gB: 0.0}
     used_core = used_mod = 0
 
     def vote_for(var, weight):
@@ -774,25 +763,26 @@ def _compute_alignment_counts_weighted(
         centers = models_tbl.loc[var, groups].astype(float)
         if centers.isna().any():
             return
-        d1 = abs(xv - centers["FT=1"]); d0 = abs(xv - centers["FT=0"])
-        if abs(d1 - d0) <= TOL:
+        dA = abs(xv - centers[gA]); dB = abs(xv - centers[gB])
+        if abs(dA - dB) <= TOL:
             return
-        if d1 < d0: counts["FT=1"] += weight
-        else:       counts["FT=0"] += weight
+        if dA < dB: counts[gA] += weight
+        else:       counts[gB] += weight
         if weight == w_core: used_core += 1
         else:                used_mod += 1
 
     for v in var_core: vote_for(v, w_core)
     for v in var_mod:  vote_for(v, w_mod)
 
-    total_weight = counts["FT=1"] + counts["FT=0"]
-    pct1 = round(100.0 * counts["FT=1"] / total_weight, 0) if total_weight > 0 else 0.0
-    pct0 = round(100.0 * counts["FT=0"] / total_weight, 0) if total_weight > 0 else 0.0
-    return {"FT=1": counts["FT=1"], "FT=0": counts["FT=0"], "FT1_pct": pct1, "FT0_pct": pct0,
-            "N_core_used": used_core, "N_mod_used": used_mod}
+    total_weight = counts[gA] + counts[gB]
+    pctA = round(100.0 * counts[gA] / total_weight, 0) if total_weight > 0 else 0.0
+    pctB = round(100.0 * counts[gB] / total_weight, 0) if total_weight > 0 else 0.0
+    return {gA: counts[gA], gB: counts[gB], "A_pct": pctA, "B_pct": pctB,
+            "A_label": gA, "B_label": gB, "N_core_used": used_core, "N_mod_used": used_mod}
 
-if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(models_tbl.columns):
+if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
     summary_rows, detail_map = [], {}
+    gA, gB = list(models_tbl.columns)
 
     detail_order = [("Core variables", var_core),
                     ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
@@ -803,7 +793,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
         if not counts: continue
 
-        summary_rows.append({"Ticker": tkr, "FT1_val": counts.get("FT1_pct", 0.0), "FT0_val": counts.get("FT0_pct", 0.0)})
+        summary_rows.append({"Ticker": tkr, "A_val": counts.get("A_pct", 0.0), "B_val": counts.get("B_pct", 0.0),
+                             "A_label": counts.get("A_label", gA), "B_label": counts.get("B_label", gB)})
 
         drows_grouped = []
         for grp_label, grp_vars in detail_order:
@@ -811,41 +802,40 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
             for v in grp_vars:
                 if v == "Daily_Vol_M":
                     continue
-
                 va = pd.to_numeric(stock.get(v), errors="coerce")
 
                 med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
-                v1 = models_tbl.loc[med_var, "FT=1"] if (med_var in models_tbl.index) else np.nan
-                v0 = models_tbl.loc[med_var, "FT=0"] if (med_var in models_tbl.index) else np.nan
+                vA = models_tbl.loc[med_var, gA] if (med_var in models_tbl.index) else np.nan
+                vB = models_tbl.loc[med_var, gB] if (med_var in models_tbl.index) else np.nan
 
-                s1 = spread_tbl.loc[med_var, "FT=1"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=1" in spread_tbl.columns) else np.nan
-                s0 = spread_tbl.loc[med_var, "FT=0"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=0" in spread_tbl.columns) else np.nan
+                sA = spread_tbl.loc[med_var, gA] if (not spread_tbl.empty and med_var in spread_tbl.index and gA in spread_tbl.columns) else np.nan
+                sB = spread_tbl.loc[med_var, gB] if (not spread_tbl.empty and med_var in spread_tbl.index and gB in spread_tbl.columns) else np.nan
 
-                if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(v1) and pd.isna(v0):
+                if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(vA) and pd.isna(vB):
                     continue
 
-                d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
-                d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
+                dA = None if (pd.isna(va) or pd.isna(vA)) else float(va - vA)
+                dB = None if (pd.isna(va) or pd.isna(vB)) else float(va - vB)
 
                 denom = 0.0
-                denom += float(s1) if pd.notna(s1) else 0.0
-                denom += float(s0) if pd.notna(s0) else 0.0
+                denom += float(sA) if pd.notna(sA) else 0.0
+                denom += float(sB) if pd.notna(sB) else 0.0
                 if denom == 0.0:
-                    s1_val = np.nan
-                    s0_val = np.nan
+                    sA_val = np.nan
+                    sB_val = np.nan
                 else:
-                    s1_val = (abs(d1) / denom) if d1 is not None else np.nan
-                    s0_val = (abs(d0) / denom) if d0 is not None else np.nan
+                    sA_val = (abs(dA) / denom) if dA is not None else np.nan
+                    sB_val = (abs(dB) / denom) if dB is not None else np.nan
 
-                sig1 = (not pd.isna(s1_val)) and (s1_val >= st.session_state.get("sig_thresh", 3.0))
-                sig0 = (not pd.isna(s0_val)) and (s0_val >= st.session_state.get("sig_thresh", 3.0))
-                significant = sig1 or sig0
+                sigA = (not pd.isna(sA_val)) and (sA_val >= SIG_THR)
+                sigB = (not pd.isna(sB_val)) and (sB_val >= SIG_THR)
+                significant = sigA or sigB
 
                 dominant = None
                 if significant:
-                    abs1 = -np.inf if (d1 is None or pd.isna(d1)) else abs(float(d1))
-                    abs0 = -np.inf if (d0 is None or pd.isna(d0)) else abs(float(d0))
-                    dominant = float(d1) if abs1 >= abs0 else float(d0)
+                    absA = -np.inf if (dA is None or pd.isna(dA)) else abs(float(dA))
+                    absB = -np.inf if (dB is None or pd.isna(dB)) else abs(float(dB))
+                    dominant = float(dA) if absA >= absB else float(dB)
                 sig_dir = ''
                 if dominant is not None and np.isfinite(dominant):
                     sig_dir = 'up' if dominant >= 0 else 'down'
@@ -855,12 +845,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 drows_grouped.append({
                     "Variable": v,
                     "Value": None if pd.isna(va) else float(va),
-                    "FT1":   None if pd.isna(v1) else float(v1),
-                    "FT0":   None if pd.isna(v0) else float(v0),
-                    "d_vs_FT1": None if d1 is None else d1,
-                    "d_vs_FT0": None if d0 is None else d0,
-                    "sig1": bool(sig1),
-                    "sig0": bool(sig0),
+                    "A":   None if pd.isna(vA) else float(vA),
+                    "B":   None if pd.isna(vB) else float(vB),
+                    "d_vs_A": None if dA is None else dA,
+                    "d_vs_B": None if dB is None else dB,
+                    "sigA": bool(sigA),
+                    "sigB": bool(sigB),
                     "is_core": is_core,
                     "sig_dir": sig_dir,
                     "significant": bool(significant),
@@ -868,8 +858,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
         detail_map[tkr] = drows_grouped
 
+    # ---------- Render alignment with dynamic group labels ----------
     import streamlit.components.v1 as components
-    payload = {"rows": summary_rows, "details": detail_map}
+    payload = {"rows": summary_rows, "details": detail_map, "gA": gA, "gB": gB}
 
     html = """
 <!DOCTYPE html>
@@ -911,10 +902,10 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
   .col-var { width: 18%; }
   .col-val { width: 12%; }
-  .col-ft1 { width: 18%; }
-  .col-ft0 { width: 18%; }
-  .col-d1  { width: 17%; }
-  .col-d0  { width: 17%; }
+  .col-a   { width: 18%; }
+  .col-b   { width: 18%; }
+  .col-da  { width: 17%; }
+  .col-db  { width: 17%; }
 
   .pos { color:#059669; } 
   .neg { color:#dc2626; }
@@ -925,8 +916,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
     <thead>
       <tr>
         <th>Ticker</th>
-        <th>FT=1</th>
-        <th>FT=0</th>
+        <th id="hdrA"></th>
+        <th id="hdrB"></th>
       </tr>
     </thead>
   </table>
@@ -936,8 +927,10 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
   <script>
     const data = %%PAYLOAD%%;
+    document.getElementById('hdrA').textContent = data.gA;
+    document.getElementById('hdrB').textContent = data.gB;
 
-    function barCellBlue(val) {
+    function barCell(val) {
       const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
       return `
         <div class="bar-wrap">
@@ -967,12 +960,12 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         const isCore = !!r.is_core;
 
         const v  = formatVal(r.Value);
-        const f1 = formatVal(r.FT1);
-        const f0 = formatVal(r.FT0);
-        const d1 = formatVal(r.d_vs_FT1);
-        const d0 = formatVal(r.d_vs_FT0);
-        const c1 = (!d1)? '' : (parseFloat(d1)>=0 ? 'pos' : 'neg');
-        const c0 = (!d0)? '' : (parseFloat(d0)>=0 ? 'pos' : 'neg');
+        const a  = formatVal(r.A);
+        const b  = formatVal(r.B);
+        const da = formatVal(r.d_vs_A);
+        const db = formatVal(r.d_vs_B);
+        const ca = (!da)? '' : (parseFloat(da)>=0 ? 'pos' : 'neg');
+        const cb = (!db)? '' : (parseFloat(db)>=0 ? 'pos' : 'neg');
 
         let rowClass = '';
         if (r.significant) {
@@ -987,26 +980,26 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
           <tr class="${rowClass}">
             <td class="col-var">${r.Variable}</td>
             <td class="col-val">${v}</td>
-            <td class="col-ft1">${f1}</td>
-            <td class="col-ft0">${f0}</td>
-            <td class="col-d1 ${c1}">${d1}</td>
-            <td class="col-d0 ${c0}">${d0}</td>
+            <td class="col-a">${a}</td>
+            <td class="col-b">${b}</td>
+            <td class="col-da ${ca}">${da}</td>
+            <td class="col-db ${cb}">${db}</td>
           </tr>`;
       }).join('');
 
       return `
         <table class="child-table">
           <colgroup>
-            <col class="col-var"/><col class="col-val"/><col class="col-ft1"/><col class="col-ft0"/><col class="col-d1"/><col class="col-d0"/>
+            <col class="col-var"/><col class="col-val"/><col class="col-a"/><col class="col-b"/><col class="col-da"/><col class="col-db"/>
           </colgroup>
           <thead>
             <tr>
               <th class="col-var">Variable</th>
               <th class="col-val">Value</th>
-              <th class="col-ft1">FT=1 center</th>
-              <th class="col-ft0">FT=0 center</th>
-              <th class="col-d1">Δ vs FT=1</th>
-              <th class="col-d0">Δ vs FT=0</th>
+              <th class="col-a">${data.gA} center</th>
+              <th class="col-b">${data.gB} center</th>
+              <th class="col-da">Δ vs ${data.gA}</th>
+              <th class="col-db">Δ vs ${data.gB}</th>
             </tr>
           </thead>
           <tbody>${cells}</tbody>
@@ -1021,8 +1014,8 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
         order: [[0,'asc']],
         columns: [
           { data: 'Ticker' },
-          { data: 'FT1_val', render: (d)=>barCellBlue(d) },
-          { data: 'FT0_val', render: (d)=>barCellRed(d) },
+          { data: 'A_val', render: (d)=>barCell(d) },
+          { data: 'B_val', render: (d)=>barCellRed(d) },
         ]
       });
 
