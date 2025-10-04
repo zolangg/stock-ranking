@@ -1003,10 +1003,17 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
         const v  = formatVal(r.Value);
         const a  = formatVal(r.A);
         const b  = formatVal(r.B);
-        const da = formatVal(Math.abs(r.d_vs_A));
-        const db = formatVal(Math.abs(r.d_vs_B));
-        const ca = '';  // no sign-based color when using absolute deltas
-        const cb = '';
+        const rawDa = (r.d_vs_A==null || isNaN(r.d_vs_A)) ? null : Number(r.d_vs_A);
+        const rawDb = (r.d_vs_B==null || isNaN(r.d_vs_B)) ? null : Number(r.d_vs_B);
+        const daAbs = (rawDa==null) ? null : Math.abs(rawDa);
+        const dbAbs = (rawDb==null) ? null : Math.abs(rawDb);
+        
+        const da = (daAbs==null) ? '' : formatVal(daAbs);
+        const db = (dbAbs==null) ? '' : formatVal(dbAbs);
+        
+        // color by sign (green for +, red for -)
+        const ca = (rawDa==null) ? '' : (rawDa >= 0 ? 'pos' : 'neg');
+        const cb = (rawDb==null) ? '' : (rawDb >= 0 ? 'pos' : 'neg');
 
         let rowClass = '';
         if (r.significant) {
