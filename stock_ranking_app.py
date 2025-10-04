@@ -570,22 +570,23 @@ labels = [lbl for _, lbl in OPTIONS]
 
 # --- Compact controls: radios | multiselect | delete button (no labels) ---
 
-# Build list of current tickers (stable order)
+# --- Compact top bar: radios on left | multiselect + delete on right ---
+
 tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
 unique_tickers, _seen = [], set()
 for t in tickers:
     if t and t not in _seen:
         unique_tickers.append(t); _seen.add(t)
 
-c_radios, c_select, c_btn = st.columns([4.0, 1.5, 1.0])
+left, right = st.columns([2.5, 2.5])
 
-with c_radios:
-    # four radios inline, no title
+with left:
+    # radios inline, no label
     if ss.view_choice_label not in [lbl for _, lbl in OPTIONS]:
         ss.view_choice_label = {k: lbl for k, lbl in OPTIONS}[ss.view_mode_key]
     chosen_label = st.radio(
-        "",                                   # no label
-        [lbl for _, lbl in OPTIONS],          # FT: Median | FT: Mean | Top 10%: Median | Top 10%: Mean
+        "",
+        [lbl for _, lbl in OPTIONS],
         index=[lbl for _, lbl in OPTIONS].index(ss.view_choice_label),
         horizontal=True,
         key="view_choice_label",
@@ -593,27 +594,25 @@ with c_radios:
     )
     ss.view_mode_key = {lbl: k for k, lbl in OPTIONS}[chosen_label]
 
-with c_select:
-    # multiselect with no title, no "Select all" checkbox
-    to_delete = st.multiselect(
-        "",
-        options=unique_tickers,
-        default=[],
-        key="del_selection",
-        placeholder="Select tickers…",
-        label_visibility="collapsed",
-    )
-
-with c_btn:
-    # right-aligned delete button
-    st.write("&nbsp;")  # vertical align with multiselect
-    if st.button("Delete", use_container_width=True, key="delete_btn"):
-        if to_delete:
-            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
-            st.success(f"Deleted: {', '.join(to_delete)}")
-            do_rerun()
-        else:
-            st.info("No tickers selected.")
+with right:
+    r1, r2 = st.columns([4, 1])
+    with r1:
+        to_delete = st.multiselect(
+            "",
+            options=unique_tickers,
+            default=[],
+            key="del_selection",
+            placeholder="Select tickers…",
+            label_visibility="collapsed",
+        )
+    with r2:
+        if st.button("Delete", use_container_width=True, key="delete_btn"):
+            if to_delete:
+                ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
+                st.success(f"Deleted: {', '.join(to_delete)}")
+                do_rerun()
+            else:
+                st.info("No tickers selected.")
 
 def _pick_tables_by_key(view_key: str):
     if view_key == "ft_robust" and has_ft:   return models["ft_med_tbl"]
