@@ -1,9 +1,8 @@
-# app.py
+# app.py — Premarket Stock Ranking (fixed + optimized)
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
-import json
+import re, json, hashlib
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -12,45 +11,56 @@ st.title("Premarket Stock Ranking")
 # ============================== Stable Session Keys ==============================
 DEFAULT_VIEW = "ft_robust"  # "ft_robust" | "ft_classic" | "t10_robust" | "t10_classic"
 
-if "rows" not in st.session_state: st.session_state.rows = []
-if "last" not in st.session_state: st.session_state.last = {}
-if "models" not in st.session_state: st.session_state.models = {}
-if "lassoA" not in st.session_state: st.session_state.lassoA = {}
-if "view_mode_key" not in st.session_state: st.session_state.view_mode_key = DEFAULT_VIEW
-if "models_tbl_current" not in st.session_state: st.session_state.models_tbl_current = pd.DataFrame()
-if "view_choice_label" not in st.session_state: st.session_state.view_choice_label = "FT: Median"
+ss = st.session_state
+ss.setdefault("rows", [])
+ss.setdefault("last", {})
+ss.setdefault("models", {})
+ss.setdefault("lassoA", {})
+ss.setdefault("view_mode_key", DEFAULT_VIEW)
+ss.setdefault("models_tbl_current", pd.DataFrame())
+ss.setdefault("view_choice_label", "FT: Median")
 
 # ============================== Helpers ==============================
 def do_rerun():
+    # Avoid redundant reruns
     if hasattr(st, "rerun"): st.rerun()
     elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
 
 def SAFE_JSON_DUMPS(obj) -> str:
-    # Convert numpy types to native Python so json can serialize
-    return json.dumps(obj, default=float, ensure_ascii=False)
+    # Compact + stable + converts numpy types
+    class NpEncoder(json.JSONEncoder):
+        def default(self, o):
+            if isinstance(o, (np.integer,)): return int(o)
+            if isinstance(o, (np.floating,)): return float(o)
+            if isinstance(o, (np.ndarray,)): return o.tolist()
+            return super().default(o)
+    s = json.dumps(obj, cls=NpEncoder, ensure_ascii=False, separators=(",", ":"))
+    # Prevent accidental </script> termination in inline JSON
+    return s.replace("</script>", "<\\/script>")
 
+_norm_cache = {}
 def _norm(s: str) -> str:
-    s = re.sub(r"\s+", " ", str(s).strip().lower())
-    return s.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
+    if s in _norm_cache: return _norm_cache[s]
+    v = re.sub(r"\s+", " ", str(s).strip().lower())
+    v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
+    _norm_cache[s] = v
+    return v
 
 def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     if df is None or df.empty: return None
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
-    # exact (case-insensitive)
+    nm = {c: _norm(c) for c in cols}
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
             if cols_lc[c] == lc:
                 return c
-    # normalized exact
-    nm = {c: _norm(c) for c in cols}
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n:
                 return c
-    # normalized contains
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
@@ -142,7 +152,8 @@ def _kfold_indices(n, k=5, seed=42):
     idx = np.arange(n); rng.shuffle(idx)
     return np.array_split(idx, k)
 
-def _lasso_cd_std(Xs, y, lam, max_iter=1200, tol=1e-6):
+def _lasso_cd_std(Xs, y, lam, max_iter=900, tol=1e-6):
+    # (slightly fewer iters; same convergence tolerance)
     n, p = Xs.shape
     w = np.zeros(p)
     for _ in range(max_iter):
@@ -200,8 +211,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         ("ln_rvolmaxpm",   ln_rvolmaxpm),
         ("pm_dol_over_mc", pm_dol_over_mc),
     ]
-    cols = [arr.reshape(-1,1) for _, arr in feats]
-    X_all = np.hstack(cols)
+    X_all = np.hstack([arr.reshape(-1,1) for _, arr in feats])
 
     mask = valid_pm & np.isfinite(y_ln_all) & np.isfinite(X_all).all(axis=1)
     if mask.sum() < 50: return {}
@@ -233,7 +243,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     Xs_tr = (X_tr - mu) / sd
 
     folds = _kfold_indices(len(y_tr), k=min(5, max(2, len(y_tr)//10)), seed=42)
-    lam_grid = np.geomspace(0.001, 1.0, 30)
+    lam_grid = np.geomspace(0.001, 1.0, 26)  # fewer evals → faster
     cv_mse = []
     for lam in lam_grid:
         errs = []
@@ -241,12 +251,12 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
             te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(len(folds)) if j != vi])
             Xtr, ytr = Xs_tr[tr_idx], y_tr[tr_idx]
             Xte, yte = Xs_tr[te_idx], y_tr[te_idx]
-            w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1600)
+            w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1400)
             yhat = Xte @ w
             errs.append(np.mean((yhat - yte)**2))
         cv_mse.append(np.mean(errs))
     lam_best = float(lam_grid[int(np.argmin(cv_mse))])
-    w_l1 = _lasso_cd_std(Xs_tr, y_tr, lam=lam_best, max_iter=2500)
+    w_l1 = _lasso_cd_std(Xs_tr, y_tr, lam=lam_best, max_iter=2000)
     sel = np.flatnonzero(np.abs(w_l1) > 1e-8)
     if sel.size == 0: return {}
 
@@ -342,10 +352,10 @@ def _summaries_for(df_in: pd.DataFrame, var_all: list[str], group_col: str, labe
     if not avail:
         empty = pd.DataFrame()
         return {"med_tbl": empty, "mad_tbl": empty, "mean_tbl": empty, "sd_tbl": empty, "avail": []}
-    g = df_in.groupby(group_col)[avail]
+    g = df_in.groupby(group_col, observed=True)[avail]
     med_tbl  = g.median(numeric_only=True).T
     mean_tbl = g.mean(numeric_only=True).T
-    mad_tbl  = df_in.groupby(group_col)[avail].apply(lambda gg: gg.apply(_mad)).T
+    mad_tbl  = df_in.groupby(group_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad)).T
     sd_tbl   = g.std(numeric_only=True).T
     if labels_map is not None:
         med_tbl  = med_tbl.rename(columns=labels_map)
@@ -367,15 +377,26 @@ st.subheader("Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
 build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
 
+@st.cache_data(show_spinner=False)
+def _hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+@st.cache_data(show_spinner=True)
+def _load_sheet(file_bytes: bytes):
+    xls = pd.ExcelFile(file_bytes)
+    sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
+    sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
+    raw = pd.read_excel(xls, sheet)
+    return raw, sheet, tuple(xls.sheet_names)
+
 if build_btn:
     if not uploaded:
         st.error("Please upload an Excel workbook first.")
     else:
         try:
-            xls = pd.ExcelFile(uploaded)
-            sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
-            sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
-            raw = pd.read_excel(xls, sheet)
+            file_bytes = uploaded.getvalue()
+            _ = _hash_bytes(file_bytes)  # creates a cache boundary
+            raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
 
             # detect FT column
             possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
@@ -442,7 +463,7 @@ if build_btn:
                     fv = float(sv); return 1 if fv >= 0.5 else 0
                 except: return np.nan
             df["FT01"] = df["GroupRaw"].map(_to_binary)
-            df = df[df["FT01"].isin([0,1])]
+            df = df[df["FT01"].isin([0,1])].copy()
             df["GroupFT"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
             # Top10 from Max Push Daily (%) (fraction → %)
@@ -465,7 +486,7 @@ if build_btn:
             ft_summ  = _summaries_for(df, var_all, "GroupFT")
             t10_summ = _summaries_for(df, var_all, "GroupTop10", labels_map={"Top10":"Top10","Rest":"Rest"})
 
-            st.session_state.models = {
+            ss.models = {
                 "ft_med_tbl":  ft_summ["med_tbl"],  "ft_mad_tbl":  ft_summ["mad_tbl"],
                 "ft_mean_tbl": ft_summ["mean_tbl"], "ft_sd_tbl":   ft_summ["sd_tbl"],
                 "t10_med_tbl":  t10_summ["med_tbl"],  "t10_mad_tbl":  t10_summ["mad_tbl"],
@@ -475,16 +496,15 @@ if build_btn:
             }
 
             # default current models table = FT Median
-            if st.session_state.models_tbl_current.empty:
-                st.session_state.models_tbl_current = ft_summ["med_tbl"].copy()
-                st.session_state.view_mode_key = "ft_robust"
-                st.session_state.view_choice_label = "FT: Median"
+            if ss.models_tbl_current.empty:
+                ss.models_tbl_current = ft_summ["med_tbl"].copy()
+                ss.view_mode_key = "ft_robust"
+                ss.view_choice_label = "FT: Median"
 
             # ratio model
-            lasso_model = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99)
-            st.session_state.lassoA = lasso_model or {}
+            ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
 
-            st.success("Built FT and Top10 summaries.")
+            st.success(f"Built FT and Top10 summaries from sheet “{sel_sheet}”.")
             do_rerun()
 
         except Exception as e:
@@ -530,18 +550,17 @@ if submitted and ticker:
         "CatalystYN": catalyst_yn,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
-    pred = predict_daily_calibrated(row, st.session_state.get("lassoA", {}))
+    pred = predict_daily_calibrated(row, ss.get("lassoA", {}))
     row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
     denom = row["PredVol_M"]
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
-    st.session_state.rows.append(row); st.session_state.last = row
+    ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
 # ============================== Alignment (Radio under title; NO significance) ==============================
 st.markdown("### Alignment")
 
-# ----- Stable radio under Alignment -----
-models = st.session_state.get("models", {})
+models = ss.get("models", {})
 has_ft  = not models.get("ft_med_tbl", pd.DataFrame()).empty
 has_t10 = not models.get("t10_med_tbl", pd.DataFrame()).empty
 
@@ -555,41 +574,36 @@ key2label = {k: lbl for k, lbl in OPTIONS}
 label2key = {lbl: k for k, lbl in OPTIONS}
 labels = [lbl for _, lbl in OPTIONS]
 
-if st.session_state.view_choice_label not in labels:
-    st.session_state.view_choice_label = key2label[st.session_state.view_mode_key]
+if ss.view_choice_label not in labels:
+    ss.view_choice_label = key2label[ss.view_mode_key]
 
 chosen_label = st.radio(
-    "View",
-    labels,
-    index=labels.index(st.session_state.view_choice_label),
+    "View", labels,
+    index=labels.index(ss.view_choice_label),
     horizontal=True,
     key="view_choice_label",
 )
-st.session_state.view_mode_key = label2key[chosen_label]
+ss.view_mode_key = label2key[chosen_label]
 
 def _pick_tables_by_key(view_key: str):
-    if view_key == "ft_robust" and has_ft:
-        return models["ft_med_tbl"]
-    if view_key == "ft_classic" and has_ft:
-        return models["ft_mean_tbl"]
-    if view_key == "t10_robust" and has_t10:
-        return models["t10_med_tbl"]
-    if view_key == "t10_classic" and has_t10:
-        return models["t10_mean_tbl"]
+    if view_key == "ft_robust" and has_ft:   return models["ft_med_tbl"]
+    if view_key == "ft_classic" and has_ft:  return models["ft_mean_tbl"]
+    if view_key == "t10_robust" and has_t10: return models["t10_med_tbl"]
+    if view_key == "t10_classic" and has_t10:return models["t10_mean_tbl"]
     return pd.DataFrame()
 
-center_tbl = _pick_tables_by_key(st.session_state.view_mode_key)
-st.session_state.models_tbl_current = center_tbl.copy()
+center_tbl = _pick_tables_by_key(ss.view_mode_key)
+ss.models_tbl_current = center_tbl.copy()
 
-if st.session_state.view_mode_key.startswith("t10"):
+if ss.view_mode_key.startswith("t10"):
     thr = models.get("top10_threshold", np.nan)
     if np.isfinite(thr):
         st.caption(f"Current Top-10% cutoff (Max Push Daily %): {thr:.2f}%")
 
 # ----- Alignment table build -----
-models_tbl = st.session_state.get("models_tbl_current", pd.DataFrame()).copy()
-var_core = (st.session_state.models or {}).get("var_core", [])
-var_mod  = (st.session_state.models or {}).get("var_moderate", [])
+models_tbl = ss.get("models_tbl_current", pd.DataFrame()).copy()
+var_core = (ss.models or {}).get("var_core", [])
+var_mod  = (ss.models or {}).get("var_moderate", [])
 
 def _compute_alignment_counts_weighted(
     stock_row: dict,
@@ -609,15 +623,19 @@ def _compute_alignment_counts_weighted(
     mod_pts  = {gA: 0.0, gB: 0.0}
     used_core = used_mod = 0
 
+    # Pre-pull centers for faster lookups
+    centers = models_tbl
+    idx_set = set(centers.index)
+
     def _vote_one(var: str, weight: float, bucket: dict):
         nonlocal used_core, used_mod
+        if var not in idx_set: return
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
-        if not np.isfinite(xv) or var not in models_tbl.index: return
-        centers = models_tbl.loc[var, [gA, gB]].astype(float)
-        if centers.isna().any(): return
+        if not np.isfinite(xv): return
+        vA = float(centers.at[var, gA]); vB = float(centers.at[var, gB])
+        if np.isnan(vA) or np.isnan(vB): return
 
-        dA = abs(xv - centers[gA]); dB = abs(xv - centers[gB])
-
+        dA = abs(xv - vA); dB = abs(xv - vB)
         if dA < dB:
             counts[gA] += weight; bucket[gA] += weight
         elif dB < dA:
@@ -649,22 +667,21 @@ def _compute_alignment_counts_weighted(
         "N_core_used": used_core, "N_mod_used": used_mod,
     }
 
-if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
+if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
     summary_rows, detail_map = [], {}
     gA, gB = list(models_tbl.columns)
 
     detail_order = [("Core variables", var_core),
                     ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
 
-    for row in st.session_state.rows:
+    # Build once, avoid per-var .loc overhead by local refs
+    mt_index = set(models_tbl.index)
+
+    for row in ss.rows:
         stock = dict(row); tkr = stock.get("Ticker") or "—"
         counts = _compute_alignment_counts_weighted(
-            stock_row=stock,
-            models_tbl=models_tbl,
-            var_core=var_core,
-            var_mod=var_mod,
-            w_core=1.0, w_mod=0.5,
-            tie_mode="split",
+            stock_row=stock, models_tbl=models_tbl, var_core=var_core, var_mod=var_mod,
+            w_core=1.0, w_mod=0.5, tie_mode="split",
         )
         if not counts: continue
 
@@ -676,7 +693,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
             "B_val_int": counts.get("B_pct_int", 0),
             "A_label": counts.get("A_label", gA),
             "B_label": counts.get("B_label", gB),
-            # diagnostics (optional)
+            # diagnostics
             "A_pts": counts.get("A_pts", 0.0),
             "B_pts": counts.get("B_pts", 0.0),
             "A_core": counts.get("A_core", 0.0),
@@ -693,15 +710,17 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
                 va = pd.to_numeric(stock.get(v), errors="coerce")
 
                 med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
-                vA = models_tbl.loc[med_var, gA] if (med_var in models_tbl.index) else np.nan
-                vB = models_tbl.loc[med_var, gB] if (med_var in models_tbl.index) else np.nan
+                if med_var in mt_index:
+                    vA = models_tbl.at[med_var, gA]
+                    vB = models_tbl.at[med_var, gB]
+                else:
+                    vA = np.nan; vB = np.nan
 
                 if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(vA) and pd.isna(vB): continue
 
                 dA = None if (pd.isna(va) or pd.isna(vA)) else float(va - vA)
                 dB = None if (pd.isna(va) or pd.isna(vB)) else float(va - vB)
 
-                # No significance — just absolute deltas and sign color
                 drows_grouped.append({
                     "Variable": v,
                     "Value": None if pd.isna(va) else float(va),
@@ -716,59 +735,37 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
 
     # ---------------- HTML/JS ----------------
     import streamlit.components.v1 as components
-    payload = {"rows": summary_rows, "details": detail_map, "gA": gA, "gB": gB}
+    # compact payload (round a bit to shrink)
+    def _round_rec(o):
+        if isinstance(o, dict): return {k:_round_rec(v) for k,v in o.items()}
+        if isinstance(o, list): return [_round_rec(v) for v in o]
+        if isinstance(o, float): return float(np.round(o, 6))
+        return o
+    payload = _round_rec({"rows": summary_rows, "details": detail_map, "gA": gA, "gB": gB})
+
     html = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
 <style>
-  body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif; }
-  table.dataTable tbody tr { cursor: pointer; }
-
-  .bar-wrap { display:flex; justify-content:center; align-items:center; gap:6px; }
-  .bar { height: 12px; width: 120px; border-radius: 8px; background: #eee; position: relative; overflow: hidden; }
-  .bar > span { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; }
-  .bar-label { font-size: 11px; white-space: nowrap; color:#374151; min-width: 28px; text-align:center; }
-  .blue > span { background:#3b82f6; }  .red  > span { background:#ef4444; }
-
-  #align td:nth-child(2), #align th:nth-child(2),
-  #align td:nth-child(3), #align th:nth-child(3) { text-align: center; }
-
-  .child-table { width: 100%; border-collapse: collapse; margin: 2px 0 2px 24px; table-layout: fixed; }
-  .child-table th, .child-table td {
-    font-size: 11px; padding: 3px 6px; border-bottom: 1px solid #e5e7eb;
-    text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-  }
-  .child-table th:first-child, .child-table td:first-child { text-align:left; }
-
-  tr.group-row td { background:#f3f4f6 !important; color:#374151; font-weight:600; }
-
-  .col-var { width: 18%; }
-  .col-val { width: 12%; }
-  .col-a   { width: 18%; }
-  .col-b   { width: 18%; }
-  .col-da  { width: 17%; }
-  .col-db  { width: 17%; }
-
-  .pos { color:#059669; } 
-  .neg { color:#dc2626; }
-</style>
-</head>
-<body>
+  body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,"Helvetica Neue",sans-serif}
+  table.dataTable tbody tr{cursor:pointer}
+  .bar-wrap{display:flex;justify-content:center;align-items:center;gap:6px}
+  .bar{height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden}
+  .bar>span{position:absolute;left:0;top:0;bottom:0;width:0%}
+  .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:28px;text-align:center}
+  .blue>span{background:#3b82f6}.red>span{background:#ef4444}
+  #align td:nth-child(2),#align th:nth-child(2),#align td:nth-child(3),#align th:nth-child(3){text-align:center}
+  .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
+  .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .child-table th:first-child,.child-table td:first-child{text-align:left}
+  tr.group-row td{background:#f3f4f6!important;color:#374151;font-weight:600}
+  .col-var{width:18%}.col-val{width:12%}.col-a{width:18%}.col-b{width:18%}.col-da{width:17%}.col-db{width:17%}
+  .pos{color:#059669}.neg{color:#dc2626}
+</style></head><body>
   <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead>
-      <tr>
-        <th>Ticker</th>
-        <th id="hdrA"></th>
-        <th id="hdrB"></th>
-      </tr>
-    </thead>
+    <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th></tr></thead>
   </table>
-
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
   <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
@@ -776,109 +773,60 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
     const data = %%PAYLOAD%%;
     document.getElementById('hdrA').textContent = data.gA;
     document.getElementById('hdrB').textContent = data.gB;
-
-    function barCellLabeled(valRaw, label, valInt) {
-      const strong = (label === 'FT=1' || label === 'Top10');
-      const cls = strong ? 'blue' : 'red';
-      const w = (valRaw==null || isNaN(valRaw)) ? 0 : Math.max(0, Math.min(100, valRaw));
-      const text = (valInt==null || isNaN(valInt)) ? Math.round(w) : valInt;
-      return `
-        <div class="bar-wrap">
-          <div class="bar ${cls}"><span style="width:${w}%"></span></div>
-          <div class="bar-label">${text}</div>
-        </div>`;
+    function barCellLabeled(valRaw,label,valInt){
+      const strong=(label==='FT=1'||label==='Top10'); const cls=strong?'blue':'red';
+      const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
+      const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
+      return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
     }
-    function formatVal(x){ return (x==null || isNaN(x)) ? '' : Number(x).toFixed(2); }
-
-    function childTableHTML(ticker) {
-      const rows = (data.details || {})[ticker] || [];
-      const parent = (data.rows || []).find(r => r.Ticker === ticker) || {};
-      const leftInfo  = (parent.A_pts!=null) ? `(core ${Number(parent.A_core||0).toFixed(1)} + mod ${Number(parent.A_mod||0).toFixed(1)} = ${Number(parent.A_pts||0).toFixed(1)})` : '';
-      const rightInfo = (parent.B_pts!=null) ? `(core ${Number(parent.B_core||0).toFixed(1)} + mod ${Number(parent.B_mod||0).toFixed(1)} = ${Number(parent.B_pts||0).toFixed(1)})` : '';
-
-      if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
-
-      const cells = rows.map(r => {
-        if (r.__group__) return '<tr class="group-row"><td colspan="6">' + r.__group__ + '</td></tr>';
-
-        const v  = formatVal(r.Value);
-        const a  = formatVal(r.A);
-        const b  = formatVal(r.B);
-
-        // ABS deltas with sign color
-        const rawDa = (r.d_vs_A==null || isNaN(r.d_vs_A)) ? null : Number(r.d_vs_A);
-        const rawDb = (r.d_vs_B==null || isNaN(r.d_vs_B)) ? null : Number(r.d_vs_B);
-        const da = (rawDa==null) ? '' : formatVal(Math.abs(rawDa));
-        const db = (rawDb==null) ? '' : formatVal(Math.abs(rawDb));
-        const ca = (rawDa==null) ? '' : (rawDa >= 0 ? 'pos' : 'neg');
-        const cb = (rawDb==null) ? '' : (rawDb >= 0 ? 'pos' : 'neg');
-
-        return `
-          <tr>
-            <td class="col-var">${r.Variable}</td>
-            <td class="col-val">${v}</td>
-            <td class="col-a">${a}</td>
-            <td class="col-b">${b}</td>
-            <td class="col-da ${ca}">${da}</td>
-            <td class="col-db ${cb}">${db}</td>
-          </tr>`;
+    function formatVal(x){return (x==null||isNaN(x))?'':Number(x).toFixed(2);}
+    function childTableHTML(ticker){
+      const rows=(data.details||{})[ticker]||[];
+      const parent=(data.rows||[]).find(r=>r.Ticker===ticker)||{};
+      const leftInfo=(parent.A_pts!=null)?`(core ${Number(parent.A_core||0).toFixed(1)} + mod ${Number(parent.A_mod||0).toFixed(1)} = ${Number(parent.A_pts||0).toFixed(1)})`:'';
+      const rightInfo=(parent.B_pts!=null)?`(core ${Number(parent.B_core||0).toFixed(1)} + mod ${Number(parent.B_mod||0).toFixed(1)} = ${Number(parent.B_pts||0).toFixed(1)})`:'';
+      if(!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
+      const cells = rows.map(r=>{
+        if(r.__group__) return '<tr class="group-row"><td colspan="6">'+r.__group__+'</td></tr>';
+        const v=formatVal(r.Value), a=formatVal(r.A), b=formatVal(r.B);
+        const rawDa=(r.d_vs_A==null||isNaN(r.d_vs_A))?null:Number(r.d_vs_A);
+        const rawDb=(r.d_vs_B==null||isNaN(r.d_vs_B))?null:Number(r.d_vs_B);
+        const da=(rawDa==null)?'':formatVal(Math.abs(rawDa));
+        const db=(rawDb==null)?'':formatVal(Math.abs(rawDb));
+        const ca=(rawDa==null)?'':(rawDa>=0?'pos':'neg'); const cb=(rawDb==null)?'':(rawDb>=0?'pos':'neg');
+        return `<tr><td class="col-var">${r.Variable}</td><td class="col-val">${v}</td><td class="col-a">${a}</td><td class="col-b">${b}</td><td class="col-da ${ca}">${da}</td><td class="col-db ${cb}">${db}</td></tr>`;
       }).join('');
-
-      return `
-        <table class="child-table">
-          <colgroup>
-            <col class="col-var"/><col class="col-val"/><col class="col-a"/><col class="col-b"/><col class="col-da"/><col class="col-db"/>
-          </colgroup>
-          <thead>
-            <tr>
-              <th class="col-var">Variable</th>
-              <th class="col-val">Value</th>
-              <th class="col-a">${data.gA} center <span style="font-weight:400;color:#6b7280;">${leftInfo}</span></th>
-              <th class="col-b">${data.gB} center <span style="font-weight:400;color:#6b7280;">${rightInfo}</span></th>
-              <th class="col-da">Δ vs ${data.gA}</th>
-              <th class="col-db">Δ vs ${data.gB}</th>
-            </tr>
-          </thead>
-          <tbody>${cells}</tbody>
-        </table>`;
+      return `<table class="child-table">
+        <colgroup><col class="col-var"/><col class="col-val"/><col class="col-a"/><col class="col-b"/><col class="col-da"/><col class="col-db"/></colgroup>
+        <thead><tr><th class="col-var">Variable</th><th class="col-val">Value</th>
+        <th class="col-a">${data.gA} center <span style="font-weight:400;color:#6b7280;">${leftInfo}</span></th>
+        <th class="col-b">${data.gB} center <span style="font-weight:400;color:#6b7280;">${rightInfo}</span></th>
+        <th class="col-da">Δ vs ${data.gA}</th><th class="col-db">Δ vs ${data.gB}</th></tr></thead>
+        <tbody>${cells}</tbody></table>`;
     }
-
-    $(function() {
-      const table = $('#align').DataTable({
-        data: data.rows || [],
-        responsive: true,
-        paging: false, info: false, searching: false,
-        order: [[0,'asc']],
-        columns: [
-          { data: 'Ticker' },
-          { data: null, render: (row) => barCellLabeled(row.A_val_raw, row.A_label, row.A_val_int) },
-          { data: null, render: (row) => barCellLabeled(row.B_val_raw, row.B_label, row.B_val_int) },
-        ]
+    $(function(){
+      const table=$('#align').DataTable({
+        data: data.rows||[], responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
+        columns:[{data:'Ticker'},
+                 {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int)},
+                 {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int)}]
       });
-
-      $('#align tbody').on('click', 'tr', function () {
-        const row = table.row(this);
-        if (row.child.isShown()) {
-          row.child.hide(); $(this).removeClass('shown');
-        } else {
-          const ticker = row.data().Ticker;
-          row.child(childTableHTML(ticker)).show(); $(this).addClass('shown');
-        }
+      $('#align tbody').on('click','tr',function(){
+        const row=table.row(this);
+        if(row.child.isShown()){ row.child.hide(); $(this).removeClass('shown'); }
+        else { const ticker=row.data().Ticker; row.child(childTableHTML(ticker)).show(); $(this).addClass('shown'); }
       });
     });
-  </script>
-</body>
-</html>
+  </script></body></html>
     """
     html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
     import streamlit.components.v1 as components
-    components.html(
+    components.html(  # ❗️ FIX: no unsupported key=
         html,
         height=620,
-        scrolling=True,
-        key=f"align_{st.session_state.view_mode_key}"
+        scrolling=True
     )
-elif st.session_state.rows:
+elif ss.rows:
     st.info("Upload DB and click **Build model stocks** to compute FT and Top10 summaries first.")
 else:
     st.info("Add at least one stock above to compute alignment.")
