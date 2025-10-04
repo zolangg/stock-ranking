@@ -565,7 +565,11 @@ if has_ft or has_t10:
                           .apply(_style_sig, subset=[gA])
                           .apply(_style_sig, subset=[gB])
                           .format("{:.2f}"))
-                st.dataframe(styled, use_container_width=True)
+                st.dataframe(
+                    styled,
+                    use_container_width=True,
+                    key=f"{title}_sig_{float(st.session_state.sig_thresh):.1f}_{st.session_state.view_mode_key}"
+                )
             else:
                 st.markdown(f"**{title}**")
                 st.dataframe(sub, use_container_width=True)
@@ -590,8 +594,8 @@ with st.form("add_form", clear_on_submit=True):
         ticker      = st.text_input("Ticker", "").strip().upper()
         mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
         float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
-        gap_pct     = st.number_input("Gap %", 0.0, step=0.1, format="%.1f")
-        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.1, format="%.1f")
+        gap_pct     = st.number_input("Gap %", 0.0, step=0.1, format="%.2f")
+        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.1, format="%.2f")
     with c2:
         atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
         pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
@@ -967,6 +971,11 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
     """
     html = html.replace("%%PAYLOAD%%", json.dumps(payload))
     import streamlit.components.v1 as components
-    components.html(html, height=620, scrolling=True)
+    components.html(
+        html,
+        height=620,
+        scrolling=True,
+        key=f"align_{float(st.session_state.sig_thresh):.1f}_{st.session_state.view_mode_key}"
+    )
 else:
     st.info("No eligible rows yet. Add manual stocks and/or ensure group summaries are built.")
