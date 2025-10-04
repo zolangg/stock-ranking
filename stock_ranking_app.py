@@ -32,20 +32,17 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     if df is None or df.empty: return None
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
-    # exact (case-insensitive)
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
             if cols_lc[c] == lc:
                 return c
-    # normalized exact
     nm = {c: _norm(c) for c in cols}
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n:
                 return c
-    # normalized contains
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
@@ -474,8 +471,6 @@ if build_btn:
             lasso_model = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99)
             st.session_state.lassoA = lasso_model or {}
 
-            # default view stays stable
-            st.session_state.view_mode_key = st.session_state.view_mode_key or DEFAULT_VIEW
             st.success("Built FT and Top10 summaries.")
             do_rerun()
 
@@ -504,8 +499,13 @@ if has_ft or has_t10:
         if "view_choice_label" not in st.session_state:
             st.session_state.view_choice_label = key2label[st.session_state.view_mode_key]
 
-        chosen_label = st.radio("View", labels, index=labels.index(st.session_state.view_choice_label),
-                                horizontal=True, key="view_choice_label")
+        chosen_label = st.radio(
+            "View",
+            labels,
+            index=labels.index(st.session_state.view_choice_label),
+            horizontal=True,
+            key="view_choice_label",
+        )
         st.session_state.view_mode_key = label2key[chosen_label]
 
         var_core = models.get("var_core", []) or []
@@ -533,10 +533,11 @@ if has_ft or has_t10:
             help="Highlight rows where |GroupA − GroupB| / (SpreadA + SpreadB) ≥ σ",
         )
 
-        # expose current pair of tables to Alignment
+        # push current tables to state for alignment
         st.session_state["models_tbl_current"] = center_tbl
         st.session_state["spread_tbl_current"] = spread_tbl
 
+        # ---------- render grouped tables ----------
         def show_grouped_table(title, vars_list, center_tbl, spread_tbl):
             if center_tbl is None or center_tbl.empty or not vars_list:
                 st.info(f"No variables available for {title}."); return
@@ -548,31 +549,34 @@ if has_ft or has_t10:
             if not sub_idx: st.info(f"No overlapping variables for {title}."); return
             sub = center_tbl.loc[sub_idx].copy()
 
+            # significance using current σ; unique key forces re-style on slider move
             if not spread_tbl.empty and {gA, gB}.issubset(spread_tbl.columns):
-                eps = 1e-9
                 diff = (sub[gA] - sub[gB]).abs()
                 common = [r for r in diff.index if r in spread_tbl.index]
                 sub = sub.loc[common]; diff = diff.loc[common]
-                spread = (spread_tbl.loc[common, gA].fillna(0.0) + spread_tbl.loc[common, gB].fillna(0.0))
-                sig = diff / (spread.replace(0.0, np.nan) + eps)
-                sig_flag = sig >= float(st.session_state.sig_thresh)
+                denom = (spread_tbl.loc[common, gA].fillna(0.0) + spread_tbl.loc[common, gB].fillna(0.0))
+                denom = denom.replace(0.0, np.nan)  # avoid jitter on near-zeros
+                sig = diff / denom
+                SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
+                sig_flag = sig >= SIG_THR
 
                 def _style_sig(col: pd.Series):
                     return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
                             for idx in col.index]
-                st.markdown(f"**{title}**")
                 styled = (sub.style
                           .apply(_style_sig, subset=[gA])
                           .apply(_style_sig, subset=[gB])
                           .format("{:.2f}"))
+                st.markdown(f"**{title}**")
                 st.dataframe(
                     styled,
                     use_container_width=True,
-                    key=f"{title}_sig_{float(st.session_state.sig_thresh):.1f}_{st.session_state.view_mode_key}"
+                    key=f"sumtbl_{title}_{vmk}_{st.session_state.sig_thresh:.1f}"
                 )
             else:
                 st.markdown(f"**{title}**")
-                st.dataframe(sub, use_container_width=True)
+                st.dataframe(sub.style.format("{:.2f}"), use_container_width=True,
+                             key=f"sumtbl_{title}_{vmk}_plain")
 
         show_grouped_table("Core variables", var_core, center_tbl, spread_tbl)
         show_grouped_table("Moderate variables", var_mod, center_tbl, spread_tbl)
@@ -594,8 +598,8 @@ with st.form("add_form", clear_on_submit=True):
         ticker      = st.text_input("Ticker", "").strip().upper()
         mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
         float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
-        gap_pct     = st.number_input("Gap %", 0.0, step=0.1, format="%.2f")
-        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.1, format="%.2f")
+        gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")                 # 2dp
+        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")  # 2dp
     with c2:
         atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
         pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
@@ -637,7 +641,7 @@ models_tbl = st.session_state.get("models_tbl_current", pd.DataFrame())
 spread_tbl = st.session_state.get("spread_tbl_current", pd.DataFrame())
 var_core = (st.session_state.models or {}).get("var_core", [])
 var_mod  = (st.session_state.models or {}).get("var_moderate", [])
-SIG_THR = float(st.session_state.sig_thresh)
+SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
 
 def _compute_alignment_counts_weighted(
     stock_row: dict,
@@ -738,7 +742,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
             "B_val_int": counts.get("B_pct_int", 0),
             "A_label": counts.get("A_label", gA),
             "B_label": counts.get("B_label", gB),
-            # optional diagnostics
+            # diagnostics (optional)
             "A_pts": counts.get("A_pts", 0.0),
             "B_pts": counts.get("B_pts", 0.0),
             "A_core": counts.get("A_core", 0.0),
@@ -772,6 +776,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
                     sA_val = (abs(dA) / denom) if dA is not None else np.nan
                     sB_val = (abs(dB) / denom) if dB is not None else np.nan
 
+                SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
                 sigA = (not pd.isna(sA_val)) and (sA_val >= SIG_THR)
                 sigB = (not pd.isna(sB_val)) and (sB_val >= SIG_THR)
                 significant = sigA or sigB
@@ -882,7 +887,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
     function formatVal(x){ return (x==null || isNaN(x)) ? '' : Number(x).toFixed(2); }
 
     function childTableHTML(ticker) {
-      const rows = data.details[ticker] || [];
+      const rows = (data.details || {})[ticker] || [];
       const parent = (data.rows || []).find(r => r.Ticker === ticker) || {};
       const leftInfo  = (parent.A_pts!=null) ? `(core ${Number(parent.A_core||0).toFixed(1)} + mod ${Number(parent.A_mod||0).toFixed(1)} = ${Number(parent.A_pts||0).toFixed(1)})` : '';
       const rightInfo = (parent.B_pts!=null) ? `(core ${Number(parent.B_core||0).toFixed(1)} + mod ${Number(parent.B_mod||0).toFixed(1)} = ${Number(parent.B_pts||0).toFixed(1)})` : '';
@@ -944,7 +949,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
 
     $(function() {
       const table = $('#align').DataTable({
-        data: data.rows,
+        data: data.rows || [],
         responsive: true,
         paging: false, info: false, searching: false,
         order: [[0,'asc']],
@@ -975,7 +980,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
         html,
         height=620,
         scrolling=True,
-        key=f"align_{float(st.session_state.sig_thresh):.1f}_{st.session_state.view_mode_key}"
+        key=f"align_{st.session_state.view_mode_key}_{st.session_state.sig_thresh:.1f}"
     )
 else:
     st.info("No eligible rows yet. Add manual stocks and/or ensure group summaries are built.")
