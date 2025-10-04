@@ -817,11 +817,28 @@ def _compute_alignment_counts_weighted(
     for v in var_core: vote_for(v, w_core)
     for v in var_mod:  vote_for(v, w_mod)
 
-    total_weight = counts[gA] + counts[gB]
-    pctA = round(100.0 * counts[gA] / total_weight, 0) if total_weight > 0 else 0.0
-    pctB = round(100.0 * counts[gB] / total_weight, 0) if total_weight > 0 else 0.0
-    return {gA: counts[gA], gB: counts[gB], "A_pct": pctA, "B_pct": pctB,
-            "A_label": gA, "B_label": gB, "N_core_used": used_core, "N_mod_used": used_mod}
+    total = counts[gA] + counts[gB]
+    if total <= 0:
+        # No usable votes – show 0/0 bars
+        return {gA: 0.0, gB: 0.0,
+                "A_pct_raw": 0.0, "B_pct_raw": 0.0,
+                "A_pct_int": 0,   "B_pct_int": 0,
+                "A_label": gA, "B_label": gB,
+                "N_core_used": used_core, "N_mod_used": used_mod}
+
+    # Raw (exact) percentages for widths
+    a_raw = 100.0 * counts[gA] / total
+    b_raw = 100.0 - a_raw  # enforce sum=100
+
+    # Integer labels that always sum to 100 (derive B from A)
+    a_int = int(round(a_raw))
+    b_int = 100 - a_int
+
+    return {gA: counts[gA], gB: counts[gB],
+            "A_pct_raw": a_raw, "B_pct_raw": b_raw,
+            "A_pct_int": a_int, "B_pct_int": b_int,
+            "A_label": gA, "B_label": gB,
+            "N_core_used": used_core, "N_mod_used": used_mod}
 
 if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
     summary_rows, detail_map = [], {}
@@ -836,8 +853,15 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
         counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
         if not counts: continue
 
-        summary_rows.append({"Ticker": tkr, "A_val": counts.get("A_pct", 0.0), "B_val": counts.get("B_pct", 0.0),
-                             "A_label": counts.get("A_label", gA), "B_label": counts.get("B_label", gB)})
+        summary_rows.append({
+            "Ticker": tkr,
+            "A_val_raw": counts.get("A_pct_raw", 0.0),
+            "B_val_raw": counts.get("B_pct_raw", 0.0),
+            "A_val_int": counts.get("A_pct_int", 0),
+            "B_val_int": counts.get("B_pct_int", 0),
+            "A_label": counts.get("A_label", gA),
+            "B_label": counts.get("B_label", gB),
+        })
 
         drows_grouped = []
         for grp_label, grp_vars in detail_order:
@@ -1054,18 +1078,17 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
         </table>`;
     }
 
-    $(function() {
-      const table = $('#align').DataTable({
-        data: data.rows,
-        responsive: true,
-        paging: false, info: false, searching: false,
-        order: [[0,'asc']],
-        columns: [
-          { data: 'Ticker' },
-          { data: 'A_val', render: (d)=>barCellRed(d) },
-          { data: 'B_val', render: (d)=>barCell(d) },
-        ]
-      });
+    function barCellLabeled(valRaw, label, valInt) {
+      const strong = (label === 'FT=1' || label === 'Top10');
+      const cls = strong ? 'blue' : 'red';
+      const w = (valRaw==null || isNaN(valRaw)) ? 0 : Math.max(0, Math.min(100, valRaw));
+      const text = (valInt==null || isNaN(valInt)) ? Math.round(w) : valInt;
+      return `
+        <div class="bar-wrap">
+          <div class="bar ${cls}"><span style="width:${w}%"></span></div>
+          <div class="bar-label">${text}</div>
+        </div>`;
+    }
 
       $('#align tbody').on('click', 'tr', function () {
         const row = table.row(this);
