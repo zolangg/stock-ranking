@@ -1003,10 +1003,10 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
         const v  = formatVal(r.Value);
         const a  = formatVal(r.A);
         const b  = formatVal(r.B);
-        const da = formatVal(r.d_vs_A);
-        const db = formatVal(r.d_vs_B);
-        const ca = (!da)? '' : (parseFloat(da)>=0 ? 'pos' : 'neg');
-        const cb = (!db)? '' : (parseFloat(db)>=0 ? 'pos' : 'neg');
+        const da = formatVal(Math.abs(r.d_vs_A));
+        const db = formatVal(Math.abs(r.d_vs_B));
+        const ca = '';  // no sign-based color when using absolute deltas
+        const cb = '';
 
         let rowClass = '';
         if (r.significant) {
