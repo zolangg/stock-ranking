@@ -1,4 +1,4 @@
-# app.py — Premarket Stock Ranking (fixed + optimized)
+# app.py — Premarket Stock Ranking (fixed, optimized, + 3σ row coloring)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -22,12 +22,10 @@ ss.setdefault("view_choice_label", "FT: Median")
 
 # ============================== Helpers ==============================
 def do_rerun():
-    # Avoid redundant reruns
     if hasattr(st, "rerun"): st.rerun()
     elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
 
 def SAFE_JSON_DUMPS(obj) -> str:
-    # Compact + stable + converts numpy types
     class NpEncoder(json.JSONEncoder):
         def default(self, o):
             if isinstance(o, (np.integer,)): return int(o)
@@ -35,7 +33,6 @@ def SAFE_JSON_DUMPS(obj) -> str:
             if isinstance(o, (np.ndarray,)): return o.tolist()
             return super().default(o)
     s = json.dumps(obj, cls=NpEncoder, ensure_ascii=False, separators=(",", ":"))
-    # Prevent accidental </script> termination in inline JSON
     return s.replace("</script>", "<\\/script>")
 
 _norm_cache = {}
@@ -153,7 +150,6 @@ def _kfold_indices(n, k=5, seed=42):
     return np.array_split(idx, k)
 
 def _lasso_cd_std(Xs, y, lam, max_iter=900, tol=1e-6):
-    # (slightly fewer iters; same convergence tolerance)
     n, p = Xs.shape
     w = np.zeros(p)
     for _ in range(max_iter):
@@ -243,7 +239,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     Xs_tr = (X_tr - mu) / sd
 
     folds = _kfold_indices(len(y_tr), k=min(5, max(2, len(y_tr)//10)), seed=42)
-    lam_grid = np.geomspace(0.001, 1.0, 26)  # fewer evals → faster
+    lam_grid = np.geomspace(0.001, 1.0, 26)
     cv_mse = []
     for lam in lam_grid:
         errs = []
@@ -395,7 +391,7 @@ if build_btn:
     else:
         try:
             file_bytes = uploaded.getvalue()
-            _ = _hash_bytes(file_bytes)  # creates a cache boundary
+            _ = _hash_bytes(file_bytes)
             raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
 
             # detect FT column
@@ -592,8 +588,17 @@ def _pick_tables_by_key(view_key: str):
     if view_key == "t10_classic" and has_t10:return models["t10_mean_tbl"]
     return pd.DataFrame()
 
+def _pick_dispersion_by_key(view_key: str):
+    c = 1.4826  # MAD → σ
+    if view_key == "ft_robust" and has_ft:   return (models["ft_mad_tbl"] * c).copy()
+    if view_key == "ft_classic" and has_ft:  return models["ft_sd_tbl"].copy()
+    if view_key == "t10_robust" and has_t10: return (models["t10_mad_tbl"] * c).copy()
+    if view_key == "t10_classic" and has_t10:return models["t10_sd_tbl"].copy()
+    return pd.DataFrame()
+
 center_tbl = _pick_tables_by_key(ss.view_mode_key)
 ss.models_tbl_current = center_tbl.copy()
+disp_tbl = _pick_dispersion_by_key(ss.view_mode_key)
 
 if ss.view_mode_key.startswith("t10"):
     thr = models.get("top10_threshold", np.nan)
@@ -623,7 +628,6 @@ def _compute_alignment_counts_weighted(
     mod_pts  = {gA: 0.0, gB: 0.0}
     used_core = used_mod = 0
 
-    # Pre-pull centers for faster lookups
     centers = models_tbl
     idx_set = set(centers.index)
 
@@ -674,8 +678,13 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
     detail_order = [("Core variables", var_core),
                     ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
 
-    # Build once, avoid per-var .loc overhead by local refs
     mt_index = set(models_tbl.index)
+    # align dispersion table to models table
+    if isinstance(disp_tbl, pd.DataFrame) and not disp_tbl.empty:
+        disp_tbl = disp_tbl.reindex(index=models_tbl.index)
+        dt_index = set(disp_tbl.index)
+    else:
+        dt_index = set()
 
     for row in ss.rows:
         stock = dict(row); tkr = stock.get("Ticker") or "—"
@@ -693,7 +702,6 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
             "B_val_int": counts.get("B_pct_int", 0),
             "A_label": counts.get("A_label", gA),
             "B_label": counts.get("B_label", gB),
-            # diagnostics
             "A_pts": counts.get("A_pts", 0.0),
             "B_pts": counts.get("B_pts", 0.0),
             "A_core": counts.get("A_core", 0.0),
@@ -716,6 +724,13 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
                 else:
                     vA = np.nan; vB = np.nan
 
+                # pull sigmas
+                if med_var in dt_index:
+                    sA = float(disp_tbl.at[med_var, gA]) if pd.notna(disp_tbl.at[med_var, gA]) else np.nan
+                    sB = float(disp_tbl.at[med_var, gB]) if pd.notna(disp_tbl.at[med_var, gB]) else np.nan
+                else:
+                    sA = np.nan; sB = np.nan
+
                 if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(vA) and pd.isna(vB): continue
 
                 dA = None if (pd.isna(va) or pd.isna(vA)) else float(va - vA)
@@ -726,6 +741,8 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
                     "Value": None if pd.isna(va) else float(va),
                     "A":   None if pd.isna(vA) else float(vA),
                     "B":   None if pd.isna(vB) else float(vB),
+                    "sA":  None if not np.isfinite(sA) else float(sA),
+                    "sB":  None if not np.isfinite(sB) else float(sB),
                     "d_vs_A": None if dA is None else dA,
                     "d_vs_B": None if dB is None else dB,
                     "is_core": (v in var_core),
@@ -735,7 +752,7 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
 
     # ---------------- HTML/JS ----------------
     import streamlit.components.v1 as components
-    # compact payload (round a bit to shrink)
+
     def _round_rec(o):
         if isinstance(o, dict): return {k:_round_rec(v) for k,v in o.items()}
         if isinstance(o, list): return [_round_rec(v) for v in o]
@@ -762,6 +779,8 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
   tr.group-row td{background:#f3f4f6!important;color:#374151;font-weight:600}
   .col-var{width:18%}.col-val{width:12%}.col-a{width:18%}.col-b{width:18%}.col-da{width:17%}.col-db{width:17%}
   .pos{color:#059669}.neg{color:#dc2626}
+  .sig-hi{background:rgba(250,204,21,0.18)!important} /* yellow */
+  .sig-lo{background:rgba(239,68,68,0.18)!important}  /* red */
 </style></head><body>
   <table id="align" class="display nowrap stripe" style="width:100%">
     <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th></tr></thead>
@@ -773,6 +792,7 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
     const data = %%PAYLOAD%%;
     document.getElementById('hdrA').textContent = data.gA;
     document.getElementById('hdrB').textContent = data.gB;
+
     function barCellLabeled(valRaw,label,valInt){
       const strong=(label==='FT=1'||label==='Top10'); const cls=strong?'blue':'red';
       const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
@@ -780,36 +800,80 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
       return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
     }
     function formatVal(x){return (x==null||isNaN(x))?'':Number(x).toFixed(2);}
+
     function childTableHTML(ticker){
       const rows=(data.details||{})[ticker]||[];
       const parent=(data.rows||[]).find(r=>r.Ticker===ticker)||{};
       const leftInfo=(parent.A_pts!=null)?`(core ${Number(parent.A_core||0).toFixed(1)} + mod ${Number(parent.A_mod||0).toFixed(1)} = ${Number(parent.A_pts||0).toFixed(1)})`:'';
       const rightInfo=(parent.B_pts!=null)?`(core ${Number(parent.B_core||0).toFixed(1)} + mod ${Number(parent.B_mod||0).toFixed(1)} = ${Number(parent.B_pts||0).toFixed(1)})`:'';
+
       if(!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
+
       const cells = rows.map(r=>{
         if(r.__group__) return '<tr class="group-row"><td colspan="6">'+r.__group__+'</td></tr>';
+
         const v=formatVal(r.Value), a=formatVal(r.A), b=formatVal(r.B);
+
         const rawDa=(r.d_vs_A==null||isNaN(r.d_vs_A))?null:Number(r.d_vs_A);
         const rawDb=(r.d_vs_B==null||isNaN(r.d_vs_B))?null:Number(r.d_vs_B);
         const da=(rawDa==null)?'':formatVal(Math.abs(rawDa));
         const db=(rawDb==null)?'':formatVal(Math.abs(rawDb));
-        const ca=(rawDa==null)?'':(rawDa>=0?'pos':'neg'); const cb=(rawDb==null)?'':(rawDb>=0?'pos':'neg');
-        return `<tr><td class="col-var">${r.Variable}</td><td class="col-val">${v}</td><td class="col-a">${a}</td><td class="col-b">${b}</td><td class="col-da ${ca}">${da}</td><td class="col-db ${cb}">${db}</td></tr>`;
+        const ca=(rawDa==null)?'':(rawDa>=0?'pos':'neg');
+        const cb=(rawDb==null)?'':(rawDb>=0?'pos':'neg');
+
+        // ------- 3σ significance vs closer center -------
+        const val  = (r.Value==null || isNaN(r.Value)) ? null : Number(r.Value);
+        const cA   = (r.A==null || isNaN(r.A)) ? null : Number(r.A);
+        const cB   = (r.B==null || isNaN(r.B)) ? null : Number(r.B);
+        const sA   = (r.sA==null || isNaN(r.sA)) ? null : Number(r.sA);
+        const sB   = (r.sB==null || isNaN(r.sB)) ? null : Number(r.sB);
+
+        let sigClass = '';
+        if (val!=null && cA!=null && cB!=null) {
+          const dAabs = Math.abs(val - cA);
+          const dBabs = Math.abs(val - cB);
+          const closer = (dAabs <= dBabs) ? 'A' : 'B';
+          const center = closer === 'A' ? cA : cB;
+          const sigma  = closer === 'A' ? sA : sB;
+
+          if (sigma!=null && sigma>0) {
+            const z = (val - center) / sigma;
+            if (z >= 3)       sigClass = 'sig-hi'; // significantly higher
+            else if (z <= -3) sigClass = 'sig-lo'; // significantly lower
+          }
+        }
+
+        return `<tr class="${sigClass}">
+          <td class="col-var">${r.Variable}</td>
+          <td class="col-val">${v}</td>
+          <td class="col-a">${a}</td>
+          <td class="col-b">${b}</td>
+          <td class="col-da ${ca}">${da}</td>
+          <td class="col-db ${cb}">${db}</td>
+        </tr>`;
       }).join('');
+
       return `<table class="child-table">
         <colgroup><col class="col-var"/><col class="col-val"/><col class="col-a"/><col class="col-b"/><col class="col-da"/><col class="col-db"/></colgroup>
-        <thead><tr><th class="col-var">Variable</th><th class="col-val">Value</th>
-        <th class="col-a">${data.gA} center <span style="font-weight:400;color:#6b7280;">${leftInfo}</span></th>
-        <th class="col-b">${data.gB} center <span style="font-weight:400;color:#6b7280;">${rightInfo}</span></th>
-        <th class="col-da">Δ vs ${data.gA}</th><th class="col-db">Δ vs ${data.gB}</th></tr></thead>
+        <thead><tr>
+          <th class="col-var">Variable</th>
+          <th class="col-val">Value</th>
+          <th class="col-a">${data.gA} center <span style="font-weight:400;color:#6b7280;">${leftInfo}</span></th>
+          <th class="col-b">${data.gB} center <span style="font-weight:400;color:#6b7280;">${rightInfo}</span></th>
+          <th class="col-da">Δ vs ${data.gA}</th>
+          <th class="col-db">Δ vs ${data.gB}</th>
+        </tr></thead>
         <tbody>${cells}</tbody></table>`;
     }
+
     $(function(){
       const table=$('#align').DataTable({
         data: data.rows||[], responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
-        columns:[{data:'Ticker'},
-                 {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int)},
-                 {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int)}]
+        columns:[
+          {data:'Ticker'},
+          {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int)},
+          {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int)}
+        ]
       });
       $('#align tbody').on('click','tr',function(){
         const row=table.row(this);
@@ -821,7 +885,7 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
     """
     html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
     import streamlit.components.v1 as components
-    components.html(  # ❗️ FIX: no unsupported key=
+    components.html(
         html,
         height=620,
         scrolling=True
