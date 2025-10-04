@@ -530,7 +530,7 @@ if has_ft or has_t10:
             value=st.session_state.sig_thresh,
             step=0.1,
             key="sig_thresh",
-            help="Highlight rows where |GroupA − GroupB| / (SpreadA + SpreadB) ≥ σ",
+            help="Highlight rows where |GroupA − GroupB| / pooled spread ≥ σ",
         )
 
         # push current tables to state for alignment
@@ -549,13 +549,24 @@ if has_ft or has_t10:
             if not sub_idx: st.info(f"No overlapping variables for {title}."); return
             sub = center_tbl.loc[sub_idx].copy()
 
-            # significance using current σ; unique key forces re-style on slider move
+            # significance using current σ; robust uses MAD→SD; pooled spread √(sA²+sB²)
             if not spread_tbl.empty and {gA, gB}.issubset(spread_tbl.columns):
                 diff = (sub[gA] - sub[gB]).abs()
                 common = [r for r in diff.index if r in spread_tbl.index]
                 sub = sub.loc[common]; diff = diff.loc[common]
-                denom = (spread_tbl.loc[common, gA].fillna(0.0) + spread_tbl.loc[common, gB].fillna(0.0))
-                denom = denom.replace(0.0, np.nan)  # avoid jitter on near-zeros
+
+                sA = spread_tbl.loc[common, gA].astype(float)
+                sB = spread_tbl.loc[common, gB].astype(float)
+
+                robust_mode = st.session_state.view_mode_key.endswith("_robust")
+                if robust_mode:
+                    MAD_TO_SD = 1.4826
+                    sA = sA * MAD_TO_SD
+                    sB = sB * MAD_TO_SD
+
+                denom = np.sqrt(np.square(sA.fillna(0.0)) + np.square(sB.fillna(0.0)))
+                denom = denom.replace(0.0, np.nan)
+
                 sig = diff / denom
                 SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
                 sig_flag = sig >= SIG_THR
@@ -598,8 +609,8 @@ with st.form("add_form", clear_on_submit=True):
         ticker      = st.text_input("Ticker", "").strip().upper()
         mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
         float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
-        gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")                 # 2dp
-        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")  # 2dp
+        gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")
+        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")
     with c2:
         atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
         pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
@@ -641,6 +652,7 @@ models_tbl = st.session_state.get("models_tbl_current", pd.DataFrame())
 spread_tbl = st.session_state.get("spread_tbl_current", pd.DataFrame())
 var_core = (st.session_state.models or {}).get("var_core", [])
 var_mod  = (st.session_state.models or {}).get("var_moderate", [])
+# read current threshold fresh
 SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
 
 def _compute_alignment_counts_weighted(
@@ -761,15 +773,26 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
                 med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
                 vA = models_tbl.loc[med_var, gA] if (med_var in models_tbl.index) else np.nan
                 vB = models_tbl.loc[med_var, gB] if (med_var in models_tbl.index) else np.nan
+
+                # spreads for significance (robust MAD→SD then pooled √(sA²+sB²))
                 sA = spread_tbl.loc[med_var, gA] if (not spread_tbl.empty and med_var in spread_tbl.index and gA in spread_tbl.columns) else np.nan
                 sB = spread_tbl.loc[med_var, gB] if (not spread_tbl.empty and med_var in spread_tbl.index and gB in spread_tbl.columns) else np.nan
+
+                robust_mode = st.session_state.view_mode_key.endswith("_robust")
+                if robust_mode:
+                    MAD_TO_SD = 1.4826
+                    if pd.notna(sA): sA = float(sA) * MAD_TO_SD
+                    if pd.notna(sB): sB = float(sB) * MAD_TO_SD
+
+                sA0 = 0.0 if pd.isna(sA) else float(sA)
+                sB0 = 0.0 if pd.isna(sB) else float(sB)
+                denom = np.hypot(sA0, sB0)  # sqrt(sA^2 + sB^2)
 
                 if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(vA) and pd.isna(vB): continue
 
                 dA = None if (pd.isna(va) or pd.isna(vA)) else float(va - vA)
                 dB = None if (pd.isna(va) or pd.isna(vB)) else float(va - vB)
 
-                denom = (float(sA) if pd.notna(sA) else 0.0) + (float(sB) if pd.notna(sB) else 0.0)
                 if denom == 0.0:
                     sA_val = np.nan; sB_val = np.nan
                 else:
