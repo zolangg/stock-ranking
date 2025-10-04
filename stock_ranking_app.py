@@ -384,6 +384,29 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
         return np.nan
     return float(PM * cal_mult)
 
+# ============================== Utility: build summaries (overall or per PMH bin) ==============================
+def _summaries_for(df_in: pd.DataFrame, var_all: list[str]) -> dict:
+    """
+    Returns {med_tbl, mad_tbl, mean_tbl, sd_tbl} grouped by "Group".
+    """
+    # Keep only numeric for centers/spreads
+    avail = [v for v in var_all if v in df_in.columns]
+    med_tbl  = df_in.groupby("Group")[avail].median(numeric_only=True).T
+    mean_tbl = df_in.groupby("Group")[avail].mean(numeric_only=True).T
+    mad_tbl  = df_in.groupby("Group")[avail].apply(lambda g: g.apply(_mad)).T
+    sd_tbl   = df_in.groupby("Group")[avail].std(numeric_only=True).T
+    return {"med_tbl": med_tbl, "mad_tbl": mad_tbl, "mean_tbl": mean_tbl, "sd_tbl": sd_tbl, "avail": avail}
+
+def _make_pmh_bins(series_pct: pd.Series) -> tuple[pd.Series, list[str]]:
+    """Create PMH bins from Max Push Daily % and return categorical series + label order."""
+    max_val = float(np.nanmax(series_pct.values)) if series_pct.notna().any() else 0.0
+    base_edges = [0, 10, 25, 50, 100, 200, 500, 1000]
+    last_edge = max_val + 1 if max_val >= base_edges[-1] else base_edges[-1]
+    edges = base_edges + ([last_edge] if last_edge > base_edges[-1] else [])
+    labels = [f"{edges[i]}-{edges[i+1]}%" for i in range(len(edges)-1)]
+    sbin = pd.cut(series_pct, bins=edges, labels=labels, include_lowest=True, right=True)
+    return sbin, labels
+
 # ============================== Upload DB → Build Summaries & Train ==============================
 st.subheader("Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
@@ -477,26 +500,67 @@ if build_btn:
                 else:
                     df["Group"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
+                    # ---------- Max Push Daily (%) scaling + PMH bins ----------
+                    pmh_push_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
+                    pmh_counts_tbl = pd.DataFrame()
+                    pmh_bin_labels = []
+                    if pmh_push_col is not None:
+                        pmh_raw = pd.to_numeric(raw[pmh_push_col].map(_to_float), errors="coerce")
+                        df["Max_Push_Daily_%"] = pmh_raw * 100.0  # FRACTIONED → convert to %
+                        mask_pmh = df["Max_Push_Daily_%"].notna()
+                        if mask_pmh.any():
+                            sbin, labels = _make_pmh_bins(df.loc[mask_pmh, "Max_Push_Daily_%"])
+                            pmh_bin_labels = labels
+                            df.loc[mask_pmh, "PMH_Bin"] = sbin
+                            # counts per bin per FT group
+                            pmh_counts_tbl = (df.loc[mask_pmh, ["PMH_Bin", "Group"]]
+                                                .groupby(["PMH_Bin","Group"]).size()
+                                                .unstack("Group", fill_value=0)
+                                                .reindex(labels, axis=0)
+                                                .rename_axis(index=None)
+                                                .rename(columns={"FT=1":"FT=1 (n)", "FT=0":"FT=0 (n)"}))
+
+                    # ---------- Summaries (overall) ----------
                     var_core = [v for v in VAR_CORE if v in df.columns]
                     var_mod  = [v for v in VAR_MODERATE if v in df.columns]
                     var_all  = var_core + var_mod
 
-                    # Robust & classic summaries
-                    gmed  = df.groupby("Group")[var_all].median(numeric_only=True).T
-                    gmads = df.groupby("Group")[var_all].apply(lambda g: g.apply(_mad)).T
-                    gmean = df.groupby("Group")[var_all].mean(numeric_only=True).T
-                    gsd   = df.groupby("Group")[var_all].std(numeric_only=True).T
+                    overall = _summaries_for(df, var_all)
 
+                    # ---------- Summaries (per PMH bin) ----------
+                    pmh_bin_summ = {
+                        "median": {},  # bin -> med_tbl
+                        "mad": {},     # bin -> mad_tbl
+                        "mean": {},    # bin -> mean_tbl
+                        "sd": {}       # bin -> sd_tbl
+                    }
+                    if "PMH_Bin" in df.columns and pmh_bin_labels:
+                        for lbl in pmh_bin_labels:
+                            sub = df[df["PMH_Bin"] == lbl]
+                            if sub.empty or sub["Group"].nunique() < 2:
+                                continue
+                            summ = _summaries_for(sub, var_all)
+                            pmh_bin_summ["median"][lbl] = summ["med_tbl"]
+                            pmh_bin_summ["mad"][lbl]    = summ["mad_tbl"]
+                            pmh_bin_summ["mean"][lbl]   = summ["mean_tbl"]
+                            pmh_bin_summ["sd"][lbl]     = summ["sd_tbl"]
+
+                    # ---------- Persist in session ----------
                     st.session_state.models = {
-                        "med_tbl": gmed,
-                        "mad_tbl": gmads,
-                        "mean_tbl": gmean,
-                        "sd_tbl": gsd,
+                        # overall
+                        "med_tbl": overall["med_tbl"],
+                        "mad_tbl": overall["mad_tbl"],
+                        "mean_tbl": overall["mean_tbl"],
+                        "sd_tbl": overall["sd_tbl"],
                         "var_core": var_core,
-                        "var_moderate": var_mod
+                        "var_moderate": var_mod,
+                        # pmh
+                        "pmh_counts": pmh_counts_tbl,
+                        "pmh_labels": pmh_bin_labels,
+                        "pmh_bin_summ": pmh_bin_summ,
                     }
 
-                    # Train calibrated ratio model
+                    # Train calibrated ratio model (unchanged)
                     lasso_model = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99)
                     st.session_state.lassoA = lasso_model or {}
 
@@ -510,41 +574,102 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# ============================== Summary tables (flip: robust vs classic) ==============================
+# ============================== Summary tables (now with 3-way view, same expander) ==============================
 models_data = st.session_state.models
 if models_data and isinstance(models_data, dict) and not models_data.get("med_tbl", pd.DataFrame()).empty:
-    with st.expander("Group summaries — flip between robust (Median+MAD) and classic (Mean+SD)", expanded=False):
-        view_mode = st.radio(
-            "Center/Spread view",
-            ["Median + MAD (robust)", "Mean + SD (classic)"],
-            index=0,
-            horizontal=True
+    with st.expander("Group summaries — flip between robust (Median+MAD), classic (Mean+SD), or PMH Gainers", expanded=False):
+        # 3-way view selector
+        view_choice = st.radio(
+            "View basis",
+            ["Median + MAD (robust)", "Mean + SD (classic)", "PMH Gainers (by Max Push Daily %)"],
+            index=0, horizontal=True
         )
 
         var_core = models_data.get("var_core", [])
         var_mod  = models_data.get("var_moderate", [])
 
-        if view_mode.startswith("Median"):
-            center_tbl = models_data["med_tbl"]
-            spread_tbl = models_data["mad_tbl"]
-        else:
+        # Defaults
+        center_tbl = models_data["med_tbl"]
+        spread_tbl = models_data["mad_tbl"]
+        st.session_state["view_mode"] = "robust"
+        st.session_state["view_mode_basis"] = "robust"
+
+        # PMH controls (only visible when PMH view selected)
+        pmh_labels = models_data.get("pmh_labels", [])
+        pmh_counts = models_data.get("pmh_counts", pd.DataFrame())
+        pmh_bin_summ = models_data.get("pmh_bin_summ", {"median":{}, "mad":{}, "mean":{}, "sd":{}})
+
+        if view_choice.startswith("Mean"):
             center_tbl = models_data["mean_tbl"]
             spread_tbl = models_data["sd_tbl"]
+            st.session_state["view_mode"] = "classic"
+            st.session_state["view_mode_basis"] = "classic"
 
+        elif view_choice.startswith("PMH"):
+            st.session_state["view_mode"] = "pmh"
+            st.session_state["view_mode_basis"] = "pmh"
+
+            # Bin dropdown
+            if pmh_labels:
+                # Compose label with counts for convenience
+                def label_with_counts(lbl):
+                    if pmh_counts is None or pmh_counts.empty or lbl not in pmh_counts.index:
+                        return f"{lbl}"
+                    c1 = int(pmh_counts.loc[lbl]["FT=1 (n)"]) if "FT=1 (n)" in pmh_counts.columns else 0
+                    c0 = int(pmh_counts.loc[lbl]["FT=0 (n)"]) if "FT=0 (n)" in pmh_counts.columns else 0
+                    return f"{lbl} — FT=1:{c1} | FT=0:{c0}"
+
+                dd_labels = [label_with_counts(lbl) for lbl in pmh_labels]
+                sel = st.selectbox("Select PMH gainer bin", options=dd_labels, index=0)
+                # Map back to raw label
+                sel_raw = pmh_labels[dd_labels.index(sel)]
+
+                # Center choice for PMH (Median/Mean)
+                pmh_center_choice = st.radio("Center for PMH bin", ["Median", "Mean"], index=0, horizontal=True)
+
+                # Fetch bin tables
+                if pmh_center_choice == "Median":
+                    center_tbl = pmh_bin_summ["median"].get(sel_raw, pd.DataFrame())
+                    spread_tbl = pmh_bin_summ["mad"].get(sel_raw, pd.DataFrame())
+                else:
+                    center_tbl = pmh_bin_summ["mean"].get(sel_raw, pd.DataFrame())
+                    spread_tbl = pmh_bin_summ["sd"].get(sel_raw, pd.DataFrame())
+
+                if center_tbl is None or center_tbl.empty or spread_tbl is None:
+                    st.warning("Selected bin has insufficient data for both FT groups.")
+                else:
+                    st.caption("Bins: 0–10, 10–25, 25–50, 50–100, 100–200, 200–500, 500–1000, 1000%+")
+
+        # Persist current tables for alignment section
+        st.session_state["models_tbl_current"] = center_tbl
+        st.session_state["spread_tbl_current"] = spread_tbl
+
+        # Significance slider
         sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
                                help="Highlight rows where |FT=1 − FT=0| / (Spread₁ + Spread₀) ≥ σ")
         st.session_state["sig_thresh"] = float(sig_thresh)
-        st.session_state["view_mode"] = "robust" if view_mode.startswith("Median") else "classic"
 
-        def show_grouped_table(title, vars_list):
-            if not vars_list:
+        def show_grouped_table(title, vars_list, center_tbl, spread_tbl):
+            if center_tbl is None or center_tbl.empty:
                 st.info(f"No variables available for {title}.")
                 return
-            sub = center_tbl.loc[[v for v in vars_list if v in center_tbl.index]].copy()
+            if not vars_list:
+                st.info(f"No variables selected for {title}.")
+                return
+            sub_idx = [v for v in vars_list if v in center_tbl.index]
+            if not sub_idx:
+                st.info(f"No overlapping variables for {title}.")
+                return
+            sub = center_tbl.loc[sub_idx].copy()
+
             if not spread_tbl.empty and {"FT=1","FT=0"}.issubset(spread_tbl.columns):
                 eps = 1e-9
                 diff = (sub["FT=1"] - sub["FT=0"]).abs()
-                spread = (spread_tbl.loc[diff.index, "FT=1"].fillna(0.0) + spread_tbl.loc[diff.index, "FT=0"].fillna(0.0))
+                # Align spread rows
+                common = [r for r in diff.index if r in spread_tbl.index]
+                sub = sub.loc[common]
+                diff = diff.loc[common]
+                spread = (spread_tbl.loc[common, "FT=1"].fillna(0.0) + spread_tbl.loc[common, "FT=0"].fillna(0.0))
                 sig = diff / (spread.replace(0.0, np.nan) + eps)
                 sig_flag = sig >= st.session_state["sig_thresh"]
 
@@ -565,8 +690,11 @@ if models_data and isinstance(models_data, dict) and not models_data.get("med_tb
                        "FT=0": st.column_config.NumberColumn("FT=0 (center)", format="%.2f")}
                 st.dataframe(sub, use_container_width=True, column_config=cfg, hide_index=False)
 
-        show_grouped_table("Core variables", var_core)
-        show_grouped_table("Moderate variables", var_mod)
+        # Render (uses currently selected basis: overall OR PMH bin)
+        show_grouped_table("Core variables", var_core, center_tbl, spread_tbl)
+        show_grouped_table("Moderate variables", var_mod, center_tbl, spread_tbl)
+else:
+    st.info("Upload DB and click **Build model stocks** to compute FT summaries.")
 
 # ============================== ➕ Manual Input ==============================
 st.markdown("---")
@@ -659,20 +787,22 @@ with tcol_sel:
 # ============================== Alignment (DataTables child-rows) ==============================
 st.markdown("### Alignment")
 
-# Choose which center/spread tables feed the alignment (flip)
-view_mode = st.session_state.get("view_mode", "robust")
-if models_data:
-    if view_mode == "robust":
-        models_tbl = models_data.get("med_tbl", pd.DataFrame())
-        spread_tbl = models_data.get("mad_tbl", pd.DataFrame())
+# Choose which center/spread tables feed the alignment (= from the current view)
+models_tbl = st.session_state.get("models_tbl_current", pd.DataFrame())
+spread_tbl = st.session_state.get("spread_tbl_current", pd.DataFrame())
+if models_tbl is None or models_tbl.empty:
+    # Fallback to overall based on last chosen overall view if any
+    view_basis = st.session_state.get("view_mode_basis", "robust")
+    models_data = st.session_state.models
+    if view_basis == "classic":
+        models_tbl = (models_data.get("mean_tbl") or pd.DataFrame())
+        spread_tbl = (models_data.get("sd_tbl") or pd.DataFrame())
     else:
-        models_tbl = models_data.get("mean_tbl", pd.DataFrame())
-        spread_tbl = models_data.get("sd_tbl", pd.DataFrame())
-else:
-    models_tbl = pd.DataFrame(); spread_tbl = pd.DataFrame()
+        models_tbl = (models_data.get("med_tbl") or pd.DataFrame())
+        spread_tbl = (models_data.get("mad_tbl") or pd.DataFrame())
 
-var_core = (models_data or {}).get("var_core", [])
-var_mod  = (models_data or {}).get("var_moderate", [])
+var_core = (st.session_state.models or {}).get("var_core", [])
+var_mod  = (st.session_state.models or {}).get("var_moderate", [])
 SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
 
 def _compute_alignment_counts_weighted(
@@ -741,6 +871,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
                 v1 = models_tbl.loc[med_var, "FT=1"] if (med_var in models_tbl.index) else np.nan
                 v0 = models_tbl.loc[med_var, "FT=0"] if (med_var in models_tbl.index) else np.nan
+
                 s1 = spread_tbl.loc[med_var, "FT=1"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=1" in spread_tbl.columns) else np.nan
                 s0 = spread_tbl.loc[med_var, "FT=0"] if (not spread_tbl.empty and med_var in spread_tbl.index and "FT=0" in spread_tbl.columns) else np.nan
 
@@ -751,7 +882,7 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
                 d1 = None if (pd.isna(va) or pd.isna(v1)) else float(va - v1)
                 d0 = None if (pd.isna(va) or pd.isna(v0)) else float(va - v0)
 
-                # significance for BOTH Core and Moderate: |Δ| / (spread1 + spread0)
+                # significance: |Δ| / (spread1 + spread0)
                 denom = 0.0
                 denom += float(s1) if pd.notna(s1) else 0.0
                 denom += float(s0) if pd.notna(s0) else 0.0
@@ -794,11 +925,10 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
 
         detail_map[tkr] = drows_grouped
 
-    if summary_rows:
-        import streamlit.components.v1 as components
-        payload = {"rows": summary_rows, "details": detail_map}
+    import streamlit.components.v1 as components
+    payload = {"rows": summary_rows, "details": detail_map}
 
-        html = """
+    html = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -970,13 +1100,9 @@ if st.session_state.rows and not models_tbl.empty and {"FT=1","FT=0"}.issubset(m
   </script>
 </body>
 </html>
-        """
-        html = html.replace("%%PAYLOAD%%", json.dumps(payload))
-        import streamlit.components.v1 as components
-        components.html(html, height=620, scrolling=True)
-    else:
-        st.info("No eligible rows yet. Add manual stocks and/or ensure group summaries are built.")
-elif st.session_state.rows and (models_tbl.empty or not {"FT=1","FT=0"}.issubset(models_tbl.columns)):
-    st.info("Upload DB and click **Build model stocks** to compute FT=1/FT=0 summaries first.")
+    """
+    html = html.replace("%%PAYLOAD%%", json.dumps(payload))
+    import streamlit.components.v1 as components
+    components.html(html, height=620, scrolling=True)
 else:
-    st.info("Add at least one stock above to compute alignment.")
+    st.info("No eligible rows yet. Add manual stocks and/or ensure group summaries are built.")
