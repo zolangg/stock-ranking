@@ -18,6 +18,7 @@ if "models" not in st.session_state: st.session_state.models = {}
 if "lassoA" not in st.session_state: st.session_state.lassoA = {}
 if "view_mode_key" not in st.session_state: st.session_state.view_mode_key = DEFAULT_VIEW
 if "models_tbl_current" not in st.session_state: st.session_state.models_tbl_current = pd.DataFrame()
+if "view_choice_label" not in st.session_state: st.session_state.view_choice_label = "FT: Median"
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -32,17 +33,20 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     if df is None or df.empty: return None
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
+    # exact (case-insensitive)
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
             if cols_lc[c] == lc:
                 return c
+    # normalized exact
     nm = {c: _norm(c) for c in cols}
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n:
                 return c
+    # normalized contains
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
@@ -466,9 +470,11 @@ if build_btn:
                 "top10_threshold": float(top10_thr) if np.isfinite(top10_thr) else np.nan,
             }
 
-            # initialize alignment tables (center) to FT robust if not present
+            # default current models table = FT Median
             if st.session_state.models_tbl_current.empty:
                 st.session_state.models_tbl_current = ft_summ["med_tbl"].copy()
+                st.session_state.view_mode_key = "ft_robust"
+                st.session_state.view_choice_label = "FT: Median"
 
             # ratio model
             lasso_model = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99)
@@ -480,77 +486,6 @@ if build_btn:
         except Exception as e:
             st.error("Loading/processing failed.")
             st.exception(e)
-
-# ============================== Summary tables (Stable Radio, NO significance) ==============================
-models = st.session_state.get("models", {})
-has_ft  = not models.get("ft_med_tbl", pd.DataFrame()).empty
-has_t10 = not models.get("t10_med_tbl", pd.DataFrame()).empty
-
-def _pick_tables_by_key(view_key: str):
-    # We only need center tables now
-    if view_key == "ft_robust" and has_ft:
-        return models["ft_med_tbl"]
-    if view_key == "ft_classic" and has_ft:
-        return models["ft_mean_tbl"]
-    if view_key == "t10_robust" and has_t10:
-        return models["t10_med_tbl"]
-    if view_key == "t10_classic" and has_t10:
-        return models["t10_mean_tbl"]
-    return pd.DataFrame()
-
-if has_ft or has_t10:
-    with st.expander("Group summaries — FT vs Top 10% (center only)", expanded=False):
-        OPTIONS = [
-            ("ft_robust", "FT: Median"),
-            ("ft_classic","FT: Mean"),
-            ("t10_robust","Top 10%: Median"),
-            ("t10_classic","Top 10%: Mean"),
-        ]
-        key2label = {k: lbl for k, lbl in OPTIONS}
-        label2key = {lbl: k for k, lbl in OPTIONS}
-        labels = [lbl for _, lbl in OPTIONS]
-
-        if "view_choice_label" not in st.session_state:
-            st.session_state.view_choice_label = key2label[st.session_state.view_mode_key]
-
-        chosen_label = st.radio(
-            "View",
-            labels,
-            index=labels.index(st.session_state.view_choice_label),
-            horizontal=True,
-            key="view_choice_label",
-        )
-        st.session_state.view_mode_key = label2key[chosen_label]
-
-        center_tbl = _pick_tables_by_key(st.session_state.view_mode_key)
-        # push current center to state for alignment
-        st.session_state.models_tbl_current = center_tbl.copy()
-
-        var_core = models.get("var_core", []) or []
-        var_mod  = models.get("var_moderate", []) or []
-
-        def show_grouped_table(title, vars_list, center_tbl):
-            if center_tbl is None or center_tbl.empty or not vars_list:
-                st.info(f"No variables available for {title}."); return
-            cols = list(center_tbl.columns)
-            if len(cols) != 2:
-                st.info(f"{title}: expected two groups, got {cols}."); return
-            sub_idx = [v for v in vars_list if v in center_tbl.index]
-            if not sub_idx: st.info(f"No overlapping variables for {title}."); return
-            sub = center_tbl.loc[sub_idx].copy()
-            st.markdown(f"**{title}**")
-            st.dataframe(sub.style.format("{:.2f}"), use_container_width=True,
-                         key=f"sumtbl_{title}_{st.session_state.view_mode_key}")
-
-        show_grouped_table("Core variables", var_core, center_tbl)
-        show_grouped_table("Moderate variables", var_mod, center_tbl)
-
-        if st.session_state.view_mode_key.startswith("t10"):
-            thr = models.get("top10_threshold", np.nan)
-            if np.isfinite(thr):
-                st.caption(f"Current Top-10% cutoff (Max Push Daily %): {thr:.2f}%")
-else:
-    st.info("Upload DB and click **Build model stocks** to compute FT and Top10 summaries.")
 
 # ============================== Add Stock ==============================
 st.markdown("---")
@@ -598,9 +533,59 @@ if submitted and ticker:
     st.session_state.rows.append(row); st.session_state.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
-# ============================== Alignment (Weighted, NO significance) ==============================
+# ============================== Alignment (Radio right under title; NO significance) ==============================
 st.markdown("### Alignment")
 
+# ----- Stable radio under Alignment -----
+models = st.session_state.get("models", {})
+has_ft  = not models.get("ft_med_tbl", pd.DataFrame()).empty
+has_t10 = not models.get("t10_med_tbl", pd.DataFrame()).empty
+
+OPTIONS = [
+    ("ft_robust", "FT: Median"),
+    ("ft_classic","FT: Mean"),
+    ("t10_robust","Top 10%: Median"),
+    ("t10_classic","Top 10%: Mean"),
+]
+key2label = {k: lbl for k, lbl in OPTIONS}
+label2key = {lbl: k for k, lbl in OPTIONS}
+labels = [lbl for _, lbl in OPTIONS]
+
+# Ensure the current label exists (first render or after build)
+if st.session_state.view_choice_label not in labels:
+    st.session_state.view_choice_label = key2label[st.session_state.view_mode_key]
+
+chosen_label = st.radio(
+    "View",
+    labels,
+    index=labels.index(st.session_state.view_choice_label),
+    horizontal=True,
+    key="view_choice_label",
+)
+st.session_state.view_mode_key = label2key[chosen_label]
+
+def _pick_tables_by_key(view_key: str):
+    if view_key == "ft_robust" and has_ft:
+        return models["ft_med_tbl"]
+    if view_key == "ft_classic" and has_ft:
+        return models["ft_mean_tbl"]
+    if view_key == "t10_robust" and has_t10:
+        return models["t10_med_tbl"]
+    if view_key == "t10_classic" and has_t10:
+        return models["t10_mean_tbl"]
+    return pd.DataFrame()
+
+# update current center table for alignment
+center_tbl = _pick_tables_by_key(st.session_state.view_mode_key)
+st.session_state.models_tbl_current = center_tbl.copy()
+
+# show Top-10 threshold if applicable
+if st.session_state.view_mode_key.startswith("t10"):
+    thr = models.get("top10_threshold", np.nan)
+    if np.isfinite(thr):
+        st.caption(f"Current Top-10% cutoff (Max Push Daily %): {thr:.2f}%")
+
+# ----- Alignment table build -----
 models_tbl = st.session_state.get("models_tbl_current", pd.DataFrame()).copy()
 var_core = (st.session_state.models or {}).get("var_core", [])
 var_mod  = (st.session_state.models or {}).get("var_moderate", [])
@@ -677,7 +662,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
             models_tbl=models_tbl,
             var_core=var_core,
             var_mod=var_mod,
-            w_core=1.0, w_mod=0.5,          # weighted voting
+            w_core=1.0, w_mod=0.5,
             tie_mode="split",
         )
         if not counts: continue
@@ -815,7 +800,6 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
 
       const cells = rows.map(r => {
         if (r.__group__) return '<tr class="group-row"><td colspan="6">' + r.__group__ + '</td></tr>';
-        const isCore = !!r.is_core;
 
         const v  = formatVal(r.Value);
         const a  = formatVal(r.A);
@@ -894,5 +878,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
         scrolling=True,
         key=f"align_{st.session_state.view_mode_key}"
     )
+elif st.session_state.rows:
+    st.info("Upload DB and click **Build model stocks** to compute FT and Top10 summaries first.")
 else:
-    st.info("No eligible rows yet. Add manual stocks and/or ensure group summaries are built.")
+    st.info("Add at least one stock above to compute alignment.")
