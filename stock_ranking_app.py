@@ -568,44 +568,46 @@ key2label = {k: lbl for k, lbl in OPTIONS}
 label2key = {lbl: k for k, lbl in OPTIONS}
 labels = [lbl for _, lbl in OPTIONS]
 
-# Layout row for radio + delete controls
-rc1, rc2, rc3 = st.columns([1.6, 1.8, 0.7])
-
-with rc1:
-    if ss.view_choice_label not in labels:
-        ss.view_choice_label = key2label[ss.view_mode_key]
-    chosen_label = st.radio(
-        "View",
-        labels,
-        index=labels.index(ss.view_choice_label),
-        horizontal=True,
-        key="view_choice_label",
-    )
-    ss.view_mode_key = label2key[chosen_label]
+# --- Compact controls: radios | multiselect | delete button (no labels) ---
 
 # Build list of current tickers (stable order)
 tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-unique_tickers = []
-seen = set()
+unique_tickers, _seen = [], set()
 for t in tickers:
-    if t not in seen:
-        unique_tickers.append(t); seen.add(t)
+    if t and t not in _seen:
+        unique_tickers.append(t); _seen.add(t)
 
-with rc2:
-    st.write("**Delete rows**")
-    sel_all = st.checkbox("Select all", key="del_all", value=False)
-    default_selection = unique_tickers if sel_all else []
+c_radios, c_select, c_btn = st.columns([2.0, 2.2, 0.6])
+
+with c_radios:
+    # four radios inline, no title
+    if ss.view_choice_label not in [lbl for _, lbl in OPTIONS]:
+        ss.view_choice_label = {k: lbl for k, lbl in OPTIONS}[ss.view_mode_key]
+    chosen_label = st.radio(
+        "",                                   # no label
+        [lbl for _, lbl in OPTIONS],          # FT: Median | FT: Mean | Top 10%: Median | Top 10%: Mean
+        index=[lbl for _, lbl in OPTIONS].index(ss.view_choice_label),
+        horizontal=True,
+        key="view_choice_label",
+        label_visibility="collapsed",
+    )
+    ss.view_mode_key = {lbl: k for k, lbl in OPTIONS}[chosen_label]
+
+with c_select:
+    # multiselect with no title, no "Select all" checkbox
     to_delete = st.multiselect(
-        "Choose tickers",
+        "",
         options=unique_tickers,
-        default=default_selection,
+        default=[],
         key="del_selection",
-        placeholder="Select tickers to delete…",
+        placeholder="Select tickers…",
+        label_visibility="collapsed",
     )
 
-with rc3:
-    st.write("&nbsp;")  # spacer
-    if st.button("Delete", use_container_width=True):
+with c_btn:
+    # right-aligned delete button
+    st.write("&nbsp;")  # vertical align with multiselect
+    if st.button("Delete", use_container_width=True, key="delete_btn"):
         if to_delete:
             ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
             st.success(f"Deleted: {', '.join(to_delete)}")
