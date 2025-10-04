@@ -577,7 +577,7 @@ for t in tickers:
     if t and t not in _seen:
         unique_tickers.append(t); _seen.add(t)
 
-c_radios, c_select, c_btn = st.columns([3.0, 1.5, 0.6])
+c_radios, c_select, c_btn = st.columns([4.0, 1.5, 1.0])
 
 with c_radios:
     # four radios inline, no title
