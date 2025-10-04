@@ -25,6 +25,10 @@ def do_rerun():
     if hasattr(st, "rerun"): st.rerun()
     elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
 
+def SAFE_JSON_DUMPS(obj) -> str:
+    # Convert numpy types to native Python so json can serialize
+    return json.dumps(obj, default=float, ensure_ascii=False)
+
 def _norm(s: str) -> str:
     s = re.sub(r"\s+", " ", str(s).strip().lower())
     return s.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
@@ -173,7 +177,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     ln_pm     = np.log(np.clip(pd.to_numeric(df["PM_Vol_M"], errors="coerce").values, eps, None))
     ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"], errors="coerce").values, eps, None))
     ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"], errors="coerce").values,   eps, None))
-    ln_float_pmmax = np.log(np.clip(pd.to_numeric(float_series, errors="coerce").values, eps, None))
+    ln_float_pmmax = np.log(np.clip(pd.to_numeric(df["Float_PM_Max_M"] if "Float_PM_Max_M" in df.columns else df["Float_M"], errors="coerce").values, eps, None))
     maxpullpm      = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").values
     ln_rvolmaxpm   = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum", np.nan), errors="coerce").values, eps, None))
     pm_dol_over_mc = pd.to_numeric(df.get("PM$Vol/MC_%", np.nan), errors="coerce").values
@@ -533,7 +537,7 @@ if submitted and ticker:
     st.session_state.rows.append(row); st.session_state.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
-# ============================== Alignment (Radio right under title; NO significance) ==============================
+# ============================== Alignment (Radio under title; NO significance) ==============================
 st.markdown("### Alignment")
 
 # ----- Stable radio under Alignment -----
@@ -551,7 +555,6 @@ key2label = {k: lbl for k, lbl in OPTIONS}
 label2key = {lbl: k for k, lbl in OPTIONS}
 labels = [lbl for _, lbl in OPTIONS]
 
-# Ensure the current label exists (first render or after build)
 if st.session_state.view_choice_label not in labels:
     st.session_state.view_choice_label = key2label[st.session_state.view_mode_key]
 
@@ -575,11 +578,9 @@ def _pick_tables_by_key(view_key: str):
         return models["t10_mean_tbl"]
     return pd.DataFrame()
 
-# update current center table for alignment
 center_tbl = _pick_tables_by_key(st.session_state.view_mode_key)
 st.session_state.models_tbl_current = center_tbl.copy()
 
-# show Top-10 threshold if applicable
 if st.session_state.view_mode_key.startswith("t10"):
     thr = models.get("top10_threshold", np.nan)
     if np.isfinite(thr):
@@ -601,7 +602,7 @@ def _compute_alignment_counts_weighted(
 ) -> dict:
     if models_tbl is None or models_tbl.empty or len(models_tbl.columns) != 2:
         return {}
-    gA, gB = list(models_tbl.columns)  # e.g., ["Top10","Rest"] or ["FT=1","FT=0"]
+    gA, gB = list(models_tbl.columns)
 
     counts = {gA: 0.0, gB: 0.0}
     core_pts = {gA: 0.0, gB: 0.0}
@@ -715,8 +716,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
 
     # ---------------- HTML/JS ----------------
     import streamlit.components.v1 as components
-    payload = {"rows": summary_rows, "details": detail_map,
-               "gA": gA, "gB": gB}
+    payload = {"rows": summary_rows, "details": detail_map, "gA": gA, "gB": gB}
     html = """
 <!DOCTYPE html>
 <html>
@@ -870,7 +870,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
 </body>
 </html>
     """
-    html = html.replace("%%PAYLOAD%%", json.dumps(payload))
+    html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
     import streamlit.components.v1 as components
     components.html(
         html,
