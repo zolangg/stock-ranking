@@ -85,7 +85,6 @@ def _pav_isotonic(x: np.ndarray, y: np.ndarray):
     ys = y[order]
     level_y = ys.astype(float).copy()
     level_n = np.ones_like(level_y)
-
     i = 0
     while i < len(level_y) - 1:
         if level_y[i] > level_y[i+1]:
@@ -105,9 +104,8 @@ def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
     if break_x.size == 0:
         return np.full_like(x_new, np.nan, dtype=float)
     idx = np.argsort(break_x)
-    bx = break_x[idx]
-    by = break_y[idx]
-    if bx.size == 1:
+    bx = break_x[idx]; by = break_y[idx]
+    if bx.size == 1:  # degenerate, constant
         return np.full_like(x_new, by[0], dtype=float)
     return np.interp(x_new, bx, by, left=by[0], right=by[-1])
 
@@ -115,8 +113,9 @@ def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "models" not in st.session_state: st.session_state.models = {}
-if "lassoA" not in st.session_state: st.session_state.lassoA = {}   # ratio model + winsor + calibrator
+if "lassoA" not in st.session_state: st.session_state.lassoA = {}   # ratio model
 if "view_mode_key" not in st.session_state: st.session_state.view_mode_key = "ft_robust"
+if "sig_thresh" not in st.session_state: st.session_state.sig_thresh = 3.0
 
 # ============================== Core & Moderate sets ==============================
 VAR_CORE = [
@@ -125,17 +124,17 @@ VAR_CORE = [
     "PM$Vol/MC_%",
     "Catalyst",
     "PM_Vol_%",
-    "Max_Pull_PM_%",     # Premarket Max Pullback (%)
-    "RVOL_Max_PM_cum"    # Premarket Max RVOL (cum)
+    "Max_Pull_PM_%",
+    "RVOL_Max_PM_cum"
 ]
 VAR_MODERATE = [
-    "MC_PM_Max_M",       # Premarket Market Cap (M$)
-    "Float_PM_Max_M",    # Premarket Float (M)
+    "MC_PM_Max_M",
+    "Float_PM_Max_M",
     "PM_Vol_M",
     "PM_$Vol_M$",
     "ATR_$",
     "Daily_Vol_M",
-    "MarketCap_M$",      # fallbacks for legacy DBs
+    "MarketCap_M$",
     "Float_M",
 ]
 VAR_ALL = VAR_CORE + VAR_MODERATE
@@ -143,8 +142,7 @@ VAR_ALL = VAR_CORE + VAR_MODERATE
 # ============================== LASSO helper ==============================
 def _kfold_indices(n, k=5, seed=42):
     rng = np.random.default_rng(seed)
-    idx = np.arange(n)
-    rng.shuffle(idx)
+    idx = np.arange(n); rng.shuffle(idx)
     return np.array_split(idx, k)
 
 def _lasso_cd_std(Xs, y, lam, max_iter=1200, tol=1e-6):
@@ -169,6 +167,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     """
     Target: ln(multiplier) where multiplier = max(Daily_Vol_M / PM_Vol_M, 1).
     Winsorize selected linear features and target multiplier on TRAIN only.
+    Learn an isotonic calibration on validation if sufficient signal exists.
     """
     eps = 1e-6
 
@@ -191,15 +190,15 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"], errors="coerce").values, eps, None))
     ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"], errors="coerce").values,   eps, None))
     ln_float_pmmax = np.log(np.clip(pd.to_numeric(float_series, errors="coerce").values, eps, None))
-    maxpullpm      = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").values
+    maxpullpm      = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").values  # linear
     ln_rvolmaxpm   = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum", np.nan), errors="coerce").values, eps, None))
-    pm_dol_over_mc = pd.to_numeric(df.get("PM$Vol/MC_%", np.nan), errors="coerce").values
+    pm_dol_over_mc = pd.to_numeric(df.get("PM$Vol/MC_%", np.nan), errors="coerce").values    # linear
 
     catalyst_raw   = df.get("Catalyst", np.nan)
     catalyst       = pd.to_numeric(catalyst_raw, errors="coerce").fillna(0.0).clip(0,1).values
 
-    multiplier = np.maximum(DV / PM, 1.0)
-    y_ln = np.log(multiplier)
+    multiplier_all = np.maximum(DV / PM, 1.0)
+    y_ln_all = np.log(multiplier_all)
 
     feats = [
         ("ln_mcap_pmmax",  ln_mcap),
@@ -210,24 +209,25 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         ("ln_fr",          ln_fr),
         ("catalyst",       catalyst),
         ("ln_float_pmmax", ln_float_pmmax),
-        ("maxpullpm",      maxpullpm),        # linear %
+        ("maxpullpm",      maxpullpm),        # linear
         ("ln_rvolmaxpm",   ln_rvolmaxpm),
-        ("pm_dol_over_mc", pm_dol_over_mc),  # linear %
+        ("pm_dol_over_mc", pm_dol_over_mc),  # linear
     ]
     cols = [arr.reshape(-1,1) for _, arr in feats]
     X_all = np.hstack(cols)
 
-    mask = valid_pm & np.isfinite(y_ln) & np.isfinite(X_all).all(axis=1)
-    X_all = X_all[mask]; y_ln = y_ln[mask]
-
-    if X_all.shape[0] < 50:
+    # mask for usable rows
+    mask = valid_pm & np.isfinite(y_ln_all) & np.isfinite(X_all).all(axis=1)
+    if mask.sum() < 50:
         return {}
+    X_all = X_all[mask]; y_ln = y_ln_all[mask]
+    PMm = PM[mask]; DVv = DV[mask]  # keep for validation truth
 
     n = X_all.shape[0]
     split = max(10, int(n * 0.8))
     X_tr, X_va = X_all[:split], X_all[split:]
     y_tr = y_ln[:split]
-    y_va = y_ln[split:]   # fixed clean split
+    # y_va not strictly needed except for bookkeeping
 
     winsor_bounds = {}
     name_to_idx = {name:i for i,(name,_) in enumerate(feats)}
@@ -244,9 +244,10 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         if nm in name_to_idx:
             _winsor_feature(name_to_idx[nm])
 
-    # Target multiplier winsorization (linear space)
-    m_lo, m_hi = _compute_bounds(np.exp(y_tr))
-    mult_tr_w = _apply_bounds(np.exp(y_tr), m_lo, m_hi)
+    # Target winsorization in linear space on TRAIN
+    mult_tr = np.exp(y_tr)
+    m_lo, m_hi = _compute_bounds(mult_tr)
+    mult_tr_w = _apply_bounds(mult_tr, m_lo, m_hi)
     y_tr = np.log(mult_tr_w)
 
     # Standardize TRAIN for LASSO
@@ -278,6 +279,21 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     coef_ols, *_ = np.linalg.lstsq(X_design, y_tr, rcond=None)
     b0 = float(coef_ols[0]); bet = coef_ols[1:].astype(float)
 
+    # ----- Isotonic calibration on VALIDATION (raw multiplier -> true multiplier) -----
+    iso_bx = np.array([], dtype=float); iso_by = np.array([], dtype=float)
+    if X_va.shape[0] >= 8:  # need some validation points
+        Xva_sel = X_va[:, sel]
+        yhat_va_ln = (np.column_stack([np.ones(Xva_sel.shape[0]), Xva_sel]) @ coef_ols).astype(float)
+        mult_pred_va = np.exp(yhat_va_ln)
+
+        mult_true_all = np.maximum(DVv / PMm, 1.0)
+        mult_va_true = mult_true_all[split:]  # same split
+
+        finite = np.isfinite(mult_pred_va) & np.isfinite(mult_va_true)
+        if finite.sum() >= 8 and np.unique(mult_pred_va[finite]).size >= 3:
+            iso_bx, iso_by = _pav_isotonic(mult_pred_va[finite], mult_va_true[finite])
+        # else: keep empty arrays → indicates "no calibration"
+
     model = {
         "eps": eps,
         "terms": [feats[i][0] for i in sel],
@@ -289,7 +305,8 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         "winsor_bounds": {k: (float(v[0]) if np.isfinite(v[0]) else np.nan,
                               float(v[1]) if np.isfinite(v[1]) else np.nan)
                           for k, v in winsor_bounds.items()},
-        "iso_bx": [1.0], "iso_by": [1.0],
+        "iso_bx": iso_bx.tolist(),
+        "iso_by": iso_by.tolist(),
         "feat_order": [nm for nm,_ in feats],
         "mult_bounds": (float(m_lo) if np.isfinite(m_lo) else np.nan,
                         float(m_hi) if np.isfinite(m_hi) else np.nan)
@@ -304,8 +321,6 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     eps = float(model.get("eps", 1e-6))
     feat_order = model["feat_order"]
     winsor_bounds = model.get("winsor_bounds", {})
-    iso_bx = np.array(model.get("iso_bx", [1.0]), dtype=float)
-    iso_by = np.array(model.get("iso_by", [1.0]), dtype=float)
     sel = model.get("sel_idx", [])
     b0 = float(model["b0"]); bet = np.array(model["betas"], dtype=float)
 
@@ -339,6 +354,7 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
         "pm_dol_over_mc": pm_dol_over_mc,
     }
 
+    # Build feature vector with per-feature winsor
     X_vec = []
     for nm in feat_order:
         v = feat_map.get(nm, np.nan)
@@ -355,9 +371,15 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     yhat_ln = b0 + float(np.dot(bet, X_orig_sel))
 
     raw_mult = np.exp(yhat_ln) if np.isfinite(yhat_ln) else np.nan
-    if not np.isfinite(raw_mult): return np.nan
+    if not np.isfinite(raw_mult):
+        return np.nan
 
-    cal_mult = float(_iso_predict(np.array(iso_bx, dtype=float), np.array(iso_by, dtype=float), np.array([raw_mult]))[0])
+    iso_bx = np.array(model.get("iso_bx", []), dtype=float)
+    iso_by = np.array(model.get("iso_by", []), dtype=float)
+    if iso_bx.size >= 2 and iso_by.size >= 2:
+        cal_mult = float(_iso_predict(iso_bx, iso_by, np.array([raw_mult]))[0])
+    else:
+        cal_mult = float(raw_mult)
     cal_mult = max(cal_mult, 1.0)
 
     PM = float(row.get("PM_Vol_M") or np.nan)
@@ -367,11 +389,10 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
 
 # ============================== Utility ==============================
 def _summaries_for(df_in: pd.DataFrame, var_all: list[str], group_col: str, labels_map=None) -> dict:
-    """Build center/spread tables for a given group column; optionally relabel columns."""
     avail = [v for v in var_all if v in df_in.columns]
-    if not avail: 
-        return {"med_tbl": pd.DataFrame(), "mad_tbl": pd.DataFrame(),
-                "mean_tbl": pd.DataFrame(), "sd_tbl": pd.DataFrame(), "avail": []}
+    if not avail:
+        empty = pd.DataFrame()
+        return {"med_tbl": empty, "mad_tbl": empty, "mean_tbl": empty, "sd_tbl": empty, "avail": []}
     g = df_in.groupby(group_col)[avail]
     med_tbl  = g.median(numeric_only=True).T
     mean_tbl = g.mean(numeric_only=True).T
@@ -385,7 +406,6 @@ def _summaries_for(df_in: pd.DataFrame, var_all: list[str], group_col: str, labe
     return {"med_tbl": med_tbl, "mad_tbl": mad_tbl, "mean_tbl": mean_tbl, "sd_tbl": sd_tbl, "avail": avail}
 
 def _make_top10_flag(series_pct: pd.Series) -> tuple[pd.Series, float]:
-    """Return boolean Top10 flag and threshold (percentile=90) on a % series."""
     s = pd.to_numeric(series_pct, errors="coerce")
     mask = s.notna()
     if not mask.any():
@@ -499,19 +519,18 @@ if build_btn:
                         df["Max_Push_Daily_%"] = np.nan
                         df["GroupTop10"] = "Rest"  # fallback
 
-                    # ---------- Collect variable lists ----------
+                    # ---------- Variable lists ----------
                     var_core = [v for v in VAR_CORE if v in df.columns]
                     var_mod  = [v for v in VAR_MODERATE if v in df.columns]
                     var_all  = var_core + var_mod
 
-                    # ---------- Summaries for FT (kept as before) ----------
+                    # ---------- Summaries for FT ----------
                     ft_summ = _summaries_for(df, var_all, group_col="GroupFT")
 
                     # ---------- Summaries for Top10 vs Rest ----------
-                    top_labels = {"Top10":"Top10", "Rest":"Rest"}
-                    top_summ = _summaries_for(df, var_all, group_col="GroupTop10", labels_map=top_labels)
+                    top_summ = _summaries_for(df, var_all, group_col="GroupTop10", labels_map={"Top10":"Top10","Rest":"Rest"})
 
-                    # ---------- Stash models/summaries ----------
+                    # ---------- Store ----------
                     st.session_state.models = {
                         # FT summaries
                         "ft_med_tbl":  ft_summ["med_tbl"],
@@ -526,20 +545,23 @@ if build_btn:
                         # Vars
                         "var_core": var_core,
                         "var_moderate": var_mod,
-                        # Threshold info (optional for display)
+                        # Threshold info
                         "top10_threshold": float(top10_thr) if np.isfinite(top10_thr) else np.nan,
                     }
 
-                    # ---------- Train calibrated ratio model (unchanged) ----------
+                    # ---------- Train calibrated ratio model ----------
                     lasso_model = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99)
                     st.session_state.lassoA = lasso_model or {}
 
+                    # Seed alignment basis to FT robust by default
+                    st.session_state.view_mode_key = "ft_robust"
                     st.success("Built FT and Top10 summaries. Ratio model: " + ("trained" if lasso_model else "skipped"))
                     do_rerun()
 
         except Exception as e:
             st.error("Loading/processing failed.")
             st.exception(e)
+
 # ============================== Summary tables (FT & Top10) ==============================
 models = st.session_state.get("models", {})
 has_ft  = not models.get("ft_med_tbl", pd.DataFrame()).empty
@@ -547,7 +569,7 @@ has_t10 = not models.get("t10_med_tbl", pd.DataFrame()).empty
 
 if has_ft or has_t10:
     with st.expander("Group summaries — FT vs Top 10% (flip center/spread)", expanded=False):
-        # Maps (stable)
+        # Option maps
         OPTIONS = [
             ("ft_robust", "FT: Median + MAD"),
             ("ft_classic","FT: Mean + SD"),
@@ -558,13 +580,11 @@ if has_ft or has_t10:
         label2key = {lbl: k for k, lbl in OPTIONS}
         labels     = [lbl for _, lbl in OPTIONS]
 
-        # One-time init
-        if "view_mode_key" not in st.session_state:
-            st.session_state.view_mode_key = "ft_robust"
+        # one-time seed for the widget value
         if "view_choice_radio" not in st.session_state:
             st.session_state.view_choice_radio = key2label[st.session_state.view_mode_key]
 
-        # Index derived from widget's own saved value (prevents snapping)
+        # index based on widget's persisted value (prevents snapping)
         try:
             idx = labels.index(st.session_state.view_choice_radio)
         except ValueError:
@@ -581,11 +601,11 @@ if has_ft or has_t10:
         if chosen_key != st.session_state.view_mode_key:
             st.session_state.view_mode_key = chosen_key
 
-        # ------- SAFELY GET var lists BEFORE using them -------
+        # Safely get var lists
         var_core = models.get("var_core", []) or []
         var_mod  = models.get("var_moderate", []) or []
 
-        # Pick tables per selection (default to FT robust if missing)
+        # Pick tables per selection
         if chosen_key == "ft_robust" and has_ft:
             center_tbl = models["ft_med_tbl"];  spread_tbl = models["ft_mad_tbl"]
         elif chosen_key == "ft_classic" and has_ft:
@@ -595,7 +615,7 @@ if has_ft or has_t10:
         elif chosen_key == "t10_classic" and has_t10:
             center_tbl = models["t10_mean_tbl"]; spread_tbl = models["t10_sd_tbl"]
         else:
-            # Fallback to whatever exists
+            # Fallback
             if has_ft:
                 center_tbl = models["ft_med_tbl"]; spread_tbl = models["ft_mad_tbl"]; st.session_state.view_mode_key = "ft_robust"
             else:
@@ -605,9 +625,6 @@ if has_ft or has_t10:
         st.session_state["models_tbl_current"] = center_tbl
         st.session_state["spread_tbl_current"] = spread_tbl
 
-        # Stable slider
-        if "sig_thresh" not in st.session_state:
-            st.session_state["sig_thresh"] = 3.0
         sig_thresh = st.slider(
             "Significance threshold (σ)",
             0.0, 5.0, st.session_state["sig_thresh"], 0.1,
@@ -616,7 +633,6 @@ if has_ft or has_t10:
         )
         st.session_state["sig_thresh"] = float(sig_thresh)
 
-        # Renderer
         def show_grouped_table(title, vars_list, center_tbl, spread_tbl):
             if center_tbl is None or center_tbl.empty:
                 st.info(f"No variables available for {title}.")
@@ -629,7 +645,6 @@ if has_ft or has_t10:
                 st.info(f"{title}: expected two group columns, got {cols}.")
                 return
             gA, gB = cols[0], cols[1]
-
             sub_idx = [v for v in vars_list if v in center_tbl.index]
             if not sub_idx:
                 st.info(f"No overlapping variables for {title}.")
@@ -640,8 +655,7 @@ if has_ft or has_t10:
                 eps = 1e-9
                 diff = (sub[gA] - sub[gB]).abs()
                 common = [r for r in diff.index if r in spread_tbl.index]
-                sub = sub.loc[common]
-                diff = diff.loc[common]
+                sub = sub.loc[common]; diff = diff.loc[common]
                 spread = (spread_tbl.loc[common, gA].fillna(0.0) + spread_tbl.loc[common, gB].fillna(0.0))
                 sig = diff / (spread.replace(0.0, np.nan) + eps)
                 sig_flag = sig >= st.session_state["sig_thresh"]
@@ -660,11 +674,9 @@ if has_ft or has_t10:
             else:
                 st.info(f"Select a center/spread view to see {title}.")
 
-        # Draw tables
         show_grouped_table("Core variables", var_core, center_tbl, spread_tbl)
         show_grouped_table("Moderate variables", var_mod, center_tbl, spread_tbl)
 
-        # Optional threshold caption for Top10 view
         if st.session_state.view_mode_key.startswith("t10"):
             thr = models.get("top10_threshold", np.nan)
             if np.isfinite(thr):
@@ -780,7 +792,7 @@ def _compute_alignment_counts_weighted(
 ) -> dict:
     if models_tbl is None or models_tbl.empty or len(models_tbl.columns) != 2:
         return {}
-    groups = list(models_tbl.columns)  # e.g., ["FT=1","FT=0"] OR ["Top10","Rest"]
+    groups = list(models_tbl.columns)  # e.g., ["FT=1","FT=0"] or ["Top10","Rest"]
     gA, gB = groups[0], groups[1]
     TOL = 1e-9
     counts = {gA: 0.0, gB: 0.0}
@@ -852,8 +864,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
                 denom += float(sA) if pd.notna(sA) else 0.0
                 denom += float(sB) if pd.notna(sB) else 0.0
                 if denom == 0.0:
-                    sA_val = np.nan
-                    sB_val = np.nan
+                    sA_val = np.nan; sB_val = np.nan
                 else:
                     sA_val = (abs(dA) / denom) if dA is not None else np.nan
                     sB_val = (abs(dB) / denom) if dB is not None else np.nan
@@ -889,7 +900,6 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
 
         detail_map[tkr] = drows_grouped
 
-    # ---------- Render alignment with dynamic group labels ----------
     import streamlit.components.v1 as components
     payload = {"rows": summary_rows, "details": detail_map, "gA": gA, "gB": gB}
 
