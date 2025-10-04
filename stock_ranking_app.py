@@ -92,9 +92,9 @@ def _pav_isotonic(x: np.ndarray, y: np.ndarray):
             new_n = level_n[i] + level_n[i+1]
             level_y[i] = new_y
             level_n[i] = new_n
-            xs = np.delete(xs, i+1)
             level_y = np.delete(level_y, i+1)
             level_n = np.delete(level_n, i+1)
+            xs = np.delete(xs, i+1)
             if i > 0: i -= 1
         else:
             i += 1
@@ -105,7 +105,7 @@ def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
         return np.full_like(x_new, np.nan, dtype=float)
     idx = np.argsort(break_x)
     bx = break_x[idx]; by = break_y[idx]
-    if bx.size == 1:  # degenerate, constant
+    if bx.size == 1:
         return np.full_like(x_new, by[0], dtype=float)
     return np.interp(x_new, bx, by, left=by[0], right=by[-1])
 
@@ -113,7 +113,7 @@ def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
 if "models" not in st.session_state: st.session_state.models = {}
-if "lassoA" not in st.session_state: st.session_state.lassoA = {}   # ratio model
+if "lassoA" not in st.session_state: st.session_state.lassoA = {}
 if "view_mode_key" not in st.session_state: st.session_state.view_mode_key = "ft_robust"
 if "sig_thresh" not in st.session_state: st.session_state.sig_thresh = 3.0
 
@@ -166,8 +166,8 @@ def _lasso_cd_std(Xs, y, lam, max_iter=1200, tol=1e-6):
 def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     """
     Target: ln(multiplier) where multiplier = max(Daily_Vol_M / PM_Vol_M, 1).
-    Winsorize selected linear features and target multiplier on TRAIN only.
-    Learn an isotonic calibration on validation if sufficient signal exists.
+    Winsorize selected linear features and target on TRAIN only.
+    Learn isotonic calibration on validation if sufficient signal exists.
     """
     eps = 1e-6
 
@@ -227,7 +227,6 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     split = max(10, int(n * 0.8))
     X_tr, X_va = X_all[:split], X_all[split:]
     y_tr = y_ln[:split]
-    # y_va not strictly needed except for bookkeeping
 
     winsor_bounds = {}
     name_to_idx = {name:i for i,(name,_) in enumerate(feats)}
@@ -285,14 +284,11 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         Xva_sel = X_va[:, sel]
         yhat_va_ln = (np.column_stack([np.ones(Xva_sel.shape[0]), Xva_sel]) @ coef_ols).astype(float)
         mult_pred_va = np.exp(yhat_va_ln)
-
         mult_true_all = np.maximum(DVv / PMm, 1.0)
-        mult_va_true = mult_true_all[split:]  # same split
-
+        mult_va_true = mult_true_all[split:]
         finite = np.isfinite(mult_pred_va) & np.isfinite(mult_va_true)
         if finite.sum() >= 8 and np.unique(mult_pred_va[finite]).size >= 3:
             iso_bx, iso_by = _pav_isotonic(mult_pred_va[finite], mult_va_true[finite])
-        # else: keep empty arrays → indicates "no calibration"
 
     model = {
         "eps": eps,
@@ -819,16 +815,15 @@ def _compute_alignment_counts_weighted(
 
     total = counts[gA] + counts[gB]
     if total <= 0:
-        # No usable votes – show 0/0 bars
         return {gA: 0.0, gB: 0.0,
                 "A_pct_raw": 0.0, "B_pct_raw": 0.0,
                 "A_pct_int": 0,   "B_pct_int": 0,
                 "A_label": gA, "B_label": gB,
                 "N_core_used": used_core, "N_mod_used": used_mod}
 
-    # Raw (exact) percentages for widths
+    # Raw (exact) percentages for widths; enforce exact 100 sum
     a_raw = 100.0 * counts[gA] / total
-    b_raw = 100.0 - a_raw  # enforce sum=100
+    b_raw = 100.0 - a_raw
 
     # Integer labels that always sum to 100 (derive B from A)
     a_int = int(round(a_raw))
@@ -995,20 +990,17 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
     document.getElementById('hdrA').textContent = data.gA;
     document.getElementById('hdrB').textContent = data.gB;
 
-    function barCell(val) {
-      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
+    function barCellLabeled(valRaw, label, valInt) {
+      // Blue for the “strong” group (FT=1 or Top10), red for the counterpart
+      const strong = (label === 'FT=1' || label === 'Top10');
+      const cls = strong ? 'blue' : 'red';
+      // width uses raw float; label uses stable integer that sums with the other to 100
+      const w = (valRaw==null || isNaN(valRaw)) ? 0 : Math.max(0, Math.min(100, valRaw));
+      const text = (valInt==null || isNaN(valInt)) ? Math.round(w) : valInt;
       return `
         <div class="bar-wrap">
-          <div class="bar blue"><span style="width:${v}%"></span></div>
-          <div class="bar-label">${v.toFixed(0)}</div>
-        </div>`;
-    }
-    function barCellRed(val) {
-      const v = (val==null||isNaN(val)) ? 0 : Math.max(0, Math.min(100, val));
-      return `
-        <div class="bar-wrap">
-          <div class="bar red"><span style="width:${v}%"></span></div>
-          <div class="bar-label">${v.toFixed(0)}</div>
+          <div class="bar ${cls}"><span style="width:${w}%"></span></div>
+          <div class="bar-label">${text}</div>
         </div>`;
     }
 
@@ -1027,15 +1019,12 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
         const v  = formatVal(r.Value);
         const a  = formatVal(r.A);
         const b  = formatVal(r.B);
+
+        // Show ABS values, but color by sign (green for +, red for -)
         const rawDa = (r.d_vs_A==null || isNaN(r.d_vs_A)) ? null : Number(r.d_vs_A);
         const rawDb = (r.d_vs_B==null || isNaN(r.d_vs_B)) ? null : Number(r.d_vs_B);
-        const daAbs = (rawDa==null) ? null : Math.abs(rawDa);
-        const dbAbs = (rawDb==null) ? null : Math.abs(rawDb);
-        
-        const da = (daAbs==null) ? '' : formatVal(daAbs);
-        const db = (dbAbs==null) ? '' : formatVal(dbAbs);
-        
-        // color by sign (green for +, red for -)
+        const da = (rawDa==null) ? '' : formatVal(Math.abs(rawDa));
+        const db = (rawDb==null) ? '' : formatVal(Math.abs(rawDb));
         const ca = (rawDa==null) ? '' : (rawDa >= 0 ? 'pos' : 'neg');
         const cb = (rawDb==null) ? '' : (rawDb >= 0 ? 'pos' : 'neg');
 
@@ -1078,17 +1067,18 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
         </table>`;
     }
 
-    function barCellLabeled(valRaw, label, valInt) {
-      const strong = (label === 'FT=1' || label === 'Top10');
-      const cls = strong ? 'blue' : 'red';
-      const w = (valRaw==null || isNaN(valRaw)) ? 0 : Math.max(0, Math.min(100, valRaw));
-      const text = (valInt==null || isNaN(valInt)) ? Math.round(w) : valInt;
-      return `
-        <div class="bar-wrap">
-          <div class="bar ${cls}"><span style="width:${w}%"></span></div>
-          <div class="bar-label">${text}</div>
-        </div>`;
-    }
+    $(function() {
+      const table = $('#align').DataTable({
+        data: data.rows,
+        responsive: true,
+        paging: false, info: false, searching: false,
+        order: [[0,'asc']],
+        columns: [
+          { data: 'Ticker' },
+          { data: null, render: (row) => barCellLabeled(row.A_val_raw, row.A_label, row.A_val_int) },
+          { data: null, render: (row) => barCellLabeled(row.B_val_raw, row.B_label, row.B_val_int) },
+        ]
+      });
 
       $('#align tbody').on('click', 'tr', function () {
         const row = table.row(this);
