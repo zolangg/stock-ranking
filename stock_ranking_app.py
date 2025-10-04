@@ -1,4 +1,4 @@
-# app.py — Premarket Stock Ranking (fixed, optimized, + 3σ row coloring)
+# app.py — Premarket Stock Ranking (fixed, optimized, + 3σ row coloring, + row delete UI)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -491,13 +491,11 @@ if build_btn:
                 "top10_threshold": float(top10_thr) if np.isfinite(top10_thr) else np.nan,
             }
 
-            # default current models table = FT Median
             if ss.models_tbl_current.empty:
                 ss.models_tbl_current = ft_summ["med_tbl"].copy()
                 ss.view_mode_key = "ft_robust"
                 ss.view_choice_label = "FT: Median"
 
-            # ratio model
             ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
 
             st.success(f"Built FT and Top10 summaries from sheet “{sel_sheet}”.")
@@ -553,7 +551,7 @@ if submitted and ticker:
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
-# ============================== Alignment (Radio under title; NO significance) ==============================
+# ============================== Alignment + Delete Control ==============================
 st.markdown("### Alignment")
 
 models = ss.get("models", {})
@@ -570,16 +568,50 @@ key2label = {k: lbl for k, lbl in OPTIONS}
 label2key = {lbl: k for k, lbl in OPTIONS}
 labels = [lbl for _, lbl in OPTIONS]
 
-if ss.view_choice_label not in labels:
-    ss.view_choice_label = key2label[ss.view_mode_key]
+# Layout row for radio + delete controls
+rc1, rc2, rc3 = st.columns([1.6, 1.8, 0.7])
 
-chosen_label = st.radio(
-    "View", labels,
-    index=labels.index(ss.view_choice_label),
-    horizontal=True,
-    key="view_choice_label",
-)
-ss.view_mode_key = label2key[chosen_label]
+with rc1:
+    if ss.view_choice_label not in labels:
+        ss.view_choice_label = key2label[ss.view_mode_key]
+    chosen_label = st.radio(
+        "View",
+        labels,
+        index=labels.index(ss.view_choice_label),
+        horizontal=True,
+        key="view_choice_label",
+    )
+    ss.view_mode_key = label2key[chosen_label]
+
+# Build list of current tickers (stable order)
+tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
+unique_tickers = []
+seen = set()
+for t in tickers:
+    if t not in seen:
+        unique_tickers.append(t); seen.add(t)
+
+with rc2:
+    st.write("**Delete rows**")
+    sel_all = st.checkbox("Select all", key="del_all", value=False)
+    default_selection = unique_tickers if sel_all else []
+    to_delete = st.multiselect(
+        "Choose tickers",
+        options=unique_tickers,
+        default=default_selection,
+        key="del_selection",
+        placeholder="Select tickers to delete…",
+    )
+
+with rc3:
+    st.write("&nbsp;")  # spacer
+    if st.button("Delete", use_container_width=True):
+        if to_delete:
+            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
+            st.success(f"Deleted: {', '.join(to_delete)}")
+            do_rerun()
+        else:
+            st.info("No tickers selected.")
 
 def _pick_tables_by_key(view_key: str):
     if view_key == "ft_robust" and has_ft:   return models["ft_med_tbl"]
@@ -679,7 +711,6 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
                     ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
 
     mt_index = set(models_tbl.index)
-    # align dispersion table to models table
     if isinstance(disp_tbl, pd.DataFrame) and not disp_tbl.empty:
         disp_tbl = disp_tbl.reindex(index=models_tbl.index)
         dt_index = set(disp_tbl.index)
@@ -724,7 +755,6 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
                 else:
                     vA = np.nan; vB = np.nan
 
-                # pull sigmas
                 if med_var in dt_index:
                     sA = float(disp_tbl.at[med_var, gA]) if pd.notna(disp_tbl.at[med_var, gA]) else np.nan
                     sB = float(disp_tbl.at[med_var, gB]) if pd.notna(disp_tbl.at[med_var, gB]) else np.nan
