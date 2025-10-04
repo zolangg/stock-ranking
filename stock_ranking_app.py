@@ -1055,8 +1055,8 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
         order: [[0,'asc']],
         columns: [
           { data: 'Ticker' },
-          { data: 'A_val', render: (d)=>barCell(d) },
-          { data: 'B_val', render: (d)=>barCellRed(d) },
+          { data: 'A_val', render: (d)=>barCellRed(d) },
+          { data: 'B_val', render: (d)=>barCell(d) },
         ]
       });
 
