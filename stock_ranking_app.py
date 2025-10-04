@@ -541,46 +541,70 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# ============================== Summary tables (4-way radio) ==============================
+# ============================== Summary tables (4-way radio with stable key) ==============================
 models_data = st.session_state.models
 if models_data and isinstance(models_data, dict) and (not models_data.get("ft_med_tbl", pd.DataFrame()).empty
                                                      or not models_data.get("t10_med_tbl", pd.DataFrame()).empty):
     with st.expander("Group summaries — FT vs Top 10% (flip center/spread)", expanded=False):
-        view_choice = st.radio(
+        # Map stable internal keys <-> labels
+        OPTIONS = [
+            ("ft_robust", "FT: Median + MAD"),
+            ("ft_classic","FT: Mean + SD"),
+            ("t10_robust","Top 10%: Median + MAD"),
+            ("t10_classic","Top 10%: Mean + SD"),
+        ]
+        key2label = {k: lbl for k, lbl in OPTIONS}
+        label2key = {lbl: k for k, lbl in OPTIONS}
+
+        # Ensure a default only once
+        if "view_mode_key" not in st.session_state:
+            st.session_state.view_mode_key = "ft_robust"
+
+        # Compute the radio index from the persisted key
+        current_key = st.session_state.view_mode_key
+        try:
+            current_index = [k for k, _ in OPTIONS].index(current_key)
+        except ValueError:
+            current_index = 0
+
+        # Give the radio a STABLE key so Streamlit binds it to state
+        chosen_label = st.radio(
             "View",
-            [
-                "FT: Median + MAD",
-                "FT: Mean + SD",
-                "Top 10%: Median + MAD",
-                "Top 10%: Mean + SD",
-            ],
-            index={"ft_robust":0, "ft_classic":1, "t10_robust":2, "t10_classic":3}.get(st.session_state.view_mode_key, 0),
-            horizontal=True
+            options=[lbl for _, lbl in OPTIONS],
+            index=current_index,
+            horizontal=True,
+            key="view_choice_radio",   # <-- stable widget key
         )
+        chosen_key = label2key[chosen_label]
+
+        # Persist only if it actually changed
+        if chosen_key != st.session_state.view_mode_key:
+            st.session_state.view_mode_key = chosen_key
 
         var_core = models_data.get("var_core", [])
         var_mod  = models_data.get("var_moderate", [])
 
         # Pick tables per selection
-        if view_choice == "FT: Median + MAD":
-            center_tbl = models_data["ft_med_tbl"]; spread_tbl = models_data["ft_mad_tbl"]
-            st.session_state.view_mode_key = "ft_robust"
-        elif view_choice == "FT: Mean + SD":
+        if chosen_key == "ft_robust":
+            center_tbl = models_data["ft_med_tbl"];  spread_tbl = models_data["ft_mad_tbl"]
+        elif chosen_key == "ft_classic":
             center_tbl = models_data["ft_mean_tbl"]; spread_tbl = models_data["ft_sd_tbl"]
-            st.session_state.view_mode_key = "ft_classic"
-        elif view_choice == "Top 10%: Median + MAD":
+        elif chosen_key == "t10_robust":
             center_tbl = models_data["t10_med_tbl"]; spread_tbl = models_data["t10_mad_tbl"]
-            st.session_state.view_mode_key = "t10_robust"
-        else:
+        else:  # "t10_classic"
             center_tbl = models_data["t10_mean_tbl"]; spread_tbl = models_data["t10_sd_tbl"]
-            st.session_state.view_mode_key = "t10_classic"
 
         # Save current basis for Alignment
         st.session_state["models_tbl_current"] = center_tbl
         st.session_state["spread_tbl_current"] = spread_tbl
 
-        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, 3.0, 0.1,
-                               help="Highlight rows where |GroupA − GroupB| / (SpreadA + SpreadB) ≥ σ")
+        # Give the slider a stable key too (prevents jumps)
+        sig_thresh = st.slider(
+            "Significance threshold (σ)",
+            0.0, 5.0, st.session_state.get("sig_thresh", 3.0), 0.1,
+            key="sig_thresh_slider",
+            help="Highlight rows where |GroupA − GroupB| / (SpreadA + SpreadB) ≥ σ"
+        )
         st.session_state["sig_thresh"] = float(sig_thresh)
 
         # Utility to draw group tables for core/moderate
@@ -592,7 +616,6 @@ if models_data and isinstance(models_data, dict) and (not models_data.get("ft_me
                 st.info(f"No variables selected for {title}.")
                 return
 
-            # Detect current group column names dynamically (supports FT and Top10 views)
             cols = list(center_tbl.columns)
             if len(cols) != 2:
                 st.info(f"{title}: expected two group columns, got {cols}.")
@@ -605,7 +628,7 @@ if models_data and isinstance(models_data, dict) and (not models_data.get("ft_me
                 return
             sub = center_tbl.loc[sub_idx].copy()
 
-            if not spread_tbl.empty and {gA,gB}.issubset(spread_tbl.columns):
+            if not spread_tbl.empty and {gA, gB}.issubset(spread_tbl.columns):
                 eps = 1e-9
                 diff = (sub[gA] - sub[gB]).abs()
                 common = [r for r in diff.index if r in spread_tbl.index]
@@ -632,12 +655,11 @@ if models_data and isinstance(models_data, dict) and (not models_data.get("ft_me
         show_grouped_table("Core variables", var_core, center_tbl, spread_tbl)
         show_grouped_table("Moderate variables", var_mod, center_tbl, spread_tbl)
 
-        # Optional: show current Top-10 threshold beneath (without listing any bins)
-        if st.session_state.view_mode_key.startswith("t10"):
+        # Optional: show current Top-10 threshold (no bin list text)
+        if chosen_key.startswith("t10"):
             thr = models_data.get("top10_threshold", np.nan)
             if np.isfinite(thr):
                 st.caption(f"Current Top-10% cutoff (Max Push Daily %): {thr:.2f}%")
-
 else:
     st.info("Upload DB and click **Build model stocks** to compute FT and Top10 summaries.")
 
