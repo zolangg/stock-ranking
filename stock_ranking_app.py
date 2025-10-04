@@ -9,6 +9,16 @@ import json
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
 
+# ============================== Stable Session Keys ==============================
+DEFAULT_VIEW = "ft_robust"  # "ft_robust" | "ft_classic" | "t10_robust" | "t10_classic"
+
+if "rows" not in st.session_state: st.session_state.rows = []
+if "last" not in st.session_state: st.session_state.last = {}
+if "models" not in st.session_state: st.session_state.models = {}
+if "lassoA" not in st.session_state: st.session_state.lassoA = {}
+if "view_mode_key" not in st.session_state: st.session_state.view_mode_key = DEFAULT_VIEW
+if "sig_thresh" not in st.session_state: st.session_state.sig_thresh = 3.0  # single source of truth
+
 # ============================== Helpers ==============================
 def do_rerun():
     if hasattr(st, "rerun"): st.rerun()
@@ -19,21 +29,23 @@ def _norm(s: str) -> str:
     return s.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
 
 def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    if df is None or df.empty:
-        return None
+    if df is None or df.empty: return None
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
+    # exact (case-insensitive)
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
             if cols_lc[c] == lc:
                 return c
+    # normalized exact
     nm = {c: _norm(c) for c in cols}
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n:
                 return c
+    # normalized contains
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
@@ -74,17 +86,14 @@ def _apply_bounds(arr: np.ndarray, lo: float, hi: float):
 # ---------- Isotonic Regression ----------
 def _pav_isotonic(x: np.ndarray, y: np.ndarray):
     order = np.argsort(x)
-    xs = x[order]
-    ys = y[order]
-    level_y = ys.astype(float).copy()
-    level_n = np.ones_like(level_y)
+    xs = x[order]; ys = y[order]
+    level_y = ys.astype(float).copy(); level_n = np.ones_like(level_y)
     i = 0
     while i < len(level_y) - 1:
         if level_y[i] > level_y[i+1]:
             new_y = (level_y[i]*level_n[i] + level_y[i+1]*level_n[i+1]) / (level_n[i] + level_n[i+1])
             new_n = level_n[i] + level_n[i+1]
-            level_y[i] = new_y
-            level_n[i] = new_n
+            level_y[i] = new_y; level_n[i] = new_n
             level_y = np.delete(level_y, i+1)
             level_n = np.delete(level_n, i+1)
             xs = np.delete(xs, i+1)
@@ -100,14 +109,6 @@ def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
     if bx.size == 1: return np.full_like(x_new, by[0], dtype=float)
     return np.interp(x_new, bx, by, left=by[0], right=by[-1])
 
-# ============================== Session State ==============================
-if "rows" not in st.session_state: st.session_state.rows = []
-if "last" not in st.session_state: st.session_state.last = {}
-if "models" not in st.session_state: st.session_state.models = {}
-if "lassoA" not in st.session_state: st.session_state.lassoA = {}
-if "view_mode_key" not in st.session_state: st.session_state.view_mode_key = "ft_robust"
-if "sig_thresh" not in st.session_state: st.session_state.sig_thresh = 3.0
-
 # ============================== Variables ==============================
 VAR_CORE = [
     "Gap_%",
@@ -116,7 +117,7 @@ VAR_CORE = [
     "Catalyst",
     "PM_Vol_%",
     "Max_Pull_PM_%",
-    "RVOL_Max_PM_cum"
+    "RVOL_Max_PM_cum",
 ]
 VAR_MODERATE = [
     "MC_PM_Max_M",
@@ -130,7 +131,7 @@ VAR_MODERATE = [
 ]
 VAR_ALL = VAR_CORE + VAR_MODERATE
 
-# ============================== LASSO helper ==============================
+# ============================== LASSO helpers ==============================
 def _kfold_indices(n, k=5, seed=42):
     rng = np.random.default_rng(seed)
     idx = np.arange(n); rng.shuffle(idx)
@@ -372,7 +373,7 @@ if build_btn:
             sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
             raw = pd.read_excel(xls, sheet)
 
-            # detect FT
+            # detect FT column
             possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
             col_group = possible[0] if possible else None
             if col_group is None:
@@ -390,7 +391,7 @@ if build_btn:
                 src = _pick(raw, src_candidates)
                 if src: dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-            # mapping
+            # map fields
             add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
             add_num(df, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
             add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
@@ -423,7 +424,7 @@ if build_btn:
             if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
                 df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-            # scale percents
+            # scale % fields (DB stores fractions)
             if "Gap_%" in df.columns:            df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
             if "PM_Vol_%" in df.columns:         df["PM_Vol_%"] = pd.to_numeric(df["PM_Vol_%"], errors="coerce") * 100.0
             if "Max_Pull_PM_%" in df.columns:    df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
@@ -469,11 +470,12 @@ if build_btn:
                 "top10_threshold": float(top10_thr) if np.isfinite(top10_thr) else np.nan,
             }
 
-            # model
+            # ratio model
             lasso_model = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99)
             st.session_state.lassoA = lasso_model or {}
 
-            st.session_state.view_mode_key = "t10_robust" if not ft_summ["med_tbl"].size and t10_summ["med_tbl"].size else "ft_robust"
+            # default view stays stable
+            st.session_state.view_mode_key = st.session_state.view_mode_key or DEFAULT_VIEW
             st.success("Built FT and Top10 summaries.")
             do_rerun()
 
@@ -481,7 +483,7 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# ============================== Summary tables ==============================
+# ============================== Summary tables (Stable Radio + Slider) ==============================
 models = st.session_state.get("models", {})
 has_ft  = not models.get("ft_med_tbl", pd.DataFrame()).empty
 has_t10 = not models.get("t10_med_tbl", pd.DataFrame()).empty
@@ -496,40 +498,44 @@ if has_ft or has_t10:
         ]
         key2label = {k: lbl for k, lbl in OPTIONS}
         label2key = {lbl: k for k, lbl in OPTIONS}
-        labels     = [lbl for _, lbl in OPTIONS]
+        labels = [lbl for _, lbl in OPTIONS]
 
-        if "view_choice_radio" not in st.session_state:
-            st.session_state.view_choice_radio = key2label[st.session_state.view_mode_key]
-        try:
-            idx = labels.index(st.session_state.view_choice_radio)
-        except ValueError:
-            idx = 0
+        # initialize radio from state once
+        if "view_choice_label" not in st.session_state:
+            st.session_state.view_choice_label = key2label[st.session_state.view_mode_key]
 
-        chosen_label = st.radio("View", labels, index=idx, horizontal=True, key="view_choice_radio")
-        chosen_key = label2key[chosen_label]
-        st.session_state.view_mode_key = chosen_key
+        chosen_label = st.radio("View", labels, index=labels.index(st.session_state.view_choice_label),
+                                horizontal=True, key="view_choice_label")
+        st.session_state.view_mode_key = label2key[chosen_label]
 
         var_core = models.get("var_core", []) or []
         var_mod  = models.get("var_moderate", []) or []
 
-        if chosen_key == "ft_robust" and has_ft:
+        vmk = st.session_state.view_mode_key
+        if vmk == "ft_robust" and has_ft:
             center_tbl = models["ft_med_tbl"];  spread_tbl = models["ft_mad_tbl"]
-        elif chosen_key == "ft_classic" and has_ft:
+        elif vmk == "ft_classic" and has_ft:
             center_tbl = models["ft_mean_tbl"]; spread_tbl = models["ft_sd_tbl"]
-        elif chosen_key == "t10_robust" and has_t10:
+        elif vmk == "t10_robust" and has_t10:
             center_tbl = models["t10_med_tbl"]; spread_tbl = models["t10_mad_tbl"]
-        elif chosen_key == "t10_classic" and has_t10:
+        elif vmk == "t10_classic" and has_t10:
             center_tbl = models["t10_mean_tbl"]; spread_tbl = models["t10_sd_tbl"]
         else:
             center_tbl = pd.DataFrame(); spread_tbl = pd.DataFrame()
 
+        # stable slider (single key == single source of truth)
+        _ = st.slider(
+            "Significance threshold (σ)",
+            min_value=0.0, max_value=5.0,
+            value=st.session_state.sig_thresh,
+            step=0.1,
+            key="sig_thresh",
+            help="Highlight rows where |GroupA − GroupB| / (SpreadA + SpreadB) ≥ σ",
+        )
+
+        # expose current pair of tables to Alignment
         st.session_state["models_tbl_current"] = center_tbl
         st.session_state["spread_tbl_current"] = spread_tbl
-
-        sig_thresh = st.slider("Significance threshold (σ)", 0.0, 5.0, st.session_state["sig_thresh"], 0.1,
-                               key="sig_thresh_slider",
-                               help="Highlight rows where |GroupA − GroupB| / (SpreadA + SpreadB) ≥ σ")
-        st.session_state["sig_thresh"] = float(sig_thresh)
 
         def show_grouped_table(title, vars_list, center_tbl, spread_tbl):
             if center_tbl is None or center_tbl.empty or not vars_list:
@@ -539,8 +545,7 @@ if has_ft or has_t10:
                 st.info(f"{title}: expected two groups, got {cols}."); return
             gA, gB = cols[0], cols[1]
             sub_idx = [v for v in vars_list if v in center_tbl.index]
-            if not sub_idx:
-                st.info(f"No overlapping variables for {title}."); return
+            if not sub_idx: st.info(f"No overlapping variables for {title}."); return
             sub = center_tbl.loc[sub_idx].copy()
 
             if not spread_tbl.empty and {gA, gB}.issubset(spread_tbl.columns):
@@ -550,7 +555,7 @@ if has_ft or has_t10:
                 sub = sub.loc[common]; diff = diff.loc[common]
                 spread = (spread_tbl.loc[common, gA].fillna(0.0) + spread_tbl.loc[common, gB].fillna(0.0))
                 sig = diff / (spread.replace(0.0, np.nan) + eps)
-                sig_flag = sig >= st.session_state["sig_thresh"]
+                sig_flag = sig >= float(st.session_state.sig_thresh)
 
                 def _style_sig(col: pd.Series):
                     return ["background-color: #fde68a; font-weight: 600;" if sig_flag.get(idx, False) else "" 
@@ -621,14 +626,14 @@ if submitted and ticker:
     st.session_state.rows.append(row); st.session_state.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
-# ============================== Alignment ==============================
+# ============================== Alignment (Weighted, Stable) ==============================
 st.markdown("### Alignment")
 
 models_tbl = st.session_state.get("models_tbl_current", pd.DataFrame())
 spread_tbl = st.session_state.get("spread_tbl_current", pd.DataFrame())
 var_core = (st.session_state.models or {}).get("var_core", [])
 var_mod  = (st.session_state.models or {}).get("var_moderate", [])
-SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
+SIG_THR = float(st.session_state.sig_thresh)
 
 def _compute_alignment_counts_weighted(
     stock_row: dict,
@@ -645,14 +650,17 @@ def _compute_alignment_counts_weighted(
         return {}
     groups = list(models_tbl.columns)  # e.g., ["Top10","Rest"] or ["FT=1","FT=0"]
     gA, gB = groups[0], groups[1]
+
     counts = {gA: 0.0, gB: 0.0}
+    core_pts = {gA: 0.0, gB: 0.0}
+    mod_pts  = {gA: 0.0, gB: 0.0}
     used_core = used_mod = 0
 
-    def _vote_one(var: str, weight: float):
+    def _vote_one(var: str, weight: float, bucket: dict):
         nonlocal used_core, used_mod
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
         if not np.isfinite(xv) or var not in models_tbl.index: return
-        centers = models_tbl.loc[var, groups].astype(float)
+        centers = models_tbl.loc[var, [gA, gB]].astype(float)
         if centers.isna().any(): return
 
         dA = abs(xv - centers[gA]); dB = abs(xv - centers[gB])
@@ -660,39 +668,42 @@ def _compute_alignment_counts_weighted(
         if normalize and spread_tbl is not None and var in spread_tbl.index:
             sA = spread_tbl.loc[var, gA] if gA in spread_tbl.columns else np.nan
             sB = spread_tbl.loc[var, gB] if gB in spread_tbl.columns else np.nan
-            denom = 0.0
-            denom += float(sA) if pd.notna(sA) else 0.0
-            denom += float(sB) if pd.notna(sB) else 0.0
+            denom = (float(sA) if pd.notna(sA) else 0.0) + (float(sB) if pd.notna(sB) else 0.0)
             if denom > 0:
                 dA /= denom; dB /= denom
 
         if not np.isfinite(dA) or not np.isfinite(dB): return
-        if dA < dB: counts[gA] += weight
-        elif dB < dA: counts[gB] += weight
+
+        if dA < dB:
+            counts[gA] += weight; bucket[gA] += weight
+        elif dB < dA:
+            counts[gB] += weight; bucket[gB] += weight
         else:
             if tie_mode == "split":
-                counts[gA] += weight * 0.5; counts[gB] += weight * 0.5
+                counts[gA] += weight*0.5; counts[gB] += weight*0.5
+                bucket[gA] += weight*0.5; bucket[gB] += weight*0.5
 
         if weight == w_core: used_core += 1
         elif weight == w_mod: used_mod += 1
 
-    for v in var_core: _vote_one(v, w_core)
-    for v in var_mod:  _vote_one(v, w_mod)
+    for v in var_core: _vote_one(v, w_core, core_pts)
+    for v in var_mod:  _vote_one(v, w_mod,  mod_pts)
 
     total = counts[gA] + counts[gB]
-    if total <= 0:
-        a_raw = b_raw = 0.0; a_int = b_int = 0
-    else:
-        a_raw = 100.0 * counts[gA] / total
-        b_raw = 100.0 - a_raw
-        a_int = int(round(a_raw)); b_int = 100 - a_int
+    a_raw = 100.0 * counts[gA] / total if total > 0 else 0.0
+    b_raw = 100.0 - a_raw
+    a_int = int(round(a_raw)); b_int = 100 - a_int
 
-    return {gA: counts[gA], gB: counts[gB],
-            "A_pts": counts[gA], "B_pts": counts[gB],
-            "A_pct_raw": a_raw, "B_pct_raw": b_raw,
-            "A_pct_int": a_int, "B_pct_int": b_int,
-            "A_label": gA, "B_label": gB,
-            "N_core_used": used_core, "N_mod_used": used_mod}
+    return {
+        gA: counts[gA], gB: counts[gB],
+        "A_pts": counts[gA], "B_pts": counts[gB],
+        "A_core": core_pts[gA], "B_core": core_pts[gB],
+        "A_mod":  mod_pts[gA],  "B_mod":  mod_pts[gB],
+        "A_pct_raw": a_raw, "B_pct_raw": b_raw,
+        "A_pct_int": a_int, "B_pct_int": b_int,
+        "A_label": gA, "B_label": gB,
+        "N_core_used": used_core, "N_mod_used": used_mod,
+    }
 
 if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
     summary_rows, detail_map = [], {}
@@ -708,7 +719,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
             models_tbl=models_tbl,
             var_core=var_core,
             var_mod=var_mod,
-            w_core=1.0, w_mod=0.5,          # << weighted voting
+            w_core=1.0, w_mod=0.5,          # weighted voting
             tie_mode="split",
             normalize=False,
             spread_tbl=spread_tbl,
@@ -723,8 +734,13 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
             "B_val_int": counts.get("B_pct_int", 0),
             "A_label": counts.get("A_label", gA),
             "B_label": counts.get("B_label", gB),
+            # optional diagnostics
             "A_pts": counts.get("A_pts", 0.0),
             "B_pts": counts.get("B_pts", 0.0),
+            "A_core": counts.get("A_core", 0.0),
+            "B_core": counts.get("B_core", 0.0),
+            "A_mod": counts.get("A_mod", 0.0),
+            "B_mod": counts.get("B_mod", 0.0),
         })
 
         drows_grouped = []
@@ -745,9 +761,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
                 dA = None if (pd.isna(va) or pd.isna(vA)) else float(va - vA)
                 dB = None if (pd.isna(va) or pd.isna(vB)) else float(va - vB)
 
-                denom = 0.0
-                denom += float(sA) if pd.notna(sA) else 0.0
-                denom += float(sB) if pd.notna(sB) else 0.0
+                denom = (float(sA) if pd.notna(sA) else 0.0) + (float(sB) if pd.notna(sB) else 0.0)
                 if denom == 0.0:
                     sA_val = np.nan; sB_val = np.nan
                 else:
@@ -865,6 +879,10 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
 
     function childTableHTML(ticker) {
       const rows = data.details[ticker] || [];
+      const parent = (data.rows || []).find(r => r.Ticker === ticker) || {};
+      const leftInfo  = (parent.A_pts!=null) ? `(core ${Number(parent.A_core||0).toFixed(1)} + mod ${Number(parent.A_mod||0).toFixed(1)} = ${Number(parent.A_pts||0).toFixed(1)})` : '';
+      const rightInfo = (parent.B_pts!=null) ? `(core ${Number(parent.B_core||0).toFixed(1)} + mod ${Number(parent.B_mod||0).toFixed(1)} = ${Number(parent.B_pts||0).toFixed(1)})` : '';
+
       if (!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
 
       const cells = rows.map(r => {
@@ -875,7 +893,7 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
         const a  = formatVal(r.A);
         const b  = formatVal(r.B);
 
-        // ABS text with sign color
+        // ABS deltas with sign color
         const rawDa = (r.d_vs_A==null || isNaN(r.d_vs_A)) ? null : Number(r.d_vs_A);
         const rawDb = (r.d_vs_B==null || isNaN(r.d_vs_B)) ? null : Number(r.d_vs_B);
         const da = (rawDa==null) ? '' : formatVal(Math.abs(rawDa));
@@ -910,8 +928,8 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
             <tr>
               <th class="col-var">Variable</th>
               <th class="col-val">Value</th>
-              <th class="col-a">${data.gA} center</th>
-              <th class="col-b">${data.gB} center</th>
+              <th class="col-a">${data.gA} center <span style="font-weight:400;color:#6b7280;">${leftInfo}</span></th>
+              <th class="col-b">${data.gB} center <span style="font-weight:400;color:#6b7280;">${rightInfo}</span></th>
               <th class="col-da">Δ vs ${data.gA}</th>
               <th class="col-db">Δ vs ${data.gB}</th>
             </tr>
