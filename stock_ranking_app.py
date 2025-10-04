@@ -540,13 +540,14 @@ if build_btn:
         except Exception as e:
             st.error("Loading/processing failed.")
             st.exception(e)
+# ============================== Summary tables (FT & Top10) ==============================
+models = st.session_state.get("models", {})
+has_ft  = not models.get("ft_med_tbl", pd.DataFrame()).empty
+has_t10 = not models.get("t10_med_tbl", pd.DataFrame()).empty
 
-# ============================== Summary tables (4-way radio with stable key) ==============================
-models_data = st.session_state.models
-if models_data and isinstance(models_data, dict) and (not models_data.get("ft_med_tbl", pd.DataFrame()).empty
-                                                     or not models_data.get("t10_med_tbl", pd.DataFrame()).empty):
+if has_ft or has_t10:
     with st.expander("Group summaries — FT vs Top 10% (flip center/spread)", expanded=False):
-        # 1) Define options and persistent “view key” ↔ label maps
+        # Maps (stable)
         OPTIONS = [
             ("ft_robust", "FT: Median + MAD"),
             ("ft_classic","FT: Mean + SD"),
@@ -556,52 +557,55 @@ if models_data and isinstance(models_data, dict) and (not models_data.get("ft_me
         key2label = {k: lbl for k, lbl in OPTIONS}
         label2key = {lbl: k for k, lbl in OPTIONS}
         labels     = [lbl for _, lbl in OPTIONS]
-    
-        # 2) One-time init of your persistent logical key
+
+        # One-time init
         if "view_mode_key" not in st.session_state:
-            st.session_state.view_mode_key = "ft_robust"  # default once
-    
-        # 3) One-time init of the widget’s own state (don’t keep resetting it!)
+            st.session_state.view_mode_key = "ft_robust"
         if "view_choice_radio" not in st.session_state:
-            # seed the widget value from your persistent logical key
             st.session_state.view_choice_radio = key2label[st.session_state.view_mode_key]
-    
-        # 4) Compute index ONLY from the already-saved widget value (not from scratch)
+
+        # Index derived from widget's own saved value (prevents snapping)
         try:
             idx = labels.index(st.session_state.view_choice_radio)
         except ValueError:
             idx = 0
-    
-        # 5) Give the radio a unique, stable key; do not change its key later
+
         chosen_label = st.radio(
             "View",
             options=labels,
-            index=idx,                     # safe now; aligns with widget value we control
+            index=idx,
             horizontal=True,
-            key="view_choice_radio",       # stable widget key
+            key="view_choice_radio",   # stable key
         )
-    
-        # 6) Update the persistent logical key only if the user changed the widget
         chosen_key = label2key[chosen_label]
         if chosen_key != st.session_state.view_mode_key:
             st.session_state.view_mode_key = chosen_key
-    
-        # 7) Use the chosen_key to pick the center/spread tables
-        models = st.session_state.models
-        if chosen_key == "ft_robust":
+
+        # ------- SAFELY GET var lists BEFORE using them -------
+        var_core = models.get("var_core", []) or []
+        var_mod  = models.get("var_moderate", []) or []
+
+        # Pick tables per selection (default to FT robust if missing)
+        if chosen_key == "ft_robust" and has_ft:
             center_tbl = models["ft_med_tbl"];  spread_tbl = models["ft_mad_tbl"]
-        elif chosen_key == "ft_classic":
+        elif chosen_key == "ft_classic" and has_ft:
             center_tbl = models["ft_mean_tbl"]; spread_tbl = models["ft_sd_tbl"]
-        elif chosen_key == "t10_robust":
+        elif chosen_key == "t10_robust" and has_t10:
             center_tbl = models["t10_med_tbl"]; spread_tbl = models["t10_mad_tbl"]
-        else:  # "t10_classic"
+        elif chosen_key == "t10_classic" and has_t10:
             center_tbl = models["t10_mean_tbl"]; spread_tbl = models["t10_sd_tbl"]
-    
-        # 8) Save basis for Alignment (don’t overwrite elsewhere)
+        else:
+            # Fallback to whatever exists
+            if has_ft:
+                center_tbl = models["ft_med_tbl"]; spread_tbl = models["ft_mad_tbl"]; st.session_state.view_mode_key = "ft_robust"
+            else:
+                center_tbl = models["t10_med_tbl"]; spread_tbl = models["t10_mad_tbl"]; st.session_state.view_mode_key = "t10_robust"
+
+        # Save basis for Alignment
         st.session_state["models_tbl_current"] = center_tbl
         st.session_state["spread_tbl_current"] = spread_tbl
-    
-        # 9) Slider should also have a stable key; don’t reset its default each run
+
+        # Stable slider
         if "sig_thresh" not in st.session_state:
             st.session_state["sig_thresh"] = 3.0
         sig_thresh = st.slider(
@@ -612,7 +616,7 @@ if models_data and isinstance(models_data, dict) and (not models_data.get("ft_me
         )
         st.session_state["sig_thresh"] = float(sig_thresh)
 
-        # Utility to draw group tables for core/moderate
+        # Renderer
         def show_grouped_table(title, vars_list, center_tbl, spread_tbl):
             if center_tbl is None or center_tbl.empty:
                 st.info(f"No variables available for {title}.")
@@ -620,7 +624,6 @@ if models_data and isinstance(models_data, dict) and (not models_data.get("ft_me
             if not vars_list:
                 st.info(f"No variables selected for {title}.")
                 return
-
             cols = list(center_tbl.columns)
             if len(cols) != 2:
                 st.info(f"{title}: expected two group columns, got {cols}.")
@@ -657,12 +660,13 @@ if models_data and isinstance(models_data, dict) and (not models_data.get("ft_me
             else:
                 st.info(f"Select a center/spread view to see {title}.")
 
+        # Draw tables
         show_grouped_table("Core variables", var_core, center_tbl, spread_tbl)
         show_grouped_table("Moderate variables", var_mod, center_tbl, spread_tbl)
 
-        # Optional: show current Top-10 threshold (no bin list text)
-        if chosen_key.startswith("t10"):
-            thr = models_data.get("top10_threshold", np.nan)
+        # Optional threshold caption for Top10 view
+        if st.session_state.view_mode_key.startswith("t10"):
+            thr = models.get("top10_threshold", np.nan)
             if np.isfinite(thr):
                 st.caption(f"Current Top-10% cutoff (Max Push Daily %): {thr:.2f}%")
 else:
