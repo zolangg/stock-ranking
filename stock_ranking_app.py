@@ -11,6 +11,8 @@ st.title("Premarket Stock Ranking")
 
 # ============================== Stable Session Keys ==============================
 DEFAULT_VIEW = "ft_robust"  # "ft_robust" | "ft_classic" | "t10_robust" | "t10_classic"
+EPS = 1e-9
+MAD_TO_SD = 1.4826
 
 if "rows" not in st.session_state: st.session_state.rows = []
 if "last" not in st.session_state: st.session_state.last = {}
@@ -18,6 +20,8 @@ if "models" not in st.session_state: st.session_state.models = {}
 if "lassoA" not in st.session_state: st.session_state.lassoA = {}
 if "view_mode_key" not in st.session_state: st.session_state.view_mode_key = DEFAULT_VIEW
 if "sig_thresh" not in st.session_state: st.session_state.sig_thresh = 3.0  # single source of truth
+if "models_tbl_current" not in st.session_state: st.session_state.models_tbl_current = pd.DataFrame()
+if "spread_tbl_current" not in st.session_state: st.session_state.spread_tbl_current = pd.DataFrame()
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -173,7 +177,6 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     maxpullpm      = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").values
     ln_rvolmaxpm   = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum", np.nan), errors="coerce").values, eps, None))
     pm_dol_over_mc = pd.to_numeric(df.get("PM$Vol/MC_%", np.nan), errors="coerce").values
-
     catalyst_raw   = df.get("Catalyst", np.nan)
     catalyst       = pd.to_numeric(catalyst_raw, errors="coerce").fillna(0.0).clip(0,1).values
 
@@ -438,7 +441,7 @@ if build_btn:
             df = df[df["FT01"].isin([0,1])]
             df["GroupFT"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-            # Top10 groups from Max Push Daily (%) (fraction → %)
+            # Top10 from Max Push Daily (%) (fraction → %)
             pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
             if pmh_col is not None:
                 pmh_raw = pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce")
@@ -458,6 +461,7 @@ if build_btn:
             ft_summ  = _summaries_for(df, var_all, "GroupFT")
             t10_summ = _summaries_for(df, var_all, "GroupTop10", labels_map={"Top10":"Top10","Rest":"Rest"})
 
+            # store
             st.session_state.models = {
                 "ft_med_tbl":  ft_summ["med_tbl"],  "ft_mad_tbl":  ft_summ["mad_tbl"],
                 "ft_mean_tbl": ft_summ["mean_tbl"], "ft_sd_tbl":   ft_summ["sd_tbl"],
@@ -466,6 +470,11 @@ if build_btn:
                 "var_core": var_core, "var_moderate": var_mod,
                 "top10_threshold": float(top10_thr) if np.isfinite(top10_thr) else np.nan,
             }
+
+            # initialize alignment tables to FT robust if not present
+            if st.session_state.models_tbl_current.empty:
+                st.session_state.models_tbl_current = ft_summ["med_tbl"].copy()
+                st.session_state.spread_tbl_current = ft_summ["mad_tbl"].copy()
 
             # ratio model
             lasso_model = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99)
@@ -483,6 +492,31 @@ models = st.session_state.get("models", {})
 has_ft  = not models.get("ft_med_tbl", pd.DataFrame()).empty
 has_t10 = not models.get("t10_med_tbl", pd.DataFrame()).empty
 
+def _pick_tables_by_key(view_key: str):
+    # returns (center_tbl, spread_tbl)
+    if view_key == "ft_robust" and has_ft:
+        return models["ft_med_tbl"], models["ft_mad_tbl"]
+    if view_key == "ft_classic" and has_ft:
+        return models["ft_mean_tbl"], models["ft_sd_tbl"]
+    if view_key == "t10_robust" and has_t10:
+        return models["t10_med_tbl"], models["t10_mad_tbl"]
+    if view_key == "t10_classic" and has_t10:
+        return models["t10_mean_tbl"], models["t10_sd_tbl"]
+    return pd.DataFrame(), pd.DataFrame()
+
+def _align_spread_columns(center_tbl: pd.DataFrame, spread_tbl: pd.DataFrame):
+    if center_tbl.empty or spread_tbl.empty: return center_tbl, spread_tbl
+    ccols = list(center_tbl.columns)
+    scols = list(spread_tbl.columns)
+    if set(ccols) <= set(scols):
+        # reorder spread to match center
+        spread_tbl = spread_tbl[ccols]
+    else:
+        # try canonical renames
+        if {"Top10","Rest"} <= set(scols): spread_tbl = spread_tbl[["Top10","Rest"]]
+        elif {"FT=1","FT=0"} <= set(scols): spread_tbl = spread_tbl[["FT=1","FT=0"]]
+    return center_tbl, spread_tbl
+
 if has_ft or has_t10:
     with st.expander("Group summaries — FT vs Top 10% (flip center/spread)", expanded=False):
         OPTIONS = [
@@ -495,49 +529,38 @@ if has_ft or has_t10:
         label2key = {lbl: k for k, lbl in OPTIONS}
         labels = [lbl for _, lbl in OPTIONS]
 
-        # initialize radio from state once
         if "view_choice_label" not in st.session_state:
-            st.session_state.view_choice_label = key2label[st.session_state.view_mode_key]
+            st.session_state.view_choice_label = key2key = key2label[st.session_state.view_mode_key]
 
         chosen_label = st.radio(
             "View",
             labels,
-            index=labels.index(st.session_state.view_choice_label),
+            index=labels.index(key2label[st.session_state.view_mode_key]),
             horizontal=True,
             key="view_choice_label",
         )
         st.session_state.view_mode_key = label2key[chosen_label]
 
-        var_core = models.get("var_core", []) or []
-        var_mod  = models.get("var_moderate", []) or []
-
-        vmk = st.session_state.view_mode_key
-        if vmk == "ft_robust" and has_ft:
-            center_tbl = models["ft_med_tbl"];  spread_tbl = models["ft_mad_tbl"]
-        elif vmk == "ft_classic" and has_ft:
-            center_tbl = models["ft_mean_tbl"]; spread_tbl = models["ft_sd_tbl"]
-        elif vmk == "t10_robust" and has_t10:
-            center_tbl = models["t10_med_tbl"]; spread_tbl = models["t10_mad_tbl"]
-        elif vmk == "t10_classic" and has_t10:
-            center_tbl = models["t10_mean_tbl"]; spread_tbl = models["t10_sd_tbl"]
-        else:
-            center_tbl = pd.DataFrame(); spread_tbl = pd.DataFrame()
-
-        # stable slider (single key == single source of truth)
+        # stable slider (single source of truth)
         _ = st.slider(
             "Significance threshold (σ)",
             min_value=0.0, max_value=5.0,
-            value=st.session_state.sig_thresh,
+            value=float(st.session_state.sig_thresh),
             step=0.1,
             key="sig_thresh",
-            help="Highlight rows where |GroupA − GroupB| / pooled spread ≥ σ",
+            help="Highlight rows where |GroupA − GroupB| / pooled spread ≥ σ (MAD scaled in robust view).",
         )
 
-        # push current tables to state for alignment
-        st.session_state["models_tbl_current"] = center_tbl
-        st.session_state["spread_tbl_current"] = spread_tbl
+        center_tbl, spread_tbl = _pick_tables_by_key(st.session_state.view_mode_key)
+        center_tbl, spread_tbl = _align_spread_columns(center_tbl, spread_tbl)
 
-        # ---------- render grouped tables ----------
+        # push current tables to state for alignment (copy to avoid mutation)
+        st.session_state.models_tbl_current = center_tbl.copy()
+        st.session_state.spread_tbl_current = spread_tbl.copy()
+
+        var_core = models.get("var_core", []) or []
+        var_mod  = models.get("var_moderate", []) or []
+
         def show_grouped_table(title, vars_list, center_tbl, spread_tbl):
             if center_tbl is None or center_tbl.empty or not vars_list:
                 st.info(f"No variables available for {title}."); return
@@ -549,7 +572,6 @@ if has_ft or has_t10:
             if not sub_idx: st.info(f"No overlapping variables for {title}."); return
             sub = center_tbl.loc[sub_idx].copy()
 
-            # significance using current σ; robust uses MAD→SD; pooled spread √(sA²+sB²)
             if not spread_tbl.empty and {gA, gB}.issubset(spread_tbl.columns):
                 diff = (sub[gA] - sub[gB]).abs()
                 common = [r for r in diff.index if r in spread_tbl.index]
@@ -560,12 +582,12 @@ if has_ft or has_t10:
 
                 robust_mode = st.session_state.view_mode_key.endswith("_robust")
                 if robust_mode:
-                    MAD_TO_SD = 1.4826
                     sA = sA * MAD_TO_SD
                     sB = sB * MAD_TO_SD
 
                 denom = np.sqrt(np.square(sA.fillna(0.0)) + np.square(sB.fillna(0.0)))
-                denom = denom.replace(0.0, np.nan)
+                # epsilon fallback so zero/NaN spreads don’t kill significance
+                denom = denom.apply(lambda d: d if (pd.notna(d) and d >= EPS) else max(float(sA.fillna(0.0).max()), float(sB.fillna(0.0).max()), 1.0))
 
                 sig = diff / denom
                 SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
@@ -582,12 +604,12 @@ if has_ft or has_t10:
                 st.dataframe(
                     styled,
                     use_container_width=True,
-                    key=f"sumtbl_{title}_{vmk}_{st.session_state.sig_thresh:.1f}"
+                    key=f"sumtbl_{title}_{st.session_state.view_mode_key}_{st.session_state.sig_thresh:.1f}"
                 )
             else:
                 st.markdown(f"**{title}**")
                 st.dataframe(sub.style.format("{:.2f}"), use_container_width=True,
-                             key=f"sumtbl_{title}_{vmk}_plain")
+                             key=f"sumtbl_{title}_{st.session_state.view_mode_key}_plain")
 
         show_grouped_table("Core variables", var_core, center_tbl, spread_tbl)
         show_grouped_table("Moderate variables", var_mod, center_tbl, spread_tbl)
@@ -648,12 +670,16 @@ if submitted and ticker:
 # ============================== Alignment (Weighted, Stable) ==============================
 st.markdown("### Alignment")
 
-models_tbl = st.session_state.get("models_tbl_current", pd.DataFrame())
-spread_tbl = st.session_state.get("spread_tbl_current", pd.DataFrame())
+models_tbl = st.session_state.get("models_tbl_current", pd.DataFrame()).copy()
+spread_tbl = st.session_state.get("spread_tbl_current", pd.DataFrame()).copy()
+
+# Ensure columns are aligned
+models_tbl, spread_tbl = _align_spread_columns(models_tbl, spread_tbl)
+
 var_core = (st.session_state.models or {}).get("var_core", [])
 var_mod  = (st.session_state.models or {}).get("var_moderate", [])
-# read current threshold fresh
 SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
+robust_mode_current = st.session_state.view_mode_key.endswith("_robust")
 
 def _compute_alignment_counts_weighted(
     stock_row: dict,
@@ -665,6 +691,7 @@ def _compute_alignment_counts_weighted(
     tie_mode: str = "split",
     normalize: bool = False,
     spread_tbl: pd.DataFrame | None = None,
+    robust_mode: bool = False,
 ) -> dict:
     if models_tbl is None or models_tbl.empty or len(models_tbl.columns) != 2:
         return {}
@@ -688,9 +715,15 @@ def _compute_alignment_counts_weighted(
         if normalize and spread_tbl is not None and var in spread_tbl.index:
             sA = spread_tbl.loc[var, gA] if gA in spread_tbl.columns else np.nan
             sB = spread_tbl.loc[var, gB] if gB in spread_tbl.columns else np.nan
-            denom = (float(sA) if pd.notna(sA) else 0.0) + (float(sB) if pd.notna(sB) else 0.0)
-            if denom > 0:
-                dA /= denom; dB /= denom
+            if robust_mode:
+                if pd.notna(sA): sA = float(sA) * MAD_TO_SD
+                if pd.notna(sB): sB = float(sB) * MAD_TO_SD
+            sA0 = 0.0 if pd.isna(sA) else float(sA)
+            sB0 = 0.0 if pd.isna(sB) else float(sB)
+            denom = sA0 + sB0
+            if not np.isfinite(denom) or denom < EPS:
+                denom = max(sA0, sB0, 1.0)
+            dA /= denom; dB /= denom
 
         if not np.isfinite(dA) or not np.isfinite(dB): return
 
@@ -741,8 +774,9 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
             var_mod=var_mod,
             w_core=1.0, w_mod=0.5,          # weighted voting
             tie_mode="split",
-            normalize=False,
+            normalize=False,                 # keep raw-distance voting (your preference)
             spread_tbl=spread_tbl,
+            robust_mode=robust_mode_current,
         )
         if not counts: continue
 
@@ -777,29 +811,25 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
                 # spreads for significance (robust MAD→SD then pooled √(sA²+sB²))
                 sA = spread_tbl.loc[med_var, gA] if (not spread_tbl.empty and med_var in spread_tbl.index and gA in spread_tbl.columns) else np.nan
                 sB = spread_tbl.loc[med_var, gB] if (not spread_tbl.empty and med_var in spread_tbl.index and gB in spread_tbl.columns) else np.nan
-
-                robust_mode = st.session_state.view_mode_key.endswith("_robust")
-                if robust_mode:
-                    MAD_TO_SD = 1.4826
+                if robust_mode_current:
                     if pd.notna(sA): sA = float(sA) * MAD_TO_SD
                     if pd.notna(sB): sB = float(sB) * MAD_TO_SD
-
                 sA0 = 0.0 if pd.isna(sA) else float(sA)
                 sB0 = 0.0 if pd.isna(sB) else float(sB)
-                denom = np.hypot(sA0, sB0)  # sqrt(sA^2 + sB^2)
+
+                denom = np.hypot(sA0, sB0)
+                if not np.isfinite(denom) or denom < EPS:
+                    # epsilon fallback; keep rows eligible for significance
+                    denom = max(sA0, sB0, 1.0)
 
                 if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(vA) and pd.isna(vB): continue
 
                 dA = None if (pd.isna(va) or pd.isna(vA)) else float(va - vA)
                 dB = None if (pd.isna(va) or pd.isna(vB)) else float(va - vB)
 
-                if denom == 0.0:
-                    sA_val = np.nan; sB_val = np.nan
-                else:
-                    sA_val = (abs(dA) / denom) if dA is not None else np.nan
-                    sB_val = (abs(dB) / denom) if dB is not None else np.nan
+                sA_val = (abs(dA) / denom) if dA is not None else np.nan
+                sB_val = (abs(dB) / denom) if dB is not None else np.nan
 
-                SIG_THR = float(st.session_state.get("sig_thresh", 3.0))
                 sigA = (not pd.isna(sA_val)) and (sA_val >= SIG_THR)
                 sigB = (not pd.isna(sB_val)) and (sB_val >= SIG_THR)
                 significant = sigA or sigB
