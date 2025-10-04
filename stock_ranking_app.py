@@ -783,57 +783,87 @@ def _compute_alignment_counts_weighted(
     models_tbl: pd.DataFrame,
     var_core: list[str],
     var_mod: list[str],
-    w_core: float = 1.0,
-    w_mod: float = 0.5,
+    w_core: float = 1.0,   # Core weight
+    w_mod: float = 0.5,    # Moderate weight
+    spread_tbl: pd.DataFrame | None = None,  # kept for compatibility; unused when normalize=False
+    tie_mode: str = "split",                 # "split" gives 0.5 to each on ties
+    normalize: bool = False,                 # keep False to match your 45/55 math
 ) -> dict:
+    """
+    Weighted alignment: Core=1.0, Moderate=0.5 by default.
+    Compares absolute distance to Group A vs Group B centers.
+    Ties split (0.5/0.5). No normalization unless normalize=True.
+    Returns both raw point totals and percentages (sum to 100).
+    """
     if models_tbl is None or models_tbl.empty or len(models_tbl.columns) != 2:
         return {}
-    groups = list(models_tbl.columns)  # e.g., ["FT=1","FT=0"] or ["Top10","Rest"]
+
+    groups = list(models_tbl.columns)  # e.g. ["Top10","Rest"] or ["FT=1","FT=0"]
     gA, gB = groups[0], groups[1]
-    TOL = 1e-9
     counts = {gA: 0.0, gB: 0.0}
     used_core = used_mod = 0
 
-    def vote_for(var, weight):
+    def _vote_one(var: str, weight: float):
         nonlocal used_core, used_mod
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
         if not np.isfinite(xv) or var not in models_tbl.index:
             return
+
         centers = models_tbl.loc[var, groups].astype(float)
         if centers.isna().any():
             return
-        dA = abs(xv - centers[gA]); dB = abs(xv - centers[gB])
-        if abs(dA - dB) <= TOL:
-            return
-        if dA < dB: counts[gA] += weight
-        else:       counts[gB] += weight
-        if weight == w_core: used_core += 1
-        else:                used_mod += 1
 
-    for v in var_core: vote_for(v, w_core)
-    for v in var_mod:  vote_for(v, w_mod)
+        dA = abs(xv - centers[gA])
+        dB = abs(xv - centers[gB])
+
+        # optional normalization (off by default)
+        if normalize and spread_tbl is not None and var in spread_tbl.index:
+            sA = spread_tbl.loc[var, gA] if gA in spread_tbl.columns else np.nan
+            sB = spread_tbl.loc[var, gB] if gB in spread_tbl.columns else np.nan
+            denom = 0.0
+            denom += float(sA) if pd.notna(sA) else 0.0
+            denom += float(sB) if pd.notna(sB) else 0.0
+            if denom > 0:
+                dA /= denom; dB /= denom
+
+        if not np.isfinite(dA) or not np.isfinite(dB):
+            return
+
+        if dA < dB:
+            counts[gA] += weight
+        elif dB < dA:
+            counts[gB] += weight
+        else:
+            if tie_mode == "split":
+                counts[gA] += weight * 0.5
+                counts[gB] += weight * 0.5
+
+        # track usage counts (for info only)
+        if weight == w_core: used_core += 1
+        elif weight == w_mod: used_mod += 1
+
+    # apply votes
+    for v in var_core: _vote_one(v, w_core)
+    for v in var_mod:  _vote_one(v, w_mod)
 
     total = counts[gA] + counts[gB]
     if total <= 0:
-        return {gA: 0.0, gB: 0.0,
-                "A_pct_raw": 0.0, "B_pct_raw": 0.0,
-                "A_pct_int": 0,   "B_pct_int": 0,
-                "A_label": gA, "B_label": gB,
-                "N_core_used": used_core, "N_mod_used": used_mod}
+        a_raw = b_raw = 0.0
+        a_int = b_int = 0
+    else:
+        a_raw = 100.0 * counts[gA] / total
+        b_raw = 100.0 - a_raw                 # exact complement
+        a_int = int(round(a_raw))
+        b_int = 100 - a_int                   # integer complement
 
-    # Raw (exact) percentages for widths; enforce exact 100 sum
-    a_raw = 100.0 * counts[gA] / total
-    b_raw = 100.0 - a_raw
-
-    # Integer labels that always sum to 100 (derive B from A)
-    a_int = int(round(a_raw))
-    b_int = 100 - a_int
-
-    return {gA: counts[gA], gB: counts[gB],
-            "A_pct_raw": a_raw, "B_pct_raw": b_raw,
-            "A_pct_int": a_int, "B_pct_int": b_int,
-            "A_label": gA, "B_label": gB,
-            "N_core_used": used_core, "N_mod_used": used_mod}
+    return {
+        gA: counts[gA], gB: counts[gB],
+        "A_pts": counts[gA], "B_pts": counts[gB],
+        "A_pct_raw": a_raw, "B_pct_raw": b_raw,
+        "A_pct_int": a_int, "B_pct_int": b_int,
+        "A_label": gA, "B_label": gB,
+        "N_core_used": used_core, "N_mod_used": used_mod,
+    }
 
 if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
     summary_rows, detail_map = [], {}
@@ -845,7 +875,17 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
     for row in st.session_state.rows:
         stock = dict(row)
         tkr = stock.get("Ticker") or "—"
-        counts = _compute_alignment_counts_weighted(stock, models_tbl, var_core, var_mod, w_core=1.0, w_mod=0.5)
+        counts = _compute_alignment_counts_weighted(
+        stock_row=stock,
+        models_tbl=models_tbl,
+        var_core=var_core,
+        var_mod=var_mod,
+        w_core=1.0,
+        w_mod=0.5,
+        spread_tbl=spread_tbl,   # not used when normalize=False, but safe to pass
+        tie_mode="split",
+        normalize=False,
+    )
         if not counts: continue
 
         summary_rows.append({
@@ -856,6 +896,8 @@ if st.session_state.rows and not models_tbl.empty and len(models_tbl.columns) ==
             "B_val_int": counts.get("B_pct_int", 0),
             "A_label": counts.get("A_label", gA),
             "B_label": counts.get("B_label", gB),
+            "A_pts": counts.get("A_pts", 0.0),   # optional, if you want to display points
+            "B_pts": counts.get("B_pts", 0.0),
         })
 
         drows_grouped = []
