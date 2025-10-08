@@ -521,22 +521,20 @@ if submitted and ticker:
 # ============================== Alignment ==============================
 st.markdown("### Alignment")
 
-# --- one compact row: radios (left) + Gain% dropdown (right) ---
+# --- compact top row: radios (left) + Gain% dropdown (right) ---
 col_mode, col_gain = st.columns([2.2, 1.0])
-
 with col_mode:
     mode = st.radio(
-        "",                           # no label = cleaner
+        "",
         ["Gain% vs Rest", "FT vs Fail (Gain%)"],
         horizontal=True,
         key="cmp_mode",
         label_visibility="collapsed"
     )
-
 with col_gain:
     gain_choices = [50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
     gain_min = st.selectbox(
-        "",                           # inline with radios
+        "",
         gain_choices,
         index=gain_choices.index(100) if 100 in gain_choices else 0,
         key="gain_min_pct",
@@ -544,6 +542,7 @@ with col_gain:
         label_visibility="collapsed"
     )
 
+# --- base data guardrails ---
 base_df = ss.get("base_df", pd.DataFrame()).copy()
 if base_df.empty:
     if ss.rows:
@@ -551,13 +550,11 @@ if base_df.empty:
     else:
         st.info("Upload DB (and/or add at least one stock) to compute alignment.")
     st.stop()
-
-# Column presence
 if "Max_Push_Daily_%" not in base_df.columns:
     st.error("Column “Max Push Daily (%)” not found in DB (expected as Max_Push_Daily_% after load).")
     st.stop()
 
-# ---------- Build comparison dataframe + group labels ----------
+# ---------- build comparison dataframe + group labels ----------
 df_cmp = base_df.copy()
 thr = float(gain_min)
 
@@ -571,21 +568,24 @@ if mode == "Gain% vs Rest":
     gA, gB = f"≥{int(thr)}%", "Rest"
     status_line = f"Gain% split at ≥ {int(thr)}%"
 
-else:  # "FT vs Fail (Gain%)"
+else:  # FT vs Fail (Gain%)
     # Filter to Gain% ≥ threshold first, THEN compare FT=1 vs FT=0; A must be FT=1
     df_cmp = df_cmp[pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr].copy()
+    if "FT01" not in df_cmp.columns:
+        st.error("FT01 column not found (expected after load).")
+        st.stop()
     df_cmp["__Group__"] = df_cmp["FT01"].map({1:"FT=1", 0:"FT=0"})
     gA, gB = "FT=1", "FT=0"
     status_line = f"Filtered to Gain% ≥ {int(thr)}%"
 
 st.caption(status_line)
 
-# ---------- Summaries (median centers + MAD→σ for 3σ highlighting) ----------
+# ---------- summaries (median centers + MAD→σ for 3σ highlighting) ----------
 var_core = ss.get("var_core", [])
 var_mod  = ss.get("var_moderate", [])
 var_all  = var_core + var_mod
 
-def _mad(series: pd.Series) -> float:
+def _mad_local(series: pd.Series) -> float:
     s = pd.to_numeric(series, errors="coerce").dropna()
     if s.empty: return np.nan
     med = float(np.median(s))
@@ -598,18 +598,16 @@ def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col
         return {"med_tbl": empty, "mad_tbl": empty}
     g = df_in.groupby(group_col, observed=True)[avail]
     med_tbl = g.median(numeric_only=True).T
-    mad_tbl = df_in.groupby(group_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad)).T
+    mad_tbl = df_in.groupby(group_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad_local)).T
     return {"med_tbl": med_tbl, "mad_tbl": mad_tbl}
 
 summ = _summaries_median_and_mad(df_cmp, var_all, "__Group__")
 med_tbl = summ["med_tbl"]; mad_tbl = summ["mad_tbl"] * 1.4826  # MAD → σ
 
-# Ensure exactly two groups exist
+# ensure exactly two groups exist (reorder as A|B and drop extras)
 if med_tbl.empty or med_tbl.shape[1] < 2:
     st.info("Not enough data to form two groups with the current mode/threshold. Adjust settings.")
     st.stop()
-
-# Reorder columns so A is left, B is right (and drop any extra accidental groups)
 cols = list(med_tbl.columns)
 if (gA in cols) and (gB in cols):
     med_tbl = med_tbl[[gA, gB]]
@@ -622,37 +620,7 @@ else:
     med_tbl = med_tbl[[gA, gB]]
 mad_tbl = mad_tbl.reindex(index=med_tbl.index)[[gA, gB]]
 
-# ----- Delete UI (compact) -----
-tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-unique_tickers, _seen = [], set()
-for t in tickers:
-    if t and t not in _seen:
-        unique_tickers.append(t); _seen.add(t)
-
-left, right = st.columns([2.5, 2.5])
-with left:
-    st.caption("Delete rows")
-with right:
-    r1, r2 = st.columns([4, 1])
-    with r1:
-        to_delete = st.multiselect(
-            "",
-            options=unique_tickers,
-            default=[],
-            key="del_selection",
-            placeholder="Select tickers…",
-            label_visibility="collapsed",
-        )
-    with r2:
-        if st.button("Delete", use_container_width=True, key="delete_btn"):
-            if to_delete:
-                ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
-                st.success(f"Deleted: {', '.join(to_delete)}")
-                do_rerun()
-            else:
-                st.info("No tickers selected.")
-
-# ----- Alignment computation -----
+# ---------- alignment computation for entered rows ----------
 def _compute_alignment_counts_weighted(
     stock_row: dict,
     centers_tbl: pd.DataFrame,
@@ -667,7 +635,7 @@ def _compute_alignment_counts_weighted(
     gA_, gB_ = list(centers_tbl.columns)
     counts = {gA_: 0.0, gB_: 0.0}
     core_pts = {gA_: 0.0, gB_: 0.0}
-    mod_pts  = {gA_: 0.0, gB_:  0.0}
+    mod_pts  = {gA_: 0.0, gB_: 0.0}
     idx_set = set(centers_tbl.index)
 
     def _vote_one(var: str, weight: float, bucket: dict):
@@ -727,8 +695,8 @@ for row in ss.rows:
         "B_val_raw": counts.get("B_pct_raw", 0.0),
         "A_val_int": counts.get("A_pct_int", 0),
         "B_val_int": counts.get("B_pct_int", 0),
-        "A_label": counts.get("A_label", list(centers_tbl.columns)[0]),
-        "B_label": counts.get("B_label", list(centers_tbl.columns)[1]),
+        "A_label": counts.get("A_label", gA),
+        "B_label": counts.get("B_label", gB),
         "A_pts": counts.get("A_pts", 0.0),
         "B_pts": counts.get("B_pts", 0.0),
         "A_core": counts.get("A_core", 0.0),
@@ -772,16 +740,6 @@ for row in ss.rows:
 # ---------------- HTML/JS render ----------------
 import streamlit.components.v1 as components
 
-def SAFE_JSON_DUMPS(obj) -> str:
-    class NpEncoder(json.JSONEncoder):
-        def default(self, o):
-            if isinstance(o, (np.integer,)): return int(o)
-            if isinstance(o, (np.floating,)): return float(o)
-            if isinstance(o, (np.ndarray,)): return o.tolist()
-            return super().default(o)
-    s = json.dumps(obj, cls=NpEncoder, ensure_ascii=False, separators=(",", ":"))
-    return s.replace("</script>", "<\\/script>")
-
 def _round_rec(o):
     if isinstance(o, dict): return {k:_round_rec(v) for k,v in o.items()}
     if isinstance(o, list): return [_round_rec(v) for v in o]
@@ -824,7 +782,7 @@ html = """
     document.getElementById('hdrB').textContent = data.gB;
 
     function barCellLabeled(valRaw,label,valInt){
-      const strong=(label==='FT=1'||label.startsWith('≥')); 
+      const strong=(label==='FT=1'||label.startsWith('≥'));
       const cls=strong?'blue':'red';
       const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
       const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
@@ -913,3 +871,29 @@ html = """
 """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=620, scrolling=True)
+
+# ============================== Delete Control (below table; no title) ==============================
+tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
+unique_tickers, _seen = [], set()
+for t in tickers:
+    if t and t not in _seen:
+        unique_tickers.append(t); _seen.add(t)
+
+del_cols = st.columns([4, 1])
+with del_cols[0]:
+    to_delete = st.multiselect(
+        "",
+        options=unique_tickers,
+        default=[],
+        key="del_selection",
+        placeholder="Select tickers…",
+        label_visibility="collapsed"
+    )
+with del_cols[1]:
+    if st.button("Delete", use_container_width=True, key="delete_btn"):
+        if to_delete:
+            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
+            st.success(f"Deleted: {', '.join(to_delete)}")
+            do_rerun()
+        else:
+            st.info("No tickers selected.")
