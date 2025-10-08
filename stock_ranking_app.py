@@ -518,25 +518,31 @@ if submitted and ticker:
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
-# ============================== Alignment (Gain-only modes) ==============================
+# ============================== Alignment ==============================
 st.markdown("### Alignment")
 
-# ---------- UI: choose ONE of two modes ----------
-mode = st.radio(
-    "Comparison mode",
-    ["Gain% vs Rest", "FT vs Fail (Gain%)"],
-    horizontal=True,
-    key="cmp_mode"
-)
+# --- one compact row: radios (left) + Gain% dropdown (right) ---
+col_mode, col_gain = st.columns([2.2, 1.0])
 
-gain_choices = [50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
-gain_min = st.selectbox(
-    "Gain% minimum (absolute)",
-    gain_choices,
-    index=gain_choices.index(100) if 100 in gain_choices else 0,
-    key="gain_min_pct",
-    help="Threshold on Max Push Daily (%)."
-)
+with col_mode:
+    mode = st.radio(
+        "",                           # no label = cleaner
+        ["Gain% vs Rest", "FT vs Fail (Gain%)"],
+        horizontal=True,
+        key="cmp_mode",
+        label_visibility="collapsed"
+    )
+
+with col_gain:
+    gain_choices = [50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
+    gain_min = st.selectbox(
+        "",                           # inline with radios
+        gain_choices,
+        index=gain_choices.index(100) if 100 in gain_choices else 0,
+        key="gain_min_pct",
+        help="Threshold on Max Push Daily (%).",
+        label_visibility="collapsed"
+    )
 
 base_df = ss.get("base_df", pd.DataFrame()).copy()
 if base_df.empty:
