@@ -522,14 +522,18 @@ if submitted and ticker:
 st.markdown("### Alignment")
 
 # --- compact top row: radios (left) + Gain% dropdown (right) ---
-col_mode, col_gain = st.columns([2.2, 1.0])
+col_mode, col_gain = st.columns([2.8, 1.0])
 with col_mode:
     mode = st.radio(
         "",
-        ["Gain% vs Rest", "FT vs Fail (Gain%)"],
+        [
+            "FT vs Fail (Gain% cutoff on FT=1 only)",
+            "FT=1 (High vs Low cutoff)",
+            "Gain% vs Rest",
+        ],
         horizontal=True,
         key="cmp_mode",
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
 with col_gain:
     gain_choices = [50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
@@ -539,7 +543,7 @@ with col_gain:
         index=gain_choices.index(100) if 100 in gain_choices else 0,
         key="gain_min_pct",
         help="Threshold on Max Push Daily (%).",
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
 
 # --- base data guardrails ---
@@ -550,8 +554,12 @@ if base_df.empty:
     else:
         st.info("Upload DB (and/or add at least one stock) to compute alignment.")
     st.stop()
+
 if "Max_Push_Daily_%" not in base_df.columns:
     st.error("Column “Max Push Daily (%)” not found in DB (expected as Max_Push_Daily_% after load).")
+    st.stop()
+if "FT01" not in base_df.columns:
+    st.error("FT01 column not found (expected after load).")
     st.stop()
 
 # ---------- build comparison dataframe + group labels ----------
@@ -559,24 +567,31 @@ df_cmp = base_df.copy()
 thr = float(gain_min)
 
 if mode == "Gain% vs Rest":
-    # Absolute split on full set
+    # Absolute split on full set (NaNs fall to Rest)
     df_cmp["__Group__"] = np.where(
         pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr,
         f"≥{int(thr)}%",
-        "Rest"
+        "Rest",
     )
     gA, gB = f"≥{int(thr)}%", "Rest"
     status_line = f"Gain% split at ≥ {int(thr)}%"
 
-else:  # FT vs Fail (Gain%)
-    # Filter to Gain% ≥ threshold first, THEN compare FT=1 vs FT=0; A must be FT=1
-    df_cmp = df_cmp[pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr].copy()
-    if "FT01" not in df_cmp.columns:
-        st.error("FT01 column not found (expected after load).")
-        st.stop()
-    df_cmp["__Group__"] = df_cmp["FT01"].map({1:"FT=1", 0:"FT=0"})
-    gA, gB = "FT=1", "FT=0"
-    status_line = f"Filtered to Gain% ≥ {int(thr)}%"
+elif mode == "FT=1 (High vs Low cutoff)":
+    # Keep only FT=1, then split by cutoff; NaNs count as Low to preserve sample size
+    df_cmp = df_cmp[df_cmp["FT01"] == 1].copy()
+    gain_val = pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce")
+    df_cmp["__Group__"] = np.where(gain_val >= thr, f"FT=1 ≥{int(thr)}%", "FT=1 <{int_thr}%".format(int_thr=int(thr)))
+    gA, gB = f"FT=1 ≥{int(thr)}%", f"FT=1 <{int(thr)}%"
+    status_line = f"FT=1 split at Gain% ≥ {int(thr)}% (NaNs treated as Low)"
+
+else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
+    # A: FT=1 & ≥ cutoff ; B: all FT=0 (no cutoff)
+    a_mask = (df_cmp["FT01"] == 1) & (pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr)
+    b_mask = (df_cmp["FT01"] == 0)
+    df_cmp = df_cmp[a_mask | b_mask].copy()
+    df_cmp["__Group__"] = np.where(df_cmp["FT01"] == 1, f"FT=1 ≥{int(thr)}%", "FT=0 (all)")
+    gA, gB = f"FT=1 ≥{int(thr)}%", "FT=0 (all)"
+    status_line = f"A: FT=1 with Gain% ≥ {int(thr)}% • B: all FT=0 (no cutoff)"
 
 st.caption(status_line)
 
@@ -608,16 +623,19 @@ med_tbl = summ["med_tbl"]; mad_tbl = summ["mad_tbl"] * 1.4826  # MAD → σ
 if med_tbl.empty or med_tbl.shape[1] < 2:
     st.info("Not enough data to form two groups with the current mode/threshold. Adjust settings.")
     st.stop()
+
 cols = list(med_tbl.columns)
 if (gA in cols) and (gB in cols):
     med_tbl = med_tbl[[gA, gB]]
 else:
+    # Fallback: pick two largest groups present
     top2 = df_cmp["__Group__"].value_counts().index[:2].tolist()
     if len(top2) < 2:
         st.info("One of the groups is empty. Adjust Gain% threshold.")
         st.stop()
     gA, gB = top2[0], top2[1]
     med_tbl = med_tbl[[gA, gB]]
+
 mad_tbl = mad_tbl.reindex(index=med_tbl.index)[[gA, gB]]
 
 # ---------- alignment computation for entered rows ----------
@@ -782,7 +800,7 @@ html = """
     document.getElementById('hdrB').textContent = data.gB;
 
     function barCellLabeled(valRaw,label,valInt){
-      const strong=(label==='FT=1'||label.startsWith('≥'));
+      const strong=(label==='FT=1' || label.startsWith('FT=1') || label.startsWith('≥'));
       const cls=strong?'blue':'red';
       const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
       const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
@@ -887,7 +905,7 @@ with del_cols[0]:
         default=[],
         key="del_selection",
         placeholder="Select tickers…",
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
 with del_cols[1]:
     if st.button("Delete", use_container_width=True, key="delete_btn"):
