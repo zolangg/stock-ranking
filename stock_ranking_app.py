@@ -4,6 +4,14 @@ import pandas as pd
 import numpy as np
 import re, json, hashlib
 
+try:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.ensemble import RandomForestClassifier
+except ModuleNotFoundError:
+    import streamlit as st
+    st.error("Missing dependency: scikit-learn. Add `scikit-learn==1.5.2` to requirements.txt and redeploy.")
+    st.stop()
+    
 # ============================== ML imports (RF only) ==============================
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
