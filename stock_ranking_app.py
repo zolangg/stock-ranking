@@ -1,235 +1,196 @@
-# app.py — RF proximity similarity (FT=1 blue / FT=0 red)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re, json, hashlib
 
-# ============================== RF deps ==============================
+# ===== RF deps =====
 try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.ensemble import RandomForestClassifier
 except ModuleNotFoundError:
-    st.error("Missing dependency: scikit-learn. Add `scikit-learn==1.5.2` to requirements.txt and redeploy.")
+    st.error("scikit-learn not installed. Add `scikit-learn==1.5.2` to requirements.txt and redeploy.")
     st.stop()
 
-# ============================== Page ==============================
-st.set_page_config(page_title="Premarket RF Similarity", layout="wide")
-st.title("Premarket RF Similarity (FT=1 blue / FT=0 red)")
+st.set_page_config(page_title="RF Similarity (FT=1 blue / FT=0 red)", layout="wide")
+st.title("RF Similarity — FT=1 (blue) vs FT=0 (red)")
 
-# ============================== Session ==============================
 ss = st.session_state
-ss.setdefault("rows", [])        # added stocks
 ss.setdefault("base_df", pd.DataFrame())
-ss.setdefault("rf_model", {})    # {scaler, rf, leaf_train, X_scaled, y, feat_names, df_meta}
-ss.setdefault("face_vars", [
-    "MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%","Max_Pull_PM_%","PM_Vol_M","PM$Vol/MC_%","RVOL_Max_PM_cum"
-])
+ss.setdefault("rf_model", {})     # scaler, rf, leaf_train, X_scaled, y, feat_names, df_meta
+ss.setdefault("rows", [])         # added queries
 
-# ============================== Helpers ==============================
-def do_rerun():
-    if hasattr(st, "rerun"): st.rerun()
-    elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
+FACE_VARS = [
+    "MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%",
+    "Max_Pull_PM_%","PM_Vol_M","PM$Vol/MC_%","RVOL_Max_PM_cum"
+]
 
-def SAFE_JSON_DUMPS(obj) -> str:
-    class NpEncoder(json.JSONEncoder):
-        def default(self, o):
-            if isinstance(o, (np.integer,)): return int(o)
-            if isinstance(o, (np.floating,)): return float(o)
-            if isinstance(o, (np.ndarray,)): return o.tolist()
-            return super().default(o)
-    s = json.dumps(obj, cls=NpEncoder, ensure_ascii=False, separators=(",", ":"))
-    return s.replace("</script>", "<\\/script>")
-
-_norm_cache = {}
+# ---------- helpers ----------
 def _norm(s: str) -> str:
-    if s in _norm_cache: return _norm_cache[s]
-    v = re.sub(r"\s+", " ", str(s).strip().lower())
-    v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
-    _norm_cache[s] = v
-    return v
+    s = re.sub(r"\s+", " ", str(s).strip().lower())
+    return s.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
 
-def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    if df is None or df.empty: return None
+def _pick(df: pd.DataFrame, candidates):
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
     nm = {c: _norm(c) for c in cols}
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
-            if cols_lc[c] == lc:
-                return c
+            if cols_lc[c] == lc: return c
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
-            if nm[c] == n:
-                return c
+            if nm[c] == n: return c
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
-            if n in nm[c]:
-                return c
+            if n in nm[c]: return c
     return None
 
 def _to_float(s):
     if pd.isna(s): return np.nan
     try:
-        ss_ = str(s).strip().replace(" ", "")
-        if "," in ss_ and "." not in ss_:
-            ss_ = ss_.replace(",", ".")
-        else:
-            ss_ = ss_.replace(",", "")
-        return float(ss_)
-    except Exception:
-        return np.nan
-
-# ============================== Upload / Build ==============================
-st.subheader("Upload Database")
-uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
-build_btn = st.button("Build RF model", use_container_width=True, key="db_build_btn")
-
-@st.cache_data(show_spinner=False)
-def _hash_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-@st.cache_data(show_spinner=True)
-def _load_sheet(file_bytes: bytes):
-    xls = pd.ExcelFile(file_bytes)
-    sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
-    sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
-    raw = pd.read_excel(xls, sheet)
-    return raw, sheet, tuple(xls.sheet_names)
+        s = str(s).strip().replace(" ", "")
+        if "," in s and "." not in s: s = s.replace(",", ".")
+        else: s = s.replace(",", "")
+        return float(s)
+    except: return np.nan
 
 def _safe_to_binary(v):
     sv = str(v).strip().lower()
     if sv in {"1","true","yes","y","t"}: return 1
     if sv in {"0","false","no","n","f"}: return 0
     try:
-        fv = float(sv); return 1 if fv >= 0.5 else 0
+        return 1 if float(sv) >= 0.5 else 0
     except: return np.nan
 
 def _safe_to_binary_float(v):
     x = _safe_to_binary(v)
-    if np.isnan(x): return np.nan
-    return float(x)
+    return float(x) if x in (0,1) else np.nan
 
 def _map_numeric(dfout, raw, name, candidates):
     src = _pick(raw, candidates)
     if src is not None:
         dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-def _build_rf_from_df(df: pd.DataFrame, face_vars: list[str]):
-    # Need FT01 + all face vars with no NaNs
-    needed = ["FT01"] + face_vars
-    if not set(needed).issubset(df.columns):
+def _build_rf(df: pd.DataFrame):
+    need = ["FT01"] + FACE_VARS
+    miss = [c for c in need if c not in df.columns]
+    if miss:
+        st.error(f"DB missing required columns: {miss}")
         return {}
-    df_face = df[needed].dropna()
+    df_face = df[need].dropna()
     if df_face.shape[0] < 30:
+        st.error(f"Need ≥30 rows without NaNs in {need}. Have {df_face.shape[0]}.")
         return {}
     y = df_face["FT01"].astype(int).values
-    X = df_face[face_vars].astype(float).values
+    X = df_face[FACE_VARS].astype(float).values
     scaler = StandardScaler().fit(X)
     Xs = scaler.transform(X)
     rf = RandomForestClassifier(n_estimators=200, random_state=42)
     rf.fit(Xs, y)
-    leaf_train = rf.apply(Xs)  # (n_samples, n_trees)
-    # Meta (optional)
+    leaf_train = rf.apply(Xs)
     meta_cols = []
     if "Ticker" in df.columns: meta_cols.append("Ticker")
     if "TickerDB" in df.columns: meta_cols.append("TickerDB")
     if "Max_Push_Daily_%" in df.columns: meta_cols.append("Max_Push_Daily_%")
-    df_meta = df_face.reset_index(drop=True)
-    extra = [c for c in meta_cols if c in df.columns]
-    meta_frame = df.loc[df_face.index, extra].reset_index(drop=True) if extra else pd.DataFrame(index=df_face.index)
-    meta_frame["FT01"] = y
-    return {
-        "scaler": scaler,
-        "rf": rf,
-        "leaf_train": leaf_train,
-        "X_scaled": Xs,
-        "y": y,
-        "feat_names": face_vars,
-        "df_meta": meta_frame.reset_index(drop=True),
-    }
+    meta = df.loc[df_face.index, meta_cols].reset_index(drop=True) if meta_cols else pd.DataFrame(index=df_face.index)
+    meta["FT01"] = y
+    return {"scaler":scaler,"rf":rf,"leaf_train":leaf_train,"X_scaled":Xs,"y":y,"feat_names":FACE_VARS,"df_meta":meta}
 
-if build_btn:
-    if not uploaded:
-        st.error("Please upload an Excel workbook first.")
-    else:
-        try:
-            file_bytes = uploaded.getvalue()
-            _ = _hash_bytes(file_bytes)
-            raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
+def _row_to_face(row: dict):
+    vals = []
+    for f in FACE_VARS:
+        v = row.get(f, None)
+        if v is None or (isinstance(v,float) and not np.isfinite(v)):
+            return None
+        vals.append(float(v))
+    return np.array(vals, dtype=float)
 
-            # Detect FT column
-            possible = [c for c in raw.columns if _norm(c) in {"ft", "ft01", "group", "label"}]
-            col_group = possible[0] if possible else None
-            if col_group is None:
-                for c in raw.columns:
-                    vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
-                    if len(vals) and vals.isin(["0","1","true","false","yes","no"]).all():
-                        col_group = c; break
-            if col_group is None:
-                st.error("Could not detect FT (0/1) column."); st.stop()
+def _rf_proximity(model, x_vec):
+    xs = model["scaler"].transform(x_vec.reshape(1,-1)).ravel()
+    leaf_q = model["rf"].apply(xs.reshape(1,-1)).ravel()
+    prox = (model["leaf_train"] == leaf_q).mean(axis=1)  # (n_train,)
+    order = np.argsort(-prox)
+    return prox[order], order
 
-            df = pd.DataFrame()
-            df["GroupRaw"] = raw[col_group]
+def _elbow_kstar(prox_sorted, max_rank=30, k_min=3, k_max=25):
+    if prox_sorted.size <= k_min: return max(1, prox_sorted.size)
+    upto = min(max_rank, prox_sorted.size - 1)
+    if upto < 2: return min(k_max, max(k_min, prox_sorted.size))
+    gaps = prox_sorted[:upto] - prox_sorted[1:upto+1]
+    k_star = int(np.argmax(gaps) + 1)
+    return max(k_min, min(k_max, k_star))
 
-            # Map numeric fields used by RF face
-            _map_numeric(df, raw, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
-            _map_numeric(df, raw, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
-            _map_numeric(df, raw, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
-            _map_numeric(df, raw, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
-            _map_numeric(df, raw, "Gap_%",            ["gap %","gap%","premarket gap","gap","gap_percent"])
-            _map_numeric(df, raw, "ATR_$",            ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
-            _map_numeric(df, raw, "PM_Vol_M",         ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
-            _map_numeric(df, raw, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
-            _map_numeric(df, raw, "PM_Vol_%",         ["pm vol (%)","pm_vol_%","pm vol percent","pm volume (%)","pm_vol_percent"])
-            _map_numeric(df, raw, "Daily_Vol_M",      ["daily vol (m)","daily_vol_m","day volume (m)","dvol_m"])
-            _map_numeric(df, raw, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
-            _map_numeric(df, raw, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
+def _safe_json(obj):
+    class Np(json.JSONEncoder):
+        def default(self, o):
+            if isinstance(o,(np.integer,)): return int(o)
+            if isinstance(o,(np.floating,)): return float(o)
+            if isinstance(o,(np.ndarray,)): return o.tolist()
+            return super().default(o)
+    return json.dumps(obj, cls=Np, ensure_ascii=False, separators=(",",":")).replace("</script>","<\\/script>")
 
-            # Catalyst
-            cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
-            if cand_catalyst:
-                df["Catalyst"] = pd.Series(raw[cand_catalyst]).map(_safe_to_binary_float)
+# ---------- upload / build ----------
+st.subheader("Upload Database")
+upl = st.file_uploader("Upload .xlsx", type=["xlsx"])
+if st.button("Build RF model", use_container_width=True):
+    if not upl:
+        st.error("Upload an Excel first."); st.stop()
+    try:
+        raw = pd.read_excel(upl)
+        # detect FT
+        poss = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
+        col_group = poss[0] if poss else None
+        if col_group is None:
+            for c in raw.columns:
+                vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
+                if len(vals) and vals.isin(["0","1","true","false","yes","no"]).all():
+                    col_group = c; break
+        if col_group is None:
+            st.error("Could not detect FT (0/1) column."); st.stop()
+        df = pd.DataFrame()
+        df["GroupRaw"] = raw[col_group]
+        # map fields needed for face
+        _map_numeric(df, raw, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
+        _map_numeric(df, raw, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
+        _map_numeric(df, raw, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
+        _map_numeric(df, raw, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
+        _map_numeric(df, raw, "Gap_%",            ["gap %","gap%","premarket gap","gap","gap_percent"])
+        _map_numeric(df, raw, "ATR_$",            ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
+        _map_numeric(df, raw, "PM_Vol_M",         ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
+        _map_numeric(df, raw, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
+        _map_numeric(df, raw, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
+        _map_numeric(df, raw, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
+        # Catalyst
+        cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
+        if cand_catalyst:
+            df["Catalyst"] = pd.Series(raw[cand_catalyst]).map(_safe_to_binary_float)
+        # derived PM$Vol/MC_% from MarketCap or MC_PM_Max_M
+        basis = "MC_PM_Max_M" if "MC_PM_Max_M" in df.columns and df["MC_PM_Max_M"].notna().any() else "MarketCap_M$"
+        if {"PM_$Vol_M$", basis}.issubset(df.columns):
+            df["PM$Vol/MC_%"] = (pd.to_numeric(df["PM_$Vol_M$"], errors="coerce") /
+                                 pd.to_numeric(df[basis], errors="coerce") * 100.0).replace([np.inf,-np.inf], np.nan)
+        # scale % fields (if stored as fraction)
+        if "Gap_%" in df.columns:         df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
+        if "Max_Pull_PM_%" in df.columns: df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
+        # FT labels
+        df["FT01"] = pd.Series(df["GroupRaw"]).map(_safe_to_binary)
+        df = df[df["FT01"].isin([0,1])].copy()
+        # passthrough ticker if present
+        tcol = _pick(raw, ["ticker","symbol","name"])
+        if tcol is not None: df["TickerDB"] = raw[tcol].astype(str).str.upper().str.strip()
+        ss.base_df = df
+        ss.rf_model = _build_rf(df)
+        if not ss.rf_model: st.stop()
+        st.success(f"RF model ready with {ss.rf_model['X_scaled'].shape[0]} rows.")
+    except Exception as e:
+        st.error("Loading/processing failed.")
+        st.exception(e)
 
-            # Derived needed for face vars
-            float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
-            mcap_basis  = "MC_PM_Max_M"    if "MC_PM_Max_M"    in df.columns and df["MC_PM_Max_M"].notna().any()    else "MarketCap_M$"
-            if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
-                df["PM$Vol/MC_%"] = (pd.to_numeric(df["PM_$Vol_M$"], errors="coerce") / pd.to_numeric(df[mcap_basis], errors="coerce") * 100.0).replace([np.inf,-np.inf], np.nan)
-
-            # Scale % fields (DB may store as fractions)
-            if "Gap_%" in df.columns:         df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
-            if "Max_Pull_PM_%" in df.columns: df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
-
-            # FT labels
-            df["FT01"] = pd.Series(df["GroupRaw"]).map(_safe_to_binary)
-            df = df[df["FT01"].isin([0,1])].copy()
-
-            # Optional Ticker passthrough
-            tcol = _pick(raw, ["ticker","symbol","name"])
-            if tcol is not None:
-                df["TickerDB"] = raw[tcol].astype(str).str.upper().str.strip()
-
-            ss.base_df = df
-
-            # Build RF model on the 9-face vars
-            ss.rf_model = _build_rf_from_df(df, ss.face_vars) or {}
-            if not ss.rf_model:
-                st.error("RF model could not be built (need FT01 and all 9 variables; ≥30 valid rows).")
-                st.stop()
-
-            st.success(f"Loaded “{sel_sheet}”. RF model ready with {ss.rf_model['X_scaled'].shape[0]} rows.")
-            do_rerun()
-        except Exception as e:
-            st.error("Loading/processing failed.")
-            st.exception(e)
-
-# ============================== Add Stock ==============================
+# ---------- Add Stock ----------
 st.markdown("---")
-st.subheader("Add Stock")
-
+st.subheader("Add Stock to Compare (9 variables)")
 with st.form("add_form", clear_on_submit=True):
     c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
     with c1:
@@ -245,127 +206,73 @@ with st.form("add_form", clear_on_submit=True):
         rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
     with c3:
         catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
-    submitted = st.form_submit_button("Add & Compare", use_container_width=True)
+    submit = st.form_submit_button("Add & Compare", use_container_width=True)
 
-def _row_to_face(row: dict, face_vars: list[str]):
-    vals = []
-    for f in face_vars:
-        v = row.get(f, None)
-        if v is None or (isinstance(v, float) and not np.isfinite(v)):
-            return None
-        vals.append(float(v))
-    return np.array(vals, dtype=float)
-
-def _rf_proximity(model: dict, x_vec: np.ndarray):
-    scaler = model["scaler"]; rf = model["rf"]; leaf_train = model["leaf_train"]
-    xs = scaler.transform(x_vec.reshape(1, -1)).ravel()
-    leaf_q = rf.apply(xs.reshape(1, -1)).ravel()
-    prox = (leaf_train == leaf_q).mean(axis=1)  # (n_train,)
-    order = np.argsort(-prox)                   # best first
-    return prox[order], order
-
-def _elbow_kstar(prox_sorted: np.ndarray, max_rank: int = 30, k_min=3, k_max=25):
-    if prox_sorted.size < k_min:
-        return max(1, prox_sorted.size)
-    upto = min(max_rank, prox_sorted.size - 1)
-    if upto < 2:
-        return min(k_max, max(k_min, prox_sorted.size))
-    gaps = prox_sorted[:upto] - prox_sorted[1:upto+1]
-    k_star = int(np.argmax(gaps) + 1)
-    return max(k_min, min(k_max, k_star))
-
-if submitted and ticker:
+if submit:
     row = {
-        "Ticker": ticker,
+        "Ticker": ticker or "—",
         "MC_PM_Max_M": mc_pmmax,
         "Float_PM_Max_M": float_pm,
-        "Gap_%": gap_pct,
-        "ATR_$": atr_usd,
-        "PM_Vol_M": pm_vol,
-        "PM$Vol_M$": pm_dol,
-        "Max_Pull_PM_%": max_pull_pm,
-        "RVOL_Max_PM_cum": rvol_pm_cum,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
+        "ATR_$": atr_usd,
+        "Gap_%": gap_pct,
+        "Max_Pull_PM_%": max_pull_pm,
+        "PM_Vol_M": pm_vol,
+        "PM$Vol/MC_%": (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else np.nan,
+        "RVOL_Max_PM_cum": rvol_pm_cum,
     }
     ss.rows.append(row)
-    st.success(f"Saved {ticker}.")
-    do_rerun()
+    st.success(f"Saved {row['Ticker']}")
 
-# ============================== Similarity (RF) ==============================
-st.markdown("### RF Similarity — FT=1 vs FT=0 (Top-K* by elbow)")
+# ---------- RF Similarity ----------
+st.markdown("### Similarity (Top-K* by elbow) — bars show FT=1 (blue) vs FT=0 (red) share")
 
-if ss.get("rf_model", {}):
-    rf_m = ss["rf_model"]; face_vars = ss["face_vars"]
-    n_train = rf_m["X_scaled"].shape[0]
-    st.caption(f"Model rows: {n_train} • Features: {', '.join(face_vars)}")
-
-    # Build summary for each added stock
-    summary_rows = []
-    detail_map = {}
-
+if not ss.rf_model:
+    st.info("Build the RF model first.")
+else:
+    rf_m = ss.rf_model
+    # build summaries
+    summaries, details = [], {}
     for row in ss.rows:
-        tkr = row.get("Ticker") or "—"
-        x = _row_to_face(row, face_vars)
+        tkr = row.get("Ticker","—")
+        x = _row_to_face(row)
         if x is None:
-            summary_rows.append({
-                "Ticker": tkr, "A_val_raw": 0.0, "B_val_raw": 0.0,
-                "A_val_int": 0, "B_val_int": 0,
-                "A_label": "FT=1", "B_label": "FT=0",
-                "A_cnt": 0, "B_cnt": 0, "Kstar": 0
-            })
-            detail_map[tkr] = [{"__group__": "Missing required inputs for similarity."}]
+            summaries.append({"Ticker": tkr, "pA":0.0,"pB":0.0,"iA":0,"iB":0,"cntA":0,"cntB":0,"K":0})
+            details[tkr] = [{"__group__":"Missing inputs for similarity (need all 9 variables)."}]
             continue
-
-        prox_sorted, order = _rf_proximity(rf_m, x)
-        if prox_sorted.size == 0:
-            summary_rows.append({
-                "Ticker": tkr, "A_val_raw": 0.0, "B_val_raw": 0.0,
-                "A_val_int": 0, "B_val_int": 0,
-                "A_label": "FT=1", "B_label": "FT=0",
-                "A_cnt": 0, "B_cnt": 0, "Kstar": 0
-            })
-            detail_map[tkr] = [{"__group__": "No proximities computed."}]
+        prox, order = _rf_proximity(rf_m, x)
+        if prox.size == 0:
+            summaries.append({"Ticker": tkr, "pA":0.0,"pB":0.0,"iA":0,"iB":0,"cntA":0,"cntB":0,"K":0})
+            details[tkr] = [{"__group__":"No proximities computed."}]
             continue
-
-        k_star = _elbow_kstar(prox_sorted, max_rank=30, k_min=3, k_max=min(25, prox_sorted.size))
-        sel_idx = order[:k_star]
-        y = rf_m["y"][sel_idx]
-        cnt_A = int((y == 1).sum())
-        cnt_B = int((y == 0).sum())
-        tot = max(1, cnt_A + cnt_B)
-        pct_A = 100.0 * cnt_A / tot
-        pct_B = 100.0 - pct_A
-
-        summary_rows.append({
-            "Ticker": tkr,
-            "A_val_raw": pct_A, "B_val_raw": pct_B,
-            "A_val_int": int(round(pct_A)), "B_val_int": int(round(pct_B)),
-            "A_label": "FT=1", "B_label": "FT=0",
-            "A_cnt": cnt_A, "B_cnt": cnt_B, "Kstar": int(k_star),
-        })
-
-        # Build details table for this ticker
+        K = _elbow_kstar(prox, max_rank=30, k_min=3, k_max=min(25, prox.size))
+        sel = order[:K]; y = rf_m["y"][sel]
+        cntA = int((y==1).sum()); cntB = int((y==0).sum()); tot = max(1, cntA+cntB)
+        pA = 100.0*cntA/tot; pB = 100.0 - pA
+        summaries.append({"Ticker": tkr, "pA":pA,"pB":pB,"iA":int(round(pA)),"iB":int(round(pB)),"cntA":cntA,"cntB":cntB,"K":int(K)})
+        # detail rows
         meta = rf_m.get("df_meta", pd.DataFrame())
-        det_rows = [{"__group__": f"Top-K* neighbors (K*={k_star}) by RF proximity"}]
-        for i, idx in enumerate(sel_idx, start=1):
-            rec = {"Rank": i, "FT01": int(rf_m["y"][idx]), "Proximity": float(prox_sorted[i-1])}
+        rows = [{"__group__": f"Top-{K} neighbors by RF proximity"}]
+        for rnk, idx in enumerate(sel, start=1):
+            rec = {"#": rnk, "FT": int(rf_m["y"][idx]), "Proximity": float(prox[rnk-1])}
             if not meta.empty:
-                # Attach meta if present
-                for c in meta.columns:
-                    rec[c] = meta.iloc[idx][c]
-            det_rows.append(rec)
-        detail_map[tkr] = det_rows
+                rec.update({c: meta.iloc[idx][c] for c in meta.columns})
+            rows.append(rec)
+        details[tkr] = rows
 
-    # ---------------- HTML/JS render (bars: FT=1 blue, FT=0 red) ----------------
+    # render bars
     import streamlit.components.v1 as components
-
-    def _round_rec(o):
-        if isinstance(o, dict): return {k:_round_rec(v) for k,v in o.items()}
-        if isinstance(o, list): return [_round_rec(v) for v in o]
+    def _round(o):
+        if isinstance(o, dict): return {k:_round(v) for k,v in o.items()}
+        if isinstance(o, list): return [_round(v) for v in o]
         if isinstance(o, float): return float(np.round(o, 6))
         return o
-
-    payload = _round_rec({"rows": summary_rows, "details": detail_map})
+    payload = _round({"rows":[
+        {"Ticker":s["Ticker"],"A_val_raw":s["pA"],"B_val_raw":s["pB"],
+         "A_val_int":s["iA"],"B_val_int":s["iB"],
+         "A_cnt":s["cntA"],"B_cnt":s["cntB"],"Kstar":s["K"]}
+        for s in summaries
+    ], "details":details})
 
     html = """
 <!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -377,7 +284,7 @@ if ss.get("rf_model", {}):
   .bar-wrap{display:flex;justify-content:center;align-items:center;gap:6px}
   .bar{height:12px;width:160px;border-radius:8px;background:#eee;position:relative;overflow:hidden}
   .bar>span{position:absolute;left:0;top:0;bottom:0;width:0%}
-  .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:54px;text-align:center}
+  .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:70px;text-align:center}
   .blue>span{background:#3b82f6}.red>span{background:#ef4444}
   #align td:nth-child(2),#align th:nth-child(2),#align td:nth-child(3),#align th:nth-child(3){text-align:center}
   .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
@@ -393,80 +300,58 @@ if ss.get("rf_model", {}):
   <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
   <script>
     const data = %%PAYLOAD%%;
-
-    function barCellLabeled(valRaw,label,valInt,count){
-      const cls = (label==='FT=1') ? 'blue' : 'red';
-      const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
-      const pct=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
+    function barCell(valRaw,isBlue,valInt,count){
+      const cls = isBlue ? 'blue' : 'red';
+      const w = (!valRaw||isNaN(valRaw)) ? 0 : Math.max(0, Math.min(100, valRaw));
+      const pct = (!valInt||isNaN(valInt)) ? Math.round(w) : valInt;
       const txt = `${pct}% • n=${count}`;
       return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${txt}</div></div>`;
     }
-    function formatVal(x){return (x==null||isNaN(x))?'':Number(x).toFixed(4);}
-
-    function childTableHTML(ticker){
-      const rows=(data.details||{})[ticker]||[];
+    function fmt(x){return (x==null||isNaN(x))?'':Number(x).toFixed(4);}
+    function childHTML(t){
+      const rows=(data.details||{})[t]||[];
       if(!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No neighbors.</div>';
-
       const cells = rows.map(r=>{
         if(r.__group__) return '<tr class="group-row"><td colspan="8">'+r.__group__+'</td></tr>';
-        const ft = (r.FT01===1)?'FT=1':'FT=0';
-        const prox = formatVal(r.Proximity);
+        const ft = (r.FT===1)?'FT=1':'FT=0';
         const tick = (r.TickerDB||r.Ticker||'');
         const mpd = (r.Max_Push_Daily_%!=null)?Number(r.Max_Push_Daily_%).toFixed(2)+'%':'';
-        return `<tr>
-          <td>${r.Rank}</td><td>${ft}</td><td>${prox}</td><td>${tick}</td><td>${mpd}</td>
-        </tr>`;
+        return `<tr><td>${r["#"]}</td><td>${ft}</td><td>${fmt(r.Proximity)}</td><td>${tick}</td><td>${mpd}</td></tr>`;
       }).join('');
-
-      return `<table class="child-table">
-        <thead><tr>
-          <th>#</th><th>FT</th><th>Proximity</th><th>Ticker</th><th>MaxPushDaily%</th>
-        </tr></thead><tbody>${cells}</tbody></table>`;
+      return `<table class="child-table"><thead><tr><th>#</th><th>FT</th><th>Proximity</th><th>Ticker</th><th>MaxPushDaily%</th></tr></thead><tbody>${cells}</tbody></table>`;
     }
-
     $(function(){
       const table=$('#align').DataTable({
         data: data.rows||[], responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
         columns:[
           {data:'Ticker'},
-          {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int,row.A_cnt)},
-          {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int,row.B_cnt)},
+          {data:null, render:(r)=>barCell(r.A_val_raw,true,r.A_val_int,r.A_cnt)},
+          {data:null, render:(r)=>barCell(r.B_val_raw,false,r.B_val_int,r.B_cnt)},
           {data:'Kstar'}
         ]
       });
       $('#align tbody').on('click','tr',function(){
         const row=table.row(this);
         if(row.child.isShown()){ row.child.hide(); $(this).removeClass('shown'); }
-        else { const t=row.data().Ticker; row.child(childTableHTML(t)).show(); $(this).addClass('shown'); }
+        else { row.child(childHTML(row.data().Ticker)).show(); $(this).addClass('shown'); }
       });
     });
-  </script>
-</body></html>
+  </script></body></html>
 """
-    html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
-    components.html(html, height=620, scrolling=True)
+    components.html(html.replace("%%PAYLOAD%%", _safe_json(payload)), height=620, scrolling=True)
 
-# ============================== Delete Control ==============================
-tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-unique_tickers, _seen = [], set()
-for t in tickers:
-    if t and t not in _seen:
-        unique_tickers.append(t); _seen.add(t)
-
-del_cols = st.columns([4, 1])
-with del_cols[0]:
-    to_delete = st.multiselect(
-        "",
-        options=unique_tickers,
-        default=[],
-        key="del_selection",
-        placeholder="Select tickers…",
-        label_visibility="collapsed",
-    )
-with del_cols[1]:
-    if st.button("Delete", use_container_width=True, key="delete_btn"):
-        if to_delete:
-            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
-            st.success(f"Deleted: {', '.join(to_delete)}"); do_rerun()
+# delete control
+names = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
+opts, seen = [], set()
+for t in names:
+    if t and t not in seen: opts.append(t); seen.add(t)
+c1, c2 = st.columns([4,1])
+with c1:
+    sel = st.multiselect("", options=opts, default=[], placeholder="Select tickers…", label_visibility="collapsed")
+with c2:
+    if st.button("Delete", use_container_width=True):
+        if sel:
+            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(sel)]
+            st.success(f"Deleted: {', '.join(sel)}"); st.experimental_rerun()
         else:
             st.info("No tickers selected.")
