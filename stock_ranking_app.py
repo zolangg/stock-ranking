@@ -4,6 +4,10 @@ import pandas as pd
 import numpy as np
 import re, json, hashlib
 
+# ============================== ML imports (RF only) ==============================
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
@@ -16,6 +20,11 @@ ss.setdefault("lassoA", {})
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("var_core", [])
 ss.setdefault("var_moderate", [])
+
+# RF proximity (pattern-recognition) model cache
+# { scaler, rf, leaf_train, X_scaled, y, feat_names, df_meta }
+ss.setdefault("rf_model", {})
+ss.setdefault("last_neighbors", pd.DataFrame())
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -140,7 +149,20 @@ VAR_MODERATE = [
 ]
 VAR_ALL = VAR_CORE + VAR_MODERATE
 
-# ============================== LASSO (unchanged) ==============================
+# RF "face" features (9 vars)
+FACE_VARS = [
+    "MC_PM_Max_M",
+    "Float_PM_Max_M",
+    "Catalyst",
+    "ATR_$",
+    "Gap_%",
+    "Max_Pull_PM_%",
+    "PM_Vol_M",
+    "PM$Vol/MC_%",
+    "RVOL_Max_PM_cum",
+]
+
+# ============================== LASSO (unchanged, for PredVol only) ==============================
 def _kfold_indices(n, k=5, seed=42):
     rng = np.random.default_rng(seed)
     idx = np.arange(n); rng.shuffle(idx)
@@ -280,7 +302,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         "feat_order": [nm for nm,_ in feats],
     }
 
-# ============================== Predict ==============================
+# ============================== Predict (for PredVol) ==============================
 def predict_daily_calibrated(row: dict, model: dict) -> float:
     if not model or "betas" not in model: return np.nan
     eps = float(model.get("eps", 1e-6))
@@ -334,6 +356,89 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     PM = float(row.get("PM_Vol_M") or np.nan)
     if not np.isfinite(PM) or PM <= 0: return np.nan
     return float(PM * cal_mult)
+
+# ============================== RF Proximity Model ==============================
+def _build_rf_model(df: pd.DataFrame) -> dict:
+    # Need FT and the 9 "face" variables
+    needed = ["FT01"] + FACE_VARS
+    if not set(needed).issubset(df.columns):
+        return {}
+    # Keep Ticker if available for neighbor table
+    tcol = None
+    for cand in ["Ticker","ticker","symbol","name","TickerDB"]:
+        if cand in df.columns:
+            tcol = cand; break
+
+    df_face = df[needed + ([tcol] if tcol else [])].dropna()
+    if df_face.shape[0] < 30:
+        return {}
+
+    y = df_face["FT01"].astype(int).values
+    X = df_face[FACE_VARS].astype(float).values
+
+    scaler = StandardScaler().fit(X)
+    Xs = scaler.transform(X)
+
+    rf = RandomForestClassifier(n_estimators=300, random_state=42)
+    rf.fit(Xs, y)
+    leaf_train = rf.apply(Xs)  # (n_samples, n_trees)
+
+    meta_cols = ["FT01"] + ([tcol] if tcol else []) + ["Max_Push_Daily_%"]
+    meta_keep = [c for c in meta_cols if c in df.columns]
+    df_meta = df_face.reset_index(drop=True)
+    for c in meta_keep:
+        if c not in df_meta.columns:
+            # align from original df if needed
+            df_meta[c] = df.loc[df_face.index, c].values
+
+    return {
+        "scaler": scaler,
+        "rf": rf,
+        "leaf_train": leaf_train,
+        "X_scaled": Xs,
+        "y": y,
+        "feat_names": FACE_VARS,
+        "df_meta": df_meta.reset_index(drop=True),
+    }
+
+def _face_from_row(row: dict) -> np.ndarray | None:
+    vals = []
+    for f in FACE_VARS:
+        v = row.get(f)
+        if v is None or (isinstance(v, float) and not np.isfinite(v)): return None
+        vals.append(float(v))
+    return np.array(vals, dtype=float)
+
+def rf_neighbors_for_row(row: dict, model: dict, k: int = 8) -> pd.DataFrame:
+    if not model or "rf" not in model: return pd.DataFrame()
+    x = _face_from_row(row)
+    if x is None: return pd.DataFrame()
+    xs = model["scaler"].transform(x.reshape(1, -1)).ravel()
+    leaf_train = model["leaf_train"]
+    leaf_q = model["rf"].apply(xs.reshape(1, -1)).ravel()  # (n_trees,)
+
+    same = (leaf_train == leaf_q)  # (n_samples, n_trees)
+    prox = same.mean(axis=1)       # proximity
+    order = np.argsort(-prox)      # highest proximity first
+    k = int(min(k, prox.shape[0]))
+    idx = order[:k]
+    out = model["df_meta"].iloc[idx].copy()
+    out.insert(0, "Similarity", prox[idx])
+    # pretty similarity
+    out["Similarity"] = out["Similarity"].map(lambda v: float(np.round(v, 4)))
+    # rename columns for display
+    if "FT01" in out.columns: out["FT"] = out["FT01"].map({1:"FT=1", 0:"FT=0"})
+    if "Max_Push_Daily_%" in out.columns:
+        out["Gain%"] = out["Max_Push_Daily_%"].map(lambda v: float(np.round(v, 2)))
+    # keep key cols first
+    keep_order = [c for c in ["Similarity", "Ticker", "FT", "Gain%"] if c in out.columns]
+    # then add face vars
+    for f in FACE_VARS:
+        if f in out.columns and f not in keep_order: keep_order.append(f)
+    # plus anything else that slipped in (TickerDB etc.)
+    for c in out.columns:
+        if c not in keep_order: keep_order.append(c)
+    return out[keep_order].reset_index(drop=True)
 
 # ============================== Summaries ==============================
 def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col: str, labels_map=None):
@@ -459,12 +564,24 @@ if build_btn:
             else:
                 df["Max_Push_Daily_%"] = np.nan
 
+            # keep a ticker-like column for neighbor reporting
+            tcol = _pick(raw, ["ticker","symbol","name"])
+            if tcol is not None:
+                df["Ticker"] = raw[tcol].astype(str).str.upper().str.strip()
+
             ss.base_df = df
             ss.var_core = [v for v in VAR_CORE if v in df.columns]
             ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
 
-            # train model once (on full base)
+            # train PredVol model once (unchanged)
             ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
+
+            # ------- Build RF proximity model on the 9-variable "face" -------
+            ss.rf_model = _build_rf_model(df) or {}
+            if ss.rf_model:
+                st.success("RF proximity model built.")
+            else:
+                st.warning("RF proximity model NOT built (need ≥30 rows with FT + all 9 face variables).")
 
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
             do_rerun()
@@ -475,6 +592,7 @@ if build_btn:
 # ============================== Add Stock ==============================
 st.markdown("---")
 st.subheader("Add Stock")
+k_neighbors = st.number_input("Top-K similar trades (RF proximity)", min_value=3, max_value=25, value=8, step=1)
 
 with st.form("add_form", clear_on_submit=True):
     c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
@@ -515,6 +633,17 @@ if submitted and ticker:
     row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
     denom = row["PredVol_M"]
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
+
+    # --- RF proximity neighbors for the newly added stock ---
+    if ss.get("rf_model"):
+        try:
+            nn_df = rf_neighbors_for_row(row, ss["rf_model"], k=int(k_neighbors))
+            ss.last_neighbors = nn_df
+        except Exception:
+            ss.last_neighbors = pd.DataFrame()
+    else:
+        ss.last_neighbors = pd.DataFrame()
+
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
@@ -567,7 +696,6 @@ df_cmp = base_df.copy()
 thr = float(gain_min)
 
 if mode == "Gain% vs Rest":
-    # Absolute split on full set (NaNs fall to Rest)
     df_cmp["__Group__"] = np.where(
         pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr,
         f"≥{int(thr)}%",
@@ -577,7 +705,6 @@ if mode == "Gain% vs Rest":
     status_line = f"Gain% split at ≥ {int(thr)}%"
 
 elif mode == "FT=1 (High vs Low cutoff)":
-    # Keep only FT=1, then split by cutoff; NaNs count as Low to preserve sample size
     df_cmp = df_cmp[df_cmp["FT01"] == 1].copy()
     gain_val = pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce")
     df_cmp["__Group__"] = np.where(gain_val >= thr, f"FT=1 ≥{int(thr)}%", "FT=1 <{int_thr}%".format(int_thr=int(thr)))
@@ -585,7 +712,6 @@ elif mode == "FT=1 (High vs Low cutoff)":
     status_line = f"FT=1 split at Gain% ≥ {int(thr)}% (NaNs treated as Low)"
 
 else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
-    # A: FT=1 & ≥ cutoff ; B: all FT=0 (no cutoff)
     a_mask = (df_cmp["FT01"] == 1) & (pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr)
     b_mask = (df_cmp["FT01"] == 0)
     df_cmp = df_cmp[a_mask | b_mask].copy()
@@ -628,7 +754,6 @@ cols = list(med_tbl.columns)
 if (gA in cols) and (gB in cols):
     med_tbl = med_tbl[[gA, gB]]
 else:
-    # Fallback: pick two largest groups present
     top2 = df_cmp["__Group__"].value_counts().index[:2].tolist()
     if len(top2) < 2:
         st.info("One of the groups is empty. Adjust Gain% threshold.")
@@ -889,6 +1014,27 @@ html = """
 """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=620, scrolling=True)
+
+# ============================== RF Neighbors of last added stock ==============================
+if isinstance(ss.get("last_neighbors"), pd.DataFrame) and not ss.last_neighbors.empty:
+    st.markdown("### Most similar historical trades (RF proximity)")
+    st.dataframe(
+        ss.last_neighbors.style.format({
+            "Similarity": "{:.4f}",
+            "Gain%": "{:.2f}",
+            "MC_PM_Max_M": "{:.2f}",
+            "Float_PM_Max_M": "{:.2f}",
+            "ATR_$": "{:.2f}",
+            "Gap_%": "{:.2f}",
+            "Max_Pull_PM_%": "{:.2f}",
+            "PM_Vol_M": "{:.2f}",
+            "PM$Vol/MC_%": "{:.2f}",
+            "RVOL_Max_PM_cum": "{:.2f}",
+        }),
+        use_container_width=True,
+    )
+elif ss.get("rf_model"):
+    st.caption("Add a stock above to see RF similarity neighbors based on your 9-variable face.")
 
 # ============================== Delete Control (below table; no title) ==============================
 tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
