@@ -518,34 +518,41 @@ if submitted and ticker:
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
-# ============================== Alignment (Median-only) ==============================
+# ============================== Alignment (FOUR MODES) ==============================
 st.markdown("### Alignment")
 
-# --- UI: Group mode + Top% cutoff + Gain% minimum ---
-c1, c2, c3 = st.columns([1.2, 1, 1.2])
+# ---------- UI: choose ONE of four modes ----------
+mode = st.radio(
+    "Comparison mode",
+    ["Top% vs Rest", "Gain% vs Rest", "FT vs Fail (Top%)", "FT vs Fail (Gain%)"],
+    horizontal=True,
+    key="cmp_mode"
+)
+
+c1, c2 = st.columns([1.2, 1.2])
 with c1:
-    group_mode = st.radio(
-        "Grouping",
-        ["FT vs Fail", "Top% vs Rest"],
-        horizontal=True,
-        key="group_mode_sel"
-    )
-with c2:
     top_cut = st.radio(
-        "Top% cutoff",
+        "Top% cutoff (percentile)",
         [50, 40, 30, 20, 10],
         index=4,
         horizontal=True,
         key="top_cutoff",
-        help="Used only when 'Top% vs Rest' is selected; computed on Max Push Daily (%)."
+        help="Used in modes with (Top%): percentile of Max Push Daily (%)."
     )
-with c3:
+with c2:
     gain_min = st.selectbox(
-        "Gain% minimum (Max Push Daily ≥)",
+        "Gain% minimum (absolute)",
         [0,10,20,30,40,50,75,100,150,200,300,400,500],
         index=0,
-        key="gain_min_pct"
+        key="gain_min_pct",
+        help="Used in modes with (Gain%): absolute threshold on Max Push Daily (%)."
     )
+
+# Show/hide controls based on mode
+if "Top%" in mode:
+    st.caption("Percentile mode active → absolute Gain% control ignored.")
+else:
+    st.caption("Absolute Gain% mode active → percentile Top% control ignored.")
 
 base_df = ss.get("base_df", pd.DataFrame()).copy()
 if base_df.empty:
@@ -555,44 +562,105 @@ if base_df.empty:
         st.info("Upload DB (and/or add at least one stock) to compute alignment.")
     st.stop()
 
-# Apply Gain% (Max Push Daily %) filter if present
-if "Max_Push_Daily_%" in base_df.columns and gain_min > 0:
-    base_df = base_df[pd.to_numeric(base_df["Max_Push_Daily_%"], errors="coerce") >= float(gain_min)].copy()
+# Helper: percentile top flag on Max_Push_Daily_%
+def _make_top_flag(series_pct: pd.Series, top_cut: int) -> tuple[pd.Series, float]:
+    s = pd.to_numeric(series_pct, errors="coerce")
+    mask = s.notna()
+    if not mask.any(): 
+        return pd.Series(False, index=series_pct.index), np.nan
+    thr = float(np.nanpercentile(s[mask].values, 100 - top_cut))
+    flag = (s >= thr) & mask
+    return flag, thr
 
-# Build Top% flag if needed
-top_thr = np.nan
-if "Max_Push_Daily_%" in base_df.columns:
-    top_flag, top_thr = _make_top_flag(base_df["Max_Push_Daily_%"], top_cut)
-    base_df["GroupTop"] = np.where(top_flag, f"Top{top_cut}", "Rest")
-else:
-    base_df["GroupTop"] = "Rest"
+# Prepare columns presence
+has_mpd = "Max_Push_Daily_%" in base_df.columns
+if not has_mpd:
+    st.error("Column “Max Push Daily (%)” not found in DB (expected as Max_Push_Daily_% after load).")
+    st.stop()
 
-# Choose grouping column
-if group_mode == "FT vs Fail":
-    grp_col = "GroupFT"
-    labels_map = {"FT=1":"FT=1", "FT=0":"FT=0"}
-else:
-    grp_col = "GroupTop"
-    labels_map = {f"Top{top_cut}": f"Top{top_cut}", "Rest": "Rest"}
+# ---------- Build comparison dataframe + group labels ----------
+df_cmp = base_df.copy()
+status_line = ""
 
-# Summaries (median only) + MAD (for 3σ)
+if mode == "Top% vs Rest":
+    # No absolute filter; compute percentile on full set
+    top_flag, top_thr = _make_top_flag(df_cmp["Max_Push_Daily_%"], top_cut)
+    df_cmp["__Group__"] = np.where(top_flag, f"Top{top_cut}", "Rest")
+    gA, gB = f"Top{top_cut}", "Rest"
+    status_line = f"Current Top-{top_cut}% cutoff (Max Push Daily %): {top_thr:.2f}%"
+
+elif mode == "Gain% vs Rest":
+    # No percentile; just absolute split on full set
+    thr = float(gain_min)
+    df_cmp["__Group__"] = np.where(
+        pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr,
+        f"≥{int(thr)}%",
+        "Rest"
+    )
+    gA, gB = f"≥{int(thr)}%", "Rest"
+    status_line = f"Gain% split at ≥ {int(thr)}%"
+
+elif mode == "FT vs Fail (Top%)":
+    # Filter to Top% first, THEN compare FT=1 vs FT=0; A must be FT=1
+    top_flag, top_thr = _make_top_flag(df_cmp["Max_Push_Daily_%"], top_cut)
+    df_cmp = df_cmp[top_flag].copy()
+    df_cmp["__Group__"] = df_cmp["FT01"].map({1:"FT=1", 0:"FT=0"})
+    gA, gB = "FT=1", "FT=0"
+    status_line = f"Filtered to Top-{top_cut}% (cutoff: {top_thr:.2f}%)"
+
+else:  # "FT vs Fail (Gain%)"
+    # Filter to Gain% ≥ threshold first, THEN compare FT=1 vs FT=0; A must be FT=1
+    thr = float(gain_min)
+    df_cmp = df_cmp[pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr].copy()
+    df_cmp["__Group__"] = df_cmp["FT01"].map({1:"FT=1", 0:"FT=0"})
+    gA, gB = "FT=1", "FT=0"
+    status_line = f"Filtered to Gain% ≥ {int(thr)}%"
+
+# Show status line
+if status_line:
+    st.caption(status_line)
+
+# ---------- Summaries (median centers + MAD→σ for 3σ highlighting) ----------
 var_core = ss.get("var_core", [])
 var_mod  = ss.get("var_moderate", [])
 var_all  = var_core + var_mod
-summ = _summaries_median_and_mad(base_df, var_all, grp_col, labels_map=labels_map)
+
+def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col: str):
+    avail = [v for v in var_all if v in df_in.columns]
+    if not avail:
+        empty = pd.DataFrame()
+        return {"med_tbl": empty, "mad_tbl": empty}
+    g = df_in.groupby(group_col, observed=True)[avail]
+    med_tbl = g.median(numeric_only=True).T
+    mad_tbl = df_in.groupby(group_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad)).T
+    return {"med_tbl": med_tbl, "mad_tbl": mad_tbl}
+
+summ = _summaries_median_and_mad(df_cmp, var_all, "__Group__")
 med_tbl = summ["med_tbl"]; mad_tbl = summ["mad_tbl"] * 1.4826  # MAD → σ
 
-if med_tbl.empty or med_tbl.shape[1] != 2:
-    st.info("Need two non-empty groups to compare. Adjust filters.")
+# Ensure exactly two groups exist
+if med_tbl.empty or med_tbl.shape[1] < 2:
+    st.info("Not enough data to form two groups with the current mode/filters. Adjust settings.")
     st.stop()
 
-gA, gB = list(med_tbl.columns)
+# Reorder columns so A is left, B is right (and drop any extra accidental groups)
+cols = list(med_tbl.columns)
+# Ensure desired labels present; otherwise pick the two largest groups by count
+if (gA in cols) and (gB in cols):
+    med_tbl = med_tbl[[gA, gB]]
+else:
+    # Fallback: pick the two most frequent groups in df_cmp
+    top2 = df_cmp["__Group__"].value_counts().index[:2].tolist()
+    if len(top2) < 2: 
+        st.info("One of the groups is empty. Adjust settings.")
+        st.stop()
+    gA, gB = top2[0], top2[1]
+    med_tbl = med_tbl[[gA, gB]]
 
-# Optional: show current cutoff if Top% mode
-if group_mode != "FT vs Fail" and np.isfinite(top_thr):
-    st.caption(f"Current Top-{top_cut}% cutoff (Max Push Daily %): {top_thr:.2f}% • Gain% minimum: ≥ {gain_min}%")
+# Align dispersion table
+mad_tbl = mad_tbl.reindex(index=med_tbl.index)[[gA, gB]]
 
-# ----- Delete UI (unchanged layout) -----
+# ----- Delete UI (compact) -----
 tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
 unique_tickers, _seen = [], set()
 for t in tickers:
@@ -638,11 +706,9 @@ def _compute_alignment_counts_weighted(
     counts = {gA_: 0.0, gB_: 0.0}
     core_pts = {gA_: 0.0, gB_: 0.0}
     mod_pts  = {gA_: 0.0, gB_:  0.0}
-    used_core = used_mod = 0
     idx_set = set(centers_tbl.index)
 
     def _vote_one(var: str, weight: float, bucket: dict):
-        nonlocal used_core, used_mod
         if var not in idx_set: return
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
         if not np.isfinite(xv): return
@@ -657,8 +723,6 @@ def _compute_alignment_counts_weighted(
             if tie_mode == "split":
                 counts[gA_] += weight*0.5; counts[gB_] += weight*0.5
                 bucket[gA_] += weight*0.5; bucket[gB_] += weight*0.5
-        if weight == w_core: used_core += 1
-        elif weight == w_mod: used_mod += 1
 
     for v in var_core: _vote_one(v, w_core, core_pts)
     for v in var_mod:  _vote_one(v, w_mod,  mod_pts)
@@ -676,14 +740,15 @@ def _compute_alignment_counts_weighted(
         "A_pct_raw": a_raw, "B_pct_raw": b_raw,
         "A_pct_int": a_int, "B_pct_int": b_int,
         "A_label": gA_, "B_label": gB_,
-        "N_core_used": len(var_core), "N_mod_used": len(var_mod),
     }
 
 centers_tbl = med_tbl.copy()
-disp_tbl = mad_tbl.reindex(index=centers_tbl.index)
+disp_tbl = mad_tbl.copy()
 
 summary_rows, detail_map = [], {}
-detail_order = [("Core variables", var_core), ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
+detail_order = [("Core variables", var_core),
+                ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
+
 mt_index = set(centers_tbl.index); dt_index = set(disp_tbl.index)
 
 for row in ss.rows:
@@ -718,17 +783,11 @@ for row in ss.rows:
             va = pd.to_numeric(stock.get(v), errors="coerce")
 
             med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
-            if med_var in mt_index:
-                vA = centers_tbl.at[med_var, gA]
-                vB = centers_tbl.at[med_var, gB]
-            else:
-                vA = np.nan; vB = np.nan
+            vA = centers_tbl.at[med_var, gA] if med_var in mt_index else np.nan
+            vB = centers_tbl.at[med_var, gB] if med_var in mt_index else np.nan
 
-            if med_var in dt_index:
-                sA = float(disp_tbl.at[med_var, gA]) if pd.notna(disp_tbl.at[med_var, gA]) else np.nan
-                sB = float(disp_tbl.at[med_var, gB]) if pd.notna(disp_tbl.at[med_var, gB]) else np.nan
-            else:
-                sA = np.nan; sB = np.nan
+            sA = float(disp_tbl.at[med_var, gA]) if (med_var in dt_index and pd.notna(disp_tbl.at[med_var, gA])) else np.nan
+            sB = float(disp_tbl.at[med_var, gB]) if (med_var in dt_index and pd.notna(disp_tbl.at[med_var, gB])) else np.nan
 
             if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(vA) and pd.isna(vB): continue
 
@@ -746,10 +805,9 @@ for row in ss.rows:
                 "d_vs_B": None if dB is None else dB,
                 "is_core": (v in var_core),
             })
-
     detail_map[tkr] = drows_grouped
 
-# ---------------- HTML/JS ----------------
+# ---------------- HTML/JS render ----------------
 import streamlit.components.v1 as components
 
 def _round_rec(o):
@@ -794,7 +852,8 @@ html = """
     document.getElementById('hdrB').textContent = data.gB;
 
     function barCellLabeled(valRaw,label,valInt){
-      const strong=(label==='FT=1'||label.startsWith('Top')); const cls=strong?'blue':'red';
+      const strong=(label==='FT=1'||label.startsWith('Top')||label.startsWith('≥')); 
+      const cls=strong?'blue':'red';
       const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
       const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
       return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
@@ -802,14 +861,11 @@ html = """
     function formatVal(x){return (x==null||isNaN(x))?'':Number(x).toFixed(2);}
 
     function childTableHTML(ticker){
-      const rows=(data.details||{})[ticker]||[];
-      const parent=(data.rows||[]).find(r=>r.Ticker===ticker)||{};
-      const leftInfo=(parent.A_pts!=null)?`(core ${Number(parent.A_core||0).toFixed(1)} + mod ${Number(parent.A_mod||0).toFixed(1)} = ${Number(parent.A_pts||0).toFixed(1)})`:'';
-      const rightInfo=(parent.B_pts!=null)?`(core ${Number(parent.B_core||0).toFixed(1)} + mod ${Number(parent.B_mod||0).toFixed(1)} = ${Number(parent.B_pts||0).toFixed(1)})`:'';
+      const rows=(data.details||{})[ticker]||{};
+      const items=Array.isArray(rows)?rows:[];
+      if(!items.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
 
-      if(!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
-
-      const cells = rows.map(r=>{
+      const cells = items.map(r=>{
         if(r.__group__) return '<tr class="group-row"><td colspan="6">'+r.__group__+'</td></tr>';
 
         const v=formatVal(r.Value), a=formatVal(r.A), b=formatVal(r.B);
@@ -821,7 +877,7 @@ html = """
         const ca=(rawDa==null)?'':(rawDa>=0?'pos':'neg');
         const cb=(rawDb==null)?'':(rawDb>=0?'pos':'neg');
 
-        // ------- 3σ significance vs closer center -------
+        // 3σ significance vs closer center
         const val  = (r.Value==null || isNaN(r.Value)) ? null : Number(r.Value);
         const cA   = (r.A==null || isNaN(r.A)) ? null : Number(r.A);
         const cB   = (r.B==null || isNaN(r.B)) ? null : Number(r.B);
@@ -838,8 +894,8 @@ html = """
 
           if (sigma!=null && sigma>0) {
             const z = (val - center) / sigma;
-            if (z >= 3)       sigClass = 'sig-hi'; // significantly higher
-            else if (z <= -3) sigClass = 'sig-lo'; // significantly lower
+            if (z >= 3)       sigClass = 'sig-hi';
+            else if (z <= -3) sigClass = 'sig-lo';
           }
         }
 
@@ -867,8 +923,18 @@ html = """
     }
 
     $(function(){
+      const rows = (%%PAYLOAD%%).rows || [];
+    });
+  </script>
+  <script>
+    const payload = %%PAYLOAD%%;
+    const tableData = payload.rows || [];
+    document.getElementById('hdrA').textContent = payload.gA;
+    document.getElementById('hdrB').textContent = payload.gB;
+
+    $(function(){
       const table=$('#align').DataTable({
-        data: data.rows||[], responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
+        data: tableData, responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
         columns:[
           {data:'Ticker'},
           {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int)},
@@ -878,10 +944,11 @@ html = """
       $('#align tbody').on('click','tr',function(){
         const row=table.row(this);
         if(row.child.isShown()){ row.child.hide(); $(this).removeClass('shown'); }
-        else { const ticker=row.data().Ticker; row.child(childTableHTML(ticker)).show(); $(this).addClass('shown'); }
+        else { const t=row.data().Ticker; row.child(childTableHTML(t)).show(); $(this).addClass('shown'); }
       });
     });
-  </script></body></html>
+  </script>
+</body></html>
 """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=620, scrolling=True)
