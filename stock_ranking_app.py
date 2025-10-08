@@ -1,4 +1,4 @@
-# app.py — Premarket Stock Ranking (fixed, optimized, + 3σ row coloring, + row delete UI)
+# app.py — Premarket Stock Ranking (Median-only centers; Group UI + Gain% filter; 3σ coloring; delete UI)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,17 +8,14 @@ import re, json, hashlib
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
 
-# ============================== Stable Session Keys ==============================
-DEFAULT_VIEW = "ft_robust"  # "ft_robust" | "ft_classic" | "t10_robust" | "t10_classic"
-
+# ============================== Session ==============================
 ss = st.session_state
 ss.setdefault("rows", [])
 ss.setdefault("last", {})
-ss.setdefault("models", {})
 ss.setdefault("lassoA", {})
-ss.setdefault("view_mode_key", DEFAULT_VIEW)
-ss.setdefault("models_tbl_current", pd.DataFrame())
-ss.setdefault("view_choice_label", "FT: Median")
+ss.setdefault("base_df", pd.DataFrame())
+ss.setdefault("var_core", [])
+ss.setdefault("var_moderate", [])
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -68,12 +65,12 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
 def _to_float(s):
     if pd.isna(s): return np.nan
     try:
-        ss = str(s).strip().replace(" ", "")
-        if "," in ss and "." not in ss:
-            ss = ss.replace(",", ".")
+        ss_ = str(s).strip().replace(" ", "")
+        if "," in ss_ and "." not in ss_:
+            ss_ = ss_.replace(",", ".")
         else:
-            ss = ss.replace(",", "")
-        return float(ss)
+            ss_ = ss_.replace(",", "")
+        return float(ss_)
     except Exception:
         return np.nan
 
@@ -143,7 +140,7 @@ VAR_MODERATE = [
 ]
 VAR_ALL = VAR_CORE + VAR_MODERATE
 
-# ============================== LASSO helpers ==============================
+# ============================== LASSO (unchanged) ==============================
 def _kfold_indices(n, k=5, seed=42):
     rng = np.random.default_rng(seed)
     idx = np.arange(n); rng.shuffle(idx)
@@ -165,7 +162,6 @@ def _lasso_cd_std(Xs, y, lam, max_iter=900, tol=1e-6):
         if np.linalg.norm(w - w_old) < tol: break
     return w
 
-# ============================== Train ratio model ==============================
 def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     eps = 1e-6
     mcap_series  = df["MC_PM_Max_M"]    if "MC_PM_Max_M"    in df.columns else df.get("MarketCap_M$")
@@ -332,39 +328,32 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
 
     iso_bx = np.array(model.get("iso_bx", []), dtype=float)
     iso_by = np.array(model.get("iso_by", []), dtype=float)
-    if iso_bx.size >= 2 and iso_by.size >= 2:
-        cal_mult = float(_iso_predict(iso_bx, iso_by, np.array([raw_mult]))[0])
-    else:
-        cal_mult = float(raw_mult)
+    cal_mult = float(_iso_predict(iso_bx, iso_by, np.array([raw_mult]))[0]) if (iso_bx.size>=2 and iso_by.size>=2) else float(raw_mult)
     cal_mult = max(cal_mult, 1.0)
 
     PM = float(row.get("PM_Vol_M") or np.nan)
     if not np.isfinite(PM) or PM <= 0: return np.nan
     return float(PM * cal_mult)
 
-# ============================== Summaries utils ==============================
-def _summaries_for(df_in: pd.DataFrame, var_all: list[str], group_col: str, labels_map=None) -> dict:
+# ============================== Summaries ==============================
+def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col: str, labels_map=None):
     avail = [v for v in var_all if v in df_in.columns]
     if not avail:
         empty = pd.DataFrame()
-        return {"med_tbl": empty, "mad_tbl": empty, "mean_tbl": empty, "sd_tbl": empty, "avail": []}
+        return {"med_tbl": empty, "mad_tbl": empty, "avail": []}
     g = df_in.groupby(group_col, observed=True)[avail]
-    med_tbl  = g.median(numeric_only=True).T
-    mean_tbl = g.mean(numeric_only=True).T
-    mad_tbl  = df_in.groupby(group_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad)).T
-    sd_tbl   = g.std(numeric_only=True).T
+    med_tbl = g.median(numeric_only=True).T
+    mad_tbl = df_in.groupby(group_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad)).T
     if labels_map is not None:
-        med_tbl  = med_tbl.rename(columns=labels_map)
-        mean_tbl = mean_tbl.rename(columns=labels_map)
-        mad_tbl  = mad_tbl.rename(columns=labels_map)
-        sd_tbl   = sd_tbl.rename(columns=labels_map)
-    return {"med_tbl": med_tbl, "mad_tbl": mad_tbl, "mean_tbl": mean_tbl, "sd_tbl": sd_tbl, "avail": avail}
+        med_tbl = med_tbl.rename(columns=labels_map)
+        mad_tbl = mad_tbl.rename(columns=labels_map)
+    return {"med_tbl": med_tbl, "mad_tbl": mad_tbl, "avail": avail}
 
-def _make_top10_flag(series_pct: pd.Series) -> tuple[pd.Series, float]:
+def _make_top_flag(series_pct: pd.Series, top_cut: int) -> tuple[pd.Series, float]:
     s = pd.to_numeric(series_pct, errors="coerce")
     mask = s.notna()
     if not mask.any(): return pd.Series(False, index=series_pct.index), np.nan
-    thr = float(np.nanpercentile(s[mask].values, 90))
+    thr = float(np.nanpercentile(s[mask].values, 100 - top_cut))
     flag = (s >= thr) & mask
     return flag, thr
 
@@ -462,45 +451,23 @@ if build_btn:
             df = df[df["FT01"].isin([0,1])].copy()
             df["GroupFT"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-            # Top10 from Max Push Daily (%) (fraction → %)
+            # Max Push Daily (%) fraction -> %
             pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
             if pmh_col is not None:
                 pmh_raw = pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce")
                 df["Max_Push_Daily_%"] = pmh_raw * 100.0
-                top10_flag, top10_thr = _make_top10_flag(df["Max_Push_Daily_%"])
-                df["GroupTop10"] = np.where(top10_flag, "Top10", "Rest")
             else:
                 df["Max_Push_Daily_%"] = np.nan
-                df["GroupTop10"] = "Rest"
-                top10_thr = np.nan
 
-            # summaries
-            var_core = [v for v in VAR_CORE if v in df.columns]
-            var_mod  = [v for v in VAR_MODERATE if v in df.columns]
-            var_all  = var_core + var_mod
+            ss.base_df = df
+            ss.var_core = [v for v in VAR_CORE if v in df.columns]
+            ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
 
-            ft_summ  = _summaries_for(df, var_all, "GroupFT")
-            t10_summ = _summaries_for(df, var_all, "GroupTop10", labels_map={"Top10":"Top10","Rest":"Rest"})
-
-            ss.models = {
-                "ft_med_tbl":  ft_summ["med_tbl"],  "ft_mad_tbl":  ft_summ["mad_tbl"],
-                "ft_mean_tbl": ft_summ["mean_tbl"], "ft_sd_tbl":   ft_summ["sd_tbl"],
-                "t10_med_tbl":  t10_summ["med_tbl"],  "t10_mad_tbl":  t10_summ["mad_tbl"],
-                "t10_mean_tbl": t10_summ["mean_tbl"], "t10_sd_tbl":   t10_summ["sd_tbl"],
-                "var_core": var_core, "var_moderate": var_mod,
-                "top10_threshold": float(top10_thr) if np.isfinite(top10_thr) else np.nan,
-            }
-
-            if ss.models_tbl_current.empty:
-                ss.models_tbl_current = ft_summ["med_tbl"].copy()
-                ss.view_mode_key = "ft_robust"
-                ss.view_choice_label = "FT: Median"
-
+            # train model once (on full base)
             ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
 
-            st.success(f"Built FT and Top10 summaries from sheet “{sel_sheet}”.")
+            st.success(f"Loaded “{sel_sheet}”. Base ready.")
             do_rerun()
-
         except Exception as e:
             st.error("Loading/processing failed.")
             st.exception(e)
@@ -551,27 +518,81 @@ if submitted and ticker:
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
-# ============================== Alignment + Delete Control ==============================
+# ============================== Alignment (Median-only) ==============================
 st.markdown("### Alignment")
 
-models = ss.get("models", {})
-has_ft  = not models.get("ft_med_tbl", pd.DataFrame()).empty
-has_t10 = not models.get("t10_med_tbl", pd.DataFrame()).empty
+# --- UI: Group mode + Top% cutoff + Gain% minimum ---
+c1, c2, c3 = st.columns([1.2, 1, 1.2])
+with c1:
+    group_mode = st.radio(
+        "Grouping",
+        ["FT vs Fail", "Top% vs Rest"],
+        horizontal=True,
+        key="group_mode_sel"
+    )
+with c2:
+    top_cut = st.radio(
+        "Top% cutoff",
+        [50, 40, 30, 20, 10],
+        index=4,
+        horizontal=True,
+        key="top_cutoff",
+        help="Used only when 'Top% vs Rest' is selected; computed on Max Push Daily (%)."
+    )
+with c3:
+    gain_min = st.selectbox(
+        "Gain% minimum (Max Push Daily ≥)",
+        [0,10,20,30,40,50,75,100,150,200,300,400,500],
+        index=0,
+        key="gain_min_pct"
+    )
 
-OPTIONS = [
-    ("ft_robust", "FT: Median"),
-    ("ft_classic","FT: Mean"),
-    ("t10_robust","Top 10%: Median"),
-    ("t10_classic","Top 10%: Mean"),
-]
-key2label = {k: lbl for k, lbl in OPTIONS}
-label2key = {lbl: k for k, lbl in OPTIONS}
-labels = [lbl for _, lbl in OPTIONS]
+base_df = ss.get("base_df", pd.DataFrame()).copy()
+if base_df.empty:
+    if ss.rows:
+        st.info("Upload DB and click **Build model stocks** to compute group centers first.")
+    else:
+        st.info("Upload DB (and/or add at least one stock) to compute alignment.")
+    st.stop()
 
-# --- Compact controls: radios | multiselect | delete button (no labels) ---
+# Apply Gain% (Max Push Daily %) filter if present
+if "Max_Push_Daily_%" in base_df.columns and gain_min > 0:
+    base_df = base_df[pd.to_numeric(base_df["Max_Push_Daily_%"], errors="coerce") >= float(gain_min)].copy()
 
-# --- Compact top bar: radios on left | multiselect + delete on right ---
+# Build Top% flag if needed
+top_thr = np.nan
+if "Max_Push_Daily_%" in base_df.columns:
+    top_flag, top_thr = _make_top_flag(base_df["Max_Push_Daily_%"], top_cut)
+    base_df["GroupTop"] = np.where(top_flag, f"Top{top_cut}", "Rest")
+else:
+    base_df["GroupTop"] = "Rest"
 
+# Choose grouping column
+if group_mode == "FT vs Fail":
+    grp_col = "GroupFT"
+    labels_map = {"FT=1":"FT=1", "FT=0":"FT=0"}
+else:
+    grp_col = "GroupTop"
+    labels_map = {f"Top{top_cut}": f"Top{top_cut}", "Rest": "Rest"}
+
+# Summaries (median only) + MAD (for 3σ)
+var_core = ss.get("var_core", [])
+var_mod  = ss.get("var_moderate", [])
+var_all  = var_core + var_mod
+summ = _summaries_median_and_mad(base_df, var_all, grp_col, labels_map=labels_map)
+med_tbl = summ["med_tbl"]; mad_tbl = summ["mad_tbl"] * 1.4826  # MAD → σ
+
+if med_tbl.empty or med_tbl.shape[1] != 2:
+    st.info("Need two non-empty groups to compare. Adjust filters.")
+    st.stop()
+
+gA, gB = list(med_tbl.columns)
+
+# Optional: show current cutoff if Top% mode
+if group_mode != "FT vs Fail" and np.isfinite(top_thr):
+    st.caption(f"Current Top-{top_cut}% cutoff (Max Push Daily %): {top_thr:.2f}% • Gain% minimum: ≥ {gain_min}%")
+
+# ----- Delete UI (unchanged layout) -----
 tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
 unique_tickers, _seen = [], set()
 for t in tickers:
@@ -579,21 +600,8 @@ for t in tickers:
         unique_tickers.append(t); _seen.add(t)
 
 left, right = st.columns([2.5, 2.5])
-
 with left:
-    # radios inline, no label
-    if ss.view_choice_label not in [lbl for _, lbl in OPTIONS]:
-        ss.view_choice_label = {k: lbl for k, lbl in OPTIONS}[ss.view_mode_key]
-    chosen_label = st.radio(
-        "",
-        [lbl for _, lbl in OPTIONS],
-        index=[lbl for _, lbl in OPTIONS].index(ss.view_choice_label),
-        horizontal=True,
-        key="view_choice_label",
-        label_visibility="collapsed",
-    )
-    ss.view_mode_key = {lbl: k for k, lbl in OPTIONS}[chosen_label]
-
+    st.caption("Delete rows")
 with right:
     r1, r2 = st.columns([4, 1])
     with r1:
@@ -614,184 +622,145 @@ with right:
             else:
                 st.info("No tickers selected.")
 
-def _pick_tables_by_key(view_key: str):
-    if view_key == "ft_robust" and has_ft:   return models["ft_med_tbl"]
-    if view_key == "ft_classic" and has_ft:  return models["ft_mean_tbl"]
-    if view_key == "t10_robust" and has_t10: return models["t10_med_tbl"]
-    if view_key == "t10_classic" and has_t10:return models["t10_mean_tbl"]
-    return pd.DataFrame()
-
-def _pick_dispersion_by_key(view_key: str):
-    c = 1.4826  # MAD → σ
-    if view_key == "ft_robust" and has_ft:   return (models["ft_mad_tbl"] * c).copy()
-    if view_key == "ft_classic" and has_ft:  return models["ft_sd_tbl"].copy()
-    if view_key == "t10_robust" and has_t10: return (models["t10_mad_tbl"] * c).copy()
-    if view_key == "t10_classic" and has_t10:return models["t10_sd_tbl"].copy()
-    return pd.DataFrame()
-
-center_tbl = _pick_tables_by_key(ss.view_mode_key)
-ss.models_tbl_current = center_tbl.copy()
-disp_tbl = _pick_dispersion_by_key(ss.view_mode_key)
-
-if ss.view_mode_key.startswith("t10"):
-    thr = models.get("top10_threshold", np.nan)
-    if np.isfinite(thr):
-        st.caption(f"Current Top-10% cutoff (Max Push Daily %): {thr:.2f}%")
-
-# ----- Alignment table build -----
-models_tbl = ss.get("models_tbl_current", pd.DataFrame()).copy()
-var_core = (ss.models or {}).get("var_core", [])
-var_mod  = (ss.models or {}).get("var_moderate", [])
-
+# ----- Build alignment rows -----
 def _compute_alignment_counts_weighted(
     stock_row: dict,
-    models_tbl: pd.DataFrame,
+    centers_tbl: pd.DataFrame,
     var_core: list[str],
     var_mod: list[str],
     w_core: float = 1.0,
     w_mod: float = 0.5,
     tie_mode: str = "split",
 ) -> dict:
-    if models_tbl is None or models_tbl.empty or len(models_tbl.columns) != 2:
+    if centers_tbl is None or centers_tbl.empty or len(centers_tbl.columns) != 2:
         return {}
-    gA, gB = list(models_tbl.columns)
-
-    counts = {gA: 0.0, gB: 0.0}
-    core_pts = {gA: 0.0, gB: 0.0}
-    mod_pts  = {gA: 0.0, gB: 0.0}
+    gA_, gB_ = list(centers_tbl.columns)
+    counts = {gA_: 0.0, gB_: 0.0}
+    core_pts = {gA_: 0.0, gB_: 0.0}
+    mod_pts  = {gA_: 0.0, gB_:  0.0}
     used_core = used_mod = 0
-
-    centers = models_tbl
-    idx_set = set(centers.index)
+    idx_set = set(centers_tbl.index)
 
     def _vote_one(var: str, weight: float, bucket: dict):
         nonlocal used_core, used_mod
         if var not in idx_set: return
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
         if not np.isfinite(xv): return
-        vA = float(centers.at[var, gA]); vB = float(centers.at[var, gB])
+        vA = float(centers_tbl.at[var, gA_]); vB = float(centers_tbl.at[var, gB_])
         if np.isnan(vA) or np.isnan(vB): return
-
         dA = abs(xv - vA); dB = abs(xv - vB)
         if dA < dB:
-            counts[gA] += weight; bucket[gA] += weight
+            counts[gA_] += weight; bucket[gA_] += weight
         elif dB < dA:
-            counts[gB] += weight; bucket[gB] += weight
+            counts[gB_] += weight; bucket[gB_] += weight
         else:
             if tie_mode == "split":
-                counts[gA] += weight*0.5; counts[gB] += weight*0.5
-                bucket[gA] += weight*0.5; bucket[gB] += weight*0.5
-
+                counts[gA_] += weight*0.5; counts[gB_] += weight*0.5
+                bucket[gA_] += weight*0.5; bucket[gB_] += weight*0.5
         if weight == w_core: used_core += 1
         elif weight == w_mod: used_mod += 1
 
     for v in var_core: _vote_one(v, w_core, core_pts)
     for v in var_mod:  _vote_one(v, w_mod,  mod_pts)
 
-    total = counts[gA] + counts[gB]
-    a_raw = 100.0 * counts[gA] / total if total > 0 else 0.0
+    total = counts[gA_] + counts[gB_]
+    a_raw = 100.0 * counts[gA_] / total if total > 0 else 0.0
     b_raw = 100.0 - a_raw
     a_int = int(round(a_raw)); b_int = 100 - a_int
 
     return {
-        gA: counts[gA], gB: counts[gB],
-        "A_pts": counts[gA], "B_pts": counts[gB],
-        "A_core": core_pts[gA], "B_core": core_pts[gB],
-        "A_mod":  mod_pts[gA],  "B_mod":  mod_pts[gB],
+        gA_: counts[gA_], gB_: counts[gB_],
+        "A_pts": counts[gA_], "B_pts": counts[gB_],
+        "A_core": core_pts[gA_], "B_core": core_pts[gB_],
+        "A_mod":  mod_pts[gA_],  "B_mod":  mod_pts[gB_],
         "A_pct_raw": a_raw, "B_pct_raw": b_raw,
         "A_pct_int": a_int, "B_pct_int": b_int,
-        "A_label": gA, "B_label": gB,
-        "N_core_used": used_core, "N_mod_used": used_mod,
+        "A_label": gA_, "B_label": gB_,
+        "N_core_used": len(var_core), "N_mod_used": len(var_mod),
     }
 
-if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
-    summary_rows, detail_map = [], {}
-    gA, gB = list(models_tbl.columns)
+centers_tbl = med_tbl.copy()
+disp_tbl = mad_tbl.reindex(index=centers_tbl.index)
 
-    detail_order = [("Core variables", var_core),
-                    ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
+summary_rows, detail_map = [], {}
+detail_order = [("Core variables", var_core), ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
+mt_index = set(centers_tbl.index); dt_index = set(disp_tbl.index)
 
-    mt_index = set(models_tbl.index)
-    if isinstance(disp_tbl, pd.DataFrame) and not disp_tbl.empty:
-        disp_tbl = disp_tbl.reindex(index=models_tbl.index)
-        dt_index = set(disp_tbl.index)
-    else:
-        dt_index = set()
+for row in ss.rows:
+    stock = dict(row); tkr = stock.get("Ticker") or "—"
+    counts = _compute_alignment_counts_weighted(
+        stock_row=stock, centers_tbl=centers_tbl, var_core=var_core, var_mod=var_mod,
+        w_core=1.0, w_mod=0.5, tie_mode="split",
+    )
+    if not counts: continue
 
-    for row in ss.rows:
-        stock = dict(row); tkr = stock.get("Ticker") or "—"
-        counts = _compute_alignment_counts_weighted(
-            stock_row=stock, models_tbl=models_tbl, var_core=var_core, var_mod=var_mod,
-            w_core=1.0, w_mod=0.5, tie_mode="split",
-        )
-        if not counts: continue
+    summary_rows.append({
+        "Ticker": tkr,
+        "A_val_raw": counts.get("A_pct_raw", 0.0),
+        "B_val_raw": counts.get("B_pct_raw", 0.0),
+        "A_val_int": counts.get("A_pct_int", 0),
+        "B_val_int": counts.get("B_pct_int", 0),
+        "A_label": counts.get("A_label", gA),
+        "B_label": counts.get("B_label", gB),
+        "A_pts": counts.get("A_pts", 0.0),
+        "B_pts": counts.get("B_pts", 0.0),
+        "A_core": counts.get("A_core", 0.0),
+        "B_core": counts.get("B_core", 0.0),
+        "A_mod": counts.get("A_mod", 0.0),
+        "B_mod": counts.get("B_mod", 0.0),
+    })
 
-        summary_rows.append({
-            "Ticker": tkr,
-            "A_val_raw": counts.get("A_pct_raw", 0.0),
-            "B_val_raw": counts.get("B_pct_raw", 0.0),
-            "A_val_int": counts.get("A_pct_int", 0),
-            "B_val_int": counts.get("B_pct_int", 0),
-            "A_label": counts.get("A_label", gA),
-            "B_label": counts.get("B_label", gB),
-            "A_pts": counts.get("A_pts", 0.0),
-            "B_pts": counts.get("B_pts", 0.0),
-            "A_core": counts.get("A_core", 0.0),
-            "B_core": counts.get("B_core", 0.0),
-            "A_mod": counts.get("A_mod", 0.0),
-            "B_mod": counts.get("B_mod", 0.0),
-        })
+    drows_grouped = []
+    for grp_label, grp_vars in detail_order:
+        drows_grouped.append({"__group__": grp_label})
+        for v in grp_vars:
+            if v == "Daily_Vol_M": continue
+            va = pd.to_numeric(stock.get(v), errors="coerce")
 
-        drows_grouped = []
-        for grp_label, grp_vars in detail_order:
-            drows_grouped.append({"__group__": grp_label})
-            for v in grp_vars:
-                if v == "Daily_Vol_M": continue
-                va = pd.to_numeric(stock.get(v), errors="coerce")
+            med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
+            if med_var in mt_index:
+                vA = centers_tbl.at[med_var, gA]
+                vB = centers_tbl.at[med_var, gB]
+            else:
+                vA = np.nan; vB = np.nan
 
-                med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
-                if med_var in mt_index:
-                    vA = models_tbl.at[med_var, gA]
-                    vB = models_tbl.at[med_var, gB]
-                else:
-                    vA = np.nan; vB = np.nan
+            if med_var in dt_index:
+                sA = float(disp_tbl.at[med_var, gA]) if pd.notna(disp_tbl.at[med_var, gA]) else np.nan
+                sB = float(disp_tbl.at[med_var, gB]) if pd.notna(disp_tbl.at[med_var, gB]) else np.nan
+            else:
+                sA = np.nan; sB = np.nan
 
-                if med_var in dt_index:
-                    sA = float(disp_tbl.at[med_var, gA]) if pd.notna(disp_tbl.at[med_var, gA]) else np.nan
-                    sB = float(disp_tbl.at[med_var, gB]) if pd.notna(disp_tbl.at[med_var, gB]) else np.nan
-                else:
-                    sA = np.nan; sB = np.nan
+            if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(vA) and pd.isna(vB): continue
 
-                if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(vA) and pd.isna(vB): continue
+            dA = None if (pd.isna(va) or pd.isna(vA)) else float(va - vA)
+            dB = None if (pd.isna(va) or pd.isna(vB)) else float(va - vB)
 
-                dA = None if (pd.isna(va) or pd.isna(vA)) else float(va - vA)
-                dB = None if (pd.isna(va) or pd.isna(vB)) else float(va - vB)
+            drows_grouped.append({
+                "Variable": v,
+                "Value": None if pd.isna(va) else float(va),
+                "A":   None if pd.isna(vA) else float(vA),
+                "B":   None if pd.isna(vB) else float(vB),
+                "sA":  None if not np.isfinite(sA) else float(sA),
+                "sB":  None if not np.isfinite(sB) else float(sB),
+                "d_vs_A": None if dA is None else dA,
+                "d_vs_B": None if dB is None else dB,
+                "is_core": (v in var_core),
+            })
 
-                drows_grouped.append({
-                    "Variable": v,
-                    "Value": None if pd.isna(va) else float(va),
-                    "A":   None if pd.isna(vA) else float(vA),
-                    "B":   None if pd.isna(vB) else float(vB),
-                    "sA":  None if not np.isfinite(sA) else float(sA),
-                    "sB":  None if not np.isfinite(sB) else float(sB),
-                    "d_vs_A": None if dA is None else dA,
-                    "d_vs_B": None if dB is None else dB,
-                    "is_core": (v in var_core),
-                })
+    detail_map[tkr] = drows_grouped
 
-        detail_map[tkr] = drows_grouped
+# ---------------- HTML/JS ----------------
+import streamlit.components.v1 as components
 
-    # ---------------- HTML/JS ----------------
-    import streamlit.components.v1 as components
+def _round_rec(o):
+    if isinstance(o, dict): return {k:_round_rec(v) for k,v in o.items()}
+    if isinstance(o, list): return [_round_rec(v) for v in o]
+    if isinstance(o, float): return float(np.round(o, 6))
+    return o
 
-    def _round_rec(o):
-        if isinstance(o, dict): return {k:_round_rec(v) for k,v in o.items()}
-        if isinstance(o, list): return [_round_rec(v) for v in o]
-        if isinstance(o, float): return float(np.round(o, 6))
-        return o
-    payload = _round_rec({"rows": summary_rows, "details": detail_map, "gA": gA, "gB": gB})
+payload = _round_rec({"rows": summary_rows, "details": detail_map, "gA": gA, "gB": gB})
 
-    html = """
+html = """
 <!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
@@ -825,7 +794,7 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
     document.getElementById('hdrB').textContent = data.gB;
 
     function barCellLabeled(valRaw,label,valInt){
-      const strong=(label==='FT=1'||label==='Top10'); const cls=strong?'blue':'red';
+      const strong=(label==='FT=1'||label.startsWith('Top')); const cls=strong?'blue':'red';
       const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
       const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
       return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
@@ -889,8 +858,8 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
         <thead><tr>
           <th class="col-var">Variable</th>
           <th class="col-val">Value</th>
-          <th class="col-a">${data.gA} center <span style="font-weight:400;color:#6b7280;">${leftInfo}</span></th>
-          <th class="col-b">${data.gB} center <span style="font-weight:400;color:#6b7280;">${rightInfo}</span></th>
+          <th class="col-a">${data.gA} center</th>
+          <th class="col-b">${data.gB} center</th>
           <th class="col-da">Δ vs ${data.gA}</th>
           <th class="col-db">Δ vs ${data.gB}</th>
         </tr></thead>
@@ -913,15 +882,6 @@ if ss.rows and not models_tbl.empty and len(models_tbl.columns) == 2:
       });
     });
   </script></body></html>
-    """
-    html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
-    import streamlit.components.v1 as components
-    components.html(
-        html,
-        height=620,
-        scrolling=True
-    )
-elif ss.rows:
-    st.info("Upload DB and click **Build model stocks** to compute FT and Top10 summaries first.")
-else:
-    st.info("Add at least one stock above to compute alignment.")
+"""
+html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
+components.html(html, height=620, scrolling=True)
