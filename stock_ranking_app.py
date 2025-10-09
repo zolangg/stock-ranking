@@ -1,481 +1,432 @@
-# app.py — Premarket Ranking with OOF Pred Model + NCA kernel-kNN + CatBoost Leaf-kNN (efficient build)
+# app.py — Premarket Stock Ranking (+ NCA FT=1 similarity bar)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re, json, hashlib
 
-st.set_page_config(page_title="Premarket Stock Ranking (NCA + Leaf-kNN)", layout="wide")
-st.title("Premarket Stock Ranking — NCA + Leaf-kNN Similarity")
+# ============================== Page ==============================
+st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
+st.title("Premarket Stock Ranking")
 
-# ============== Session ==============
+# ============================== Session ==============================
 ss = st.session_state
 ss.setdefault("rows", [])
 ss.setdefault("last", {})
+ss.setdefault("lassoA", {})
 ss.setdefault("base_df", pd.DataFrame())
+ss.setdefault("var_core", [])
+ss.setdefault("var_moderate", [])
+ss.setdefault("nca", {})  # <-- NCA model holder
 
-ss.setdefault("pred_model_full", {})   # daily vol predictor for queries
-ss.setdefault("nca_model", {})         # scaler, nca, emb, y, feat_names, guard
-ss.setdefault("leaf_model", {})        # scaler, cat, emb, y, feat_names, metric
-
-ss.setdefault("building", False)       # build lock
-ss.setdefault("data_hash", "")         # hash of uploaded xlsx (content-based)
-
-# ============== Deps ==============
-try:
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.neighbors import NeighborhoodComponentsAnalysis
-    from sklearn.ensemble import IsolationForest
-    from sklearn.metrics import pairwise_distances, roc_auc_score
-    from sklearn.model_selection import StratifiedKFold
-except ModuleNotFoundError:
-    st.error("Install scikit-learn==1.5.2")
-    st.stop()
-
-CATBOOST_AVAILABLE = True
-try:
-    from catboost import CatBoostClassifier, Pool
-except Exception:
-    CATBOOST_AVAILABLE = False
-
-# ============== Small utils ==============
+# ============================== Helpers ==============================
 def do_rerun():
     if hasattr(st, "rerun"): st.rerun()
     elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
 
 def SAFE_JSON_DUMPS(obj) -> str:
-    class Np(json.JSONEncoder):
+    class NpEncoder(json.JSONEncoder):
         def default(self, o):
-            if isinstance(o,(np.integer,)): return int(o)
-            if isinstance(o,(np.floating,)): return float(o)
-            if isinstance(o,(np.ndarray,)): return o.tolist()
+            if isinstance(o, (np.integer,)): return int(o)
+            if isinstance(o, (np.floating,)): return float(o)
+            if isinstance(o, (np.ndarray,)): return o.tolist()
             return super().default(o)
-    return json.dumps(obj, cls=Np, ensure_ascii=False, separators=(",",":")).replace("</script>","<\\/script>")
+    s = json.dumps(obj, cls=NpEncoder, ensure_ascii=False, separators=(",", ":"))
+    return s.replace("</script>", "<\\/script>")
 
-_norm_cache={}
-def _norm(s:str)->str:
+_norm_cache = {}
+def _norm(s: str) -> str:
     if s in _norm_cache: return _norm_cache[s]
-    v=re.sub(r"\s+"," ",str(s).strip().lower())
-    v=v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
-    _norm_cache[s]=v; return v
+    v = re.sub(r"\s+", " ", str(s).strip().lower())
+    v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
+    _norm_cache[s] = v
+    return v
 
-def _pick(df: pd.DataFrame, candidates):
+def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     if df is None or df.empty: return None
-    cols=list(df.columns); cols_lc={c:c.strip().lower() for c in cols}
-    nm={c:_norm(c) for c in cols}
+    cols = list(df.columns)
+    cols_lc = {c: c.strip().lower() for c in cols}
+    nm = {c: _norm(c) for c in cols}
     for cand in candidates:
-        lc=cand.strip().lower()
+        lc = cand.strip().lower()
         for c in cols:
-            if cols_lc[c]==lc: return c
+            if cols_lc[c] == lc:
+                return c
     for cand in candidates:
-        n=_norm(cand)
+        n = _norm(cand)
         for c in cols:
-            if nm[c]==n: return c
+            if nm[c] == n:
+                return c
     for cand in candidates:
-        n=_norm(cand)
+        n = _norm(cand)
         for c in cols:
-            if n in nm[c]: return c
+            if n in nm[c]:
+                return c
     return None
 
 def _to_float(s):
     if pd.isna(s): return np.nan
     try:
-        x=str(s).strip().replace(" ","")
-        if "," in x and "." not in x: x=x.replace(",",".")
-        else: x=x.replace(",","")
-        return float(x)
-    except: return np.nan
-
-def _safe_to_binary(v):
-    sv=str(v).strip().lower()
-    if sv in {"1","true","yes","y","t"}: return 1
-    if sv in {"0","false","no","n","f"}: return 0
-    try: return 1 if float(sv)>=0.5 else 0
-    except: return np.nan
+        ss_ = str(s).strip().replace(" ", "")
+        if "," in ss_ and "." not in ss_:
+            ss_ = ss_.replace(",", ".")
+        else:
+            ss_ = ss_.replace(",", "")
+        return float(ss_)
+    except Exception:
+        return np.nan
 
 def _mad(series: pd.Series) -> float:
-    s=pd.to_numeric(series, errors="coerce").dropna()
+    s = pd.to_numeric(series, errors="coerce").dropna()
     if s.empty: return np.nan
-    med=float(np.median(s)); return float(np.median(np.abs(s-med)))
+    med = float(np.median(s))
+    return float(np.median(np.abs(s - med)))
 
-def _compute_bounds(arr, lo_q=0.01, hi_q=0.99):
-    arr=np.asarray(arr); arr=arr[np.isfinite(arr)]
-    if arr.size==0: return (np.nan, np.nan)
+# ---------- Winsorization ----------
+def _compute_bounds(arr: np.ndarray, lo_q=0.01, hi_q=0.99):
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0: return (np.nan, np.nan)
     return (float(np.quantile(arr, lo_q)), float(np.quantile(arr, hi_q)))
 
-def _apply_bounds(arr, lo, hi):
-    out=np.array(arr, dtype=float)
-    if np.isfinite(lo): out=np.maximum(out, lo)
-    if np.isfinite(hi): out=np.minimum(out, hi)
+def _apply_bounds(arr: np.ndarray, lo: float, hi: float):
+    out = arr.copy()
+    if np.isfinite(lo): out = np.maximum(out, lo)
+    if np.isfinite(hi): out = np.minimum(out, hi)
     return out
 
-# ============== Daily volume predictor (LASSO→OLS) ==============
+# ---------- Isotonic Regression ----------
+def _pav_isotonic(x: np.ndarray, y: np.ndarray):
+    order = np.argsort(x)
+    xs = x[order]; ys = y[order]
+    level_y = ys.astype(float).copy(); level_n = np.ones_like(level_y)
+    i = 0
+    while i < len(level_y) - 1:
+        if level_y[i] > level_y[i+1]:
+            new_y = (level_y[i]*level_n[i] + level_y[i+1]*level_n[i+1]) / (level_n[i] + level_n[i+1])
+            new_n = level_n[i] + level_n[i+1]
+            level_y[i] = new_y; level_n[i] = new_n
+            level_y = np.delete(level_y, i+1)
+            level_n = np.delete(level_n, i+1)
+            xs = np.delete(xs, i+1)
+            if i > 0: i -= 1
+        else:
+            i += 1
+    return xs, level_y
+
+def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
+    if break_x.size == 0: return np.full_like(x_new, np.nan, dtype=float)
+    idx = np.argsort(break_x)
+    bx = break_x[idx]; by = break_y[idx]
+    if bx.size == 1: return np.full_like(x_new, by[0], dtype=float)
+    return np.interp(x_new, bx, by, left=by[0], right=by[-1])
+
+# ============================== Variables ==============================
+VAR_CORE = [
+    "Gap_%",
+    "FR_x",
+    "PM$Vol/MC_%",
+    "Catalyst",
+    "PM_Vol_%",
+    "Max_Pull_PM_%",
+    "RVOL_Max_PM_cum",
+]
+VAR_MODERATE = [
+    "MC_PM_Max_M",
+    "Float_PM_Max_M",
+    "PM_Vol_M",
+    "PM_$Vol_M$",
+    "ATR_$",
+    "Daily_Vol_M",
+    "MarketCap_M$",
+    "Float_M",
+]
+VAR_ALL = VAR_CORE + VAR_MODERATE
+
+# ============================== LASSO (unchanged) ==============================
 def _kfold_indices(n, k=5, seed=42):
-    rng=np.random.default_rng(seed); idx=np.arange(n); rng.shuffle(idx)
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n); rng.shuffle(idx)
     return np.array_split(idx, k)
 
 def _lasso_cd_std(Xs, y, lam, max_iter=900, tol=1e-6):
-    n,p=Xs.shape; w=np.zeros(p)
+    n, p = Xs.shape
+    w = np.zeros(p)
     for _ in range(max_iter):
-        w_old=w.copy(); yhat=Xs@w
+        w_old = w.copy()
+        y_hat = Xs @ w
         for j in range(p):
-            rj=y-yhat+Xs[:,j]*w[j]
-            rho=(Xs[:,j]@rj)/n
-            if   rho<-lam/2: w[j]=rho+lam/2
-            elif rho> lam/2: w[j]=rho-lam/2
-            else:            w[j]=0.0
-            yhat=Xs@w
-        if np.linalg.norm(w-w_old)<tol: break
+            r_j = y - y_hat + Xs[:, j] * w[j]
+            rho = (Xs[:, j] @ r_j) / n
+            if   rho < -lam/2: w[j] = rho + lam/2
+            elif rho >  lam/2: w[j] = rho - lam/2
+            else:              w[j] = 0.0
+            y_hat = Xs @ w
+        if np.linalg.norm(w - w_old) < tol: break
     return w
 
-@st.cache_data(show_spinner=False)
-def train_ratio_winsor_iso(df: pd.DataFrame) -> dict:
-    eps=1e-6
-    need_min={"ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Daily_Vol_M","Gap_%"}
-    if not need_min.issubset(df.columns): return {}
+def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
+    eps = 1e-6
+    mcap_series  = df["MC_PM_Max_M"]    if "MC_PM_Max_M"    in df.columns else df.get("MarketCap_M$")
+    float_series = df["Float_PM_Max_M"] if "Float_PM_Max_M" in df.columns else df.get("Float_M")
+    need_min = {"ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Daily_Vol_M","Gap_%"}
+    if mcap_series is None or float_series is None or not need_min.issubset(df.columns): return {}
 
-    # Ensure Series (not ndarray) for mcap/float bases
-    if "MC_PM_Max_M" in df.columns and df["MC_PM_Max_M"].notna().any():
-        mcap_s = df["MC_PM_Max_M"]
-    else:
-        mcap_s = df["MarketCap_M$"] if "MarketCap_M$" in df.columns else pd.Series(np.nan, index=df.index)
-    mcap_s = pd.to_numeric(mcap_s, errors="coerce").fillna(np.nan)
+    PM  = pd.to_numeric(df["PM_Vol_M"],    errors="coerce").values
+    DV  = pd.to_numeric(df["Daily_Vol_M"], errors="coerce").values
+    valid_pm = np.isfinite(PM) & np.isfinite(DV) & (PM > 0) & (DV > 0)
+    if valid_pm.sum() < 50: return {}
 
-    if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any():
-        float_s = df["Float_PM_Max_M"]
-    else:
-        float_s = df["Float_M"] if "Float_M" in df.columns else pd.Series(np.nan, index=df.index)
-    float_s = pd.to_numeric(float_s, errors="coerce").fillna(np.nan)
+    ln_mcap   = np.log(np.clip(pd.to_numeric(mcap_series, errors="coerce").values,  eps, None))
+    ln_gapf   = np.log(np.clip(pd.to_numeric(df["Gap_%"], errors="coerce").values,  0,   None) / 100.0 + eps)
+    ln_atr    = np.log(np.clip(pd.to_numeric(df["ATR_$"], errors="coerce").values,  eps, None))
+    ln_pm     = np.log(np.clip(pd.to_numeric(df["PM_Vol_M"], errors="coerce").values, eps, None))
+    ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"], errors="coerce").values, eps, None))
+    ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"], errors="coerce").values,   eps, None))
+    ln_float_pmmax = np.log(np.clip(pd.to_numeric(df["Float_PM_Max_M"] if "Float_PM_Max_M" in df.columns else df["Float_M"], errors="coerce").values, eps, None))
+    maxpullpm      = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").values
+    ln_rvolmaxpm   = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum", np.nan), errors="coerce").values, eps, None))
+    pm_dol_over_mc = pd.to_numeric(df.get("PM$Vol/MC_%", np.nan), errors="coerce").values
+    catalyst_raw   = df.get("Catalyst", np.nan)
+    catalyst       = pd.to_numeric(catalyst_raw, errors="coerce").fillna(0.0).clip(0,1).values
 
-    PM = pd.to_numeric(df["PM_Vol_M"],    errors="coerce").astype(float)
-    DV = pd.to_numeric(df["Daily_Vol_M"], errors="coerce").astype(float)
-    valid=(PM>0) & (DV>0) & PM.notna() & DV.notna()
-    if valid.sum()<50: return {}
+    multiplier_all = np.maximum(DV / PM, 1.0)
+    y_ln_all = np.log(multiplier_all)
 
-    ln_mcap   = np.log(np.clip(mcap_s.to_numpy(dtype=float), eps, None))
-    ln_gapf   = np.log(np.clip(pd.to_numeric(df["Gap_%"], errors="coerce").to_numpy(dtype=float), 0, None)/100.0 + eps)
-    ln_atr    = np.log(np.clip(pd.to_numeric(df["ATR_$"], errors="coerce").to_numpy(dtype=float), eps, None))
-    ln_pm     = np.log(np.clip(PM.to_numpy(dtype=float), eps, None))
-    ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"], errors="coerce").to_numpy(dtype=float), eps, None))
-    ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"], errors="coerce").to_numpy(dtype=float), eps, None))
-    ln_float  = np.log(np.clip(float_s.to_numpy(dtype=float), eps, None))
-    maxpullpm = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").to_numpy(dtype=float)
-    ln_rvol   = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum", np.nan), errors="coerce").to_numpy(dtype=float), eps, None))
-    pmmc      = pd.to_numeric(df.get("PM$Vol/MC_%", np.nan), errors="coerce").to_numpy(dtype=float)
-    catalyst  = pd.to_numeric(df.get("Catalyst", np.nan), errors="coerce").fillna(0.0).clip(0,1).to_numpy(dtype=float)
-
-    mult = np.maximum(DV.to_numpy(dtype=float)/PM.to_numpy(dtype=float), 1.0)
-    y_ln = np.log(mult)
-
-    feats=[
-        ("ln_mcap_pmmax",ln_mcap),("ln_gapf",ln_gapf),("ln_atr",ln_atr),("ln_pm",ln_pm),
-        ("ln_pm_dol",ln_pm_dol),("ln_fr",ln_fr),("catalyst",catalyst),
-        ("ln_float_pmmax",ln_float),("maxpullpm",maxpullpm),
-        ("ln_rvolmaxpm",ln_rvol),("pm_dol_over_mc",pmmc)
+    feats = [
+        ("ln_mcap_pmmax",  ln_mcap),
+        ("ln_gapf",        ln_gapf),
+        ("ln_atr",         ln_atr),
+        ("ln_pm",          ln_pm),
+        ("ln_pm_dol",      ln_pm_dol),
+        ("ln_fr",          ln_fr),
+        ("catalyst",       catalyst),
+        ("ln_float_pmmax", ln_float_pmmax),
+        ("maxpullpm",      maxpullpm),
+        ("ln_rvolmaxpm",   ln_rvolmaxpm),
+        ("pm_dol_over_mc", pm_dol_over_mc),
     ]
-    X=np.hstack([a.reshape(-1,1) for _,a in feats])
+    X_all = np.hstack([arr.reshape(-1,1) for _, arr in feats])
 
-    mask = valid.to_numpy() & np.isfinite(y_ln) & np.isfinite(X).all(axis=1)
-    if mask.sum()<50: return {}
-    X=X[mask]; y_ln=y_ln[mask]
+    mask = valid_pm & np.isfinite(y_ln_all) & np.isfinite(X_all).all(axis=1)
+    if mask.sum() < 50: return {}
+    X_all = X_all[mask]; y_ln = y_ln_all[mask]
+    PMm = PM[mask]; DVv = DV[mask]
 
-    # winsor heavy tails
-    wins={}
-    name_to_idx={n:i for i,(n,_) in enumerate(feats)}
-    def _w(idx):
-        arr=X[:,idx]; lo,hi=_compute_bounds(arr); wins[feats[idx][0]]=(lo,hi)
-        X[:,idx]=_apply_bounds(arr,lo,hi)
-    for nm in ["maxpullpm","pm_dol_over_mc"]:
-        if nm in name_to_idx: _w(name_to_idx[nm])
+    n = X_all.shape[0]
+    split = max(10, int(n * 0.8))
+    X_tr, X_va = X_all[:split], X_all[split:]
+    y_tr = y_ln[:split]
 
-    # winsor target
-    mult_tr=np.exp(y_ln); mlo,mhi=_compute_bounds(mult_tr)
-    y_ln=np.log(_apply_bounds(mult_tr,mlo,mhi))
+    winsor_bounds = {}
+    name_to_idx = {name:i for i,(name,_) in enumerate(feats)}
+    def _winsor_feature(col_idx):
+        arr_tr = X_tr[:, col_idx]
+        lo, hi = _compute_bounds(arr_tr[np.isfinite(arr_tr)])
+        winsor_bounds[feats[col_idx][0]] = (lo, hi)
+        X_tr[:, col_idx] = _apply_bounds(arr_tr, lo, hi)
+        X_va[:, col_idx] = _apply_bounds(X_va[:, col_idx], lo, hi)
+    for nm in ["maxpullpm", "pm_dol_over_mc"]:
+        if nm in name_to_idx: _winsor_feature(name_to_idx[nm])
 
-    mu=X.mean(axis=0); sd=X.std(axis=0, ddof=0); sd[sd==0]=1.0
-    Xs=(X-mu)/sd
+    mult_tr = np.exp(y_tr)
+    m_lo, m_hi = _compute_bounds(mult_tr)
+    mult_tr_w = _apply_bounds(mult_tr, m_lo, m_hi)
+    y_tr = np.log(mult_tr_w)
 
-    folds=_kfold_indices(len(y_ln), k=min(5,max(2, len(y_ln)//10)), seed=42)
-    lam_grid=np.geomspace(0.001,1.0,26)
-    cv=[]
+    mu = X_tr.mean(axis=0); sd = X_tr.std(axis=0, ddof=0); sd[sd==0] = 1.0
+    Xs_tr = (X_tr - mu) / sd
+
+    folds = _kfold_indices(len(y_tr), k=min(5, max(2, len(y_tr)//10)), seed=42)
+    lam_grid = np.geomspace(0.001, 1.0, 26)
+    cv_mse = []
     for lam in lam_grid:
-        errs=[]
+        errs = []
         for vi in range(len(folds)):
-            te=folds[vi]; tr=np.hstack([folds[j] for j in range(len(folds)) if j!=vi])
-            w=_lasso_cd_std(Xs[tr], y_ln[tr], lam=lam, max_iter=1500)
-            yhat=Xs[te]@w
-            errs.append(np.mean((yhat - y_ln[te])**2))
-        cv.append(np.mean(errs))
-    lam_best=float(lam_grid[int(np.argmin(cv))])
-    w=_lasso_cd_std(Xs, y_ln, lam=lam_best, max_iter=2000)
-    sel=np.flatnonzero(np.abs(w)>1e-8)
-    if sel.size==0: return {}
-    Xsel=X[:,sel]; Xd=np.column_stack([np.ones(Xsel.shape[0]), Xsel])
-    coef, *_=np.linalg.lstsq(Xd, y_ln, rcond=None)
-    b0=float(coef[0]); bet=coef[1:].astype(float)
+            te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(len(folds)) if j != vi])
+            Xtr, ytr = Xs_tr[tr_idx], y_tr[tr_idx]
+            Xte, yte = Xs_tr[te_idx], y_tr[te_idx]
+            w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1400)
+            yhat = Xte @ w
+            errs.append(np.mean((yhat - yte)**2))
+        cv_mse.append(np.mean(errs))
+    lam_best = float(lam_grid[int(np.argmin(cv_mse))])
+    w_l1 = _lasso_cd_std(Xs_tr, y_tr, lam=lam_best, max_iter=2000)
+    sel = np.flatnonzero(np.abs(w_l1) > 1e-8)
+    if sel.size == 0: return {}
+
+    Xtr_sel = X_tr[:, sel]
+    X_design = np.column_stack([np.ones(Xtr_sel.shape[0]), Xtr_sel])
+    coef_ols, *_ = np.linalg.lstsq(X_design, y_tr, rcond=None)
+    b0 = float(coef_ols[0]); bet = coef_ols[1:].astype(float)
+
+    iso_bx = np.array([], dtype=float); iso_by = np.array([], dtype=float)
+    if X_va.shape[0] >= 8:
+        Xva_sel = X_va[:, sel]
+        yhat_va_ln = (np.column_stack([np.ones(Xva_sel.shape[0]), Xva_sel]) @ coef_ols).astype(float)
+        mult_pred_va = np.exp(yhat_va_ln)
+        mult_true_all = np.maximum(DVv / PMm, 1.0)
+        mult_va_true = mult_true_all[split:]
+        finite = np.isfinite(mult_pred_va) & np.isfinite(mult_va_true)
+        if finite.sum() >= 8 and np.unique(mult_pred_va[finite]).size >= 3:
+            iso_bx, iso_by = _pav_isotonic(mult_pred_va[finite], mult_va_true[finite])
 
     return {
-        "eps":eps,"terms":[feats[i][0] for i in sel],"b0":b0,"betas":bet,"sel_idx":sel.tolist(),
-        "mu":mu.tolist(),"sd":sd.tolist(),"winsor_bounds":wins,"feat_order":[nm for nm,_ in feats]
+        "eps": eps,
+        "terms": [feats[i][0] for i in sel],
+        "b0": b0, "betas": bet, "sel_idx": sel.tolist(),
+        "mu": mu.tolist(), "sd": sd.tolist(),
+        "winsor_bounds": {k: (float(v[0]) if np.isfinite(v[0]) else np.nan,
+                              float(v[1]) if np.isfinite(v[1]) else np.nan)
+                          for k, v in winsor_bounds.items()},
+        "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(),
+        "feat_order": [nm for nm,_ in feats],
     }
 
-def predict_daily_calibrated_row(row: dict, model: dict) -> float:
+# ============================== Predict ==============================
+def predict_daily_calibrated(row: dict, model: dict) -> float:
     if not model or "betas" not in model: return np.nan
-    eps=float(model.get("eps",1e-6)); feat_order=model["feat_order"]
-    wins=model.get("winsor_bounds",{}); sel=model.get("sel_idx",[])
-    b0=float(model["b0"]); bet=np.array(model["betas"], dtype=float)
+    eps = float(model.get("eps", 1e-6))
+    feat_order = model["feat_order"]
+    winsor_bounds = model.get("winsor_bounds", {})
+    sel = model.get("sel_idx", [])
+    b0 = float(model["b0"]); bet = np.array(model["betas"], dtype=float)
 
     def safe_log(v):
-        v=float(v) if v is not None else np.nan
+        v = float(v) if v is not None else np.nan
         return np.log(np.clip(v, eps, None)) if np.isfinite(v) else np.nan
 
-    mcap=row.get("MC_PM_Max_M")
-    if mcap is None or (isinstance(mcap,float) and not np.isfinite(mcap)):
-        mcap=row.get("MarketCap_M$")
-    ln_mcap=np.log(np.clip(mcap if mcap is not None else np.nan, eps, None)) if mcap is not None else np.nan
+    ln_mcap_pmmax  = safe_log(row.get("MC_PM_Max_M") or row.get("MarketCap_M$"))
+    ln_gapf        = np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + eps, eps, None)) if row.get("Gap_%") is not None else np.nan
+    ln_atr         = safe_log(row.get("ATR_$"))
+    ln_pm          = safe_log(row.get("PM_Vol_M"))
+    ln_pm_dol      = safe_log(row.get("PM_$Vol_M$"))
+    ln_fr          = safe_log(row.get("FR_x"))
+    catalyst       = 1.0 if (str(row.get("CatalystYN","No")).lower()=="yes" or float(row.get("Catalyst",0))>=0.5) else 0.0
+    ln_float_pmmax = safe_log(row.get("Float_PM_Max_M") or row.get("Float_M"))
+    maxpullpm      = float(row.get("Max_Pull_PM_%")) if row.get("Max_Pull_PM_%") is not None else np.nan
+    ln_rvolmaxpm   = safe_log(row.get("RVOL_Max_PM_cum"))
+    pm_dol_over_mc = float(row.get("PM$Vol/MC_%")) if row.get("PM$Vol/MC_%") is not None else np.nan
 
-    ln_gapf=np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + eps, eps, None)) if row.get("Gap_%") is not None else np.nan
-    ln_atr=safe_log(row.get("ATR_$"))
-    ln_pm =safe_log(row.get("PM_Vol_M"))
-    ln_pm_dol=safe_log(row.get("PM_$Vol_M$"))
-    ln_fr =safe_log(row.get("FR_x"))
-    catalyst=1.0 if (str(row.get("CatalystYN","No")).lower()=="yes" or float(row.get("Catalyst",0))>=0.5) else 0.0
-
-    flt=row.get("Float_PM_Max_M")
-    if flt is None or (isinstance(flt,float) and not np.isfinite(flt)):
-        flt=row.get("Float_M")
-    ln_float=safe_log(flt)
-
-    maxpullpm=float(row.get("Max_Pull_PM_%")) if row.get("Max_Pull_PM_%") is not None else np.nan
-    ln_rvol=safe_log(row.get("RVOL_Max_PM_cum"))
-    pmmc=float(row.get("PM$Vol/MC_%")) if row.get("PM$Vol/MC_%") is not None else np.nan
-
-    fmap={
-        "ln_mcap_pmmax":ln_mcap, "ln_gapf":ln_gapf, "ln_atr":ln_atr, "ln_pm":ln_pm,
-        "ln_pm_dol":ln_pm_dol, "ln_fr":ln_fr, "catalyst":catalyst,
-        "ln_float_pmmax":ln_float, "maxpullpm":maxpullpm,
-        "ln_rvolmaxpm":ln_rvol, "pm_dol_over_mc":pmmc
+    feat_map = {
+        "ln_mcap_pmmax":  ln_mcap_pmmax, "ln_gapf": ln_gapf, "ln_atr": ln_atr, "ln_pm": ln_pm,
+        "ln_pm_dol": ln_pm_dol, "ln_fr": ln_fr, "catalyst": catalyst,
+        "ln_float_pmmax": ln_float_pmmax, "maxpullpm": maxpullpm,
+        "ln_rvolmaxpm": ln_rvolmaxpm, "pm_dol_over_mc": pm_dol_over_mc,
     }
-    X=[]
+
+    X_vec = []
     for nm in feat_order:
-        v=fmap.get(nm, np.nan)
+        v = feat_map.get(nm, np.nan)
         if not np.isfinite(v): return np.nan
-        lo,hi=wins.get(nm,(np.nan,np.nan))
+        lo, hi = winsor_bounds.get(nm, (np.nan, np.nan))
         if np.isfinite(lo) or np.isfinite(hi):
-            v=float(np.clip(v, lo if np.isfinite(lo) else v, hi if np.isfinite(hi) else v))
-        X.append(v)
-    X=np.array(X,dtype=float)
+            v = float(np.clip(v, lo if np.isfinite(lo) else v, hi if np.isfinite(hi) else v))
+        X_vec.append(v)
+    X_vec = np.array(X_vec, dtype=float)
     if not sel: return np.nan
-    yhat=b0+float(np.dot(X[sel], bet))
-    mult=np.exp(yhat) if np.isfinite(yhat) else np.nan
-    if not np.isfinite(mult): return np.nan
-    PM=float(row.get("PM_Vol_M") or np.nan)
-    if not np.isfinite(PM) or PM<=0: return np.nan
-    return float(PM*mult)
+    yhat_ln = b0 + float(np.dot(np.array(X_vec)[sel], bet))
+    raw_mult = np.exp(yhat_ln) if np.isfinite(yhat_ln) else np.nan
+    if not np.isfinite(raw_mult): return np.nan
 
-# ============== Similarity heads ==============
-def _elbow_kstar(d_sorted, k_min=3, k_max=15, max_rank=30):
-    n=len(d_sorted)
-    if n<=k_min: return max(1,n)
-    upto=min(max_rank, n-1)
-    if upto<2: return min(k_max, max(k_min, n))
-    gaps=d_sorted[:upto]-d_sorted[1:upto+1]
-    k=int(np.argmax(gaps)+1)
-    return max(k_min, min(k_max, k))
+    iso_bx = np.array(model.get("iso_bx", []), dtype=float)
+    iso_by = np.array(model.get("iso_by", []), dtype=float)
+    cal_mult = float(_iso_predict(iso_bx, iso_by, np.array([raw_mult]))[0]) if (iso_bx.size>=2 and iso_by.size>=2) else float(raw_mult)
+    cal_mult = max(cal_mult, 1.0)
 
-def _kernel_weights(d, k):
-    d=np.asarray(d)
-    k=min(k, len(d))
-    d=d[:k]
-    if d.size==0: return d, np.array([])
-    bw=np.median(d[d>0]) if np.any(d>0) else (np.mean(d)+1e-6)
-    bw=max(bw, 1e-6)
-    w=np.exp(-(d/bw)**2)
-    mask=w>=1e-6
-    return d[mask], w[mask]
+    PM = float(row.get("PM_Vol_M") or np.nan)
+    if not np.isfinite(PM) or PM <= 0: return np.nan
+    return float(PM * cal_mult)
 
-def train_nca_head(df: pd.DataFrame, feat_names: list[str]):
-    need=["FT01"]+feat_names
-    dfx=df[need].dropna()
-    if dfx.shape[0]<30: return {}
-    y=dfx["FT01"].astype(int).values
-    X=dfx[feat_names].astype(float).values
-    scaler=StandardScaler().fit(X)
-    Xs=scaler.transform(X)
-    nca=NeighborhoodComponentsAnalysis(n_components=min(6, len(feat_names)), random_state=42, max_iter=250)
-    Xn=nca.fit_transform(Xs, y)
-    guard=IsolationForest(n_estimators=200, random_state=42, contamination="auto").fit(Xn)
-    meta_cols=["FT01"]
-    for c in ("TickerDB","Ticker"):
-        if c in df.columns: meta_cols.append(c)
-    for f in feat_names:
-        if f in df.columns and f not in meta_cols: meta_cols.append(f)
-    meta=df.loc[dfx.index, meta_cols].reset_index(drop=True)
-    return {"scaler":scaler,"nca":nca,"X_emb":Xn,"y":y,"feat_names":feat_names,"df_meta":meta,"guard":guard}
-
-def train_leaf_head(df: pd.DataFrame, feat_names: list[str]):
-    if not CATBOOST_AVAILABLE: return {}
-    need=["FT01"]+feat_names
-    dfx=df[need].dropna()
-    if dfx.shape[0]<30: return {}
-    y=dfx["FT01"].astype(int).values
-    X=dfx[feat_names].astype(float).values
-    scaler=StandardScaler().fit(X); Xs=scaler.transform(X)
-    class_weights=[1.0, float((y==0).sum()/max(1,(y==1).sum()))]
-    n=len(y); val_size=max(20, int(0.15*n))
-    idx=np.arange(n); rs=np.random.RandomState(42); rs.shuffle(idx)
-    tr_idx, va_idx=idx[val_size:], idx[:val_size]
-    train_pool=Pool(Xs[tr_idx], y[tr_idx]); val_pool=Pool(Xs[va_idx], y[va_idx])
-    cat=CatBoostClassifier(
-        depth=6, learning_rate=0.08, iterations=2000, loss_function="Logloss",
-        random_seed=42, l2_leaf_reg=6, class_weights=class_weights,
-        bootstrap_type='No', random_strength=0.0, early_stopping_rounds=50,
-        verbose=False, allow_writing_files=False
-    )
-    cat.fit(train_pool, eval_set=val_pool, use_best_model=True)
-    leaf_mat=np.array(cat.calc_leaf_indexes(Pool(Xs)), dtype=int)  # (n, n_trees)
-    metric="hamming"
-    meta_cols=["FT01"]
-    for c in ("TickerDB","Ticker"):
-        if c in df.columns: meta_cols.append(c)
-    for f in feat_names:
-        if f in df.columns and f not in meta_cols: meta_cols.append(f)
-    meta=df.loc[dfx.index, meta_cols].reset_index(drop=True)
-    return {"scaler":scaler,"cat":cat,"emb":leaf_mat,"y":y,"feat_names":feat_names,"metric":metric,"df_meta":meta}
-
-def _nca_score(model, row_dict):
-    if not model: return None
-    feats=model["feat_names"]
-    vec=[]
-    for f in feats:
-        v=row_dict.get(f, None)
-        if v is None or (isinstance(v,float) and not np.isfinite(v)): return None
-        vec.append(float(v))
-    xs=model["scaler"].transform(np.array(vec)[None,:])
-    xn=model["nca"].transform(xs)
-    oos=model["guard"].decision_function(xn.reshape(1,-1))[0]
-    d=pairwise_distances(xn, model["X_emb"], metric="euclidean").ravel()
-    order=np.argsort(d); d_sorted=d[order]
-    k=_elbow_kstar(d_sorted, 3, 15, 30)
-    d_top, w_top=_kernel_weights(d_sorted, k)
-    if w_top.size==0: return {"p1":0.0,"k":0,"oos":float(oos)}
-    idx=order[:len(d_top)]
-    y=model["y"][idx]
-    w=w_top/(w_top.sum() if w_top.sum()>0 else 1.0)
-    p1=float(np.dot((y==1).astype(float), w))*100.0
-    return {"p1":p1,"k":int(len(idx)),"oos":float(oos)}
-
-def _leaf_score(model, row_dict):
-    if (not CATBOOST_AVAILABLE) or (not model): return None
-    feats=model["feat_names"]
-    vec=[]
-    for f in feats:
-        v=row_dict.get(f, None)
-        if v is None or (isinstance(v,float) and not np.isfinite(v)): return None
-        vec.append(float(v))
-    xs=model["scaler"].transform(np.array(vec)[None,:])
-    emb_q=np.array(model["cat"].calc_leaf_indexes(Pool(xs)), dtype=int)
-    d=pairwise_distances(emb_q, model["emb"], metric=model["metric"]).ravel()
-    order=np.argsort(d); d_sorted=d[order]
-    k=_elbow_kstar(d_sorted, 3, 15, 30)
-    d_top, w_top=_kernel_weights(d_sorted, k)
-    if w_top.size==0: return {"p1":0.0,"k":0}
-    idx=order[:len(d_top)]
-    y=model["y"][idx]
-    w=w_top/(w_top.sum() if w_top.sum()>0 else 1.0)
-    p1=float(np.dot((y==1).astype(float), w))*100.0
-    return {"p1":p1,"k":int(len(idx))}
-
-# ============== Feature selection (efficient drop-one + stability) ==============
-def _stratified_folds(y, max_splits=5):
-    # keep folds small/fast and valid for tiny DBs
-    n_pos=int((y==1).sum()); n_neg=int((y==0).sum())
-    n_splits=min(max_splits, max(2, min(n_pos, n_neg, 5)))
-    return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-
-def _cv_scores_for_head_per_fold(df, feats, head="nca"):
-    dfx=df[["FT01"]+feats].dropna()
-    if dfx.empty or dfx["FT01"].nunique()<2:
-        return [0.5]
-    X=dfx[feats].astype(float).values
-    y=dfx["FT01"].astype(int).values
-    skf=_stratified_folds(y, max_splits=5)
-    scores=[]
-    for tr, va in skf.split(X, y):
-        part=dfx.reset_index(drop=True)
-        tr_df=part.loc[tr]; va_df=part.loc[va]
-        if head=="nca":
-            mdl=train_nca_head(tr_df, feats)
-            if not mdl: 
-                scores.append(0.5); continue
-            s=[]
-            for i in va_df.index:
-                x=_nca_score(mdl, va_df.loc[i, feats].to_dict())
-                s.append(np.nan if x is None else x["p1"]/100.0)
-        else:
-            mdl=train_leaf_head(tr_df, feats)
-            if not mdl:
-                scores.append(0.5); continue
-            s=[]
-            for i in va_df.index:
-                x=_leaf_score(mdl, va_df.loc[i, feats].to_dict())
-                s.append(np.nan if x is None else x["p1"]/100.0)
-        y_true=va_df["FT01"].values
-        s=np.array(s, dtype=float); m=np.isfinite(s)
-        if m.sum()<3 or len(np.unique(y_true[m]))<2:
-            scores.append(float(np.mean((s[m]>=0.5)==y_true[m])) if m.any() else 0.5)
-        else:
-            try: scores.append(float(roc_auc_score(y_true[m], s[m])))
-            except: scores.append(float(np.mean((s[m]>=0.5)==y_true[m])))
-    return scores
-
-def select_features_with_drop_one(df, base_feats, head="nca", stability=0.6, max_keep=10, min_keep=6):
-    # compute base fold-scores once
-    base_fold_scores=_cv_scores_for_head_per_fold(df, base_feats, head=head)
-    base=np.nanmean(base_fold_scores)
-
-    contrib={}
-    stable_mask={}  # feature -> list of per-fold positive-contrib booleans
-
-    # drop-one per feature: compute per-fold scores once → deltas
-    for f in base_feats:
-        feats_minus=[x for x in base_feats if x!=f]
-        fold_scores=_cv_scores_for_head_per_fold(df, feats_minus, head=head)
-        # align lengths (just in case)
-        L=min(len(base_fold_scores), len(fold_scores))
-        deltas=np.array(base_fold_scores[:L]) - np.array(fold_scores[:L])
-        contrib[f]=float(np.nanmean(deltas))
-        stable_mask[f]=list((deltas>0).astype(int))
-
-    # stability filter
-    stable=[]
-    for f in base_feats:
-        arr=np.array(stable_mask[f], dtype=float)
-        if arr.size==0: continue
-        if np.nanmean(arr)>=stability: stable.append(f)
-
-    # floor by contribution if too few
-    if len(stable)<min_keep:
-        rank=sorted(contrib.items(), key=lambda kv: (-kv[1], kv[0]))
-        stable=[f for f,_ in rank[:max(min_keep, min(len(base_feats), max_keep))]]
-
-    # cap max_keep by contribution
-    if len(stable)>max_keep:
-        rank=sorted([(f, contrib.get(f,0.0)) for f in stable], key=lambda kv:(-kv[1], kv[0]))
-        stable=[f for f,_ in rank[:max_keep]]
-
-    return stable
-
-# ============== Variables (12) ==============
-FEAT12 = [
-    "MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%",
-    "Max_Pull_PM_%","PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%",
-    "RVOL_Max_PM_cum","FR_x","PM_Vol_%"
+# ============================== NCA (FT=1) ==============================
+# We add a compact NCA head that uses 12 signals:
+# ["MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%","Max_Pull_PM_%",
+#  "PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%","RVOL_Max_PM_cum","FR_x","PM_Vol_%"]
+NCA_FEATS = [
+    "MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%","Max_Pull_PM_%",
+    "PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%","RVOL_Max_PM_cum","FR_x","PM_Vol_%"
 ]
 
-# ============== Upload / Build ==============
+try:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.neighbors import NeighborhoodComponentsAnalysis
+    from sklearn.metrics import pairwise_distances
+    SKLEARN_OK = True
+except Exception:
+    SKLEARN_OK = False
+
+def _build_nca(df: pd.DataFrame):
+    """Fit NCA on rows with FT01 and available features; return dict model or {}."""
+    if not SKLEARN_OK: return {}
+    feats = [f for f in NCA_FEATS if f in df.columns]
+    need = feats + ["FT01"]
+    face = df[need].dropna()
+    if face.shape[0] < 30 or len(feats) < 3:
+        return {}
+    y = face["FT01"].astype(int).values
+    X = face[feats].astype(float).values
+    scaler = StandardScaler().fit(X)
+    Xs = scaler.transform(X)
+    nca = NeighborhoodComponentsAnalysis(
+        n_components=min(6, Xs.shape[1]),
+        random_state=42,
+        max_iter=250
+    )
+    Xn = nca.fit_transform(Xs, y)
+    return {"scaler":scaler, "nca":nca, "X_emb":Xn, "y":y, "feat_names":feats}
+
+def _nca_score(model: dict, row: dict, k_fixed=7):
+    """Return % of FT=1 among kernel-weighted NCA neighbors."""
+    if not model: return np.nan
+    feats = model["feat_names"]
+    vec = []
+    for f in feats:
+        v = row.get(f, np.nan)
+        if v is None or (isinstance(v,float) and not np.isfinite(v)):
+            return np.nan
+        vec.append(float(v))
+    x = np.array(vec, dtype=float)[None, :]
+    xs = model["scaler"].transform(x)
+    xn = model["nca"].transform(xs)
+    Xn = model["X_emb"]; y = model["y"]
+    d = pairwise_distances(xn, Xn, metric="euclidean").ravel()
+    order = np.argsort(d)
+    k = int(max(1, min(k_fixed, len(order))))
+    top = order[:k]
+    d_top = d[top]
+    # Gaussian kernel with bandwidth = median positive distance (with a small floor)
+    pos = d_top[d_top>0]
+    bw = np.median(pos) if pos.size else (np.mean(d_top)+1e-6)
+    bw = max(bw, 1e-6)
+    w = np.exp(-(d_top/bw)**2)
+    s = w.sum() if w.sum()>0 else 1.0
+    p = float(np.dot((y[top]==1).astype(float), w/s))*100.0
+    return p
+
+# ============================== Summaries ==============================
+def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col: str, labels_map=None):
+    avail = [v for v in var_all if v in df_in.columns]
+    if not avail:
+        empty = pd.DataFrame()
+        return {"med_tbl": empty, "mad_tbl": empty, "avail": []}
+    g = df_in.groupby(group_col, observed=True)[avail]
+    med_tbl = g.median(numeric_only=True).T
+    mad_tbl = df_in.groupby(group_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad)).T
+    if labels_map is not None:
+        med_tbl = med_tbl.rename(columns=labels_map)
+        mad_tbl = mad_tbl.rename(columns=labels_map)
+    return {"med_tbl": med_tbl, "mad_tbl": mad_tbl, "avail": avail}
+
+def _make_top_flag(series_pct: pd.Series, top_cut: int) -> tuple[pd.Series, float]:
+    s = pd.to_numeric(series_pct, errors="coerce")
+    mask = s.notna()
+    if not mask.any(): return pd.Series(False, index=series_pct.index), np.nan
+    thr = float(np.nanpercentile(s[mask].values, 100 - top_cut))
+    flag = (s >= thr) & mask
+    return flag, thr
+
+# ============================== Upload / Build ==============================
 st.subheader("Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
-build_btn = st.button("Build models", use_container_width=True, key="db_build_btn")
+build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
 
 @st.cache_data(show_spinner=False)
 def _hash_bytes(b: bytes) -> str:
@@ -483,222 +434,410 @@ def _hash_bytes(b: bytes) -> str:
 
 @st.cache_data(show_spinner=True)
 def _load_sheet(file_bytes: bytes):
-    xls=pd.ExcelFile(file_bytes)
-    sheet_candidates=[s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
-    sheet=sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
-    raw=pd.read_excel(xls, sheet)
+    xls = pd.ExcelFile(file_bytes)
+    sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
+    sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
+    raw = pd.read_excel(xls, sheet)
     return raw, sheet, tuple(xls.sheet_names)
 
-if build_btn and not ss.building:
-    ss.building = True
-    try:
-        if not uploaded:
-            st.error("Please upload an Excel workbook first.")
-        else:
-            file_bytes=uploaded.getvalue()
-            data_hash=_hash_bytes(file_bytes)
-            if data_hash == ss.data_hash and not ss.base_df.empty:
-                st.info("Same file as last build — skipping rebuild.")
-                ss.building = False
-                st.stop()
-
-            raw, sel_sheet, _ = _load_sheet(file_bytes)
+if build_btn:
+    if not uploaded:
+        st.error("Please upload an Excel workbook first.")
+    else:
+        try:
+            file_bytes = uploaded.getvalue()
+            _ = _hash_bytes(file_bytes)
+            raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
 
             # detect FT column
-            poss=[c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
-            col_group=poss[0] if poss else None
+            possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
+            col_group = possible[0] if possible else None
             if col_group is None:
                 for c in raw.columns:
-                    vals=pd.Series(raw[c]).dropna().astype(str).str.lower()
+                    vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
                     if len(vals) and vals.isin(["0","1","true","false","yes","no"]).all():
-                        col_group=c; break
+                        col_group = c; break
             if col_group is None:
-                st.error("Could not detect FT (0/1) column.")
-                ss.building=False
-                st.stop()
+                st.error("Could not detect FT (0/1) column."); st.stop()
 
-            df=pd.DataFrame()
-            df["GroupRaw"]=raw[col_group]
+            df = pd.DataFrame()
+            df["GroupRaw"] = raw[col_group]
 
-            def add_num(dfout,name,cands):
-                src=_pick(raw,cands)
-                if src: dfout[name]=pd.to_numeric(raw[src].map(_to_float), errors="coerce")
+            def add_num(dfout, name, src_candidates):
+                src = _pick(raw, src_candidates)
+                if src: dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-            # map
-            add_num(df,"MC_PM_Max_M",["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
-            add_num(df,"Float_PM_Max_M",["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
-            add_num(df,"MarketCap_M$",["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
-            add_num(df,"Float_M",["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
-            add_num(df,"Gap_%",["gap %","gap%","premarket gap","gap","gap_percent"])
-            add_num(df,"ATR_$",["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
-            add_num(df,"PM_Vol_M",["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
-            add_num(df,"PM_$Vol_M$",["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
-            add_num(df,"PM_Vol_%",["pm vol (%)","pm_vol_%","pm vol percent","pm volume (%)","pm_vol_percent"])
-            add_num(df,"Daily_Vol_M",["daily vol (m)","daily_vol_m","day volume (m)","dvol_m"])
-            add_num(df,"Max_Pull_PM_%",["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
-            add_num(df,"RVOL_Max_PM_cum",["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
+            # map fields
+            add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
+            add_num(df, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
+            add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
+            add_num(df, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
+            add_num(df, "Gap_%",            ["gap %","gap%","premarket gap","gap","gap_percent"])
+            add_num(df, "ATR_$",            ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
+            add_num(df, "PM_Vol_M",         ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
+            add_num(df, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
+            add_num(df, "PM_Vol_%",         ["pm vol (%)","pm_vol_%","pm vol percent","pm volume (%)","pm_vol_percent"])
+            add_num(df, "Daily_Vol_M",      ["daily vol (m)","daily_vol_m","day volume (m)","dvol_m"])
+            add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
+            add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
 
             # catalyst
-            cand_catalyst=_pick(raw,["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
-            if cand_catalyst: df["Catalyst"]=pd.Series(raw[cand_catalyst]).map(lambda v: float(_safe_to_binary(v)) if _safe_to_binary(v) in (0,1) else np.nan)
+            cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
+            def _to_binary_local(v):
+                sv = str(v).strip().lower()
+                if sv in {"1","true","yes","y","t"}: return 1.0
+                if sv in {"0","false","no","n","f"}: return 0.0
+                try:
+                    fv = float(sv); return 1.0 if fv >= 0.5 else 0.0
+                except: return np.nan
+            if cand_catalyst: df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
 
-            # derived fields
-            float_basis = "Float_PM_Max_M" if ("Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any()) else "Float_M"
+            # derived
+            float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
             if {"PM_Vol_M", float_basis}.issubset(df.columns):
-                df["FR_x"]=(df["PM_Vol_M"]/df[float_basis]).replace([np.inf,-np.inf], np.nan)
-
-            mcap_basis="MC_PM_Max_M" if ("MC_PM_Max_M" in df.columns and df["MC_PM_Max_M"].notna().any()) else "MarketCap_M$"
+                df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
+            mcap_basis = "MC_PM_Max_M" if "MC_PM_Max_M" in df.columns and df["MC_PM_Max_M"].notna().any() else "MarketCap_M$"
             if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
-                df["PM$Vol/MC_%"]=(df["PM_$Vol_M$"]/df[mcap_basis]*100.0).replace([np.inf,-np.inf], np.nan)
+                df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-            # % scaling (DB stores fractions)
-            if "Gap_%" in df.columns: df["Gap_%"]=pd.to_numeric(df["Gap_%"], errors="coerce")*100.0
-            if "PM_Vol_%" in df.columns: df["PM_Vol_%"]=pd.to_numeric(df["PM_Vol_%"], errors="coerce")*100.0
-            if "Max_Pull_PM_%" in df.columns: df["Max_Pull_PM_%"]=pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce")*100.0
+            # scale % fields (DB stores fractions)
+            if "Gap_%" in df.columns:            df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
+            if "PM_Vol_%" in df.columns:         df["PM_Vol_%"] = pd.to_numeric(df["PM_Vol_%"], errors="coerce") * 100.0
+            if "Max_Pull_PM_%" in df.columns:    df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
 
-            df["FT01"]=pd.Series(df["GroupRaw"]).map(_safe_to_binary)
-            df=df[df["FT01"].isin([0,1])].copy()
+            # FT groups
+            def _to_binary(v):
+                sv = str(v).strip().lower()
+                if sv in {"1","true","yes","y","t"}: return 1
+                if sv in {"0","false","no","n","f"}: return 0
+                try:
+                    fv = float(sv); return 1 if fv >= 0.5 else 0
+                except: return np.nan
+            df["FT01"] = df["GroupRaw"].map(_to_binary)
+            df = df[df["FT01"].isin([0,1])].copy()
+            df["GroupFT"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-            # Build full predictor for queries (cached)
-            ss.pred_model_full = train_ratio_winsor_iso(df) or {}
-
-            # OOF PredVol_M for PM_Vol_% (anti-leak)
-            needed_pred_cols={"PM_Vol_M","Daily_Vol_M","ATR_$","PM_$Vol_M$","FR_x","Gap_%"}
-            mask_ok = pd.Series(True, index=df.index)
-            for c in needed_pred_cols:
-                mask_ok &= df[c].notna()
-            dfx_pred=df[mask_ok].reset_index(drop=True)
-            n=len(dfx_pred)
-            oof=np.full(n, np.nan)
-            y_ft=dfx_pred["FT01"].values
-            skf=_stratified_folds(y_ft, max_splits=5)
-            for tr, va in skf.split(np.zeros(n), y_ft):
-                mdl=train_ratio_winsor_iso(dfx_pred.iloc[tr])
-                if not mdl: continue
-                # vectorized-ish apply
-                for ridx in va:
-                    row=dfx_pred.iloc[ridx].to_dict()
-                    oof[ridx]=predict_daily_calibrated_row(row, mdl)
-            dfx_pred["PredVol_M_OOF"]=oof
-            df["PredVol_M_OOF"]=np.nan
-            df.loc[dfx_pred.index, "PredVol_M_OOF"]=dfx_pred["PredVol_M_OOF"].values
-            df["PM_Vol_%"]=100.0*df["PM_Vol_M"]/df["PredVol_M_OOF"]
+            # Max Push Daily (%) fraction -> %
+            pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
+            if pmh_col is not None:
+                pmh_raw = pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce")
+                df["Max_Push_Daily_%"] = pmh_raw * 100.0
+            else:
+                df["Max_Push_Daily_%"] = np.nan
 
             ss.base_df = df
-            ss.data_hash = data_hash
+            ss.var_core = [v for v in VAR_CORE if v in df.columns]
+            ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
 
-            # Feature selection per head on clean rows
-            feat_base=[f for f in FEAT12 if f in df.columns]
-            train_df=df.dropna(subset=feat_base+["FT01"]).copy()
-            if train_df.shape[0]<40:
-                st.warning("Very small training set after NaN drop; results may be unstable.")
+            # train model once (on full base)
+            ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
 
-            feat_nca  = select_features_with_drop_one(train_df, feat_base, head="nca", stability=0.6, max_keep=10, min_keep=6)
-            feat_leaf = select_features_with_drop_one(train_df, feat_base, head="leaf", stability=0.6, max_keep=10, min_keep=6) if CATBOOST_AVAILABLE else []
+            # ---- Build the NCA model (FT=1 similarity) ----
+            ss.nca = _build_nca(df)  # safe {}, if not enough data keeps UI working
 
-            ss.nca_model  = train_nca_head(train_df, feat_nca) if len(feat_nca)>=3 else {}
-            ss.leaf_model = train_leaf_head(train_df, feat_leaf) if (CATBOOST_AVAILABLE and len(feat_leaf)>=3) else {}
+            st.success(f"Loaded “{sel_sheet}”. Base ready.")
+            do_rerun()
+        except Exception as e:
+            st.error("Loading/processing failed.")
+            st.exception(e)
 
-            sf_cols = st.columns(3)
-            with sf_cols[0]:
-                st.success(f"NCA features ({len(feat_nca)}): " + ", ".join(feat_nca))
-            with sf_cols[1]:
-                if CATBOOST_AVAILABLE and ss.leaf_model:
-                    st.success(f"Leaf features ({len(feat_leaf)}): " + ", ".join(feat_leaf))
-                elif not CATBOOST_AVAILABLE:
-                    st.error("CatBoost not installed — Leaf head disabled.")
-                else:
-                    st.warning("Leaf head not trained (too few clean rows).")
-            with sf_cols[2]:
-                st.info(f"OOF PredVol_M computed for PM_Vol_% (anti-leak).")
-
-            st.success(f"Loaded “{sel_sheet}”. Models ready.")
-    except Exception as e:
-        st.error("Loading/processing failed.")
-        st.exception(e)
-    finally:
-        ss.building = False
-        do_rerun()
-
-# ============== Add Stock ==============
+# ============================== Add Stock ==============================
 st.markdown("---")
 st.subheader("Add Stock")
 
 with st.form("add_form", clear_on_submit=True):
-    c1,c2,c3=st.columns([1.2,1.2,0.8])
+    c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
     with c1:
-        ticker=st.text_input("Ticker","").strip().upper()
-        mc_pmmax=st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
-        float_pm=st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
-        gap_pct=st.number_input("Gap %", 0.0, step=0.01, format="%.2f")
-        max_pull_pm=st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")
+        ticker      = st.text_input("Ticker", "").strip().upper()
+        mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
+        float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
+        gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")
+        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")
     with c2:
-        atr_usd=st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
-        pm_vol=st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
-        pm_dol=st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
-        rvol_pm_cum=st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
+        atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
+        pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
+        pm_dol      = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
+        rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
     with c3:
-        catalyst_yn=st.selectbox("Catalyst?", ["No","Yes"], index=0)
-    submitted=st.form_submit_button("Add to Table", use_container_width=True)
+        catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
+    submitted = st.form_submit_button("Add to Table", use_container_width=True)
 
 if submitted and ticker:
-    fr=(pm_vol/float_pm) if float_pm>0 else 0.0
-    pmmc=(pm_dol/mc_pmmax*100.0) if mc_pmmax>0 else 0.0
-    row={
-        "Ticker":ticker,
-        "MC_PM_Max_M":mc_pmmax,
-        "Float_PM_Max_M":float_pm,
-        "Gap_%":gap_pct,
-        "ATR_$":atr_usd,
-        "PM_Vol_M":pm_vol,
-        "PM_$Vol_M$":pm_dol,
-        "FR_x":fr,
-        "PM$Vol/MC_%":pmmc,
-        "Max_Pull_PM_%":max_pull_pm,
-        "RVOL_Max_PM_cum":rvol_pm_cum,
-        "CatalystYN":catalyst_yn,
-        "Catalyst":1.0 if catalyst_yn=="Yes" else 0.0,
+    fr   = (pm_vol / float_pm) if float_pm > 0 else 0.0
+    pmmc = (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else 0.0
+    row = {
+        "Ticker": ticker,
+        "MC_PM_Max_M": mc_pmmax,
+        "Float_PM_Max_M": float_pm,
+        "Gap_%": gap_pct,
+        "ATR_$": atr_usd,
+        "PM_Vol_M": pm_vol,
+        "PM_$Vol_M$": pm_dol,
+        "FR_x": fr,
+        "PM$Vol/MC_%": pmmc,
+        "Max_Pull_PM_%": max_pull_pm,
+        "RVOL_Max_PM_cum": rvol_pm_cum,
+        "CatalystYN": catalyst_yn,
+        "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
-    pred = predict_daily_calibrated_row(row, ss.get("pred_model_full", {}))
-    row["PredVol_M"]=float(pred) if np.isfinite(pred) else np.nan
-    denom=row["PredVol_M"]
-    row["PM_Vol_%"]=(row["PM_Vol_M"]/denom)*100.0 if np.isfinite(denom) and denom>0 else np.nan
-    ss.rows.append(row); ss.last=row
+    pred = predict_daily_calibrated(row, ss.get("lassoA", {}))
+    row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
+    denom = row["PredVol_M"]
+    row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
+    ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
-# ============== Alignment Table (bars + child summary) ==============
+# ============================== Alignment ==============================
 st.markdown("### Alignment")
 
-if not ss.base_df.empty and ss.rows:
-    summaries=[]; details={}
-    for row in ss.rows:
-        tkr=row.get("Ticker","—")
-        nca_score=_nca_score(ss.nca_model, row) if ss.nca_model else None
-        leaf_score=_leaf_score(ss.leaf_model, row) if ss.leaf_model else None
-        p_nca = 0.0 if (nca_score is None) else float(nca_score.get("p1",0.0))
-        p_leaf = 0.0 if (leaf_score is None) else float(leaf_score.get("p1",0.0))
-        vals=[x for x in [p_nca if ss.nca_model else None, p_leaf if ss.leaf_model else None] if x is not None]
-        p_avg = float(np.mean(vals)) if len(vals)>0 else 0.0
-        summaries.append({"Ticker": tkr, "NCA_raw": p_nca, "NCA_int": int(round(p_nca)),
-                          "LEAF_raw": p_leaf, "LEAF_int": int(round(p_leaf)),
-                          "AVG_raw": p_avg, "AVG_int": int(round(p_avg))})
-        fields = FEAT12 + ["PredVol_M"]
-        rows=[{"__group__": "Inputs summary"}]
-        for f in fields:
-            val=row.get(f, None)
-            v = "" if (val is None or (isinstance(val,float) and not np.isfinite(val))) else float(val)
-            rows.append({"Variable": f, "Value": v})
-        details[tkr]=rows
+# --- compact top row: radios (left) + Gain% dropdown (right) ---
+col_mode, col_gain = st.columns([2.8, 1.0])
+with col_mode:
+    mode = st.radio(
+        "",
+        [
+            "FT vs Fail (Gain% cutoff on FT=1 only)",
+            "FT=1 (High vs Low cutoff)",
+            "Gain% vs Rest",
+        ],
+        horizontal=True,
+        key="cmp_mode",
+        label_visibility="collapsed",
+    )
+with col_gain:
+    gain_choices = [50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
+    gain_min = st.selectbox(
+        "",
+        gain_choices,
+        index=gain_choices.index(100) if 100 in gain_choices else 0,
+        key="gain_min_pct",
+        help="Threshold on Max Push Daily (%).",
+        label_visibility="collapsed",
+    )
 
-    import streamlit.components.v1 as components
-    def _round_rec(o):
-        if isinstance(o, dict): return {k:_round_rec(v) for k,v in o.items()}
-        if isinstance(o, list): return [_round_rec(v) for v in o]
-        if isinstance(o, float): return float(np.round(o,6))
-        return o
-    payload=_round_rec({"rows":summaries, "details":details})
+# --- base data guardrails ---
+base_df = ss.get("base_df", pd.DataFrame()).copy()
+if base_df.empty:
+    if ss.rows:
+        st.info("Upload DB and click **Build model stocks** to compute group centers first.")
+    else:
+        st.info("Upload DB (and/or add at least one stock) to compute alignment.")
+    st.stop()
 
-    html = """
+if "Max_Push_Daily_%" not in base_df.columns:
+    st.error("Column “Max Push Daily (%)” not found in DB (expected as Max_Push_Daily_% after load).")
+    st.stop()
+if "FT01" not in base_df.columns:
+    st.error("FT01 column not found (expected after load).")
+    st.stop()
+
+# ---------- build comparison dataframe + group labels ----------
+df_cmp = base_df.copy()
+thr = float(gain_min)
+
+if mode == "Gain% vs Rest":
+    df_cmp["__Group__"] = np.where(
+        pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr,
+        f"≥{int(thr)}%",
+        "Rest",
+    )
+    gA, gB = f"≥{int(thr)}%", "Rest"
+    status_line = f"Gain% split at ≥ {int(thr)}%"
+
+elif mode == "FT=1 (High vs Low cutoff)":
+    df_cmp = df_cmp[df_cmp["FT01"] == 1].copy()
+    gain_val = pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce")
+    df_cmp["__Group__"] = np.where(gain_val >= thr, f"FT=1 ≥{int(thr)}%", "FT=1 <{int_thr}%".format(int_thr=int(thr)))
+    gA, gB = f"FT=1 ≥{int(thr)}%", f"FT=1 <{int(thr)}%"
+    status_line = f"FT=1 split at Gain% ≥ {int(thr)}% (NaNs treated as Low)"
+
+else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
+    a_mask = (df_cmp["FT01"] == 1) & (pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr)
+    b_mask = (df_cmp["FT01"] == 0)
+    df_cmp = df_cmp[a_mask | b_mask].copy()
+    df_cmp["__Group__"] = np.where(df_cmp["FT01"] == 1, f"FT=1 ≥{int(thr)}%", "FT=0 (all)")
+    gA, gB = f"FT=1 ≥{int(thr)}%", "FT=0 (all)"
+    status_line = f"A: FT=1 with Gain% ≥ {int(thr)}% • B: all FT=0 (no cutoff)"
+
+st.caption(status_line)
+
+# ---------- summaries (median centers + MAD→σ for 3σ highlighting) ----------
+var_core = ss.get("var_core", [])
+var_mod  = ss.get("var_moderate", [])
+var_all  = var_core + var_mod
+
+def _mad_local(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty: return np.nan
+    med = float(np.median(s))
+    return float(np.median(np.abs(s - med)))
+
+def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col: str):
+    avail = [v for v in var_all if v in df_in.columns]
+    if not avail:
+        empty = pd.DataFrame()
+        return {"med_tbl": empty, "mad_tbl": empty}
+    g = df_in.groupby(group_col, observed=True)[avail]
+    med_tbl = g.median(numeric_only=True).T
+    mad_tbl = df_in.groupby(group_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad_local)).T
+    return {"med_tbl": med_tbl, "mad_tbl": mad_tbl}
+
+summ = _summaries_median_and_mad(df_cmp, var_all, "__Group__")
+med_tbl = summ["med_tbl"]; mad_tbl = summ["mad_tbl"] * 1.4826  # MAD → σ
+
+# ensure exactly two groups exist (reorder as A|B and drop extras)
+if med_tbl.empty or med_tbl.shape[1] < 2:
+    st.info("Not enough data to form two groups with the current mode/threshold. Adjust settings.")
+    st.stop()
+
+cols = list(med_tbl.columns)
+if (gA in cols) and (gB in cols):
+    med_tbl = med_tbl[[gA, gB]]
+else:
+    top2 = df_cmp["__Group__"].value_counts().index[:2].tolist()
+    if len(top2) < 2:
+        st.info("One of the groups is empty. Adjust Gain% threshold.")
+        st.stop()
+    gA, gB = top2[0], top2[1]
+    med_tbl = med_tbl[[gA, gB]]
+
+mad_tbl = mad_tbl.reindex(index=med_tbl.index)[[gA, gB]]
+
+# ---------- alignment computation for entered rows ----------
+def _compute_alignment_counts_weighted(
+    stock_row: dict,
+    centers_tbl: pd.DataFrame,
+    var_core: list[str],
+    var_mod: list[str],
+    w_core: float = 1.0,
+    w_mod: float = 0.5,
+    tie_mode: str = "split",
+) -> dict:
+    if centers_tbl is None or centers_tbl.empty or len(centers_tbl.columns) != 2:
+        return {}
+    gA_, gB_ = list(centers_tbl.columns)
+    counts = {gA_: 0.0, gB_: 0.0}
+    core_pts = {gA_: 0.0, gB_: 0.0}
+    mod_pts  = {gA_: 0.0, gB_: 0.0}
+    idx_set = set(centers_tbl.index)
+
+    def _vote_one(var: str, weight: float, bucket: dict):
+        if var not in idx_set: return
+        xv = pd.to_numeric(stock_row.get(var), errors="coerce")
+        if not np.isfinite(xv): return
+        vA = float(centers_tbl.at[var, gA_]); vB = float(centers_tbl.at[var, gB_])
+        if np.isnan(vA) or np.isnan(vB): return
+        dA = abs(xv - vA); dB = abs(xv - vB)
+        if dA < dB:
+            counts[gA_] += weight; bucket[gA_] += weight
+        elif dB < dA:
+            counts[gB_] += weight; bucket[gB_] += weight
+        else:
+            if tie_mode == "split":
+                counts[gA_] += weight*0.5; counts[gB_] += weight*0.5
+                bucket[gA_] += weight*0.5; bucket[gB_] += weight*0.5
+
+    for v in var_core: _vote_one(v, w_core, core_pts)
+    for v in var_mod:  _vote_one(v, w_mod,  mod_pts)
+
+    total = counts[gA_] + counts[gB_]
+    a_raw = 100.0 * counts[gA_] / total if total > 0 else 0.0
+    b_raw = 100.0 - a_raw
+    a_int = int(round(a_raw)); b_int = 100 - a_int
+
+    return {
+        gA_: counts[gA_], gB_: counts[gB_],
+        "A_pts": counts[gA_], "B_pts": counts[gB_],
+        "A_core": core_pts[gA_], "B_core": core_pts[gB_],
+        "A_mod":  mod_pts[gA_],  "B_mod":  mod_pts[gB_],
+        "A_pct_raw": a_raw, "B_pct_raw": b_raw,
+        "A_pct_int": a_int, "B_pct_int": b_int,
+        "A_label": gA_, "B_label": gB_,
+    }
+
+centers_tbl = med_tbl.copy()
+disp_tbl = mad_tbl.copy()
+
+summary_rows, detail_map = [], {}
+detail_order = [("Core variables", var_core),
+                ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
+
+mt_index = set(centers_tbl.index); dt_index = set(disp_tbl.index)
+
+for row in ss.rows:
+    stock = dict(row); tkr = stock.get("Ticker") or "—"
+    counts = _compute_alignment_counts_weighted(
+        stock_row=stock, centers_tbl=centers_tbl, var_core=var_core, var_mod=var_mod,
+        w_core=1.0, w_mod=0.5, tie_mode="split",
+    )
+    if not counts: continue
+
+    # NCA FT=1 score (orange bar). Uses 12 signals; returns 0..100 or NaN.
+    nca_pct = _nca_score(ss.get("nca", {}), stock, k_fixed=7)
+
+    summary_rows.append({
+        "Ticker": tkr,
+        "A_val_raw": counts.get("A_pct_raw", 0.0),
+        "B_val_raw": counts.get("B_pct_raw", 0.0),
+        "A_val_int": counts.get("A_pct_int", 0),
+        "B_val_int": counts.get("B_pct_int", 0),
+        "A_label": counts.get("A_label", gA),
+        "B_label": counts.get("B_label", gB),
+        "NCA_val_raw": float(nca_pct) if (nca_pct is not None and np.isfinite(nca_pct)) else 0.0,
+        "NCA_val_int": int(round(nca_pct)) if (nca_pct is not None and np.isfinite(nca_pct)) else 0,
+        "NCA_label": "NCA (FT=1)",
+        "A_pts": counts.get("A_pts", 0.0),
+        "B_pts": counts.get("B_pts", 0.0),
+        "A_core": counts.get("A_core", 0.0),
+        "B_core": counts.get("B_core", 0.0),
+        "A_mod": counts.get("A_mod", 0.0),
+        "B_mod": counts.get("B_mod", 0.0),
+    })
+
+    drows_grouped = []
+    for grp_label, grp_vars in detail_order:
+        drows_grouped.append({"__group__": grp_label})
+        for v in grp_vars:
+            if v == "Daily_Vol_M": continue
+            va = pd.to_numeric(stock.get(v), errors="coerce")
+
+            med_var = "Daily_Vol_M" if v in ("PredVol_M",) else v
+            vA = centers_tbl.at[med_var, gA] if med_var in mt_index else np.nan
+            vB = centers_tbl.at[med_var, gB] if med_var in mt_index else np.nan
+
+            sA = float(disp_tbl.at[med_var, gA]) if (med_var in dt_index and pd.notna(disp_tbl.at[med_var, gA])) else np.nan
+            sB = float(disp_tbl.at[med_var, gB]) if (med_var in dt_index and pd.notna(disp_tbl.at[med_var, gB])) else np.nan
+
+            if v not in ("PredVol_M",) and pd.isna(va) and pd.isna(vA) and pd.isna(vB): continue
+
+            dA = None if (pd.isna(va) or pd.isna(vA)) else float(va - vA)
+            dB = None if (pd.isna(va) or pd.isna(vB)) else float(va - vB)
+
+            drows_grouped.append({
+                "Variable": v,
+                "Value": None if pd.isna(va) else float(va),
+                "A":   None if pd.isna(vA) else float(vA),
+                "B":   None if pd.isna(vB) else float(vB),
+                "sA":  None if not np.isfinite(sA) else float(sA),
+                "sB":  None if not np.isfinite(sB) else float(sB),
+                "d_vs_A": None if dA is None else dA,
+                "d_vs_B": None if dB is None else dB,
+                "is_core": (v in var_core),
+            })
+    detail_map[tkr] = drows_grouped
+
+# ---------------- HTML/JS render ----------------
+import streamlit.components.v1 as components
+
+def _round_rec(o):
+    if isinstance(o, dict): return {k:_round_rec(v) for k,v in o.items()}
+    if isinstance(o, list): return [_round_rec(v) for v in o]
+    if isinstance(o, float): return float(np.round(o, 6))
+    return o
+
+payload = _round_rec({"rows": summary_rows, "details": detail_map, "gA": gA, "gB": gB})
+
+html = """
 <!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
@@ -709,39 +848,98 @@ if not ss.base_df.empty and ss.rows:
   .bar{height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden}
   .bar>span{position:absolute;left:0;top:0;bottom:0;width:0%}
   .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:28px;text-align:center}
-  .blue>span{background:#3b82f6}.violet>span{background:#8b5cf6}.gray>span{background:#6b7280}
-  #align td:nth-child(2),#align th:nth-child(2),#align td:nth-child(3),#align th:nth-child(3),#align td:nth-child(4),#align th:nth-child(4){text-align:center}
+  .blue>span{background:#3b82f6}.red>span{background:#ef4444}.orange>span{background:#f59e0b}
+  #align td:nth-child(2),#align th:nth-child(2),
+  #align td:nth-child(3),#align th:nth-child(3),
+  #align td:nth-child(4),#align th:nth-child(4){text-align:center}
   .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
-  .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .child-table th:first-child,.child-table td:first-child{text-align:left}
   tr.group-row td{background:#f3f4f6!important;color:#374151;font-weight:600}
-  .col-var{width:40%}.col-val{width:60%}
+  .col-var{width:18%}.col-val{width:12%}.col-a{width:18%}.col-b{width:18%}.col-da{width:17%}.col-db{width:17%}
+  .pos{color:#059669}.neg{color:#dc2626}
+  .sig-hi{background:rgba(250,204,21,0.18)!important}
+  .sig-lo{background:rgba(239,68,68,0.18)!important}
 </style></head><body>
   <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead><tr><th>Ticker</th><th>NCA (FT=1)</th><th>Leaf (FT=1)</th><th>Average</th></tr></thead>
+    <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th><th>NCA (FT=1)</th></tr></thead>
   </table>
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
   <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
   <script>
     const data = %%PAYLOAD%%;
+    document.getElementById('hdrA').textContent = data.gA;
+    document.getElementById('hdrB').textContent = data.gB;
 
-    function barCell(valRaw, cls, valInt){
+    function barCellLabeled(valRaw,label,valInt){
+      const strong=(label==='FT=1' || label.startsWith('FT=1') || label.startsWith('≥'));
+      const isNCA=(label && label.toLowerCase().startsWith('nca'));
+      const cls=isNCA?'orange':(strong?'blue':'red');
       const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
       const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
       return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
     }
-    function formatVal(x){return (x==null||x==='')?'':Number(x).toFixed(4);}
+    function formatVal(x){return (x==null||isNaN(x))?'':Number(x).toFixed(2);}
 
     function childTableHTML(ticker){
       const rows=(data.details||{})[ticker]||[];
-      if(!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No details.</div>';
+      if(!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No variable overlaps for this stock.</div>';
+
       const cells = rows.map(r=>{
-        if(r.__group__) return '<tr class="group-row"><td colspan="2">'+r.__group__+'</td></tr>';
-        return `<tr><td class="col-var">${r.Variable}</td><td class="col-val">${formatVal(r.Value)}</td></tr>`;
+        if(r.__group__) return '<tr class="group-row"><td colspan="6">'+r.__group__+'</td></tr>';
+
+        const v=formatVal(r.Value), a=formatVal(r.A), b=formatVal(r.B);
+
+        const rawDa=(r.d_vs_A==null||isNaN(r.d_vs_A))?null:Number(r.d_vs_A);
+        const rawDb=(r.d_vs_B==null||isNaN(r.d_vs_B))?null:Number(r.d_vs_B);
+        const da=(rawDa==null)?'':formatVal(Math.abs(rawDa));
+        const db=(rawDb==null)?'':formatVal(Math.abs(rawDb));
+        const ca=(rawDa==null)?'':(rawDa>=0?'pos':'neg');
+        const cb=(rawDb==null)?'':(rawDb>=0?'pos':'neg');
+
+        // 3σ significance vs closer center
+        const val  = (r.Value==null || isNaN(r.Value)) ? null : Number(r.Value);
+        const cA   = (r.A==null || isNaN(r.A)) ? null : Number(r.A);
+        const cB   = (r.B==null || isNaN(r.B)) ? null : Number(r.B);
+        const sA   = (r.sA==null || isNaN(r.sA)) ? null : Number(r.sA);
+        const sB   = (r.sB==null || isNaN(r.sB)) ? null : Number(r.sB);
+
+        let sigClass = '';
+        if (val!=null && cA!=null && cB!=null) {
+          const dAabs = Math.abs(val - cA);
+          const dBabs = Math.abs(val - cB);
+          const closer = (dAabs <= dBabs) ? 'A' : 'B';
+          const center = closer === 'A' ? cA : cB;
+          const sigma  = closer === 'A' ? sA : sB;
+
+          if (sigma!=null && sigma>0) {
+            const z = (val - center) / sigma;
+            if (z >= 3)       sigClass = 'sig-hi';
+            else if (z <= -3) sigClass = 'sig-lo';
+          }
+        }
+
+        return `<tr class="${sigClass}">
+          <td class="col-var">${r.Variable}</td>
+          <td class="col-val">${v}</td>
+          <td class="col-a">${a}</td>
+          <td class="col-b">${b}</td>
+          <td class="col-da ${ca}">${da}</td>
+          <td class="col-db ${cb}">${db}</td>
+        </tr>`;
       }).join('');
+
       return `<table class="child-table">
-        <colgroup><col class="col-var"/><col class="col-val"/></colgroup>
-        <thead><tr><th class="col-var">Variable</th><th class="col-val">Value</th></tr></thead>
+        <colgroup><col class="col-var"/><col class="col-val"/><col class="col-a"/><col class="col-b"/><col class="col-da"/><col class="col-db"/></colgroup>
+        <thead><tr>
+          <th class="col-var">Variable</th>
+          <th class="col-val">Value</th>
+          <th class="col-a">${data.gA} center</th>
+          <th class="col-b">${data.gB} center</th>
+          <th class="col-da">Δ vs ${data.gA}</th>
+          <th class="col-db">Δ vs ${data.gB}</th>
+        </tr></thead>
         <tbody>${cells}</tbody></table>`;
     }
 
@@ -750,40 +948,45 @@ if not ss.base_df.empty and ss.rows:
         data: data.rows||[], responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
         columns:[
           {data:'Ticker'},
-          {data:null, render:(r)=>barCell(r.NCA_raw,'blue',r.NCA_int)},
-          {data:null, render:(r)=>barCell(r.LEAF_raw,'violet',r.LEAF_int)},
-          {data:null, render:(r)=>barCell(r.AVG_raw,'gray',r.AVG_int)}
+          {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int)},
+          {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int)},
+          {data:null, render:(row)=>barCellLabeled(row.NCA_val_raw,row.NCA_label,row.NCA_val_int)}
         ]
       });
       $('#align tbody').on('click','tr',function(){
         const row=table.row(this);
         if(row.child.isShown()){ row.child.hide(); $(this).removeClass('shown'); }
-        else { row.child(childTableHTML(row.data().Ticker)).show(); $(this).addClass('shown'); }
+        else { const t=row.data().Ticker; row.child(childTableHTML(t)).show(); $(this).addClass('shown'); }
       });
     });
   </script>
 </body></html>
 """
-    import streamlit.components.v1 as components
-    components.html(html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload)), height=620, scrolling=True)
-else:
-    if ss.base_df.empty:
-        st.info("Upload DB and click **Build models**.")
-    elif not ss.rows:
-        st.info("Add at least one stock to compare.")
+html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
+components.html(html, height=620, scrolling=True)
 
-# ============== Delete Control ==============
-tickers=[r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-unique=[]; seen=set()
+# ============================== Delete Control (below table; no title) ==============================
+tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
+unique_tickers, _seen = [], set()
 for t in tickers:
-    if t and t not in seen: unique.append(t); seen.add(t)
-c1,c2=st.columns([4,1])
-with c1:
-    sel=st.multiselect("", options=unique, default=[], placeholder="Select tickers…", label_visibility="collapsed")
-with c2:
-    if st.button("Delete", use_container_width=True):
-        if sel:
-            ss.rows=[r for r in ss.rows if r.get("Ticker") not in set(sel)]
-            st.success(f"Deleted: {', '.join(sel)}"); do_rerun()
+    if t and t not in _seen:
+        unique_tickers.append(t); _seen.add(t)
+
+del_cols = st.columns([4, 1])
+with del_cols[0]:
+    to_delete = st.multiselect(
+        "",
+        options=unique_tickers,
+        default=[],
+        key="del_selection",
+        placeholder="Select tickers…",
+        label_visibility="collapsed",
+    )
+with del_cols[1]:
+    if st.button("Delete", use_container_width=True, key="delete_btn"):
+        if to_delete:
+            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
+            st.success(f"Deleted: {', '.join(to_delete)}")
+            do_rerun()
         else:
             st.info("No tickers selected.")
