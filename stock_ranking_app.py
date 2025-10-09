@@ -571,7 +571,7 @@ if submitted and ticker:
     st.success(f"Saved {ticker}."); do_rerun()
 
 # ============================== Alignment (RF similarity) ==============================
-st.markdown("### Alignment (RF similarity — FT=1 vs FT=0)")
+st.markdown("### Alignment")
 
 base_df = ss.get("base_df", pd.DataFrame()).copy()
 if base_df.empty or not ss.rf_model:
