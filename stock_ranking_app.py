@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 import re, json, hashlib
 
+np.random.seed(42)
+
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
@@ -797,8 +799,8 @@ for row in ss.rows:
     if not counts: continue
 
     # NCA score already computed at add time; recompute if missing/new model
-    if "NCA_FT1_%" = stock.get("NCA_FT1_%", None) is None or not np.isfinite(stock.get("NCA_FT1_%", np.nan)):
-        stock["NCA_FT1_%"] = nca_score_one(ss.get("nca_model", {}), stock)
+    if ("NCA_FT1_%" not in stock) or (stock.get("NCA_FT1_%") is None) or (not np.isfinite(stock.get("NCA_FT1_%", np.nan))):
+        stock["NCA_FT1_%"] = float(p_nca) if np.isfinite(p_nca) else np.nan
 
     p_nca = stock.get("NCA_FT1_%", np.nan)
     p_nca_int = int(round(p_nca)) if (p_nca is not None and np.isfinite(p_nca)) else 0
