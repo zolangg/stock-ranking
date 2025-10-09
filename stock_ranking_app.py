@@ -425,15 +425,15 @@ def _elbow_kstar(sorted_vals, k_min=3, k_max=15, max_rank=25):
     k_star = int(np.argmax(gaps) + 1)
     return max(k_min, min(k_max, k_star))
 
-def _kernel_weights(dists, k_star):
+def _kernel_weights(dists, k_star, floor=1e-12):
     d = np.asarray(dists)[:k_star]
-    if d.size == 0: return d, np.array([])
-    bw = np.median(d[d>0]) if np.any(d>0) else (np.mean(d)+1e-6)
+    if d.size == 0:
+        return d, np.array([])
+    positive = d[d > 0]
+    bw = np.median(positive) if positive.size else (np.mean(d) + 1e-6)
     bw = max(bw, 1e-6)
-    w = np.exp(-(d/bw)**2)
-    # drop extremely tiny weights
-    mask = w >= (1e-5 * w.max())
-    return d[mask], w[mask]
+    w = np.exp(-(d / bw) ** 2)
+    return d, w
 
 def _build_nca(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
     need = [y_col] + feat_names
@@ -514,51 +514,73 @@ def _build_leaf_head(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
     return {"scaler":scaler, "cat":cb, "emb":emb, "metric":metric, "y":y,
             "feat_names":feat_names, "df_meta":meta, "head_name":"CatBoost-Leaf-kNN"}
 
-def _nca_score(model, row_dict):
-    vec = []
-    for f in model["feat_names"]:
-        v = row_dict.get(f, None)
-        if v is None or (isinstance(v, float) and not np.isfinite(v)): return None
-        vec.append(float(v))
-    x = np.array(vec)[None,:]
+def _nca_score(model, row_dict, feats=None):
+    if feats is None: feats = model["feat_names"]
+    x = np.array([row_dict.get(f, np.nan) for f in feats], dtype=float)[None, :]
     xs = model["scaler"].transform(x)
-    if model.get("pca") is not None:
-        xs = model["pca"].transform(xs)
     xn = model["nca"].transform(xs)
-    oos = model["guard"].decision_function(xn.reshape(1,-1))[0]
+
     Xn = model["X_emb"]; y = model["y"]
     d = pairwise_distances(xn, Xn, metric="euclidean").ravel()
-    order = np.argsort(d)
-    d_sorted = d[order]
-    k_star = _elbow_kstar(d_sorted, k_min=3, k_max=15)
+    order = np.argsort(d); d_sorted = d[order]
+
+    k_star = _elbow_kstar(d_sorted, k_min=3, k_max=min(15, len(order)))
     d_top, w_top = _kernel_weights(d_sorted, k_star)
     idx = order[:k_star]
-    if w_top.size == 0: return {"p1":0.0,"k":0,"oos":float(oos)}
-    y_top = y[idx]
-    w_norm = w_top / (w_top.sum() if w_top.sum()>0 else 1.0)
-    p1 = float(np.dot((y_top==1).astype(float), w_norm)) * 100.0
-    return {"p1":p1,"k":int(k_star),"oos":float(oos)}
 
-def _leaf_score(model, row_dict):
-    vec = []
-    for f in model["feat_names"]:
-        v = row_dict.get(f, None)
-        if v is None or (isinstance(v, float) and not np.isfinite(v)): return None
-        vec.append(float(v))
-    x = np.array(vec)[None,:]
-    xs = model["scaler"].transform(x)
-    emb_q = np.array(model["cat"].calc_leaf_indexes(xs), dtype=int)
-    Emb = model["emb"]; metric = model["metric"]; y = model["y"]
+    mask = np.isfinite(w_top) & (w_top > 1e-12)
+    if mask.sum() == 0:
+        return 0.0
+    idx = idx[mask]
+    w_top = w_top[mask]
+
+    s = w_top.sum()
+    if s <= 0:
+        return 0.0
+    w_norm = w_top / s
+
+    p1 = float(np.dot((y[idx] == 1).astype(float), w_norm)) * 100.0
+    return p1
+
+def _leaf_score(model, row_dict, feats=None):
+    # Build query vector (CatBoost can handle NaNs; no scaler)
+    if feats is None: feats = model["feat_names"]
+    x = np.array([row_dict.get(f, np.nan) for f in feats], dtype=float)[None, :]
+
+    # Embed query
+    cat: CatBoostClassifier = model["cat"]
+    emb_q = cat.calc_leaf_indexes(x)  # shape: (1, n_trees)
+    Emb = model["emb"]                # shape: (n_train, n_trees)
+    metric = model.get("metric", "cosine")
+
+    # Distances in leaf space
     d = pairwise_distances(emb_q, Emb, metric=metric).ravel()
     order = np.argsort(d)
     d_sorted = d[order]
-    k_star = _elbow_kstar(d_sorted, k_min=3, k_max=15)
+
+    k_star = _elbow_kstar(d_sorted, k_min=3, k_max=min(15, len(order)))
     d_top, w_top = _kernel_weights(d_sorted, k_star)
+
     idx = order[:k_star]
-    if w_top.size == 0: return {"p1":0.0,"k":0}
-    w_norm = w_top / (w_top.sum() if w_top.sum()>0 else 1.0)
-    p1 = float(np.dot((y[idx]==1).astype(float), w_norm)) * 100.0
-    return {"p1":p1,"k":int(k_star)}
+
+    # ALIGN lengths after optional tiny-weight filtering
+    mask = np.isfinite(w_top) & (w_top > 1e-12)
+    if mask.sum() == 0:
+        return 0.0  # no reliable neighbors → neutral 0% FT=1
+
+    idx = idx[mask]
+    d_top = d_top[mask]
+    w_top = w_top[mask]
+
+    # Normalize weights
+    s = w_top.sum()
+    if s <= 0:
+        return 0.0
+    w_norm = w_top / s
+
+    y = model["y"]
+    p1 = float(np.dot((y[idx] == 1).astype(float), w_norm)) * 100.0
+    return p1
 
 # ============================== Feature Selection (drop-one + stability) ==============================
 def _head_cv_metric(scores: np.ndarray, labels: np.ndarray) -> float:
