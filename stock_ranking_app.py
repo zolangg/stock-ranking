@@ -584,4 +584,4 @@ if build_btn:
             add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
             add_num(df, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
             add_num(df, "Gap_%",            ["gap %","gap%","premarket gap","gap","gap_percent"])
-            add_num(df, "ATR_$",            ["atr $","atr$","atr (usd)","atr
+            add_num(df, "ATR_$", ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
