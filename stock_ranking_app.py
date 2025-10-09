@@ -1,4 +1,4 @@
-# app.py — Premarket Stock Ranking (+ NCA FT=1 similarity bar)
+# app.py — Premarket Stock Ranking (original) + NCA (FT=1) as 3rd bar in alignment
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,7 +16,25 @@ ss.setdefault("lassoA", {})
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("var_core", [])
 ss.setdefault("var_moderate", [])
-ss.setdefault("nca", {})  # <-- NCA model holder
+
+# NCA head (added)
+ss.setdefault("nca_model", {})  # {scaler, nca, X_emb, y, feats, medians}
+
+# ============================== Dependencies for NCA ==============================
+try:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.neighbors import NeighborhoodComponentsAnalysis
+    from sklearn.metrics import pairwise_distances
+except Exception as _e:
+    st.warning("For NCA you need scikit-learn installed (e.g. scikit-learn==1.5.2). "
+               "The rest of the app will still work without it.")
+
+# features NCA tries to use if available
+FEAT12 = [
+    "MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%",
+    "Max_Pull_PM_%","PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%",
+    "RVOL_Max_PM_cum","FR_x","PM_Vol_%"
+]
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -336,70 +354,71 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     if not np.isfinite(PM) or PM <= 0: return np.nan
     return float(PM * cal_mult)
 
-# ============================== NCA (FT=1) ==============================
-# We add a compact NCA head that uses 12 signals:
-# ["MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%","Max_Pull_PM_%",
-#  "PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%","RVOL_Max_PM_cum","FR_x","PM_Vol_%"]
-NCA_FEATS = [
-    "MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%","Max_Pull_PM_%",
-    "PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%","RVOL_Max_PM_cum","FR_x","PM_Vol_%"
-]
+# ============================== NCA Head (added) ==============================
+def _elbow_kstar(sorted_vals, k_min=3, k_max=15, max_rank=30):
+    n = len(sorted_vals)
+    if n <= k_min: return max(1, n)
+    upto = min(max_rank, n-1)
+    if upto < 2: return min(k_max, max(k_min, n))
+    gaps = sorted_vals[:upto] - sorted_vals[1:upto+1]
+    k_star = int(np.argmax(gaps) + 1)
+    return max(k_min, min(k_max, k_star))
 
-try:
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.neighbors import NeighborhoodComponentsAnalysis
-    from sklearn.metrics import pairwise_distances
-    SKLEARN_OK = True
-except Exception:
-    SKLEARN_OK = False
+def _kernel_weights(dists, k_star):
+    d = np.asarray(dists)[:k_star]
+    if d.size == 0: return d, np.array([])
+    positive = d[d>0]
+    bw = np.median(positive) if positive.size else (np.mean(d)+1e-6)
+    bw = max(bw, 1e-6)
+    w = np.exp(-(d/bw)**2)
+    return d, w
 
-def _build_nca(df: pd.DataFrame):
-    """Fit NCA on rows with FT01 and available features; return dict model or {}."""
-    if not SKLEARN_OK: return {}
-    feats = [f for f in NCA_FEATS if f in df.columns]
-    need = feats + ["FT01"]
-    face = df[need].dropna()
-    if face.shape[0] < 30 or len(feats) < 3:
+def build_nca_model(df: pd.DataFrame) -> dict:
+    try:
+        _ = StandardScaler  # check import
+    except Exception:
         return {}
-    y = face["FT01"].astype(int).values
-    X = face[feats].astype(float).values
-    scaler = StandardScaler().fit(X)
-    Xs = scaler.transform(X)
-    nca = NeighborhoodComponentsAnalysis(
-        n_components=min(6, Xs.shape[1]),
-        random_state=42,
-        max_iter=250
-    )
-    Xn = nca.fit_transform(Xs, y)
-    return {"scaler":scaler, "nca":nca, "X_emb":Xn, "y":y, "feat_names":feats}
+    if "FT01" not in df.columns: return {}
+    feats = [f for f in FEAT12 if f in df.columns]
+    if len(feats) < 3: return {}
+    use = df[feats + ["FT01"]].dropna()
+    if use.shape[0] < 25:  # need enough rows
+        return {}
+    y = use["FT01"].astype(int).values
+    X = use[feats].astype(float).values
 
-def _nca_score(model: dict, row: dict, k_fixed=7):
-    """Return % of FT=1 among kernel-weighted NCA neighbors."""
+    # median impute then standardize
+    medians = np.nanmedian(X, axis=0)
+    X_imp = np.where(np.isnan(X), medians, X)
+    scaler = StandardScaler().fit(X_imp)
+    Xs = scaler.transform(X_imp)
+
+    nca = NeighborhoodComponentsAnalysis(
+        n_components=min(6, Xs.shape[1]), random_state=42, max_iter=250
+    )
+    X_emb = nca.fit_transform(Xs, y)
+
+    return {"scaler": scaler, "nca": nca, "X_emb": X_emb, "y": y,
+            "feats": feats, "medians": medians}
+
+def nca_score_one(model: dict, row: dict) -> float:
     if not model: return np.nan
-    feats = model["feat_names"]
-    vec = []
-    for f in feats:
-        v = row.get(f, np.nan)
-        if v is None or (isinstance(v,float) and not np.isfinite(v)):
-            return np.nan
-        vec.append(float(v))
-    x = np.array(vec, dtype=float)[None, :]
-    xs = model["scaler"].transform(x)
+    feats = model["feats"]
+    x = np.array([row.get(f, np.nan) for f in feats], dtype=float)[None,:]
+    med = model["medians"]
+    xr = np.where(np.isnan(x), med, x)
+    xs = model["scaler"].transform(xr)
     xn = model["nca"].transform(xs)
     Xn = model["X_emb"]; y = model["y"]
     d = pairwise_distances(xn, Xn, metric="euclidean").ravel()
-    order = np.argsort(d)
-    k = int(max(1, min(k_fixed, len(order))))
-    top = order[:k]
-    d_top = d[top]
-    # Gaussian kernel with bandwidth = median positive distance (with a small floor)
-    pos = d_top[d_top>0]
-    bw = np.median(pos) if pos.size else (np.mean(d_top)+1e-6)
-    bw = max(bw, 1e-6)
-    w = np.exp(-(d_top/bw)**2)
-    s = w.sum() if w.sum()>0 else 1.0
-    p = float(np.dot((y[top]==1).astype(float), w/s))*100.0
-    return p
+    order = np.argsort(d); d_sorted = d[order]
+    k_star = _elbow_kstar(d_sorted, k_min=3, k_max=min(15, len(order)))
+    d_top, w_top = _kernel_weights(d_sorted, k_star)
+    idx = order[:k_star]
+    if w_top.size == 0 or np.sum(w_top) <= 0: return np.nan
+    w_norm = w_top / w_top.sum()
+    p1 = float(np.dot((y[idx]==1).astype(float), w_norm)) * 100.0
+    return p1
 
 # ============================== Summaries ==============================
 def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col: str, labels_map=None):
@@ -532,10 +551,11 @@ if build_btn:
             # train model once (on full base)
             ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
 
-            # ---- Build the NCA model (FT=1 similarity) ----
-            ss.nca = _build_nca(df)  # safe {}, if not enough data keeps UI working
+            # build NCA head (on FT01 with FEAT12 subset present)
+            ss.nca_model = build_nca_model(ss.base_df) or {}
 
-            st.success(f"Loaded “{sel_sheet}”. Base ready.")
+            st.success(f"Loaded “{sel_sheet}”. Base ready. "
+                       f"NCA feats used: {', '.join(ss.nca_model.get('feats', [])) if ss.nca_model else '—'}")
             do_rerun()
         except Exception as e:
             st.error("Loading/processing failed.")
@@ -584,6 +604,10 @@ if submitted and ticker:
     row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
     denom = row["PredVol_M"]
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
+
+    # NCA score (FT=1 probability via kernel-kNN in NCA space)
+    row["NCA_FT1_%"] = nca_score_one(ss.get("nca_model", {}), row)
+
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
@@ -772,8 +796,12 @@ for row in ss.rows:
     )
     if not counts: continue
 
-    # NCA FT=1 score (orange bar). Uses 12 signals; returns 0..100 or NaN.
-    nca_pct = _nca_score(ss.get("nca", {}), stock, k_fixed=7)
+    # NCA score already computed at add time; recompute if missing/new model
+    if "NCA_FT1_%"] = stock.get("NCA_FT1_%", None) is None or not np.isfinite(stock.get("NCA_FT1_%", np.nan)):
+        stock["NCA_FT1_%"] = nca_score_one(ss.get("nca_model", {}), stock)
+
+    p_nca = stock.get("NCA_FT1_%", np.nan)
+    p_nca_int = int(round(p_nca)) if (p_nca is not None and np.isfinite(p_nca)) else 0
 
     summary_rows.append({
         "Ticker": tkr,
@@ -781,11 +809,10 @@ for row in ss.rows:
         "B_val_raw": counts.get("B_pct_raw", 0.0),
         "A_val_int": counts.get("A_pct_int", 0),
         "B_val_int": counts.get("B_pct_int", 0),
+        "NCA_val_raw": p_nca if np.isfinite(p_nca) else 0.0,
+        "NCA_val_int": p_nca_int,
         "A_label": counts.get("A_label", gA),
         "B_label": counts.get("B_label", gB),
-        "NCA_val_raw": float(nca_pct) if (nca_pct is not None and np.isfinite(nca_pct)) else 0.0,
-        "NCA_val_int": int(round(nca_pct)) if (nca_pct is not None and np.isfinite(nca_pct)) else 0,
-        "NCA_label": "NCA (FT=1)",
         "A_pts": counts.get("A_pts", 0.0),
         "B_pts": counts.get("B_pts", 0.0),
         "A_core": counts.get("A_core", 0.0),
@@ -862,7 +889,7 @@ html = """
   .sig-lo{background:rgba(239,68,68,0.18)!important}
 </style></head><body>
   <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th><th>NCA (FT=1)</th></tr></thead>
+    <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th><th id="hdrNCA">NCA (FT=1)</th></tr></thead>
   </table>
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
@@ -872,13 +899,10 @@ html = """
     document.getElementById('hdrA').textContent = data.gA;
     document.getElementById('hdrB').textContent = data.gB;
 
-    function barCellLabeled(valRaw,label,valInt){
-      const strong=(label==='FT=1' || label.startsWith('FT=1') || label.startsWith('≥'));
-      const isNCA=(label && label.toLowerCase().startsWith('nca'));
-      const cls=isNCA?'orange':(strong?'blue':'red');
+    function barCell(valRaw, cssClass, labelText, valInt){
       const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
       const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
-      return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
+      return `<div class="bar-wrap"><div class="bar ${cssClass}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
     }
     function formatVal(x){return (x==null||isNaN(x))?'':Number(x).toFixed(2);}
 
@@ -948,9 +972,9 @@ html = """
         data: data.rows||[], responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
         columns:[
           {data:'Ticker'},
-          {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int)},
-          {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int)},
-          {data:null, render:(row)=>barCellLabeled(row.NCA_val_raw,row.NCA_label,row.NCA_val_int)}
+          {data:null, render:(row)=>barCell(row.A_val_raw,'blue', row.A_label, row.A_val_int)},
+          {data:null, render:(row)=>barCell(row.B_val_raw,'red',  row.B_label, row.B_val_int)},
+          {data:null, render:(row)=>barCell(row.NCA_val_raw,'orange','NCA (FT=1)', row.NCA_val_int)}
         ]
       });
       $('#align tbody').on('click','tr',function(){
