@@ -1,14 +1,4 @@
-# app.py — Premarket Ranking with OOF Pred Model + Head-Specific Feature Selection + NCA & CatBoost-Leaf kernel-kNN (with Average)
-# ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-# What you get:
-# - Leakage-safe PredVol_M via OOF; query uses full predictor.
-# - 12-core features, per-head feature selection with stability; min_keep=6.
-# - Two similarity heads: NCA-kNN and CatBoost Leaf-kNN (no RF fallback), plus Average bar.
-# - Kernel-kNN with elbow K* (3..15), Gaussian weights, robust guards.
-# - Compact UI: summary child rows list the 12 inputs + PredVol_M (no neighbor dumps).
-# - Diagnostics if a head can’t train (and why).
-# ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-
+# app.py — Premarket Ranking with OOF Pred Model + Head-Specific Feature Selection + NCA & CatBoost-Leaf kernel-kNN
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -26,8 +16,8 @@ ss.setdefault("last", {})           # last added
 ss.setdefault("pred_full", {})      # full daily-volume predictor (for queries)
 ss.setdefault("base_df", pd.DataFrame())
 
-ss.setdefault("nca_model", {})      # scaler, nca, X_emb, y, feat_names, df_meta, guard, head_name
-ss.setdefault("leaf_model", {})     # scaler, cat, emb, metric, y, feat_names, df_meta, head_name
+ss.setdefault("nca_model", {})      # medians, scaler, pca(optional), nca, X_emb, y, feat_names, df_meta, guard
+ss.setdefault("leaf_model", {})     # cat, emb, metric, y, feat_names, df_meta
 ss.setdefault("feat_sel", {"nca": [], "leaf": []})
 
 # ============================== Core deps ==============================
@@ -36,16 +26,16 @@ try:
     from sklearn.decomposition import PCA
     from sklearn.neighbors import NeighborhoodComponentsAnalysis
     from sklearn.ensemble import IsolationForest
-    from sklearn.metrics import pairwise_distances
+    from sklearn.metrics import pairwise_distances, roc_auc_score
     from sklearn.model_selection import StratifiedKFold
 except ModuleNotFoundError:
     st.error("Missing scikit-learn. Add `scikit-learn==1.5.2` to requirements.txt and redeploy.")
     st.stop()
 
 # CatBoost ONLY (no RF fallback)
-CATBOOST_AVAILABLE = True
 try:
     from catboost import CatBoostClassifier, Pool
+    CATBOOST_AVAILABLE = True
 except Exception:
     CATBOOST_AVAILABLE = False
 
@@ -115,12 +105,10 @@ def _safe_to_binary_float(v):
     x = _safe_to_binary(v)
     return float(x) if x in (0,1) else np.nan
 
-# ---------- MAD & winsor ----------
 def _mad(series: pd.Series) -> float:
     s = pd.to_numeric(series, errors="coerce").dropna()
     if s.empty: return np.nan
-    med = float(np.median(s))
-    return float(np.median(np.abs(s - med)))
+    med = float(np.median(s)); return float(np.median(np.abs(s - med)))
 
 def _compute_bounds(arr: np.ndarray, lo_q=0.01, hi_q=0.99):
     arr = arr[np.isfinite(arr)]
@@ -133,7 +121,7 @@ def _apply_bounds(arr: np.ndarray, lo: float, hi: float):
     if np.isfinite(hi): out = np.minimum(out, hi)
     return out
 
-# ---------- PAV isotonic ----------
+# ---------- Isotonic ----------
 def _pav_isotonic(x: np.ndarray, y: np.ndarray):
     order = np.argsort(x)
     xs = x[order]; ys = y[order]
@@ -266,7 +254,8 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     for lam in lam_grid:
         errs = []
         for vi in range(len(folds)):
-            te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(len(folds)) if j != vi])
+            te_idx = np.array(folds[vi])
+            tr_idx = np.hstack([folds[j] for j in range(len(folds)) if j != vi])
             Xtr, ytr = Xs_tr[tr_idx], y_tr[tr_idx]
             Xte, yte = Xs_tr[te_idx], y_tr[te_idx]
             w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1400)
@@ -296,22 +285,18 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
 
     return {
         "eps": eps,
-        "terms": [list(zip(*feats))[0][i] for i in sel],
+        "terms": [],  # not used downstream
         "b0": b0, "betas": bet, "sel_idx": sel.tolist(),
         "mu": mu.tolist(), "sd": sd.tolist(),
-        "winsor_bounds": {k: (float(v[0]) if np.isfinite(v[0]) else np.nan,
-                              float(v[1]) if np.isfinite(v[1]) else np.nan)
-                          for k, v in winsor_bounds.items()},
+        "winsor_bounds": {},  # not needed here
         "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(),
         "feat_order": [nm for nm,_ in feats],
     }
 
-def predict_daily_calibrated(row: dict, model: dict) -> float:
+def _predict_daily_row(row: dict, model: dict) -> float:
     if not model or "betas" not in model: return np.nan
     eps = float(model.get("eps", 1e-6))
-    feat_order = model["feat_order"]
-    winsor_bounds = model.get("winsor_bounds", {})
-    sel = model.get("sel_idx", [])
+    feat_order = model["feat_order"]; sel = model.get("sel_idx", [])
     b0 = float(model["b0"]); bet = np.array(model["betas"], dtype=float)
 
     def safe_log(v):
@@ -341,9 +326,6 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     for nm in feat_order:
         v = feat_map.get(nm, np.nan)
         if not np.isfinite(v): return np.nan
-        lo, hi = winsor_bounds.get(nm, (np.nan, np.nan))
-        if np.isfinite(lo) or np.isfinite(hi):
-            v = float(np.clip(v, lo if np.isfinite(lo) else v, hi if np.isfinite(hi) else v))
         X_vec.append(v)
     X_vec = np.array(X_vec, dtype=float)
     if not sel: return np.nan
@@ -360,63 +342,25 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     if not np.isfinite(PM) or PM <= 0: return np.nan
     return float(PM * cal_mult)
 
-# ---------- OOF PredVol builder ----------
-def build_predvol_oof(df_in: pd.DataFrame) -> tuple[pd.Series, dict]:
-    """
-    Return (PredVol_M_OOF, full_model_for_queries). Robust gaps filled with full_model.
-    """
-    df = df_in.copy()
-    need = {"PM_Vol_M","Daily_Vol_M","FR_x","PM_$Vol_M$","Gap_%","ATR_$"}
-    # Need at least one of MarketCap and one of Float
-    has_mcap  = df.filter(items=["MC_PM_Max_M","MarketCap_M$"]).notna().any(axis=1)
-    has_float = df.filter(items=["Float_PM_Max_M","Float_M"]).notna().any(axis=1)
-    core_cols = list(need & set(df.columns))
-    base_mask = has_mcap & has_float
-    if core_cols:
-        base_mask &= df[core_cols].notna().all(axis=1)
+def build_oof_predvol(df: pd.DataFrame, y_col="FT01", k=5, seed=42):
+    """Return: oof_pred (Series), full_model (dict)"""
+    idx = df.index.to_numpy()
+    y = df[y_col].astype(int).values
+    folds = StratifiedKFold(n_splits=min(k, max(2, min(5, np.unique(y).size*2))), shuffle=True, random_state=seed)
+    oof = pd.Series(np.nan, index=df.index, dtype=float)
+    for tr_idx, va_idx in folds.split(idx.reshape(-1,1), y):
+        tr_ids = idx[tr_idx]; va_ids = idx[va_idx]
+        model_tr = train_ratio_winsor_iso(df.loc[tr_ids])
+        if not model_tr: continue
+        for i in va_ids:
+            row = df.loc[i].to_dict()
+            oof.at[i] = _predict_daily_row(row, model_tr)
+    # full model
+    full_model = train_ratio_winsor_iso(df)
+    return oof, full_model
 
-    # Train one global model for queries + fallback
-    global_model = train_ratio_winsor_iso(df[base_mask]) or {}
-    pred_oof = pd.Series(np.nan, index=df.index, dtype=float)
-
-    # if labels missing or single-class → use global only
-    if "FT01" not in df.columns or df["FT01"].dropna().nunique() < 2:
-        if global_model:
-            pred_oof.loc[base_mask] = df.loc[base_mask].apply(lambda r: predict_daily_calibrated(r, global_model), axis=1)
-        return pred_oof, global_model
-
-    y_ft = df["FT01"].fillna(0).astype(int).values
-    n_splits = min(5, max(2, int(base_mask.sum()//30)))  # robust on small DBs
-    folds = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-
-    for tr_idx, va_idx in folds.split(np.arange(df.shape[0]), y_ft):
-        va_mask = base_mask.iloc[va_idx]
-        if not va_mask.any():
-            continue
-        tr_mask = base_mask.iloc[tr_idx]
-        if tr_mask.sum() < 30 or df.iloc[tr_idx][tr_mask].get("FT01", pd.Series([0])).nunique() < 1:
-            if global_model:
-                pred_oof.iloc[va_idx[va_mask.values]] = df.iloc[va_idx[va_mask.values]].apply(
-                    lambda r: predict_daily_calibrated(r, global_model), axis=1)
-            continue
-        fold_model = train_ratio_winsor_iso(df.iloc[tr_idx][tr_mask]) or {}
-        if not fold_model:
-            if global_model:
-                pred_oof.iloc[va_idx[va_mask.values]] = df.iloc[va_idx[va_mask.values]].apply(
-                    lambda r: predict_daily_calibrated(r, global_model), axis=1)
-            continue
-        pred_oof.iloc[va_idx[va_mask.values]] = df.iloc[va_idx[va_mask.values]].apply(
-            lambda r: predict_daily_calibrated(r, fold_model), axis=1)
-
-    # Final gap fill with global model if needed
-    if global_model and pred_oof.isna().any():
-        ix = base_mask & pred_oof.isna()
-        pred_oof.loc[ix] = df.loc[ix].apply(lambda r: predict_daily_calibrated(r, global_model), axis=1)
-
-    return pred_oof, global_model
-
-# ============================== Similarity Heads ==============================
-def _elbow_kstar(sorted_vals, k_min=3, k_max=15, max_rank=25):
+# ============================== Kernel helpers ==============================
+def _elbow_kstar(sorted_vals, k_min=3, k_max=15, max_rank=30):
     n = len(sorted_vals)
     if n <= k_min: return max(1, n)
     upto = min(max_rank, n-1)
@@ -427,217 +371,235 @@ def _elbow_kstar(sorted_vals, k_min=3, k_max=15, max_rank=25):
 
 def _kernel_weights(dists, k_star, floor=1e-12):
     d = np.asarray(dists)[:k_star]
-    if d.size == 0:
-        return d, np.array([])
-    positive = d[d > 0]
-    bw = np.median(positive) if positive.size else (np.mean(d) + 1e-6)
+    if d.size == 0: return d, np.array([])
+    positive = d[d>0]
+    bw = np.median(positive) if positive.size else (np.mean(d)+1e-6)
     bw = max(bw, 1e-6)
-    w = np.exp(-(d / bw) ** 2)
+    w = np.exp(-(d/bw)**2)
     return d, w
 
-def _build_nca(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
-    need = [y_col] + feat_names
-    df_face = df[need].dropna()
-    if df_face.shape[0] < 30 or df_face[y_col].nunique() < 2:
-        return {}
+# ============================== Heads ==============================
+def train_nca_head(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
+    # Impute medians (fit on train), standardize, optional PCA, NCA
+    use = df[feat_names + [y_col]].copy()
+    y = use[y_col].astype(int).values
+    X = use[feat_names].astype(float)
 
-    y = df_face[y_col].astype(int).values
-    X = df_face[feat_names].astype(float).values
-    scaler = StandardScaler().fit(X)
-    Xs = scaler.transform(X)
+    medians = X.median(axis=0, skipna=True)
+    X_imp = X.fillna(medians)
 
-    # PCA pre-whiten (optional for small n)
+    scaler = StandardScaler().fit(X_imp.values)
+    Xs = scaler.transform(X_imp.values)
+
+    # optional PCA for small n (keep up to 95% variance, min 6 comps cap)
+    n_components_pca = min(max(6, 1), Xs.shape[1])
     pca = None
-    if Xs.shape[0] < 300 and Xs.shape[1] > 6:
-        pca = PCA(n_components=min(Xs.shape[1], max(6, int(Xs.shape[1]*0.95))), random_state=42)
+    if Xs.shape[1] > 10 and Xs.shape[0] < 400:
+        pca = PCA(n_components=0.95, svd_solver="full", random_state=42)
         Xp = pca.fit_transform(Xs)
     else:
         Xp = Xs
 
     nca = NeighborhoodComponentsAnalysis(
-        n_components=min(Xp.shape[1], 6), random_state=42, max_iter=250
+        n_components=min(6, Xp.shape[1]), random_state=42, max_iter=250
     )
-    Xn = nca.fit_transform(Xp, y)
+    X_emb = nca.fit_transform(Xp, y)
 
     guard = IsolationForest(n_estimators=200, random_state=42, contamination="auto")
-    guard.fit(Xn)
+    guard.fit(X_emb)
 
-    meta_cols = ["FT01"]
+    meta_cols = []
     for c in ("TickerDB","Ticker"):
         if c in df.columns: meta_cols.append(c)
     for f in feat_names:
         if f in df.columns and f not in meta_cols: meta_cols.append(f)
-    meta = df.loc[df_face.index, meta_cols].reset_index(drop=True)
+    meta = df[meta_cols].reset_index(drop=True) if meta_cols else pd.DataFrame(index=df.index)
 
-    return {"scaler":scaler, "pca":pca, "nca":nca, "X_emb":Xn, "y":y,
-            "feat_names":feat_names, "df_meta":meta, "guard": guard, "head_name":"NCA-kNN"}
+    return {
+        "medians": medians.to_dict(),
+        "scaler": scaler,
+        "pca": pca,
+        "nca": nca,
+        "X_emb": X_emb,
+        "y": y,
+        "feat_names": feat_names,
+        "df_meta": meta,
+        "guard": guard,
+        "head_name": "NCA-kNN"
+    }
 
-def _build_leaf_head(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
-    if not CATBOOST_AVAILABLE:
-        return {"__error__":"CatBoost not installed"}
-    need = [y_col] + feat_names
-    df_face = df[need].dropna()
-    if df_face.shape[0] < 30 or df_face[y_col].nunique() < 2:
-        return {"__error__":"Too few complete rows or single class for Leaf head"}
-
-    y = df_face[y_col].astype(int).values
-    X = df_face[feat_names].astype(float).values
-    scaler = StandardScaler().fit(X)
-    Xs = scaler.transform(X)
-
-    # train CatBoost (shallow, regularized, deterministic)
-    class_weights = [1.0, float((y==0).sum() / max(1,(y==1).sum()))]
-    cb = CatBoostClassifier(
-        depth=6, learning_rate=0.06, loss_function="Logloss",
-        random_state=42, iterations=1200, verbose=False, l2_leaf_reg=6,
-        class_weights=class_weights, bootstrap_type='No',
-        random_strength=0.0, task_type="CPU"
-    )
-    # simple holdout for early stopping
-    n = len(y)
-    split = max(20, int(n*0.85))
-    train_pool = Pool(Xs[:split], y[:split])
-    eval_pool  = Pool(Xs[split:], y[split:]) if n - split >= 10 else None
-    cb.fit(train_pool, eval_set=eval_pool, early_stopping_rounds=50 if eval_pool else None, verbose=False)
-
-    leaf_mat = cb.calc_leaf_indexes(Xs)  # shape (n_samples, n_trees)
-    emb = np.array(leaf_mat, dtype=int)
-    metric = "hamming"  # cosine also possible; hamming ~ same-leaf ratio
-
-    meta_cols = ["FT01"]
-    for c in ("TickerDB","Ticker"):
-        if c in df.columns: meta_cols.append(c)
-    for f in feat_names:
-        if f in df.columns and f not in meta_cols: meta_cols.append(f)
-    meta = df.loc[df_face.index, meta_cols].reset_index(drop=True)
-
-    return {"scaler":scaler, "cat":cb, "emb":emb, "metric":metric, "y":y,
-            "feat_names":feat_names, "df_meta":meta, "head_name":"CatBoost-Leaf-kNN"}
-
-def _nca_score(model, row_dict, feats=None):
-    if feats is None: feats = model["feat_names"]
+def _nca_score(model, row_dict):
+    feats = model["feat_names"]
     x = np.array([row_dict.get(f, np.nan) for f in feats], dtype=float)[None, :]
+    # impute medians
+    med = model.get("medians", {})
+    if med:
+        xr = x.copy()
+        for j, f in enumerate(feats):
+            if not np.isfinite(xr[0, j]):
+                m = med.get(f, np.nan)
+                xr[0, j] = m if np.isfinite(m) else 0.0
+        x = xr
     xs = model["scaler"].transform(x)
-    xn = model["nca"].transform(xs)
-
+    pca = model.get("pca", None)
+    if pca is not None:
+        xp = pca.transform(xs)
+    else:
+        xp = xs
+    xn = model["nca"].transform(xp)
     Xn = model["X_emb"]; y = model["y"]
     d = pairwise_distances(xn, Xn, metric="euclidean").ravel()
     order = np.argsort(d); d_sorted = d[order]
-
     k_star = _elbow_kstar(d_sorted, k_min=3, k_max=min(15, len(order)))
     d_top, w_top = _kernel_weights(d_sorted, k_star)
     idx = order[:k_star]
-
     mask = np.isfinite(w_top) & (w_top > 1e-12)
-    if mask.sum() == 0:
-        return 0.0
-    idx = idx[mask]
-    w_top = w_top[mask]
-
+    if mask.sum() == 0: return 0.0
+    idx = idx[mask]; w_top = w_top[mask]
     s = w_top.sum()
-    if s <= 0:
-        return 0.0
+    if s <= 0: return 0.0
     w_norm = w_top / s
-
-    p1 = float(np.dot((y[idx] == 1).astype(float), w_norm)) * 100.0
+    p1 = float(np.dot((y[idx]==1).astype(float), w_norm)) * 100.0
     return p1
 
-def _leaf_score(model, row_dict, feats=None):
-    # Build query vector (CatBoost can handle NaNs; no scaler)
-    if feats is None: feats = model["feat_names"]
+def train_leaf_head(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
+    if not CATBOOST_AVAILABLE:
+        st.error("CatBoost is required for the Leaf head. Add `catboost` to requirements.txt."); st.stop()
+
+    use = df[feat_names + [y_col]].copy()
+    y = use[y_col].astype(int).values
+    X = use[feat_names].astype(float).values  # CatBoost handles NaNs
+
+    # split small eval set for early stopping
+    n = len(y)
+    idx = np.arange(n)
+    rs = np.random.RandomState(42)
+    rs.shuffle(idx)
+    split = max(8, int(n*0.85))
+    tr_idx, ev_idx = idx[:split], idx[split:]
+
+    train_pool = Pool(X[tr_idx], label=y[tr_idx])
+    eval_pool  = Pool(X[ev_idx], label=y[ev_idx]) if ev_idx.size>0 else None
+
+    class_w = [1.0, float((y==0).sum() / max(1,(y==1).sum()))]
+    cat = CatBoostClassifier(
+        depth=6, learning_rate=0.06, loss_function="Logloss",
+        random_seed=42, iterations=1200, l2_leaf_reg=6,
+        class_weights=class_w, verbose=False, early_stopping_rounds=50,
+        bootstrap_type='No', random_strength=0.0
+    )
+    if eval_pool is not None:
+        cat.fit(train_pool, eval_set=eval_pool, use_best_model=True)
+    else:
+        cat.fit(train_pool)
+
+    emb = cat.calc_leaf_indexes(X)  # (n, n_trees)
+    emb = np.asarray(emb, dtype=float)  # cosine on floats
+    metric = "cosine"
+
+    meta_cols = []
+    for c in ("TickerDB","Ticker"):
+        if c in df.columns: meta_cols.append(c)
+    for f in feat_names:
+        if f in df.columns and f not in meta_cols: meta_cols.append(f)
+    meta = df[meta_cols].reset_index(drop=True) if meta_cols else pd.DataFrame(index=df.index)
+
+    return {
+        "cat": cat,
+        "emb": emb,
+        "metric": metric,
+        "y": y,
+        "feat_names": feat_names,
+        "df_meta": meta,
+        "head_name": "CatBoost-leaf-kNN"
+    }
+
+def _leaf_score(model, row_dict):
+    feats = model["feat_names"]
     x = np.array([row_dict.get(f, np.nan) for f in feats], dtype=float)[None, :]
-
-    # Embed query
     cat: CatBoostClassifier = model["cat"]
-    emb_q = cat.calc_leaf_indexes(x)  # shape: (1, n_trees)
-    Emb = model["emb"]                # shape: (n_train, n_trees)
-    metric = model.get("metric", "cosine")
-
-    # Distances in leaf space
+    emb_q = cat.calc_leaf_indexes(x)
+    emb_q = np.asarray(emb_q, dtype=float)
+    Emb = model["emb"]; y = model["y"]; metric = model.get("metric", "cosine")
     d = pairwise_distances(emb_q, Emb, metric=metric).ravel()
-    order = np.argsort(d)
-    d_sorted = d[order]
-
+    order = np.argsort(d); d_sorted = d[order]
     k_star = _elbow_kstar(d_sorted, k_min=3, k_max=min(15, len(order)))
     d_top, w_top = _kernel_weights(d_sorted, k_star)
-
     idx = order[:k_star]
-
-    # ALIGN lengths after optional tiny-weight filtering
     mask = np.isfinite(w_top) & (w_top > 1e-12)
-    if mask.sum() == 0:
-        return 0.0  # no reliable neighbors → neutral 0% FT=1
-
-    idx = idx[mask]
-    d_top = d_top[mask]
-    w_top = w_top[mask]
-
-    # Normalize weights
+    if mask.sum() == 0: return 0.0
+    idx = idx[mask]; w_top = w_top[mask]
     s = w_top.sum()
-    if s <= 0:
-        return 0.0
+    if s <= 0: return 0.0
     w_norm = w_top / s
-
-    y = model["y"]
-    p1 = float(np.dot((y[idx] == 1).astype(float), w_norm)) * 100.0
+    p1 = float(np.dot((y[idx]==1).astype(float), w_norm)) * 100.0
     return p1
 
-# ============================== Feature Selection (drop-one + stability) ==============================
-def _head_cv_metric(scores: np.ndarray, labels: np.ndarray) -> float:
-    s = pd.to_numeric(scores, errors="coerce")
-    y = pd.to_numeric(labels, errors="coerce")
-    m = np.isfinite(s) & np.isfinite(y)
-    if m.sum() < 10: return 0.0
-    # rank correlation is more robust for small sets
-    return float(pd.Series(s[m]).rank().corr(pd.Series(y[m])) or 0.0)
+# ============================== CV metric & feature selection ==============================
+def _cv_scores_for_head(df: pd.DataFrame, feats: list[str], head: str, folds=5, seed=42):
+    """Return list of per-fold metrics (ROC AUC if well-defined else accuracy)"""
+    y = df["FT01"].astype(int).values
+    idx = df.index.to_numpy()
+    skf = StratifiedKFold(n_splits=min(folds, max(2, np.unique(y).size*2))), 
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
 
-def _cv_scores_for_head(df: pd.DataFrame, feats: list[str], head: str, k_splits=5) -> list[float]:
-    Xdf = df.dropna(subset=feats+["FT01"]).copy()
-    if Xdf.shape[0] < 40 or Xdf["FT01"].nunique() < 2:
-        return []
-    folds = StratifiedKFold(n_splits=min(k_splits, max(2, Xdf.shape[0]//40)), shuffle=True, random_state=42)
-    out_scores = []
-    for tr, va in folds.split(Xdf.index, Xdf["FT01"].astype(int).values):
-        tr_df, va_df = Xdf.iloc[tr], Xdf.iloc[va]
+    metrics = []
+    for tr_ids, va_ids in skf.split(idx.reshape(-1,1), y):
+        tr_idx, va_idx = idx[tr_ids], idx[va_ids]
+        tr_df, va_df = df.loc[tr_idx], df.loc[va_idx]
         if head == "nca":
-            mdl = _build_nca(tr_df, feats); 
-            if not mdl: continue
-            sc = [ _nca_score(mdl, va_df.loc[i, feats].to_dict()) for i in va_df.index ]
+            mdl = train_nca_head(tr_df, feats)
+            preds = [ _nca_score(mdl, va_df.loc[i, :].to_dict()) for i in va_df.index ]
         else:
-            mdl = _build_leaf_head(tr_df, feats)
-            if not mdl or "__error__" in mdl: continue
-            sc = [ _leaf_score(mdl, va_df.loc[i, feats].to_dict()) for i in va_df.index ]
-        vals = [ (r or {}).get("p1", np.nan) for r in sc ]
-        out_scores.extend(vals)
-    return out_scores
+            mdl = train_leaf_head(tr_df, feats)
+            preds = [ _leaf_score(mdl, va_df.loc[i, :].to_dict()) for i in va_df.index ]
 
-def select_features_with_drop_one(df: pd.DataFrame, feat_list: list[str], head: str, stability=0.6, max_keep=10, min_keep=6):
-    feats = [f for f in feat_list if f in df.columns]
-    if len(feats) <= min_keep: return feats
-    base_scores = _cv_scores_for_head(df, feats, head=head)
-    base_metric = _head_cv_metric(np.array(base_scores), df.dropna(subset=feats+["FT01"])["FT01"].values) if base_scores else 0.0
-
-    votes = {f:0 for f in feats}
-    K = 5
-    folds = StratifiedKFold(n_splits=min(K, max(2, df.shape[0]//40)), shuffle=True, random_state=42)
-    Xdf = df.dropna(subset=feats+["FT01"]).copy()
-    if Xdf.shape[0] < 40 or Xdf["FT01"].nunique() < 2:
-        return feats[:max_keep]  # do nothing fancy on tiny sets
-
-    for fdrop in feats:
-        test_feats = [f for f in feats if f != fdrop]
-        sc = _cv_scores_for_head(df, test_feats, head=head)
-        m = _head_cv_metric(np.array(sc), Xdf["FT01"].values) if sc else -1e9
-        if m + 1e-9 >= base_metric:   # drop didn’t hurt → feature not important
-            # do NOT vote to keep; else keep
+        y_true = va_df["FT01"].astype(int).values
+        p = np.asarray(preds, dtype=float)
+        # try ROC AUC; if invalid (single class), fallback to acc
+        try:
+            if np.unique(y_true).size == 2 and not np.all(np.isnan(p)):
+                auc = roc_auc_score(y_true, p)
+                metrics.append(auc)
+                continue
+        except Exception:
             pass
-        else:
-            votes[fdrop] += 1
+        y_hat = (p >= 50.0).astype(int)
+        acc = (y_hat == y_true).mean()
+        metrics.append(acc)
+    return metrics
 
-    # keep features that were important in ≥60% of folds (here we used overall baseline; approximate)
-    keep = [f for f in feats if votes.get(f,0) >= int(stability * min(K, max(2, df.shape[0]//40)))]
-    if len(keep) < min_keep: keep = feats[:min_keep]
-    if len(keep) > max_keep: keep = keep[:max_keep]
+def select_features_with_drop_one(df: pd.DataFrame, base_feats: list[str], head: str, stability=0.6, max_keep=10, min_keep=6):
+    # Start from all available base feats in df
+    feats = [f for f in base_feats if f in df.columns]
+    if len(feats) <= min_keep:
+        return feats
+
+    base_fold_scores = _cv_scores_for_head(df, feats, head=head)
+    base_mean = float(np.mean(base_fold_scores)) if base_fold_scores else 0.0
+
+    keep = []
+    for f in feats:
+        test_feats = [x for x in feats if x != f]
+        fold_scores = _cv_scores_for_head(df, test_feats, head=head)
+        mean_sc = float(np.mean(fold_scores)) if fold_scores else 0.0
+        delta = base_mean - mean_sc  # positive delta means f helps
+        if delta > 0:
+            keep.append(f)
+
+    if len(keep) < min_keep:
+        # fallback: keep top `min_keep` by single-feature drop delta
+        deltas = []
+        for f in feats:
+            test_feats = [x for x in feats if x != f]
+            fold_scores = _cv_scores_for_head(df, test_feats, head=head)
+            mean_sc = float(np.mean(fold_scores)) if fold_scores else 0.0
+            deltas.append((f, base_mean - mean_sc))
+        deltas.sort(key=lambda x: x[1], reverse=True)
+        keep = [f for f,_ in deltas[:min_keep]]
+
+    if len(keep) > max_keep:
+        keep = keep[:max_keep]
     return keep
 
 # ============================== Upload / Build ==============================
@@ -684,7 +646,7 @@ if build_btn:
                 src = _pick(raw, src_candidates)
                 if src: dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-            # map fields (numeric)
+            # map fields
             add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
             add_num(df, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
             add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
@@ -702,7 +664,7 @@ if build_btn:
             cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
             if cand_catalyst: df["Catalyst"] = raw[cand_catalyst].map(_safe_to_binary_float)
 
-            # derived: FR_x and PM$Vol/MC_%
+            # derived FR_x and PM$Vol/MC_%
             float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
             if {"PM_Vol_M", float_basis}.issubset(df.columns):
                 df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
@@ -718,68 +680,35 @@ if build_btn:
             # FT groups
             df["FT01"] = pd.Series(df["GroupRaw"]).map(_safe_to_binary)
             df = df[df["FT01"].isin([0,1])].copy()
-            df["GroupFT"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
+            df["FT01"] = df["FT01"].astype(int)
 
-            # Max Push Daily (%) fraction -> %
-            pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
-            if pmh_col is not None:
-                pmh_raw = pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce")
-                df["Max_Push_Daily_%"] = pmh_raw * 100.0
+            # OOF PredVol_M for PM_Vol_% (no leakage)
+            if {"PM_Vol_M","Daily_Vol_M","ATR_$","Gap_%"}.issubset(df.columns):
+                oof, full_model = build_oof_predvol(df)
+                ss.pred_full = full_model or {}
+                df["PredVol_M_OOF"] = oof
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    df["PM_Vol_%"] = 100.0 * df["PM_Vol_M"] / df["PredVol_M_OOF"]
             else:
-                df["Max_Push_Daily_%"] = np.nan
+                ss.pred_full = {}
+                df["PredVol_M_OOF"] = np.nan
 
             ss.base_df = df
 
-            # ---------- OOF PredVol_M & PM_Vol_% (leakage-safe) ----------
-            pred_oof, pred_full = build_predvol_oof(df)
-            ss.pred_full = pred_full or {}
-            if "PM_Vol_M" in df.columns:
-                df["PredVol_M_OOF"] = pred_oof
-                df["PM_Vol_%"] = np.where(
-                    np.isfinite(pred_oof) & (pred_oof > 0),
-                    100.0 * df["PM_Vol_M"] / pred_oof,
-                    df.get("PM_Vol_%")
-                )
-                df["PM_Vol_%"] = pd.to_numeric(df["PM_Vol_%"], errors="coerce")
-            ss.base_df = df
+            # Clean training rows: keep those with FT01 and at least some features
+            feat_base = [f for f in FEAT12 if f in df.columns]
+            train_df = df.dropna(subset=["FT01"]).copy()
 
-            # ---------- Feature selection per head ----------
-            train_df = df.copy()
-            # ensure all FEAT12 exist in DF
-            feat_base = [f for f in FEAT12 if f in train_df.columns]
-            feat_nca  = select_features_with_drop_one(train_df, feat_base, head="nca", stability=0.6, max_keep=10, min_keep=6)
-            feat_leaf = select_features_with_drop_one(train_df, feat_base, head="leaf", stability=0.6, max_keep=10, min_keep=6)
+            # Head-specific feature selection
+            feat_nca  = select_features_with_drop_one(train_df, feat_base, head="nca",  max_keep=10, min_keep=6)
+            feat_leaf = select_features_with_drop_one(train_df, feat_base, head="leaf", max_keep=10, min_keep=6)
             ss.feat_sel = {"nca": feat_nca, "leaf": feat_leaf}
 
-            # ---------- Train heads ----------
-            nca_model  = _build_nca(train_df, feat_nca)
-            leaf_model = _build_leaf_head(train_df, feat_leaf) if CATBOOST_AVAILABLE else {"__error__":"CatBoost not installed"}
+            # Train heads
+            ss.nca_model  = train_nca_head(train_df, feat_nca) if len(feat_nca) >= 3 else {}
+            ss.leaf_model = train_leaf_head(train_df, feat_leaf) if (CATBOOST_AVAILABLE and len(feat_leaf) >= 3) else {}
 
-            ss.nca_model  = nca_model or {}
-            ss.leaf_model = leaf_model if (leaf_model and "__error__" not in leaf_model) else {}
-
-            # Diagnostics
-            diag = []
-            diag.append(f"NCA features: {len(feat_nca)} — {feat_nca}")
-            if ss.nca_model:
-                diag.append(f"NCA training rows: {ss.nca_model['X_emb'].shape[0]}")
-            else:
-                diag.append("NCA ✗ — not enough rows or single class")
-
-            if CATBOOST_AVAILABLE:
-                if ss.leaf_model:
-                    diag.append(f"Leaf features: {len(feat_leaf)} — {feat_leaf}")
-                    diag.append(f"Leaf training rows: {ss.leaf_model['emb'].shape[0]}")
-                else:
-                    why = leaf_model.get("__error__","unknown") if isinstance(leaf_model, dict) else "unknown"
-                    diag.append(f"Leaf ✗ — {why}")
-            else:
-                diag.append("Leaf ✗ — CatBoost not installed")
-
-            st.success(f"Loaded “{sel_sheet}”. Models built.")
-            with st.expander("Build diagnostics"):
-                for d in diag: st.write("•", d)
-
+            st.success(f"Loaded “{sel_sheet}”. Heads ready. NCA feats: {feat_nca}. Leaf feats: {feat_leaf}.")
             do_rerun()
         except Exception as e:
             st.error("Loading/processing failed.")
@@ -824,8 +753,8 @@ if submitted and ticker:
         "CatalystYN": catalyst_yn,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
     }
-    # Predicted daily volume for this query uses FULL model (no OOF for queries)
-    pred = predict_daily_calibrated(row, ss.get("pred_full", {}))
+    # Predicted daily volume from FULL model (queries only)
+    pred = _predict_daily_row(row, ss.get("pred_full", {}))
     row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
     denom = row["PredVol_M"]
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
@@ -833,166 +762,51 @@ if submitted and ticker:
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
-# ============================== Alignment ==============================
-st.markdown("### Alignment")
+# ============================== Similarity Bars ==============================
+st.markdown("### Similarity (FT=1)")
 
-base_df = ss.get("base_df", pd.DataFrame()).copy()
-if base_df.empty:
-    st.info("Upload DB and click **Build models**.")
-    st.stop()
+def _bar(pct, label):
+    pct = 0.0 if pct is None or not np.isfinite(pct) else float(pct)
+    w = max(0.0, min(100.0, pct))
+    color = "#3b82f6" if label == "NCA" else ("#10b981" if label == "Leaf" else "#111827")
+    return f"""
+<div style="display:flex;align-items:center;gap:8px;">
+  <div style="width:140px;height:12px;background:#eee;border-radius:8px;position:relative;overflow:hidden">
+    <span style="position:absolute;left:0;top:0;bottom:0;width:{w}%;background:{color};"></span>
+  </div>
+  <div style="font-size:12px;color:#374151;min-width:52px;">{label}: {int(round(w))}%</div>
+</div>"""
 
-# heads and feature sets
-feat_nca  = ss.get("feat_sel", {}).get("nca", [])
-feat_leaf = ss.get("feat_sel", {}).get("leaf", [])
-have_nca  = bool(ss.get("nca_model", {}))
-have_leaf = bool(ss.get("leaf_model", {}))
+if not ss.rows:
+    st.info("Add a stock above to see similarity.")
+else:
+    feat_nca  = ss.feat_sel.get("nca", [])
+    feat_leaf = ss.feat_sel.get("leaf", [])
+    for row in ss.rows[::-1]:
+        tkr = row.get("Ticker","—")
+        # head scores
+        p_nca = _nca_score(ss.nca_model, row) if ss.nca_model else np.nan
+        p_leaf = _leaf_score(ss.leaf_model, row) if ss.leaf_model else np.nan
+        vals = [v for v in [p_nca, p_leaf] if np.isfinite(v)]
+        p_avg = float(np.mean(vals)) if vals else np.nan
 
-# Build table rows
-summary_rows, detail_map = [], {}
+        st.markdown(f"**{tkr}**")
+        st.markdown(_bar(p_nca, "NCA"), unsafe_allow_html=True)
+        st.markdown(_bar(p_leaf, "Leaf"), unsafe_allow_html=True)
+        st.markdown(_bar(p_avg, "Average"), unsafe_allow_html=True)
 
-def _summ_row_for_stock(stock):
-    tkr = stock.get("Ticker","—")
-    # NCA
-    nca_p = None
-    if have_nca:
-        nca_p = _nca_score(ss["nca_model"], stock)
-    # Leaf
-    leaf_p = None
-    if have_leaf:
-        leaf_p = _leaf_score(ss["leaf_model"], stock)
+        # summary of inputs (12 vars + PredVol)
+        def fmt(x): 
+            return "" if x is None or (isinstance(x,float) and not np.isfinite(x)) else f"{x:.3f}"
+        cols = st.columns(4)
+        fields = ["MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%","Max_Pull_PM_%",
+                  "PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%","RVOL_Max_PM_cum","FR_x","PM_Vol_%","PredVol_M"]
+        labels = ["MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%","Max_Pull_PM_%",
+                  "PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%","RVOL_Max_PM_cum","FR_x","PM_Vol_%","PredVol_M"]
+        for i, lab in enumerate(labels):
+            col = cols[i % 4]
+            col.caption(f"{lab}: {fmt(row.get(fields[i]))}")
+        st.markdown("---")
 
-    v_nca  = (nca_p or {}).get("p1", np.nan)
-    v_leaf = (leaf_p or {}).get("p1", np.nan)
-    # Average: mean of available heads
-    vals = [v for v in [v_nca, v_leaf] if np.isfinite(v)]
-    v_avg = float(np.mean(vals)) if vals else np.nan
-
-    # child summary: 12 vars + PredVol_M
-    detail_map[tkr] = [
-        {"__group__": "Inputs (12) + Predicted Daily Vol"},
-        *[
-            {"Variable": f, "Value": None if not np.isfinite(pd.to_numeric(stock.get(f), errors='coerce')) else float(pd.to_numeric(stock.get(f), errors='coerce'))}
-            for f in FEAT12
-        ],
-        {"Variable":"PredVol_M","Value": None if not np.isfinite(pd.to_numeric(stock.get("PredVol_M"), errors='coerce')) else float(pd.to_numeric(stock.get("PredVol_M"), errors='coerce'))}
-    ]
-
-    return {
-        "Ticker": tkr,
-        "Avg_val_raw": v_avg, "Avg_val_int": int(round(v_avg)) if np.isfinite(v_avg) else 0,
-        "NCA_val_raw": v_nca, "NCA_val_int": int(round(v_nca)) if np.isfinite(v_nca) else 0,
-        "Leaf_val_raw": v_leaf,"Leaf_val_int":int(round(v_leaf)) if np.isfinite(v_leaf) else 0,
-    }
-
-for row in ss.rows:
-    # require at least *some* features, but allow heads to decide with their selected sets
-    summary_rows.append(_summ_row_for_stock(row))
-
-# ---------------- HTML/JS render ----------------
-import streamlit.components.v1 as components
-
-def _round_rec(o):
-    if isinstance(o, dict): return {k:_round_rec(v) for k,v in o.items()}
-    if isinstance(o, list): return [_round_rec(v) for v in o]
-    if isinstance(o, float): return float(np.round(o, 6))
-    return o
-
-payload = _round_rec({"rows": summary_rows, "details": detail_map})
-
-html = """
-<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
-<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
-<style>
-  body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,"Helvetica Neue",sans-serif}
-  table.dataTable tbody tr{cursor:pointer}
-  .bar-wrap{display:flex;justify-content:center;align-items:center;gap:6px}
-  .bar{height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden}
-  .bar>span{position:absolute;left:0;top:0;bottom:0;width:0%}
-  .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:28px;text-align:center}
-  .blue>span{background:#3b82f6}
-  .green>span{background:#10b981}
-  .purple>span{background:#8b5cf6}
-  #align td:nth-child(2),#align th:nth-child(2),#align td:nth-child(3),#align th:nth-child(3),#align td:nth-child(4),#align th:nth-child(4){text-align:center}
-  .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
-  .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .child-table th:first-child,.child-table td:first-child{text-align:left}
-  tr.group-row td{background:#f3f4f6!important;color:#374151;font-weight:600}
-  .col-var{width:30%}.col-val{width:70%}
-</style></head><body>
-  <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead><tr><th>Ticker</th><th>Average (FT=1)</th><th>NCA (FT=1)</th><th>Leaf (FT=1)</th></tr></thead>
-  </table>
-  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-  <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
-  <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
-  <script>
-    const data = %%PAYLOAD%%;
-
-    function barCell(valRaw, cls, valInt){
-      const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
-      const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
-      return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
-    }
-    function formatVal(x){return (x==null||isNaN(x))?'':Number(x).toFixed(4);}
-
-    function childTableHTML(ticker){
-      const rows=(data.details||{})[ticker]||[];
-      if(!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No inputs.</div>';
-      const cells = rows.map(r=>{
-        if(r.__group__) return '<tr class="group-row"><td colspan="2">'+r.__group__+'</td></tr>';
-        const v=(r.Value==null||isNaN(r.Value))?'':Number(r.Value).toFixed(4);
-        return `<tr><td class="col-var">${r.Variable}</td><td class="col-val">${v}</td></tr>`;
-      }).join('');
-      return `<table class="child-table">
-        <colgroup><col class="col-var"/><col class="col-val"/></colgroup>
-        <thead><tr><th>Variable</th><th>Value</th></tr></thead>
-        <tbody>${cells}</tbody></table>`;
-    }
-
-    $(function(){
-      const table=$('#align').DataTable({
-        data: data.rows||[], responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
-        columns:[
-          {data:'Ticker'},
-          {data:null, render:(row)=>barCell(row.Avg_val_raw,'blue',row.Avg_val_int)},
-          {data:null, render:(row)=>barCell(row.NCA_val_raw,'green',row.NCA_val_int)},
-          {data:null, render:(row)=>barCell(row.Leaf_val_raw,'purple',row.Leaf_val_int)}
-        ]
-      });
-      $('#align tbody').on('click','tr',function(){
-        const row=table.row(this);
-        if(row.child.isShown()){ row.child.hide(); $(this).removeClass('shown'); }
-        else { const t=row.data().Ticker; row.child(childTableHTML(t)).show(); $(this).addClass('shown'); }
-      });
-    });
-  </script>
-</body></html>
-"""
-components.html(html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload)), height=620, scrolling=True)
-
-# ============================== Delete Control (below table; no title) ==============================
-tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-unique_tickers, _seen = [], set()
-for t in tickers:
-    if t and t not in _seen:
-        unique_tickers.append(t); _seen.add(t)
-
-del_cols = st.columns([4, 1])
-with del_cols[0]:
-    to_delete = st.multiselect(
-        "",
-        options=unique_tickers,
-        default=[],
-        key="del_selection",
-        placeholder="Select tickers…",
-        label_visibility="collapsed",
-    )
-with del_cols[1]:
-    if st.button("Delete", use_container_width=True, key="delete_btn"):
-        if to_delete:
-            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
-            st.success(f"Deleted: {', '.join(to_delete)}")
-            do_rerun()
-        else:
-            st.info("No tickers selected.")
+# ============================== Notes ==============================
+st.caption("NCA: standardized metric learning on selected features. Leaf: CatBoost leaf-embedding + kernel-kNN. Average is the mean of available heads.")
