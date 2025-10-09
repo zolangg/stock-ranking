@@ -797,7 +797,7 @@ for row in ss.rows:
     if not counts: continue
 
     # NCA score already computed at add time; recompute if missing/new model
-    if ["NCA_FT1_%"] = stock.get("NCA_FT1_%", None) is None or not np.isfinite(stock.get("NCA_FT1_%", np.nan)):
+    if "NCA_FT1_%" = stock.get("NCA_FT1_%", None) is None or not np.isfinite(stock.get("NCA_FT1_%", np.nan)):
         stock["NCA_FT1_%"] = nca_score_one(ss.get("nca_model", {}), stock)
 
     p_nca = stock.get("NCA_FT1_%", np.nan)
