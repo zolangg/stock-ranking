@@ -1,4 +1,4 @@
-# app.py — Premarket Ranking with Pred Model + NCA kernel-kNN + CatBoost Leaf-Embedding kNN (no RF)
+# app.py — Premarket Ranking with Pred Model + NCA kernel-kNN + CatBoost Leaf-Embedding kNN (with Average bar)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -147,7 +147,7 @@ def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
     return np.interp(x_new, bx, by, left=by[0], right=by[-1])
 
 # ============================== Variables ==============================
-# 12 features you requested (incl. PM_$Vol_M$ and the derived FR_x and PM_Vol_%)
+# 12 features (includes PM_$Vol_M$, FR_x, PM_Vol_%)
 FEAT12 = [
     "MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%",
     "Max_Pull_PM_%","PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%",
@@ -660,7 +660,7 @@ if not ss.nca_model or not ss.leaf_model:
 
 # build summaries
 summary_rows, detail_map = [], {}
-feat_list = [f for f in FEAT12 if f]  # 12 features
+feat_list = [f for f in FEAT12 if f]  # exactly 12 features
 
 for row in ss.rows:
     stock = dict(row)
@@ -670,12 +670,18 @@ for row in ss.rows:
     nca_res = _nca_score(ss.nca_model, stock, ss.nca_model.get("feat_names", feat_list)) or {"p1":0.0,"k":0}
     leaf_res = _leaf_score(ss.leaf_model, stock, ss.leaf_model.get("feat_names", feat_list)) or {"p1":0.0,"k":0}
 
+    nca_p  = float(np.clip(nca_res["p1"],  0, 100))
+    leaf_p = float(np.clip(leaf_res["p1"], 0, 100))
+    avg_p  = (nca_p + leaf_p) / 2.0
+
     summary_rows.append({
         "Ticker": tkr,
-        "NCA_val_raw": float(np.clip(nca_res["p1"], 0, 100)),
-        "Leaf_val_raw": float(np.clip(leaf_res["p1"], 0, 100)),
-        "NCA_val_int": int(round(np.clip(nca_res["p1"], 0, 100))),
-        "Leaf_val_int": int(round(np.clip(leaf_res["p1"], 0, 100))),
+        "NCA_val_raw":   nca_p,
+        "Leaf_val_raw":  leaf_p,
+        "Avg_val_raw":   avg_p,
+        "NCA_val_int":   int(round(nca_p)),
+        "Leaf_val_int":  int(round(leaf_p)),
+        "Avg_val_int":   int(round(avg_p)),
     })
 
     # summary child rows (12 features + PredVol_M)
@@ -707,8 +713,12 @@ html = """
   .bar{height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden}
   .bar>span{position:absolute;left:0;top:0;bottom:0;width:0%}
   .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:28px;text-align:center}
-  .blue>span{background:#3b82f6}.purple>span{background:#8b5cf6}
-  #align td:nth-child(2),#align th:nth-child(2),#align td:nth-child(3),#align th:nth-child(3){text-align:center}
+  .blue>span{background:#3b82f6}
+  .purple>span{background:#8b5cf6}
+  .slate>span{background:#64748b}
+  #align td:nth-child(2),#align th:nth-child(2),
+  #align td:nth-child(3),#align th:nth-child(3),
+  #align td:nth-child(4),#align th:nth-child(4){text-align:center}
   .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
   .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .child-table th:first-child,.child-table td:first-child{text-align:left}
@@ -716,7 +726,7 @@ html = """
   .col-var{width:30%}.col-val{width:20%}
 </style></head><body>
   <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead><tr><th>Ticker</th><th>NCA (FT=1)</th><th>Leaf (FT=1)</th></tr></thead>
+    <thead><tr><th>Ticker</th><th>NCA (FT=1)</th><th>Leaf (FT=1)</th><th>Average (FT=1)</th></tr></thead>
   </table>
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
@@ -752,7 +762,8 @@ html = """
         columns:[
           {data:'Ticker'},
           {data:null, render:(row)=>barCell(row.NCA_val_raw,'blue',row.NCA_val_int)},
-          {data:null, render:(row)=>barCell(row.Leaf_val_raw,'purple',row.Leaf_val_int)}
+          {data:null, render:(row)=>barCell(row.Leaf_val_raw,'purple',row.Leaf_val_int)},
+          {data:null, render:(row)=>barCell(row.Avg_val_raw,'slate',row.Avg_val_int)}
         ]
       });
       $('#align tbody').on('click','tr',function(){
