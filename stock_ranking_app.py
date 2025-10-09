@@ -606,16 +606,31 @@ if build_btn:
                 df["Max_Push_Daily_%"] = np.nan
 
             # ---------- OOF PredVol_M to compute PM_Vol_% without leakage ----------
-            # Build folds on rows where we can train the predictor
             idx_all = np.arange(len(df))
-            has_pred_cols = df[["ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Daily_Vol_M","Gap_%"]].notna().all(axis=1)
-            has_mcap = df[["MC_PM_Max_M","MarketCap_M$"]].notna().any(axis=1)
-            has_float = df[["Float_PM_Max_M","Float_M"]].notna().any(axis=1)
+            
+            # columns required by the daily predictor
+            req_pred = ["ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Daily_Vol_M","Gap_%"]
+            present_pred = [c for c in req_pred if c in df.columns]
+            has_pred_cols = (
+                len(present_pred) == len(req_pred)
+                and df[present_pred].notna().all(axis=1)
+            )
+            
+            # at least one market-cap column
+            mcap_cols = [c for c in ["MC_PM_Max_M","MarketCap_M$"] if c in df.columns]
+            has_mcap = df[mcap_cols].notna().any(axis=1) if mcap_cols else pd.Series(False, index=df.index)
+            
+            # at least one float column
+            float_cols = [c for c in ["Float_PM_Max_M","Float_M"] if c in df.columns]
+            has_float = df[float_cols].notna().any(axis=1) if float_cols else pd.Series(False, index=df.index)
+            
             pred_mask = has_pred_cols & has_mcap & has_float
+            
             oof = np.full(len(df), np.nan)
             y_ft = df["FT01"].values
             usable = np.where(pred_mask)[0]
             if len(usable) >= 60:
+                from sklearn.model_selection import StratifiedKFold
                 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
                 for tr_idx, va_idx in skf.split(usable, y_ft[usable]):
                     tr_rows = usable[tr_idx]; va_rows = usable[va_idx]
@@ -623,14 +638,11 @@ if build_btn:
                     if not m: continue
                     preds = _predict_daily_for_rows(df.iloc[va_rows], m)
                     oof[va_rows] = preds
-            # Set PM_Vol_% from OOF preds (train rows)
+            
             df["PredVol_M_OOF"] = oof
             df["PM_Vol_%"] = np.where(np.isfinite(oof) & (oof>0),
                                       df["PM_Vol_M"] / oof * 100.0,
                                       df.get("PM_Vol_%", np.nan))
-
-            # Fit full predictor for queries (on all eligible rows)
-            ss.pred_full = _fit_daily_predictor(df)
 
             # ---------- Head-specific feature selection ----------
             train_for_heads = df.copy()
