@@ -1,10 +1,8 @@
-# app.py — Premarket Stock Ranking (original) + NCA (FT=1) as 3rd bar in alignment
+# app.py — Premarket Stock Ranking (Median-only centers; Group UI + Gain% filter; 3σ coloring; delete UI)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re, json, hashlib
-
-np.random.seed(42)
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -18,25 +16,6 @@ ss.setdefault("lassoA", {})
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("var_core", [])
 ss.setdefault("var_moderate", [])
-
-# NCA head (added)
-ss.setdefault("nca_model", {})  # {scaler, nca, X_emb, y, feats, medians}
-
-# ============================== Dependencies for NCA ==============================
-try:
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.neighbors import NeighborhoodComponentsAnalysis
-    from sklearn.metrics import pairwise_distances
-except Exception as _e:
-    st.warning("For NCA you need scikit-learn installed (e.g. scikit-learn==1.5.2). "
-               "The rest of the app will still work without it.")
-
-# features NCA tries to use if available
-FEAT12 = [
-    "MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%",
-    "Max_Pull_PM_%","PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%",
-    "RVOL_Max_PM_cum","FR_x","PM_Vol_%"
-]
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -356,72 +335,6 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     if not np.isfinite(PM) or PM <= 0: return np.nan
     return float(PM * cal_mult)
 
-# ============================== NCA Head (added) ==============================
-def _elbow_kstar(sorted_vals, k_min=3, k_max=15, max_rank=30):
-    n = len(sorted_vals)
-    if n <= k_min: return max(1, n)
-    upto = min(max_rank, n-1)
-    if upto < 2: return min(k_max, max(k_min, n))
-    gaps = sorted_vals[:upto] - sorted_vals[1:upto+1]
-    k_star = int(np.argmax(gaps) + 1)
-    return max(k_min, min(k_max, k_star))
-
-def _kernel_weights(dists, k_star):
-    d = np.asarray(dists)[:k_star]
-    if d.size == 0: return d, np.array([])
-    positive = d[d>0]
-    bw = np.median(positive) if positive.size else (np.mean(d)+1e-6)
-    bw = max(bw, 1e-6)
-    w = np.exp(-(d/bw)**2)
-    return d, w
-
-def build_nca_model(df: pd.DataFrame) -> dict:
-    try:
-        _ = StandardScaler  # check import
-    except Exception:
-        return {}
-    if "FT01" not in df.columns: return {}
-    feats = [f for f in FEAT12 if f in df.columns]
-    if len(feats) < 3: return {}
-    use = df[feats + ["FT01"]].dropna()
-    if use.shape[0] < 25:  # need enough rows
-        return {}
-    y = use["FT01"].astype(int).values
-    X = use[feats].astype(float).values
-
-    # median impute then standardize
-    medians = np.nanmedian(X, axis=0)
-    X_imp = np.where(np.isnan(X), medians, X)
-    scaler = StandardScaler().fit(X_imp)
-    Xs = scaler.transform(X_imp)
-
-    nca = NeighborhoodComponentsAnalysis(
-        n_components=min(6, Xs.shape[1]), random_state=42, max_iter=250
-    )
-    X_emb = nca.fit_transform(Xs, y)
-
-    return {"scaler": scaler, "nca": nca, "X_emb": X_emb, "y": y,
-            "feats": feats, "medians": medians}
-
-def nca_score_one(model: dict, row: dict) -> float:
-    if not model: return np.nan
-    feats = model["feats"]
-    x = np.array([row.get(f, np.nan) for f in feats], dtype=float)[None,:]
-    med = model["medians"]
-    xr = np.where(np.isnan(x), med, x)
-    xs = model["scaler"].transform(xr)
-    xn = model["nca"].transform(xs)
-    Xn = model["X_emb"]; y = model["y"]
-    d = pairwise_distances(xn, Xn, metric="euclidean").ravel()
-    order = np.argsort(d); d_sorted = d[order]
-    k_star = _elbow_kstar(d_sorted, k_min=3, k_max=min(15, len(order)))
-    d_top, w_top = _kernel_weights(d_sorted, k_star)
-    idx = order[:k_star]
-    if w_top.size == 0 or np.sum(w_top) <= 0: return np.nan
-    w_norm = w_top / w_top.sum()
-    p1 = float(np.dot((y[idx]==1).astype(float), w_norm)) * 100.0
-    return p1
-
 # ============================== Summaries ==============================
 def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col: str, labels_map=None):
     avail = [v for v in var_all if v in df_in.columns]
@@ -553,11 +466,7 @@ if build_btn:
             # train model once (on full base)
             ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
 
-            # build NCA head (on FT01 with FEAT12 subset present)
-            ss.nca_model = build_nca_model(ss.base_df) or {}
-
-            st.success(f"Loaded “{sel_sheet}”. Base ready. "
-                       f"NCA feats used: {', '.join(ss.nca_model.get('feats', [])) if ss.nca_model else '—'}")
+            st.success(f"Loaded “{sel_sheet}”. Base ready.")
             do_rerun()
         except Exception as e:
             st.error("Loading/processing failed.")
@@ -606,10 +515,6 @@ if submitted and ticker:
     row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
     denom = row["PredVol_M"]
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
-
-    # NCA score (FT=1 probability via kernel-kNN in NCA space)
-    row["NCA_FT1_%"] = nca_score_one(ss.get("nca_model", {}), row)
-
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
@@ -662,6 +567,7 @@ df_cmp = base_df.copy()
 thr = float(gain_min)
 
 if mode == "Gain% vs Rest":
+    # Absolute split on full set (NaNs fall to Rest)
     df_cmp["__Group__"] = np.where(
         pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr,
         f"≥{int(thr)}%",
@@ -671,6 +577,7 @@ if mode == "Gain% vs Rest":
     status_line = f"Gain% split at ≥ {int(thr)}%"
 
 elif mode == "FT=1 (High vs Low cutoff)":
+    # Keep only FT=1, then split by cutoff; NaNs count as Low to preserve sample size
     df_cmp = df_cmp[df_cmp["FT01"] == 1].copy()
     gain_val = pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce")
     df_cmp["__Group__"] = np.where(gain_val >= thr, f"FT=1 ≥{int(thr)}%", "FT=1 <{int_thr}%".format(int_thr=int(thr)))
@@ -678,6 +585,7 @@ elif mode == "FT=1 (High vs Low cutoff)":
     status_line = f"FT=1 split at Gain% ≥ {int(thr)}% (NaNs treated as Low)"
 
 else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
+    # A: FT=1 & ≥ cutoff ; B: all FT=0 (no cutoff)
     a_mask = (df_cmp["FT01"] == 1) & (pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr)
     b_mask = (df_cmp["FT01"] == 0)
     df_cmp = df_cmp[a_mask | b_mask].copy()
@@ -720,6 +628,7 @@ cols = list(med_tbl.columns)
 if (gA in cols) and (gB in cols):
     med_tbl = med_tbl[[gA, gB]]
 else:
+    # Fallback: pick two largest groups present
     top2 = df_cmp["__Group__"].value_counts().index[:2].tolist()
     if len(top2) < 2:
         st.info("One of the groups is empty. Adjust Gain% threshold.")
@@ -798,21 +707,12 @@ for row in ss.rows:
     )
     if not counts: continue
 
-    # NCA score already computed at add time; recompute if missing/new model
-    if ("NCA_FT1_%" not in stock) or (stock.get("NCA_FT1_%") is None) or (not np.isfinite(stock.get("NCA_FT1_%", np.nan))):
-        stock["NCA_FT1_%"] = float(p_nca) if np.isfinite(p_nca) else np.nan
-
-    p_nca = stock.get("NCA_FT1_%", np.nan)
-    p_nca_int = int(round(p_nca)) if (p_nca is not None and np.isfinite(p_nca)) else 0
-
     summary_rows.append({
         "Ticker": tkr,
         "A_val_raw": counts.get("A_pct_raw", 0.0),
         "B_val_raw": counts.get("B_pct_raw", 0.0),
         "A_val_int": counts.get("A_pct_int", 0),
         "B_val_int": counts.get("B_pct_int", 0),
-        "NCA_val_raw": p_nca if np.isfinite(p_nca) else 0.0,
-        "NCA_val_int": p_nca_int,
         "A_label": counts.get("A_label", gA),
         "B_label": counts.get("B_label", gB),
         "A_pts": counts.get("A_pts", 0.0),
@@ -877,21 +777,19 @@ html = """
   .bar{height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden}
   .bar>span{position:absolute;left:0;top:0;bottom:0;width:0%}
   .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:28px;text-align:center}
-  .blue>span{background:#3b82f6}.red>span{background:#ef4444}.orange>span{background:#f59e0b}
-  #align td:nth-child(2),#align th:nth-child(2),
-  #align td:nth-child(3),#align th:nth-child(3),
-  #align td:nth-child(4),#align th:nth-child(4){text-align:center}
+  .blue>span{background:#3b82f6}.red>span{background:#ef4444}
+  #align td:nth-child(2),#align th:nth-child(2),#align td:nth-child(3),#align th:nth-child(3){text-align:center}
   .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
   .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .child-table th:first-child,.child-table td:first-child{text-align:left}
   tr.group-row td{background:#f3f4f6!important;color:#374151;font-weight:600}
   .col-var{width:18%}.col-val{width:12%}.col-a{width:18%}.col-b{width:18%}.col-da{width:17%}.col-db{width:17%}
   .pos{color:#059669}.neg{color:#dc2626}
-  .sig-hi{background:rgba(250,204,21,0.18)!important}
-  .sig-lo{background:rgba(239,68,68,0.18)!important}
+  .sig-hi{background:rgba(250,204,21,0.18)!important} /* yellow */
+  .sig-lo{background:rgba(239,68,68,0.18)!important}  /* red */
 </style></head><body>
   <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th><th id="hdrNCA">NCA (FT=1)</th></tr></thead>
+    <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th></tr></thead>
   </table>
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
@@ -901,10 +799,12 @@ html = """
     document.getElementById('hdrA').textContent = data.gA;
     document.getElementById('hdrB').textContent = data.gB;
 
-    function barCell(valRaw, cssClass, labelText, valInt){
+    function barCellLabeled(valRaw,label,valInt){
+      const strong=(label==='FT=1' || label.startsWith('FT=1') || label.startsWith('≥'));
+      const cls=strong?'blue':'red';
       const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
       const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
-      return `<div class="bar-wrap"><div class="bar ${cssClass}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
+      return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
     }
     function formatVal(x){return (x==null||isNaN(x))?'':Number(x).toFixed(2);}
 
@@ -974,9 +874,8 @@ html = """
         data: data.rows||[], responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
         columns:[
           {data:'Ticker'},
-          {data:null, render:(row)=>barCell(row.A_val_raw,'blue', row.A_label, row.A_val_int)},
-          {data:null, render:(row)=>barCell(row.B_val_raw,'red',  row.B_label, row.B_val_int)},
-          {data:null, render:(row)=>barCell(row.NCA_val_raw,'orange','NCA (FT=1)', row.NCA_val_int)}
+          {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int)},
+          {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int)}
         ]
       });
       $('#align tbody').on('click','tr',function(){
