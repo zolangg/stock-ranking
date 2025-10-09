@@ -1,12 +1,12 @@
-# app.py — Premarket Ranking with Pred Model + NCA kernel-kNN + (CatBoost or RF) Leaf-Embedding kNN
+# app.py — Premarket Ranking with Pred Model + NCA kernel-kNN + CatBoost Leaf-Embedding kNN (no RF fallback)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re, json, hashlib
 
 # ============================== Page ==============================
-st.set_page_config(page_title="Premarket Stock Ranking (NCA + Leaf kNN)", layout="wide")
-st.title("Premarket Stock Ranking — NCA + Leaf-kNN Similarity")
+st.set_page_config(page_title="Premarket Stock Ranking (NCA + CatBoost-Leaf kNN)", layout="wide")
+st.title("Premarket Stock Ranking — NCA + CatBoost-Leaf kNN Similarity")
 
 # ============================== Session ==============================
 ss = st.session_state
@@ -15,13 +15,12 @@ ss.setdefault("last", {})
 ss.setdefault("lassoA", {})           # daily volume predictor (multiplier model)
 ss.setdefault("base_df", pd.DataFrame())
 
-ss.setdefault("nca_model", {})        # scaler, nca, Xnca, y, feat_names, df_meta
-ss.setdefault("leaf_model", {})       # scaler, leaf_clf, leaf_mat (train), y, feat_names, df_meta, head_name
+ss.setdefault("nca_model", {})        # scaler, nca, X_emb, y, feat_names, df_meta, guard
+ss.setdefault("leaf_model", {})       # scaler, cat_model, emb (train leaf indexes), y, feat_names, df_meta
 
 # ============================== Core deps ==============================
 try:
     from sklearn.preprocessing import StandardScaler
-    from sklearn.ensemble import RandomForestClassifier
     from sklearn.metrics import pairwise_distances
     from sklearn.neighbors import NeighborhoodComponentsAnalysis
     from sklearn.ensemble import IsolationForest
@@ -29,12 +28,11 @@ except ModuleNotFoundError:
     st.error("Missing scikit-learn. Add `scikit-learn==1.5.2` to requirements.txt and redeploy.")
     st.stop()
 
-# Optional CatBoost
-CATBOOST_AVAILABLE = True
 try:
     from catboost import CatBoostClassifier
-except Exception:
-    CATBOOST_AVAILABLE = False
+except ModuleNotFoundError:
+    st.error("Missing CatBoost. Add `catboost` to requirements.txt and redeploy.")
+    st.stop()
 
 # ============================== Small utils ==============================
 def do_rerun():
@@ -146,15 +144,15 @@ def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
     if bx.size == 1: return np.full_like(x_new, by[0], dtype=float)
     return np.interp(x_new, bx, by, left=by[0], right=by[-1])
 
-# ============================== Variables ==============================
-# We keep your original 9 plus *derived* PM_Vol_% and FR_x so smarter heads can use them
+# ============================== Features ==============================
+# 9 base + 2 derived (PM_Vol_% via predicted daily volume; FR_x via float)
 RF_FEATURES = [
     "MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%",
     "Max_Pull_PM_%","PM_Vol_M","PM$Vol/MC_%","RVOL_Max_PM_cum",
     "FR_x","PM_Vol_%"
 ]
 
-# ============================== Daily Volume Predictor (unchanged) ==============================
+# ============================== Daily Volume Predictor ==============================
 def _kfold_indices(n, k=5, seed=42):
     rng = np.random.default_rng(seed)
     idx = np.arange(n); rng.shuffle(idx)
@@ -348,7 +346,16 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     if not np.isfinite(PM) or PM <= 0: return np.nan
     return float(PM * cal_mult)
 
-# ============================== Heads: NCA + Leaf-Embedding ==============================
+def predict_daily_calibrated_df(df: pd.DataFrame, model: dict) -> pd.Series:
+    """Vectorized prediction for base_df to compute PredVol_M and PM_Vol_%."""
+    if not model or "betas" not in model: return pd.Series(np.nan, index=df.index)
+    out = []
+    for _, r in df.iterrows():
+        row = r.to_dict()
+        out.append(predict_daily_calibrated(row, model))
+    return pd.Series(out, index=df.index, dtype=float)
+
+# ============================== Heads: NCA + CatBoost Leaf-Embedding ==============================
 def _build_nca(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
     need = [y_col] + feat_names
     df_face = df[need].dropna()
@@ -392,31 +399,15 @@ def _build_leaf_head(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
     scaler = StandardScaler().fit(X)
     Xs = scaler.transform(X)
 
-    head_name = "CatBoost-leaf-kNN"
-    if CATBOOST_AVAILABLE:
-        model = CatBoostClassifier(
-            depth=6, learning_rate=0.08, loss_function="Logloss",
-            random_state=42, iterations=600, verbose=False, l2_leaf_reg=6,
-            class_weights=[1.0, float((y==0).sum() / max(1,(y==1).sum()))]
-        )
-        model.fit(Xs, y)
-        # leaf embedding: indices per tree -> dense vector ; use cosine distance
-        leaf_mat = model.calc_leaf_indexes(Xs)
-        leaf_mat = np.array(leaf_mat, dtype=int)
-        emb = leaf_mat  # integer leaf IDs; for cosine/Jaccard we can one-hot, but cosine on ints works if trees comparable
-        metric = "cosine"
-        leaf_clf = model
-    else:
-        head_name = "RF-leaf-kNN (fallback)"
-        model = RandomForestClassifier(
-            n_estimators=400, random_state=42, n_jobs=-1,
-            class_weight="balanced_subsample", max_features="sqrt"
-        )
-        model.fit(Xs, y)
-        leaf_ids = model.apply(Xs)  # (n, n_trees)
-        emb = leaf_ids
-        metric = "hamming"  # same-leaf match ratio ~ proximity
-        leaf_clf = model
+    cat = CatBoostClassifier(
+        depth=6, learning_rate=0.08, loss_function="Logloss",
+        random_state=42, iterations=600, verbose=False, l2_leaf_reg=6,
+        class_weights=[1.0, float((y==0).sum() / max(1,(y==1).sum()))]
+    )
+    cat.fit(Xs, y)
+    leaf_mat = cat.calc_leaf_indexes(Xs)  # (n_samples, n_trees)
+    leaf_mat = np.array(leaf_mat, dtype=int)
+    emb = leaf_mat  # integer leaf IDs; cosine on index vectors works OK across trees
 
     # meta
     meta_cols = ["FT01"]
@@ -426,8 +417,8 @@ def _build_leaf_head(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
         if f in df.columns and f not in meta_cols: meta_cols.append(f)
     meta = df.loc[df_face.index, meta_cols].reset_index(drop=True)
 
-    return {"scaler":scaler, "leaf_clf":leaf_clf, "emb":emb, "metric":metric, "y":y,
-            "feat_names":feat_names, "df_meta":meta, "head_name": head_name}
+    return {"scaler":scaler, "cat_model":cat, "emb":emb, "y":y,
+            "feat_names":feat_names, "df_meta":meta, "head_name":"CatBoost-leaf-kNN", "metric":"cosine"}
 
 def _elbow_kstar(sorted_vals, k_min=3, k_max=25, max_rank=30):
     n = len(sorted_vals)
@@ -448,7 +439,7 @@ def _kernel_weights(dists, k_star):
     return d, w
 
 def _nca_score_and_neighbors(model, row_dict, feat_names):
-    # build x
+    # vectorize row
     vec = []
     for f in feat_names:
         v = row_dict.get(f, None)
@@ -499,14 +490,11 @@ def _leaf_score_and_neighbors(model, row_dict, feat_names):
     xs = model["scaler"].transform(x)
 
     # embed query
-    if CATBOOST_AVAILABLE and model["head_name"].startswith("CatBoost"):
-        leaf_row = model["leaf_clf"].calc_leaf_indexes(xs)
-        emb_q = np.array(leaf_row, dtype=int)
-    else:
-        emb_q = model["leaf_clf"].apply(xs)  # RF: (1, n_trees)
+    leaf_row = model["cat_model"].calc_leaf_indexes(xs)
+    emb_q = np.array(leaf_row, dtype=int)
 
     Emb = model["emb"]
-    metric = model["metric"]
+    metric = model.get("metric","cosine")
 
     # distances in leaf space
     d = pairwise_distances(emb_q, Emb, metric=metric).ravel()
@@ -584,4 +572,281 @@ if build_btn:
             add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
             add_num(df, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
             add_num(df, "Gap_%",            ["gap %","gap%","premarket gap","gap","gap_percent"])
-            add_num(df, "ATR_$", ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
+            add_num(df, "ATR_$",            ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
+            add_num(df, "PM_Vol_M",         ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
+            add_num(df, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
+            add_num(df, "Daily_Vol_M",      ["daily vol (m)","daily_vol_m","day volume (m)","dvol_m"])
+            add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
+            add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
+            # catalyst
+            cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
+            if cand_catalyst: df["Catalyst"] = raw[cand_catalyst].map(_safe_to_binary_float)
+
+            # derived basic ratios (pre-prediction)
+            float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
+            if {"PM_Vol_M", float_basis}.issubset(df.columns):
+                df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
+            mcap_basis = "MC_PM_Max_M" if "MC_PM_Max_M" in df.columns and df["MC_PM_Max_M"].notna().any() else "MarketCap_M$"
+            if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
+                df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
+
+            # % fields from fractions if needed (DB commonly stores as fractions)
+            if "Gap_%" in df.columns:            df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
+            if "Max_Pull_PM_%" in df.columns:    df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
+
+            # FT labels
+            df["FT01"] = pd.Series(df["GroupRaw"]).map(_safe_to_binary)
+            df = df[df["FT01"].isin([0,1])].copy()
+
+            # Max Push Daily (%) if present (not used in features here)
+            pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
+            if pmh_col is not None:
+                pmh_raw = pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce")
+                df["Max_Push_Daily_%"] = pmh_raw * 100.0
+            else:
+                df["Max_Push_Daily_%"] = np.nan
+
+            # ================== Train daily-volume predictor ==================
+            # Need FR_x to exist before training; require min columns:
+            need_min = {"ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Daily_Vol_M","Gap_%"}
+            if not need_min.issubset(df.columns):
+                st.error(f"DB missing columns for daily-volume model: {sorted(need_min - set(df.columns))}")
+                st.stop()
+            ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
+
+            # Predict daily volume for each DB row -> PM_Vol_% (pred-based)
+            pred_series = predict_daily_calibrated_df(df, ss.lassoA)
+            df["PredVol_M"] = pred_series
+            df["PM_Vol_%"] = (df["PM_Vol_M"] / df["PredVol_M"] * 100.0).replace([np.inf,-np.inf], np.nan)
+
+            ss.base_df = df
+
+            # Build similarity heads (require RF_FEATURES present)
+            miss = [c for c in RF_FEATURES if c not in df.columns]
+            if miss:
+                st.error(f"DB missing required similarity features: {miss}")
+                st.stop()
+
+            ss.nca_model  = _build_nca(df, RF_FEATURES, y_col="FT01")
+            ss.leaf_model = _build_leaf_head(df, RF_FEATURES, y_col="FT01")
+
+            if not ss.nca_model or not ss.leaf_model:
+                st.error("Could not build models. Need at least 30 non-NaN rows for all required features.")
+                st.stop()
+
+            st.success(f"Loaded “{sel_sheet}”. Models ready. Rows used: NCA={ss.nca_model['X_emb'].shape[0]}, Leaf={ss.leaf_model['emb'].shape[0]}")
+            do_rerun()
+        except Exception as e:
+            st.error("Loading/processing failed.")
+            st.exception(e)
+
+# ============================== Add Stock ==============================
+st.markdown("---")
+st.subheader("Add Stock")
+
+with st.form("add_form", clear_on_submit=True):
+    c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
+    with c1:
+        ticker      = st.text_input("Ticker", "").strip().upper()
+        mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
+        float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
+        gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")
+        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")
+    with c2:
+        atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
+        pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
+        pm_dol      = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
+        rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
+    with c3:
+        catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
+    submitted = st.form_submit_button("Add to Table", use_container_width=True)
+
+if submitted and ticker:
+    fr   = (pm_vol / float_pm) if float_pm > 0 else 0.0
+    pmmc = (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else 0.0
+    row = {
+        "Ticker": ticker,
+        "MC_PM_Max_M": mc_pmmax,
+        "Float_PM_Max_M": float_pm,
+        "Gap_%": gap_pct,
+        "ATR_$": atr_usd,
+        "PM_Vol_M": pm_vol,
+        "PM_$Vol_M$": pm_dol,
+        "FR_x": fr,
+        "PM$Vol/MC_%": pmmc,
+        "Max_Pull_PM_%": max_pull_pm,
+        "RVOL_Max_PM_cum": rvol_pm_cum,
+        "CatalystYN": catalyst_yn,
+        "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
+    }
+    # predict daily volume -> PM_Vol_% (pred-based)
+    pred = predict_daily_calibrated(row, ss.get("lassoA", {}))
+    row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
+    denom = row["PredVol_M"]
+    row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
+
+    ss.rows.append(row); ss.last = row
+    st.success(f"Saved {ticker}."); do_rerun()
+
+# ============================== Alignment (NCA vs CatBoost-Leaf) ==============================
+st.markdown("### Alignment")
+
+base_df = ss.get("base_df", pd.DataFrame()).copy()
+if base_df.empty or (not ss.get("nca_model") or not ss.get("leaf_model")):
+    st.info("Upload DB and click **Build models** to compute embeddings first.")
+    st.stop()
+
+# Build summaries
+summaries, details = [], {}
+for row in ss.rows:
+    tkr = row.get("Ticker","—")
+
+    # NCA
+    s_nca = _nca_score_and_neighbors(ss.nca_model, row, RF_FEATURES)
+    # Leaf (CatBoost)
+    s_leaf = _leaf_score_and_neighbors(ss.leaf_model, row, RF_FEATURES)
+
+    if not s_nca and not s_leaf:
+        summaries.append({"Ticker": tkr, "NCA":0.0,"Leaf":0.0,"Avg":0.0,"kN":0,"kL":0})
+        details[tkr] = [{"__group__":"Missing inputs for similarity (need all 11 variables)."}]
+        continue
+
+    p1_n = float(s_nca["p1"]) if s_nca else 0.0
+    p1_l = float(s_leaf["p1"]) if s_leaf else 0.0
+    p1_avg = (p1_n + p1_l) / 2.0
+
+    summaries.append({
+        "Ticker": tkr, "NCA": p1_n, "Leaf": p1_l, "Avg": p1_avg,
+        "kN": int(s_nca["k"]) if s_nca else 0, "kL": int(s_leaf["k"]) if s_leaf else 0
+    })
+
+    rows = []
+    if s_nca and s_nca.get("neighbors"): rows.extend(s_nca["neighbors"])
+    if s_leaf and s_leaf.get("neighbors"): rows.extend(s_leaf["neighbors"])
+    details[tkr] = rows if rows else [{"__group__":"No neighbors."}]
+
+# ---------------- HTML/JS render ----------------
+import streamlit.components.v1 as components
+
+def _round_rec(o):
+    if isinstance(o, dict): return {k:_round_rec(v) for k,v in o.items()}
+    if isinstance(o, list): return [_round_rec(v) for v in o]
+    if isinstance(o, float): return float(np.round(o, 6))
+    return o
+
+payload = _round_rec({"rows": summaries, "details": details})
+
+html = """
+<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
+<link rel="stylesheet" href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.dataTables.min.css"/>
+<style>
+  body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,"Helvetica Neue",sans-serif}
+  table.dataTable tbody tr{cursor:pointer}
+  .bar-wrap{display:flex;justify-content:center;align-items:center;gap:6px}
+  .bar{height:12px;width:130px;border-radius:8px;background:#eee;position:relative;overflow:hidden}
+  .bar>span{position:absolute;left:0;top:0;bottom:0;width:0%}
+  .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:32px;text-align:center}
+  .nca>span{background:#3b82f6}     /* blue */
+  .leaf>span{background:#22c55e}    /* green */
+  .avg>span{background:#f59e0b}     /* amber */
+  #align td:nth-child(2),#align th:nth-child(2),#align td:nth-child(3),#align th:nth-child(3),#align td:nth-child(4),#align th:nth-child(4){text-align:center}
+  .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
+  .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .child-table th:first-child,.child-table td:first-child{text-align:left}
+  tr.group-row td{background:#f3f4f6!important;color:#374151;font-weight:600}
+</style></head><body>
+  <table id="align" class="display nowrap stripe" style="width:100%">
+    <thead><tr><th>Ticker</th><th>NCA (FT=1%)</th><th>Leaf (FT=1%)</th><th>Average</th><th>kN|kL</th></tr></thead>
+  </table>
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/responsive/2.5.0/js/dataTables.responsive.min.js"></script>
+  <script>
+    const data = %%PAYLOAD%%;
+
+    function barCell(valRaw, cls){
+      const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
+      const text=isNaN(valRaw)?'':Math.round(w);
+      return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
+    }
+    function childHTML(t){
+      const rows=(data.details||{})[t]||[];
+      if(!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No neighbors.</div>';
+      const cells = rows.map(r=>{
+        if(r.__group__) return '<tr class="group-row"><td colspan="6">'+r.__group__+'</td></tr>';
+        return `<tr>
+          <td>${r["#"]||""}</td><td>${r.FT==null?"":(r.FT===1?"FT=1":"FT=0")}</td>
+          <td>${(r.Weight==null||isNaN(r.Weight))?"":Number(r.Weight).toFixed(4)}</td>
+          <td>${(r.Dist==null||isNaN(r.Dist))?"":Number(r.Dist).toFixed(4)}</td>
+          <td>${r.Ticker||""}</td>
+          <td>${(r["MC_PM_Max_M"]??"")}</td>
+          <td>${(r["Float_PM_Max_M"]??"")}</td>
+          <td>${(r["Catalyst"]??"")}</td>
+          <td>${(r["ATR_$"]??"")}</td>
+          <td>${(r["Gap_%"]??"")}</td>
+          <td>${(r["Max_Pull_PM_%"]??"")}</td>
+          <td>${(r["PM_Vol_M"]??"")}</td>
+          <td>${(r["PM$Vol/MC_%"]??"")}</td>
+          <td>${(r["RVOL_Max_PM_cum"]??"")}</td>
+          <td>${(r["FR_x"]??"")}</td>
+          <td>${(r["PM_Vol_%"]??"")}</td>
+        </tr>`;
+      }).join('');
+      return `<table class="child-table">
+        <thead><tr>
+          <th>#</th><th>FT</th><th>Weight</th><th>Dist</th><th>Ticker</th>
+          <th>MC_PM_Max_M</th><th>Float_PM_Max_M</th><th>Catalyst</th><th>ATR_$</th><th>Gap_%</th>
+          <th>Max_Pull_PM_%</th><th>PM_Vol_M</th><th>PM$Vol/MC_%</th><th>RVOL_Max_PM_cum</th><th>FR_x</th><th>PM_Vol_%</th>
+        </tr></thead>
+        <tbody>${cells}</tbody></table>`;
+    }
+
+    $(function(){
+      const table=$('#align').DataTable({
+        data: data.rows||[], responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
+        columns:[
+          {data:'Ticker'},
+          {data:'NCA',  render:(v)=>barCell(v,'nca')},
+          {data:'Leaf', render:(v)=>barCell(v,'leaf')},
+          {data:'Avg',  render:(v)=>barCell(v,'avg')},
+          {data:null,   render:(r)=>`${r.kN||0}|${r.kL||0}`}
+        ]
+      });
+      $('#align tbody').on('click','tr',function(){
+        const row=table.row(this);
+        if(row.child.isShown()){ row.child.hide(); $(this).removeClass('shown'); }
+        else { row.child(childHTML(row.data().Ticker)).show(); $(this).addClass('shown'); }
+      });
+    });
+  </script>
+</body></html>
+"""
+html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
+components.html(html, height=620, scrolling=True)
+
+# ============================== Delete Control ==============================
+tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
+unique_tickers, _seen = [], set()
+for t in tickers:
+    if t and t not in _seen:
+        unique_tickers.append(t); _seen.add(t)
+
+del_cols = st.columns([4, 1])
+with del_cols[0]:
+    to_delete = st.multiselect(
+        "",
+        options=unique_tickers,
+        default=[],
+        key="del_selection",
+        placeholder="Select tickers…",
+        label_visibility="collapsed",
+    )
+with del_cols[1]:
+    if st.button("Delete", use_container_width=True, key="delete_btn"):
+        if to_delete:
+            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
+            st.success(f"Deleted: {', '.join(to_delete)}")
+            do_rerun()
+        else:
+            st.info("No tickers selected.")
