@@ -1,4 +1,4 @@
-# app.py — Premarket Stock Ranking (+ Metric-Learning FT=1 bar)
+# app.py — Premarket Stock Ranking (Median-only centers; Group UI + Gain% filter; 3σ coloring; delete UI)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,7 +16,6 @@ ss.setdefault("lassoA", {})
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("var_core", [])
 ss.setdefault("var_moderate", [])
-ss.setdefault("metric_model", {})  # NEW: Mahalanobis metric-learning head (FT=1)
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -336,119 +335,6 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     if not np.isfinite(PM) or PM <= 0: return np.nan
     return float(PM * cal_mult)
 
-# ============================== Metric Learning (Mahalanobis + kernel-kNN, deterministic) ==============================
-# Feature set for metric learning (use the classic “12” signals; train on whichever subset exists)
-ML_FEATURES_ORDER = [
-    "MC_PM_Max_M","Float_PM_Max_M","Catalyst","ATR_$","Gap_%",
-    "Max_Pull_PM_%","PM_Vol_M","PM_$Vol_M$","PM$Vol/MC_%",
-    "RVOL_Max_PM_cum","FR_x","PM_Vol_%"
-]
-
-def _fit_metric_head(df: pd.DataFrame, y_col="FT01"):
-    """Build a pooled-within-class Mahalanobis metric on standardized features, and store train embeddings."""
-    if y_col not in df.columns: return {}
-    feats = [f for f in ML_FEATURES_ORDER if f in df.columns]
-    if len(feats) < 3: return {}
-
-    # Keep rows with label and at least some features
-    use = df[feats + [y_col]].copy()
-    y = pd.to_numeric(use[y_col], errors="coerce").dropna().astype(int)
-    use = use.loc[y.index]
-    y = y.values
-    if np.unique(y).size < 2 or use.shape[0] < 30:
-        return {}
-
-    X = use[feats].astype(float)
-    # Median impute per feature
-    med = X.median(axis=0, skipna=True)
-    X = X.fillna(med)
-    # Standardize (store mean/std)
-    mu = X.mean(axis=0).values
-    sd = X.std(axis=0, ddof=0).replace(0, 1.0).values
-    Xs = (X.values - mu) / sd
-
-    # Pooled within-class covariance (deterministic)
-    X0 = Xs[y==0]; X1 = Xs[y==1]
-    if min(len(X0), len(X1)) < 5:
-        return {}
-    S0 = np.cov(X0, rowvar=False) if X0.shape[0] > 1 else np.eye(X0.shape[1])
-    S1 = np.cov(X1, rowvar=False) if X1.shape[0] > 1 else np.eye(X1.shape[1])
-    Sw = (S0 * (len(X0)-1) + S1 * (len(X1)-1)) / max(1,(len(X0)+len(X1)-2))
-    # Regularize (ridge) for stability
-    p = Sw.shape[0]
-    Sw_reg = Sw + 1e-6 * np.eye(p)
-    # Inverse “metric”
-    try:
-        M = np.linalg.pinv(Sw_reg)
-    except Exception:
-        return {}
-
-    # Get a metric square-root A such that d_M(x,z)=||A x - A z||_2
-    # M is SPD-ish; use eigen decomposition with floor on eigenvalues
-    vals, vecs = np.linalg.eigh(M)
-    vals = np.clip(vals, 1e-12, None)
-    A = (vecs * np.sqrt(vals)) @ vecs.T  # A = M^{1/2}
-
-    # Embed training points
-    Z = Xs @ A.T  # (n, p) -> (n, p)
-
-    return {"feats": feats, "mu": mu.tolist(), "sd": sd.tolist(),
-            "med": med.to_dict(), "A": A.tolist(),
-            "Z": Z.tolist(), "y": y.tolist()}
-
-def _metric_score(head: dict, row: dict) -> float:
-    """Kernel-kNN FT=1% using Mahalanobis metric learned above. Deterministic."""
-    if not head: return np.nan
-    feats = head["feats"]
-    x = []
-    for f in feats:
-        v = row.get(f, np.nan)
-        x.append(np.nan if v is None else float(v))
-    x = np.array(x, dtype=float)
-
-    # impute median
-    med = head["med"]
-    for j, f in enumerate(feats):
-        if not np.isfinite(x[j]):
-            m = med.get(f, np.nan)
-            x[j] = m if np.isfinite(m) else 0.0
-
-    mu = np.array(head["mu"], dtype=float)
-    sd = np.array(head["sd"], dtype=float)
-    xs = (x - mu) / sd
-
-    A = np.array(head["A"], dtype=float)
-    z = xs @ A.T  # (p,) -> (p,)
-    Z = np.array(head["Z"], dtype=float)
-    y = np.array(head["y"], dtype=int)
-
-    # Euclidean in transformed space == Mahalanobis in original
-    d = np.linalg.norm(Z - z[None,:], axis=1)
-    order = np.argsort(d)
-    d_sorted = d[order]
-    # elbow K*
-    def _elbow_kstar(sorted_vals, k_min=3, k_max=15, max_rank=30):
-        n = len(sorted_vals)
-        if n <= k_min: return max(1, n)
-        upto = min(max_rank, n-1)
-        if upto < 2: return min(k_max, max(k_min, n))
-        gaps = sorted_vals[:upto] - sorted_vals[1:upto+1]
-        k_star = int(np.argmax(gaps) + 1)
-        return max(k_min, min(k_max, k_star))
-    k_star = _elbow_kstar(d_sorted, k_min=3, k_max=min(15, len(order)))
-    top = order[:k_star]
-    d_top = d[top]
-    # kernel weights with median bandwidth (exclude zeros)
-    pos = d_top[d_top>0]
-    bw = np.median(pos) if pos.size else (np.mean(d_top)+1e-6)
-    bw = max(bw, 1e-6)
-    w = np.exp(-(d_top/bw)**2)
-    s = w.sum()
-    if s <= 0: return np.nan
-    w /= s
-    p1 = float(np.dot((y[top]==1).astype(float), w)) * 100.0
-    return p1
-
 # ============================== Summaries ==============================
 def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col: str, labels_map=None):
     avail = [v for v in var_all if v in df_in.columns]
@@ -577,11 +463,8 @@ if build_btn:
             ss.var_core = [v for v in VAR_CORE if v in df.columns]
             ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
 
-            # train daily-volume predictor once (on full base)
+            # train model once (on full base)
             ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
-
-            # train metric-learning head (deterministic)
-            ss.metric_model = _fit_metric_head(df) or {}
 
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
             do_rerun()
@@ -632,11 +515,6 @@ if submitted and ticker:
     row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
     denom = row["PredVol_M"]
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
-
-    # NEW: metric-learning FT=1 score
-    ml_pct = _metric_score(ss.get("metric_model", {}), row)
-    row["Metric_FT1_%"] = float(ml_pct) if np.isfinite(ml_pct) else np.nan
-
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
@@ -829,13 +707,6 @@ for row in ss.rows:
     )
     if not counts: continue
 
-    # NEW: metric-learning score (FT=1)
-    ml_pct = row.get("Metric_FT1_%", None)
-    if ml_pct is None or not np.isfinite(ml_pct):
-        ml_pct = _metric_score(ss.get("metric_model", {}), stock)
-        if np.isfinite(ml_pct):
-            stock["Metric_FT1_%"] = float(ml_pct)
-
     summary_rows.append({
         "Ticker": tkr,
         "A_val_raw": counts.get("A_pct_raw", 0.0),
@@ -850,9 +721,6 @@ for row in ss.rows:
         "B_core": counts.get("B_core", 0.0),
         "A_mod": counts.get("A_mod", 0.0),
         "B_mod": counts.get("B_mod", 0.0),
-        # NEW columns for metric bar
-        "ML_val_raw": float(ml_pct) if ml_pct is not None and np.isfinite(ml_pct) else 0.0,
-        "ML_val_int": int(round(float(ml_pct))) if ml_pct is not None and np.isfinite(ml_pct) else 0,
     })
 
     drows_grouped = []
@@ -909,21 +777,19 @@ html = """
   .bar{height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden}
   .bar>span{position:absolute;left:0;top:0;bottom:0;width:0%}
   .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:28px;text-align:center}
-  .blue>span{background:#3b82f6}.red>span{background:#ef4444}.orange>span{background:#f59e0b}
-  #align td:nth-child(2),#align th:nth-child(2),
-  #align td:nth-child(3),#align th:nth-child(3),
-  #align td:nth-child(4),#align th:nth-child(4){text-align:center}
+  .blue>span{background:#3b82f6}.red>span{background:#ef4444}
+  #align td:nth-child(2),#align th:nth-child(2),#align td:nth-child(3),#align th:nth-child(3){text-align:center}
   .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
   .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .child-table th:first-child,.child-table td:first-child{text-align:left}
   tr.group-row td{background:#f3f4f6!important;color:#374151;font-weight:600}
   .col-var{width:18%}.col-val{width:12%}.col-a{width:18%}.col-b{width:18%}.col-da{width:17%}.col-db{width:17%}
   .pos{color:#059669}.neg{color:#dc2626}
-  .sig-hi{background:rgba(250,204,21,0.18)!important}
-  .sig-lo{background:rgba(239,68,68,0.18)!important}
+  .sig-hi{background:rgba(250,204,21,0.18)!important} /* yellow */
+  .sig-lo{background:rgba(239,68,68,0.18)!important}  /* red */
 </style></head><body>
   <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th><th>Metric (FT=1)</th></tr></thead>
+    <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th></tr></thead>
   </table>
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
@@ -933,11 +799,12 @@ html = """
     document.getElementById('hdrA').textContent = data.gA;
     document.getElementById('hdrB').textContent = data.gB;
 
-    function barCellLabeled(valRaw,label,valInt,cls){
+    function barCellLabeled(valRaw,label,valInt){
+      const strong=(label==='FT=1' || label.startsWith('FT=1') || label.startsWith('≥'));
+      const cls=strong?'blue':'red';
       const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
       const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
-      const klass=cls || ((label==='FT=1' || String(label).startsWith('FT=1') || String(label).startsWith('≥'))?'blue':'red');
-      return `<div class="bar-wrap"><div class="bar ${klass}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
+      return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
     }
     function formatVal(x){return (x==null||isNaN(x))?'':Number(x).toFixed(2);}
 
@@ -1007,9 +874,8 @@ html = """
         data: data.rows||[], responsive:true, paging:false, info:false, searching:false, order:[[0,'asc']],
         columns:[
           {data:'Ticker'},
-          {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int,'blue')},
-          {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int,'red')},
-          {data:null, render:(row)=>barCellLabeled(row.ML_val_raw,'Metric',row.ML_val_int,'orange')}
+          {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int)},
+          {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int)}
         ]
       });
       $('#align tbody').on('click','tr',function(){
