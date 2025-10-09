@@ -1,4 +1,4 @@
-# app.py — Premarket Ranking with OOF Pred Model + NCA kernel-kNN + CatBoost Leaf-Embedding kNN
+# app.py — Premarket Ranking with OOF Pred Model + NCA kernel-kNN + CatBoost Leaf-Embedding kNN (Leaf-safe Avg)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,6 +17,8 @@ ss.setdefault("base_df", pd.DataFrame())
 
 ss.setdefault("nca_model", {})         # scaler, nca, X_emb, y, feat_names, df_meta, guard
 ss.setdefault("leaf_model", {})        # scaler, cat_model, emb(train), metric, y, feat_names, df_meta
+ss.setdefault("leaf_reason", "")       # diagnostic: why Leaf head is missing/unavailable
+ss.setdefault("nca_reason", "")        # diagnostic for NCA if needed
 
 # ============================== Core deps ==============================
 try:
@@ -32,7 +34,9 @@ except ModuleNotFoundError:
 # CatBoost only (no RF fallback)
 try:
     from catboost import CatBoostClassifier, Pool
+    CATBOOST_OK = True
 except ModuleNotFoundError:
+    CATBOOST_OK = False
     st.error("Missing CatBoost. Add `catboost==1.2.5` to requirements.txt and redeploy.")
     st.stop()
 
@@ -371,7 +375,8 @@ def _kernel_weights(dists, k_star):
 def _build_nca(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
     need = [y_col] + feat_names
     df_face = df[need].dropna()
-    if df_face.shape[0] < 30: return {}
+    if df_face.shape[0] < 30: 
+        return {}, "Not enough complete rows for NCA (need ≥30, have %d)." % df_face.shape[0]
 
     y = df_face[y_col].astype(int).values
     X = df_face[feat_names].astype(float).values
@@ -395,19 +400,21 @@ def _build_nca(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
     meta = df.loc[df_face.index, meta_cols].reset_index(drop=True)
 
     return {"scaler":scaler, "nca":nca, "X_emb":Xn, "y":y,
-            "feat_names":feat_names, "df_meta":meta, "guard": guard, "head_name":"NCA"}
+            "feat_names":feat_names, "df_meta":meta, "guard": guard, "head_name":"NCA"}, ""
 
 def _build_leaf_head(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
+    if not CATBOOST_OK:
+        return {}, "CatBoost not installed."
     need = [y_col] + feat_names
     df_face = df[need].dropna()
-    if df_face.shape[0] < 30: return {}
+    if df_face.shape[0] < 30:
+        return {}, "Not enough complete rows for Leaf head (need ≥30, have %d)." % df_face.shape[0]
 
     y = df_face[y_col].astype(int).values
     X = df_face[feat_names].astype(float).values
     scaler = StandardScaler().fit(X)
     Xs = scaler.transform(X)
 
-    # Regularized, shallow CatBoost; early stopping
     cb = CatBoostClassifier(
         depth=6, learning_rate=0.08, loss_function="Logloss", random_seed=42,
         iterations=1200, early_stopping_rounds=50,
@@ -415,14 +422,14 @@ def _build_leaf_head(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
         class_weights=[1.0, float((y==0).sum() / max(1,(y==1).sum()))],
         verbose=False
     )
-    # simple split for eval
     n = len(y); val = int(max(50, 0.15*n))
-    train_idx = np.arange(n - val); val_idx = np.arange(n - val, n)
-    cb.fit(Xs[train_idx], y[train_idx], eval_set=(Xs[val_idx], y[val_idx]))
+    if n - val < 20:
+        val = min(20, n//5)
+    cb.fit(Xs[:n-val], y[:n-val], eval_set=(Xs[n-val:], y[n-val:]))
 
     leaf_mat = cb.calc_leaf_indexes(Pool(Xs, y))
     leaf_mat = np.array(leaf_mat, dtype=int)
-    metric = "hamming"   # higher similarity -> lower distance
+    metric = "hamming"
 
     meta_cols = ["FT01"]
     for c in ("TickerDB","Ticker"):
@@ -432,7 +439,7 @@ def _build_leaf_head(df: pd.DataFrame, feat_names: list[str], y_col="FT01"):
     meta = df.loc[df_face.index, meta_cols].reset_index(drop=True)
 
     return {"scaler":scaler, "cat":cb, "emb":leaf_mat, "metric":metric, "y":y,
-            "feat_names":feat_names, "df_meta":meta, "head_name":"Leaf"}
+            "feat_names":feat_names, "df_meta":meta, "head_name":"Leaf"}, ""
 
 def _nca_score(model, row_dict):
     vec = []
@@ -482,7 +489,7 @@ def _leaf_score(model, row_dict):
     p1 = float(np.dot((y[idx]==1).astype(float), w_norm)) * 100.0
     return {"p1": p1, "k": int(k_star)}
 
-# ============================== Feature selection ==============================
+# ============================== Feature selection (drop-one; stability-ish) ==============================
 def _cv_metric_for_head(df_train, feat_names, head="nca", folds=3):
     need = ["FT01"] + feat_names
     sub = df_train[need].dropna()
@@ -498,18 +505,16 @@ def _cv_metric_for_head(df_train, feat_names, head="nca", folds=3):
         df_va = sub.iloc[va].copy()
 
         if head == "nca":
-            m = _build_nca(df_tr.assign(**{c: df_tr[c] for c in feat_names}), feat_names)
-            if not m: 
+            m, reason = _build_nca(df_tr.assign(**{c: df_tr[c] for c in feat_names}), feat_names)
+            if not m:
                 vals.append(np.nan); 
                 continue
-            # score VA
             scaler = m["scaler"]; nca = m["nca"]
             Xs_tr = scaler.transform(df_tr[feat_names].values)
             Xs_va = scaler.transform(df_va[feat_names].values)
             Xn_tr = nca.transform(Xs_tr)
             Xn_va = nca.transform(Xs_va)
             d = pairwise_distances(Xn_va, Xn_tr, metric="euclidean")
-            # kernel kNN vote to estimate proba FT=1
             order = np.argsort(d, axis=1)
             probs = []
             for i in range(d.shape[0]):
@@ -528,7 +533,6 @@ def _cv_metric_for_head(df_train, feat_names, head="nca", folds=3):
             vals.append(auc)
 
         else:  # leaf
-            # train catboost on tr
             scaler = StandardScaler().fit(df_tr[feat_names].values)
             Xtr = scaler.transform(df_tr[feat_names].values)
             Xva = scaler.transform(df_va[feat_names].values)
@@ -541,7 +545,6 @@ def _cv_metric_for_head(df_train, feat_names, head="nca", folds=3):
                 class_weights=[1.0, float((ytr==0).sum() / max(1,(ytr==1).sum()))],
                 verbose=False
             )
-            # simple internal split
             ntr = len(ytr); val = int(max(30, 0.15*ntr))
             cb.fit(Xtr[:-val], ytr[:-val], eval_set=(Xtr[-val:], ytr[-val:]))
 
@@ -581,14 +584,12 @@ def select_features_with_drop_one(df_train, feat_all, head="nca", keep_cap=10, m
         delta = (base_auc - auc) if np.isfinite(auc) else 0.0
         contrib.append((f, delta))
 
-    # keep features whose removal hurts performance (delta > 0) most often; sort by delta
     contrib.sort(key=lambda t: t[1], reverse=True)
     kept = [f for f, d in contrib if d > 0]
     if len(kept) < min_keep:
         kept = [f for f,_ in contrib[:max(min_keep, min(keep_cap, len(contrib)))]]
     if len(kept) > keep_cap:
         kept = kept[:keep_cap]
-    # final sanity: if we lost too many, fallback to top-k by delta
     if not kept:
         kept = [f for f,_ in contrib[:min(keep_cap, len(contrib))]]
     return kept
@@ -662,7 +663,7 @@ if build_btn:
                 except: return np.nan
             if cand_catalyst: df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
 
-            # derived from available cols
+            # derived
             float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
             if {"PM_Vol_M", float_basis}.issubset(df.columns):
                 df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
@@ -680,11 +681,11 @@ if build_btn:
             df = df[df["FT01"].isin([0,1])].copy()
             df["GroupFT"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
 
-            # passthrough a ticker if present
+            # passthrough ticker if present
             tcol = _pick(raw, ["ticker","symbol","name"])
             if tcol is not None: df["TickerDB"] = raw[tcol].astype(str).str.upper().str.strip()
 
-            # ---------- OOF PredVol_M to compute PM_Vol_% (no leakage) ----------
+            # ---------- OOF PredVol_M to compute PM_Vol_% ----------
             req_pred = ["ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Daily_Vol_M","Gap_%"]
             have_all = all(c in df.columns for c in req_pred)
             mcap_cols  = [c for c in ["MC_PM_Max_M","MarketCap_M$"] if c in df.columns]
@@ -702,45 +703,43 @@ if build_btn:
                         tr_rows = usable[tr_idx]; va_rows = usable[va_idx]
                         m = train_ratio_winsor_iso(df, idx_rows=tr_rows)
                         if not m: continue
-                        # predict held-out
-                        for i, ridx in enumerate(va_rows):
-                            row = df.iloc[ridx].to_dict()
-                            oof[ridx] = predict_daily_calibrated(row, m)
+                        for ridx in va_rows:
+                            rowD = df.iloc[ridx].to_dict()
+                            oof[ridx] = predict_daily_calibrated(rowD, m)
 
                 df["PredVol_M_OOF"] = oof
                 df["PM_Vol_%"] = np.where(np.isfinite(oof) & (oof>0),
                                           df["PM_Vol_M"] / oof * 100.0,
                                           df.get("PM_Vol_%", np.nan))
-                # Full-sample model for queries
                 ss.pred_model_full = train_ratio_winsor_iso(df) or {}
             else:
                 ss.pred_model_full = train_ratio_winsor_iso(df) or {}
 
-            # ---------- Feature selection per head on rows with all 12 features ----------
+            # ---------- Feature selection per head ----------
             have_12 = [c for c in FEAT12 if c in df.columns]
             train_df = df.dropna(subset=have_12 + ["FT01"]).copy()
             if train_df.shape[0] < 60:
-                st.warning("Not enough complete rows for feature selection; using all available features.")
                 feats_nca  = have_12
                 feats_leaf = have_12
+                st.warning("Not enough complete rows for feature selection; using all available features.")
             else:
                 feats_nca  = select_features_with_drop_one(train_df, have_12, head="nca",  keep_cap=10, min_keep=6)
                 feats_leaf = select_features_with_drop_one(train_df, have_12, head="leaf", keep_cap=10, min_keep=6)
 
-            # ---------- Build heads ----------
-            ss.nca_model  = _build_nca(df, feats_nca) if feats_nca else {}
-            ss.leaf_model = _build_leaf_head(df, feats_leaf) if feats_leaf else {}
+            # ---------- Build heads (capture reasons) ----------
+            ss.nca_model, ss.nca_reason   = _build_nca(df, feats_nca) if feats_nca else ({}, "No features selected for NCA.")
+            ss.leaf_model, ss.leaf_reason = _build_leaf_head(df, feats_leaf) if feats_leaf else ({}, "No features selected for Leaf.")
 
-            # Store base
             ss.base_df = df
 
-            ok_bits = []
-            if ss.pred_model_full: ok_bits.append("daily volume predictor ✓")
-            if ss.nca_model:       ok_bits.append(f"NCA head ✓ ({len(ss.nca_model['feat_names'])} vars)")
-            if ss.leaf_model:      ok_bits.append(f"Leaf head ✓ ({len(ss.leaf_model['feat_names'])} vars)")
-            if not ok_bits: st.error("No models could be trained. Check your DB coverage.")
-            else: st.success("Built: " + " • ".join(ok_bits))
+            msgs = []
+            if ss.pred_model_full: msgs.append("daily volume predictor ✓")
+            if ss.nca_model: msgs.append(f"NCA head ✓ ({len(ss.nca_model['feat_names'])} vars)")
+            else: msgs.append(f"NCA ✗ — {ss.nca_reason}")
+            if ss.leaf_model: msgs.append(f"Leaf head ✓ ({len(ss.leaf_model['feat_names'])} vars)")
+            else: msgs.append(f"Leaf ✗ — {ss.leaf_reason}")
 
+            st.success(" | ".join(msgs))
             do_rerun()
         except Exception as e:
             st.error("Loading/processing failed.")
@@ -790,7 +789,6 @@ if submitted and ticker:
     denom = row["PredVol_M"]
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom * 100.0) if np.isfinite(denom) and denom > 0 else np.nan
 
-    # guard: all 12 features must be finite
     missing = [f for f in FEAT12 if not np.isfinite(pd.to_numeric(row.get(f), errors="coerce"))]
     if missing:
         st.error("Missing inputs for: " + ", ".join(missing))
@@ -800,26 +798,41 @@ if submitted and ticker:
 
 # ============================== Alignment (Bars + Summary child) ==============================
 st.markdown("### Similarity — FT=1 share (kernel-kNN)")
-if not (ss.nca_model and ss.leaf_model):
-    st.info("Upload DB and click **Build models** first.")
+
+if not ss.nca_model and not ss.leaf_model:
+    tip = "Build models first. "
+    if ss.nca_reason: tip += f"NCA: {ss.nca_reason}. "
+    if ss.leaf_reason: tip += f"Leaf: {ss.leaf_reason}."
+    st.info(tip)
     st.stop()
 
-nca_feats  = ss.nca_model["feat_names"]
-leaf_feats = ss.leaf_model["feat_names"]
+nca_feats  = ss.nca_model.get("feat_names", [])
+leaf_feats = ss.leaf_model.get("feat_names", [])
 
 summ_rows, details = [], {}
 for row in ss.rows:
     tkr = row.get("Ticker") or "—"
 
-    s1 = _nca_score(ss.nca_model, row)
-    s2 = _leaf_score(ss.leaf_model, row)
-    if not s1 or not s2:
-        details[tkr] = [{"__group__": "Missing inputs for similarity (need all 12 variables)."}]
-        continue
+    p1_list = []
+    p1_nca = np.nan
+    p1_leaf = np.nan
 
-    p1_nca = float(np.clip(s1["p1"], 0, 100))
-    p1_leaf = float(np.clip(s2["p1"], 0, 100))
-    p1_avg = float((p1_nca + p1_leaf) / 2.0)
+    if ss.nca_model:
+        s1 = _nca_score(ss.nca_model, row)
+        if s1:
+            p1_nca = float(np.clip(s1["p1"], 0, 100))
+            p1_list.append(p1_nca)
+
+    if ss.leaf_model:
+        s2 = _leaf_score(ss.leaf_model, row)
+        if s2:
+            p1_leaf = float(np.clip(s2["p1"], 0, 100))
+            p1_list.append(p1_leaf)
+
+    if p1_list:
+        p1_avg = float(np.mean(p1_list))
+    else:
+        p1_avg = np.nan
 
     summ_rows.append({
         "Ticker": tkr,
@@ -833,7 +846,8 @@ for row in ss.rows:
     drows = [{"__group__": "Inputs summary"}]
     for v in vars_:
         val = row.get(v, np.nan)
-        drows.append({"Variable": v, "Value": (None if not np.isfinite(pd.to_numeric(val, errors="coerce")) else float(val))})
+        vnum = pd.to_numeric(val, errors="coerce")
+        drows.append({"Variable": v, "Value": (None if not np.isfinite(vnum) else float(vnum))})
     details[tkr] = drows
 
 # ---------------- HTML/JS render ----------------
@@ -849,7 +863,8 @@ payload = _round_rec({
     "rows": summ_rows,
     "details": details,
     "nca_feats": nca_feats,
-    "leaf_feats": leaf_feats
+    "leaf_feats": leaf_feats,
+    "leaf_available": bool(ss.leaf_model)
 })
 
 html = """
@@ -872,6 +887,7 @@ html = """
   .child-table th:first-child,.child-table td:first-child{text-align:left}
   tr.group-row td{background:#f3f4f6!important;color:#374151;font-weight:600}
   .col-var{width:40%}.col-val{width:60%}
+  .na{color:#6b7280;font-style:italic}
 </style></head><body>
   <div style="margin:6px 0 10px 0;font-size:12px;color:#374151;">
     <strong>NCA features:</strong> <span id="nca_feats"></span> &nbsp;|&nbsp;
@@ -886,10 +902,13 @@ html = """
   <script>
     const data = %%PAYLOAD%%;
     document.getElementById('nca_feats').textContent = (data.nca_feats||[]).join(', ');
-    document.getElementById('leaf_feats').textContent = (data.leaf_feats||[]).join(', ');
+    document.getElementById('leaf_feats').textContent = data.leaf_available ? (data.leaf_feats||[]).join(', ') : '(unavailable)';
 
     function barCell(valRaw, cls){
-      const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
+      if (valRaw==null || isNaN(valRaw)) {
+        return `<div class="na">—</div>`;
+      }
+      const w=Math.max(0,Math.min(100,valRaw));
       const text=Math.round(w);
       return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}%</div></div>`;
     }
@@ -900,7 +919,7 @@ html = """
       if(!rows.length) return '<div style="margin-left:24px;color:#6b7280;">No details.</div>';
       const cells = rows.map(r=>{
         if(r.__group__) return '<tr class="group-row"><td colspan="2">'+r.__group__+'</td></tr>';
-        const v=(r.Value==null||isNaN(r.Value))?'':formatVal(r.Value);
+        const v=(r.Value==null||isNaN(r.Value))?'<span class="na">—</span>':formatVal(r.Value);
         return `<tr><td class="col-var">${r.Variable}</td><td class="col-val">${v}</td></tr>`;
       }).join('');
       return `<table class="child-table">
