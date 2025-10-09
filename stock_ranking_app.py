@@ -5,8 +5,8 @@ import numpy as np
 import re, json, hashlib
 
 # ============================== Page ==============================
-st.set_page_config(page_title="Premarket Stock Ranking (NCA + CatBoost Leaf kNN)", layout="wide")
-st.title("Premarket Stock Ranking — NCA + CatBoost Leaf-kNN Similarity")
+st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
+st.title("Premarket Stock Ranking")
 
 # ============================== Session ==============================
 ss = st.session_state
