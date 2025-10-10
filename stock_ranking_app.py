@@ -1135,14 +1135,14 @@ else:
             # tidy frame for Altair
             dist_df = pd.DataFrame({
                 "GainCutoff_%": thr_labels,
-                f"A mean ({gA})": series_A_means,
-                f"B mean ({gB})": series_B_means,
-                f"NCA mean: P({gA})": series_N_means,
+                f"Median centers: ({gA})": series_A_means,
+                f"Median centers: ({gB})": series_B_means,
+                f"NCA: P({gA})": series_N_means,
             })
 
             df_long = dist_df.melt(id_vars="GainCutoff_%", var_name="Series", value_name="Value")
 
-            color_domain = [f"A mean ({gA})", f"B mean ({gB})", f"NCA mean: P({gA})"]
+            color_domain = [f"Median centers: ({gA})", f"Median centers: ({gB})", f"NCA: P({gA})"]
             color_range  = ["#3b82f6", "#ef4444", "#10b981"]  # blue, red, green (match table bars)
 
             chart = (
