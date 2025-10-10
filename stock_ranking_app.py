@@ -1246,6 +1246,8 @@ else:
 # ============================== Distribution chart export (PNG only) ==============================
 from datetime import datetime
 import tempfile, os
+import altair as alt
+alt.data_transformers.disable_max_rows()  # embed all data inline
 
 png_bytes = None
 try:
