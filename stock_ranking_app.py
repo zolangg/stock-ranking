@@ -528,6 +528,32 @@ with col_gain:
         label_visibility="collapsed",
     )
 
+# ============================== Delete Control (below table; no title) ==============================
+tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
+unique_tickers, _seen = [], set()
+for t in tickers:
+    if t and t not in _seen:
+        unique_tickers.append(t); _seen.add(t)
+
+del_cols = st.columns([4, 1])
+with del_cols[0]:
+    to_delete = st.multiselect(
+        "",
+        options=unique_tickers,
+        default=[],
+        key="del_selection",
+        placeholder="Select tickers…",
+        label_visibility="collapsed",
+    )
+with del_cols[1]:
+    if st.button("Delete", use_container_width=True, key="delete_btn"):
+        if to_delete:
+            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
+            st.success(f"Deleted: {', '.join(to_delete)}")
+            do_rerun()
+        else:
+            st.info("No tickers selected.")
+
 # --- base data guardrails ---
 base_df = ss.get("base_df", pd.DataFrame()).copy()
 if base_df.empty:
@@ -988,32 +1014,6 @@ html = """
 """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=620, scrolling=True)
-            
-# ============================== Delete Control (below table; no title) ==============================
-tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-unique_tickers, _seen = [], set()
-for t in tickers:
-    if t and t not in _seen:
-        unique_tickers.append(t); _seen.add(t)
-
-del_cols = st.columns([4, 1])
-with del_cols[0]:
-    to_delete = st.multiselect(
-        "",
-        options=unique_tickers,
-        default=[],
-        key="del_selection",
-        placeholder="Select tickers…",
-        label_visibility="collapsed",
-    )
-with del_cols[1]:
-    if st.button("Delete", use_container_width=True, key="delete_btn"):
-        if to_delete:
-            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
-            st.success(f"Deleted: {', '.join(to_delete)}")
-            do_rerun()
-        else:
-            st.info("No tickers selected.")
 
 # ============================== Distributions across all Gain% cutoffs (select stocks + color-matched bars) ==============================
 import altair as alt
