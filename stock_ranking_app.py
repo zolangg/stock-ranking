@@ -1158,8 +1158,3 @@ else:
                 .properties(height=320)
             )
             st.altair_chart(chart, use_container_width=True)
-
-            st.caption(
-                f"Bars are color-matched to the alignment table: **{gA}** = blue, **{gB}** = red, **NCA** = green. "
-                f"Values show the mean across the selected stocks for each Gain% cutoff."
-            )
