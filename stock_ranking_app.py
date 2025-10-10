@@ -1246,38 +1246,39 @@ else:
 # ============================== Distribution chart export (PNG only) ==============================
 from datetime import datetime
 import tempfile, os
-import altair as alt
-alt.data_transformers.disable_max_rows()  # embed all data inline
-
-png_bytes = None
-try:
-    # Preferred: pip install vl-convert-python
-    from vl_convert import vlc
-    png_bytes = vlc.vegalite_to_png(chart.to_dict())
-except Exception:
-    try:
-        # Fallback: pip install altair_saver
-        from altair_saver import save
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_name = tmp.name
-        save(chart, tmp_name)  # writes the PNG to tmp_name
-        with open(tmp_name, "rb") as f:
-            png_bytes = f.read()
-        os.remove(tmp_name)
-    except Exception:
-        png_bytes = None
 
 st.markdown("##### Export distribution chart")
-if png_bytes is not None:
-    st.download_button(
-        "Download PNG (distribution)",
-        data=png_bytes,
-        file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-        mime="image/png",
-        use_container_width=True,
-        key="dl_dist_png",
-    )
-else:
-    st.caption("PNG export unavailable — install `vl-convert-python` (recommended) or `altair_saver`.")
 
-chart.save("chart.png")  # requires altair_saver + chromium
+# Only try to export if the chart exists in this run
+if "chart" in locals():
+    png_bytes = None
+    try:
+        # Preferred (lightweight): pip install vl-convert-python
+        from vl_convert import vlc
+        png_bytes = vlc.vegalite_to_png(chart.to_dict())
+    except Exception:
+        # Fallback (heavier): pip install altair_saver (and chromium on some hosts)
+        try:
+            from altair_saver import save
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_name = tmp.name
+            save(chart, tmp_name)  # writes PNG
+            with open(tmp_name, "rb") as f:
+                png_bytes = f.read()
+            os.remove(tmp_name)
+        except Exception:
+            png_bytes = None
+
+    if png_bytes is not None:
+        st.download_button(
+            "Download PNG (distribution)",
+            data=png_bytes,
+            file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+            mime="image/png",
+            use_container_width=True,
+            key="dl_dist_png",
+        )
+    else:
+        st.caption("PNG export unavailable — install `vl-convert-python` (recommended) or `altair_saver`.")
+else:
+    st.caption("Build a distribution chart above to enable export.")
