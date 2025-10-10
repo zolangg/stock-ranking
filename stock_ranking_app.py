@@ -341,7 +341,7 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     return float(PM * cal_mult)
 
 # ============================== Upload / Build ==============================
-st.subheader("1) Upload Database")
+st.subheader("Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
 build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
 
@@ -458,7 +458,7 @@ if build_btn:
 st.divider()
 
 # ============================== Add Stock + Manage ==============================
-st.subheader("2) Add Stock")
+st.subheader("Add Stock")
 
 with st.form("add_form", clear_on_submit=True):
     c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
@@ -530,7 +530,7 @@ with cdel2:
 st.divider()
 
 # ============================== Alignment ==============================
-st.subheader("3) Alignment")
+st.subheader("Alignment")
 
 # --- controls row: radios (left) + Gain% dropdown (right) ---
 col_mode, col_gain = st.columns([2.8, 1.0])
@@ -1021,7 +1021,7 @@ components.html(html, height=620, scrolling=True)
 # ============================== Distributions across all Gain% cutoffs (select stocks + color-matched bars) ==============================
 import altair as alt
 
-st.subheader("4) Distributions across Gain% cutoffs")
+st.subheader("Distributions")
 
 if not ss.rows:
     st.info("Add at least one stock to see distributions across cutoffs.")
