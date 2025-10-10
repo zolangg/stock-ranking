@@ -1168,14 +1168,14 @@ if summary_rows:
     st.markdown("##### Export alignment")
     c1, c2 = st.columns(2)
     with c1:
-    st.download_button(
-        "Download CSV (full, with child rows)",
-        data=df_align_csv_pretty.to_csv(index=False).encode("utf-8"),
-        file_name="alignment_full_with_children.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key="dl_align_csv_full",
-    )
+        st.download_button(
+            "Download CSV (full, with child rows)",
+            data=df_align_csv_pretty.to_csv(index=False).encode("utf-8"),
+            file_name="alignment_full_with_children.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_align_csv_full",
+        )
     with c2:
         st.download_button(
             "Download Markdown (summary only)",
