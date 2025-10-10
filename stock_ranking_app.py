@@ -1043,36 +1043,37 @@ st.subheader("Distributions across Gain% cutoffs")
 if not ss.rows:
     st.info("Add at least one stock to see distributions across cutoffs.")
 else:
-    # choose which added stocks to include
+    # unique tickers, keep first occurrence order
     all_tickers = [(r.get("Ticker") or "—") for r in ss.rows]
     seen = set(); all_tickers = [t for t in all_tickers if not (t in seen or seen.add(t))]
 
-    csel1, csel2, csel3 = st.columns([4,1.2,1.2])
+    csel1, csel2 = st.columns([4, 1])
     with csel1:
         stocks_selected = st.multiselect(
             "",
             options=all_tickers,
             default=all_tickers,
-            help="Which of your added stocks are used to compute the roll-up per cutoff.",
+            help="Which added stocks are used to compute the distribution at each cutoff.",
             label_visibility="collapsed",
             key="dist_stock_sel",
         )
     with csel2:
-        agg_choice = st.radio(
-            "Rollup",
-            ["Mean", "Median"],
-            horizontal=True,
-            key="dist_rollup"
-        )
-    with csel3:
-        st.caption("Colors match the table: blue=A, red=B, green=NCA")
+        cbtn1, cbtn2 = st.columns(2)
+        with cbtn1:
+            if st.button("Select all", use_container_width=True, key="dist_sel_all"):
+                st.session_state["dist_stock_sel"] = all_tickers
+                do_rerun()
+        with cbtn2:
+            if st.button("Clear", use_container_width=True, key="dist_sel_clear"):
+                st.session_state["dist_stock_sel"] = []
+                do_rerun()
 
     rows_for_dist = [r for r in ss.rows if (r.get("Ticker") or "—") in stocks_selected]
 
     if not rows_for_dist:
         st.info("No stocks selected.")
     else:
-        # Helper: recompute split + medians + NCA for each threshold; aggregate over selected rows
+        # local helpers reusing your current split + summary logic
         def _make_split(df_base: pd.DataFrame, thr_val: float, mode_val: str):
             df_tmp = df_base.copy()
             if mode_val == "Gain% vs Rest":
@@ -1101,15 +1102,13 @@ else:
             mad_tbl_ = df_in.groupby(grp_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad_local)).T * 1.4826
             return med_tbl_, mad_tbl_
 
-        thr_labels, series_A_vals, series_B_vals, series_N_vals = [], [], [], []
-        per_thr_details = []
-
-        agg_fn = np.nanmean if agg_choice == "Mean" else np.nanmedian
+        # build series: median across selected stocks for A/B alignment; median NCA probability
+        thr_labels = []
+        series_A_med, series_B_med, series_N_med = [], [], []
 
         for thr_val in gain_choices:
             df_split, gA2, gB2 = _make_split(base_df, float(thr_val), mode)
             med_tbl2, mad_tbl2 = _summaries(df_split, var_all, "__Group__")
-
             if med_tbl2.empty or med_tbl2.shape[1] < 2:
                 continue
 
@@ -1119,18 +1118,19 @@ else:
                 mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
             else:
                 top2 = df_split["__Group__"].value_counts().index[:2].tolist()
-                if len(top2) < 2:
+                if len(top2) < 2: 
                     continue
                 gA2, gB2 = top2[0], top2[1]
                 med_tbl2 = med_tbl2[[gA2, gB2]]
                 mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
 
+            # NCA model for this cutoff (live features only inside the trainer)
             nca_model2 = _train_nca_or_lda(df_split, gA2, gB2, var_all) or {}
 
             As, Bs, Ns = [], [], []
             for row in rows_for_dist:
                 counts2 = _compute_alignment_counts_weighted(
-                    stock_row=row, centers_tbl=med_tbl2, var_core=var_core, var_mod=var_mod,
+                    stock_row=row, centers_tbl=med_tbl2, var_core=ss.var_core, var_mod=ss.var_moderate,
                     w_core=1.0, w_mod=0.5, tie_mode="split",
                 )
                 a = counts2.get("A_pct_raw", np.nan) if counts2 else np.nan
@@ -1140,61 +1140,41 @@ else:
                 n = (float(pA) * 100.0) if np.isfinite(pA) else np.nan
 
                 As.append(a); Bs.append(b); Ns.append(n)
-                per_thr_details.append({
-                    "GainCutoff_%": int(thr_val),
-                    "Ticker": row.get("Ticker","—"),
-                    f"A% ({gA2})": a,
-                    f"B% ({gB2})": b,
-                    f"NCA: P({gA2}) %": n,
-                })
 
             thr_labels.append(int(thr_val))
-            series_A_vals.append(float(agg_fn(As)) if len(As) else np.nan)
-            series_B_vals.append(float(agg_fn(Bs)) if len(Bs) else np.nan)
-            series_N_vals.append(float(agg_fn(Ns)) if len(Ns) else np.nan)
+            series_A_med.append(float(np.nanmedian(As)) if len(As) else np.nan)
+            series_B_med.append(float(np.nanmedian(Bs)) if len(Bs) else np.nan)
+            series_N_med.append(float(np.nanmedian(Ns)) if len(Ns) else np.nan)
 
         if not thr_labels:
             st.info("Not enough data across cutoffs to form two groups — broaden your DB or change mode.")
         else:
-            # labels reflect median centers; roll-up label follows agg_choice
-            roll = "mean" if agg_choice == "Mean" else "median"
-            series_A_label = f"A {roll} align% (median centers → {gA})"
-            series_B_label = f"B {roll} align% (median centers → {gB})"
-            series_N_label = f"NCA {roll}: P({gA})"
+            # legend labels per your spec
+            labA = f"{gA} (Median centers)"
+            labB = f"{gB} (Median centers)"
+            labN = f"NCA: P({gA})"
 
             dist_df = pd.DataFrame({
                 "GainCutoff_%": thr_labels,
-                series_A_label: series_A_vals,
-                series_B_label: series_B_vals,
-                series_N_label: series_N_vals,
+                labA: series_A_med,
+                labB: series_B_med,
+                labN: series_N_med,
             })
-
             df_long = dist_df.melt(id_vars="GainCutoff_%", var_name="Series", value_name="Value")
 
-            color_domain = [series_A_label, series_B_label, series_N_label]
-            color_range  = ["#3b82f6", "#ef4444", "#10b981"]  # blue, red, green
+            color_domain = [labA, labB, labN]
+            color_range  = ["#3b82f6", "#ef4444", "#10b981"]  # match main table bars
 
             chart = (
                 alt.Chart(df_long)
                 .mark_bar()
                 .encode(
                     x=alt.X("GainCutoff_%:O", title="Gain% cutoff"),
-                    y=alt.Y("Value:Q", title="Value (%)", scale=alt.Scale(domain=[0,100])),
-                    color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Series")),
+                    y=alt.Y("Value:Q", title="Median across selected stocks (%)", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="")),
                     xOffset="Series:N",
                     tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")]
                 )
                 .properties(height=320)
             )
             st.altair_chart(chart, use_container_width=True)
-
-            if agg_choice == "Mean":
-                st.caption(
-                    f"Each bar = **average alignment** computed vs **median** group centers across the selected stocks at that cutoff. "
-                    f"Colors: **{gA}**=blue, **{gB}**=red, **NCA**=green."
-                )
-            else:
-                st.caption(
-                    f"Each bar = **median alignment** computed vs **median** group centers across the selected stocks at that cutoff. "
-                    f"Colors: **{gA}**=blue, **{gB}**=red, **NCA**=green."
-                )
