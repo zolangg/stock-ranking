@@ -1034,6 +1034,60 @@ html = """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=620, scrolling=True)
 
+# ============================== Alignment exports (CSV + Markdown) ==============================
+import math
+
+# Build a simple DataFrame from summary_rows for export
+if summary_rows:
+    df_align = pd.DataFrame(summary_rows)[
+        ["Ticker", "A_label", "A_val_int", "B_label", "B_val_int", "NCA_int"]
+    ].rename(
+        columns={
+            "A_label": "A group",
+            "A_val_int": "A (%) — Median centers",
+            "B_label": "B group",
+            "B_val_int": "B (%) — Median centers",
+            "NCA_int": "NCA (%)",
+        }
+    )
+
+    def _df_to_markdown_simple(df: pd.DataFrame, float_fmt=".0f") -> str:
+        def _fmt(x):
+            if x is None: return ""
+            if isinstance(x, float):
+                if math.isnan(x) or math.isinf(x): return ""
+                return format(x, float_fmt)
+            return str(x)
+        cols = list(df.columns)
+        header = "| " + " | ".join(cols) + " |"
+        sep    = "| " + " | ".join("---" for _ in cols) + " |"
+        lines = [header, sep]
+        for _, row in df.iterrows():
+            cells = [_fmt(v) for v in row.tolist()]
+            lines.append("| " + " | ".join(cells) + " |")
+        return "\n".join(lines)
+
+    st.markdown("##### Export alignment table")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Download CSV (alignment)",
+            data=df_align.to_csv(index=False).encode("utf-8"),
+            file_name="alignment_table.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_align_csv",
+        )
+    with c2:
+        st.download_button(
+            "Download Markdown (alignment)",
+            data=_df_to_markdown_simple(df_align, float_fmt=".0f").encode("utf-8"),
+            file_name="alignment_table.md",
+            mime="text/markdown",
+            use_container_width=True,
+            key="dl_align_md",
+        )
+
 # ============================== Distributions across Gain% cutoffs ==============================
 import altair as alt
 
@@ -1189,88 +1243,37 @@ else:
             )
             st.altair_chart(chart, use_container_width=True)
 
-# ---------------- Export: PNG / Markdown / CSV (no tabulate required) ----------------
-import io
+# ============================== Distribution chart export (PNG only) ==============================
 from datetime import datetime
-import math
+import tempfile, os
 
-def _df_to_markdown_simple(df: pd.DataFrame, float_fmt=".2f") -> str:
-    # format floats, leave NaNs blank
-    def _fmt(x):
-        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-            return ""
-        if isinstance(x, float):
-            return format(x, float_fmt)
-        return str(x)
-
-    cols = list(df.columns)
-    header = "| " + " | ".join(cols) + " |"
-    sep    = "| " + " | ".join("---" for _ in cols) + " |"
-
-    lines = [header, sep]
-    for _, row in df.iterrows():
-        cells = [_fmt(v) for v in row.tolist()]
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
-# base filename (user editable)
-default_name = f"distributions_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-fname = st.text_input("File name (no extension)", value=default_name, key="dist_export_name")
-
-# data exports
-md_bytes  = _df_to_markdown_simple(dist_df, float_fmt=".2f").encode("utf-8")
-csv_bytes = dist_df.to_csv(index=False).encode("utf-8")
-
-# image export (PNG) – try vl-convert first, altair_saver second
 png_bytes = None
 try:
-    from vl_convert import vlc  # pip install vl-convert-python
+    # Preferred: pip install vl-convert-python
+    from vl_convert import vlc
     png_bytes = vlc.vegalite_to_png(chart.to_dict())
 except Exception:
     try:
-        from altair_saver import save  # pip install altair_saver
-        import tempfile, os
+        # Fallback: pip install altair_saver
+        from altair_saver import save
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_name = tmp.name
-        save(chart, tmp_name)
+        save(chart, tmp_name)  # writes the PNG to tmp_name
         with open(tmp_name, "rb") as f:
             png_bytes = f.read()
         os.remove(tmp_name)
     except Exception:
-        png_bytes = None  # neither backend available
+        png_bytes = None
 
-st.markdown("##### Export")
-exp_cols = st.columns(3)
-
-with exp_cols[0]:
+st.markdown("##### Export distribution chart")
+if png_bytes is not None:
     st.download_button(
-        "Download CSV",
-        data=csv_bytes,
-        file_name=f"{fname}.csv",
-        mime="text/csv",
+        "Download PNG (distribution)",
+        data=png_bytes,
+        file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+        mime="image/png",
         use_container_width=True,
-        key="dist_dl_csv",
+        key="dl_dist_png",
     )
-
-with exp_cols[1]:
-    st.download_button(
-        "Download Markdown",
-        data=md_bytes,
-        file_name=f"{fname}.md",
-        mime="text/markdown",
-        use_container_width=True,
-        key="dist_dl_md",
-    )
-
-with exp_cols[2]:
-    if png_bytes is not None:
-        st.download_button(
-            "Download PNG",
-            data=png_bytes,
-            file_name=f"{fname}.png",
-            mime="image/png",
-            use_container_width=True,
-            key="dist_dl_png",
-        )
-    else:
-        st.caption("PNG export unavailable (install `vl-convert-python` or `altair_saver`).")
+else:
+    st.caption("PNG export unavailable — install `vl-convert-python` (recommended) or `altair_saver`.")
