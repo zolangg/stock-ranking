@@ -1034,10 +1034,11 @@ else:
         csel1, csel2 = st.columns([4,1])
         with csel1:
             stocks_selected = st.multiselect(
-                "Stocks to include",
+                "",
                 options=all_tickers,
                 default=all_tickers,
-                help="This controls which of your added stocks are used to compute the averages at each Gain% cutoff."
+                help="This controls which of your added stocks are used to compute the averages at each Gain% cutoff.",
+                label_visibility="collapsed",
             )
         with csel2:
             if st.button("Select all", use_container_width=True):
