@@ -1305,3 +1305,29 @@ if png_bytes:
     )
 else:
     st.caption("PNG export fallback failed (Matplotlib). Make sure df_long exists above.")
+
+# ============================== Distribution chart export (HTML, no extra deps) ==============================
+import json
+
+if "chart" in locals():
+    spec = chart.to_dict()
+    html_tpl = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Distribution</title>
+<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+</head><body>
+<div id="vis"></div>
+<script>
+const spec = {json.dumps(spec)};
+vegaEmbed("#vis", spec, {{actions: true}});
+</script>
+</body></html>"""
+    st.download_button(
+        "Download HTML (interactive distribution)",
+        data=html_tpl.encode("utf-8"),
+        file_name="distribution_chart.html",
+        mime="text/html",
+        use_container_width=True,
+        key="dl_dist_html",
+    )
