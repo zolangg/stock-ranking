@@ -1187,3 +1187,96 @@ else:
                 .properties(height=320)
             )
             st.altair_chart(chart, use_container_width=True)
+
+# ---------------- Export: PNG / SVG / Markdown / CSV ----------------
+import io
+from datetime import datetime
+
+# Base filename (customizable by user)
+default_name = f"distributions_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+fname = st.text_input("File name (no extension)", value=default_name, key="dist_export_name")
+
+# Prepare data exports
+md_bytes = dist_df.to_markdown(index=False).encode("utf-8")
+csv_bytes = dist_df.to_csv(index=False).encode("utf-8")
+
+# Prepare image exports (PNG/SVG)
+png_bytes, svg_bytes = None, None
+
+# Preferred: vl-convert (fast & headless). pip install vl-convert-python
+try:
+    from vl_convert import vlc
+    png_bytes = vlc.vegalite_to_png(chart.to_dict())
+    # SVG optional; comment out if you don't need it
+    # svg_bytes = vlc.vegalite_to_svg(chart.to_dict())
+except Exception:
+    # Fallback: altair_saver. Requires: pip install altair_saver
+    # Preferably with 'vl-convert' under the hood; otherwise needs Chrome or node.
+    try:
+        from altair_saver import save
+        import tempfile, os
+        # PNG
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_name = tmp.name
+        save(chart, tmp_name)  # writes file
+        with open(tmp_name, "rb") as f:
+            png_bytes = f.read()
+        os.remove(tmp_name)
+        # SVG (optional)
+        # with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp2:
+        #     tmp2_name = tmp2.name
+        # save(chart, tmp2_name)
+        # with open(tmp2_name, "rb") as f2:
+        #     svg_bytes = f2.read()
+        # os.remove(tmp2_name)
+    except Exception:
+        pass  # If both methods fail, we’ll just hide the PNG/SVG buttons.
+
+st.markdown("##### Export")
+exp_cols = st.columns(4)
+
+with exp_cols[0]:
+    st.download_button(
+        "Download CSV",
+        data=csv_bytes,
+        file_name=f"{fname}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="dist_dl_csv",
+    )
+
+with exp_cols[1]:
+    st.download_button(
+        "Download Markdown",
+        data=md_bytes,
+        file_name=f"{fname}.md",
+        mime="text/markdown",
+        use_container_width=True,
+        key="dist_dl_md",
+    )
+
+with exp_cols[2]:
+    if png_bytes is not None:
+        st.download_button(
+            "Download PNG",
+            data=png_bytes,
+            file_name=f"{fname}.png",
+            mime="image/png",
+            use_container_width=True,
+            key="dist_dl_png",
+        )
+    else:
+        st.caption("PNG export unavailable (install `vl-convert-python` or `altair_saver`).")
+
+with exp_cols[3]:
+    if svg_bytes is not None:
+        st.download_button(
+            "Download SVG",
+            data=svg_bytes,
+            file_name=f"{fname}.svg",
+            mime="image/svg+xml",
+            use_container_width=True,
+            key="dist_dl_svg",
+        )
+    else:
+        st.caption("SVG export optional (enable in code & install converter).")
