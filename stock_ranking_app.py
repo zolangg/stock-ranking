@@ -501,31 +501,33 @@ if submitted and ticker:
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
+    
+# Build unique tickers (dedup, keep order)
+tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
+unique_tickers, _seen = [], set()
+for t in tickers:
+    if t and t not in _seen:
+        unique_tickers.append(t); _seen.add(t)
+# optional: unique_tickers = sorted(unique_tickers)
 
-with st.expander("Manage added tickers", expanded=False):
-    tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-    unique_tickers, _seen = [], set()
-    for t in tickers:
-        if t and t not in _seen:
-            unique_tickers.append(t); _seen.add(t)
-    cdel1, cdel2 = st.columns([4,1])
-    with cdel1:
-        to_delete = st.multiselect(
-            "",
-            options=unique_tickers,
-            default=[],
-            key="del_selection",
-            placeholder="Select tickers…",
-            label_visibility="collapsed", 
-        )
-    with cdel2:
-        if st.button("Delete", use_container_width=True, key="delete_btn"):
-            if to_delete:
-                ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
-                st.success(f"Deleted: {', '.join(to_delete)}")
-                do_rerun()
-            else:
-                st.info("No tickers selected.")
+cdel1, cdel2 = st.columns([4, 1])
+with cdel1:
+    to_delete = st.multiselect(
+        "",
+        options=unique_tickers,
+        default=ss.get("del_selection", []),
+        key="del_selection",
+        placeholder="Select tickers…",
+        label_visibility="collapsed",
+    )
+with cdel2:
+    if st.button("Delete", use_container_width=True, key="delete_btn", disabled=not to_delete):
+        ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
+        ss.del_selection = []  # reset selection
+        st.success(f"Deleted: {', '.join(to_delete)}")
+        do_rerun()
+    else:
+        st.info("No tickers selected.")
 
 st.divider()
 
