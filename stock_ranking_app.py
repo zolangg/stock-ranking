@@ -1243,42 +1243,65 @@ else:
             )
             st.altair_chart(chart, use_container_width=True)
 
-# ============================== Distribution chart export (PNG only) ==============================
-from datetime import datetime
-import tempfile, os
+# ============================== Distribution chart export (PNG via Matplotlib fallback) ==============================
+import io
+import math
+import matplotlib.pyplot as plt
+import numpy as np
 
 st.markdown("##### Export distribution chart")
 
-# Only try to export if the chart exists in this run
-if "chart" in locals():
-    png_bytes = None
+png_bytes = None
+if "df_long" in locals() and not df_long.empty:
     try:
-        # Preferred (lightweight): pip install vl-convert-python
-        from vl_convert import vlc
-        png_bytes = vlc.vegalite_to_png(chart.to_dict())
-    except Exception:
-        # Fallback (heavier): pip install altair_saver (and chromium on some hosts)
-        try:
-            from altair_saver import save
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                tmp_name = tmp.name
-            save(chart, tmp_name)  # writes PNG
-            with open(tmp_name, "rb") as f:
-                png_bytes = f.read()
-            os.remove(tmp_name)
-        except Exception:
-            png_bytes = None
+        # Prepare pivot for grouped bars: rows = thresholds, cols = series
+        pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
+        series_names = list(pivot.columns)
 
-    if png_bytes is not None:
-        st.download_button(
-            "Download PNG (distribution)",
-            data=png_bytes,
-            file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-            mime="image/png",
-            use_container_width=True,
-            key="dl_dist_png",
-        )
-    else:
-        st.caption("PNG export unavailable — install `vl-convert-python` (recommended) or `altair_saver`.")
+        # Colors aligned with your Altair chart
+        color_map = {
+            f"{gA} (Median centers)": "#3b82f6",   # blue
+            f"{gB} (Median centers)": "#ef4444",   # red
+            f"NCA: P({gA})": "#10b981",            # green
+        }
+        colors = [color_map.get(s, "#999999") for s in series_names]
+
+        # Build grouped bars
+        thresholds = pivot.index.tolist()
+        n_groups = len(thresholds)
+        n_series = len(series_names)
+        x = np.arange(n_groups)
+        width = 0.8 / max(n_series, 1)
+
+        fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4))
+        for i, s in enumerate(series_names):
+            vals = pivot[s].values.astype(float)
+            ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(t) for t in thresholds])
+        ax.set_ylim(0, 100)
+        ax.set_xlabel("Gain% cutoff")
+        ax.set_ylabel("Median across selected stocks (%)")
+        ax.legend(loc="upper left", frameon=False)
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+        plt.close(fig)
+        png_bytes = buf.getvalue()
+    except Exception:
+        png_bytes = None
+
+if png_bytes:
+    from datetime import datetime
+    st.download_button(
+        "Download PNG (distribution)",
+        data=png_bytes,
+        file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+        mime="image/png",
+        use_container_width=True,
+        key="dl_dist_png_matplotlib",
+    )
 else:
-    st.caption("Build a distribution chart above to enable export.")
+    st.caption("PNG export fallback failed (Matplotlib). Make sure df_long exists above.")
