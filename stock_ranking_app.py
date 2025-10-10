@@ -570,32 +570,6 @@ if "FT01" not in base_df.columns:
     st.error("FT01 column not found (expected after load).")
     st.stop()
 
-# ---------- build comparison dataframe + group labels ----------
-df_cmp = base_df.copy()
-thr = float(gain_min)
-
-if mode == "Gain% vs Rest":
-    df_cmp["__Group__"] = np.where(pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr, f"≥{int(thr)}%", "Rest")
-    gA, gB = f"≥{int(thr)}%", "Rest"
-    status_line = f"Gain% split at ≥ {int(thr)}%"
-
-elif mode == "FT=1 (High vs Low cutoff)":
-    df_cmp = df_cmp[df_cmp["FT01"] == 1].copy()
-    gain_val = pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce")
-    df_cmp["__Group__"] = np.where(gain_val >= thr, f"FT=1 ≥{int(thr)}%", "FT=1 <{int_thr}%".format(int_thr=int(thr)))
-    gA, gB = f"FT=1 ≥{int(thr)}%", f"FT=1 <{int(thr)}%"
-    status_line = f"FT=1 split at Gain% ≥ {int(thr)}% (NaNs treated as Low)"
-
-else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
-    a_mask = (df_cmp["FT01"] == 1) & (pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr)
-    b_mask = (df_cmp["FT01"] == 0)
-    df_cmp = df_cmp[a_mask | b_mask].copy()
-    df_cmp["__Group__"] = np.where(df_cmp["FT01"] == 1, f"FT=1 ≥{int(thr)}%", "FT=0 (all)")
-    gA, gB = f"FT=1 ≥{int(thr)}%", "FT=0 (all)"
-    status_line = f"A: FT=1 with Gain% ≥ {int(thr)}% • B: all FT=0 (no cutoff)"
-
-st.caption(status_line)
-
 # ---------- summaries (median centers + MAD→σ for 3σ highlighting) ----------
 var_core = ss.get("var_core", [])
 var_mod  = ss.get("var_moderate", [])
