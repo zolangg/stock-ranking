@@ -518,7 +518,7 @@ with col_mode:
         label_visibility="collapsed",
     )
 with col_gain:
-    gain_choices = [50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
+    gain_choices = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
     gain_min = st.selectbox(
         "",
         gain_choices,
