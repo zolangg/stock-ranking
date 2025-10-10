@@ -511,11 +511,12 @@ with st.expander("Manage added tickers", expanded=False):
     cdel1, cdel2 = st.columns([4,1])
     with cdel1:
         to_delete = st.multiselect(
-            "Delete tickers",
+            "",
             options=unique_tickers,
             default=[],
             key="del_selection",
             placeholder="Select tickers…",
+            label_visibility="collapsed", 
         )
     with cdel2:
         if st.button("Delete", use_container_width=True, key="delete_btn"):
