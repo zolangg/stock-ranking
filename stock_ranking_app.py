@@ -526,8 +526,6 @@ with cdel2:
         ss.del_selection = []  # reset selection
         st.success(f"Deleted: {', '.join(to_delete)}")
         do_rerun()
-    else:
-        st.info("No tickers selected.")
 
 st.divider()
 
