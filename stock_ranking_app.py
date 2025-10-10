@@ -1,5 +1,6 @@
 # app.py — Premarket Stock Ranking
-# (Median-only centers; Group UI + Gain% filter; 3σ coloring; delete UI + NCA bar w/ live features only)
+# (Median-only centers; Gain% filter; 3σ coloring; delete UI callback-safe; NCA bar w/ live features; distributions w/ clear labels)
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,7 +18,9 @@ ss.setdefault("lassoA", {})
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("var_core", [])
 ss.setdefault("var_moderate", [])
-ss.setdefault("nca_model", {})  # stash for NCA
+ss.setdefault("nca_model", {})
+ss.setdefault("del_selection", [])       # for delete UI
+ss.setdefault("__delete_msg", None)      # flash msg
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -137,15 +140,14 @@ VAR_MODERATE = [
 ]
 VAR_ALL = VAR_CORE + VAR_MODERATE
 
-# NCA feature policy: only features you can actually enter in the Add Stock form (live),
-# excluding PredVol_M / PM_Vol_% / Daily_Vol_M (explicitly).
+# NCA: only “live” features from Add Stock (exclude PredVol_M / PM_Vol_% / Daily_Vol_M)
 ALLOWED_LIVE_FEATURES = [
     "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
     "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
 ]
 EXCLUDE_FOR_NCA = {"PredVol_M","PM_Vol_%","Daily_Vol_M"}
 
-# ============================== LASSO (unchanged) ==============================
+# ============================== LASSO (unchanged core) ==============================
 def _kfold_indices(n, k=5, seed=42):
     rng = np.random.default_rng(seed)
     idx = np.arange(n); rng.shuffle(idx)
@@ -180,7 +182,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
     if valid_pm.sum() < 50: return {}
 
     ln_mcap   = np.log(np.clip(pd.to_numeric(mcap_series, errors="coerce").values,  eps, None))
-    ln_gapf   = np.log(np.clip(pd.to_numeric(df["Gap_%"], errors="coerce").values,  0,   None) / 100.0 + eps)
+    ln_gapf   = np.log(np.clip(pd.to_numeric(df["Gap_%"], errors="coerce").values,  0, None) / 100.0 + eps)
     ln_atr    = np.log(np.clip(pd.to_numeric(df["ATR_$"], errors="coerce").values,  eps, None))
     ln_pm     = np.log(np.clip(pd.to_numeric(df["PM_Vol_M"], errors="coerce").values, eps, None))
     ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"], errors="coerce").values, eps, None))
@@ -285,7 +287,7 @@ def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
         "feat_order": [nm for nm,_ in feats],
     }
 
-# ============================== Predict ==============================
+# ============================== Predict (daily) ==============================
 def predict_daily_calibrated(row: dict, model: dict) -> float:
     if not model or "betas" not in model: return np.nan
     eps = float(model.get("eps", 1e-6))
@@ -455,9 +457,8 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-st.divider()
-
-# ============================== Add Stock + Manage ==============================
+# ============================== Add Stock ==============================
+st.markdown("---")
 st.subheader("Add Stock")
 
 with st.form("add_form", clear_on_submit=True):
@@ -501,38 +502,12 @@ if submitted and ticker:
     row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
-    
-# Build unique tickers (dedup, keep order)
-tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-unique_tickers, _seen = [], set()
-for t in tickers:
-    if t and t not in _seen:
-        unique_tickers.append(t); _seen.add(t)
-# optional: unique_tickers = sorted(unique_tickers)
-
-cdel1, cdel2 = st.columns([4, 1])
-with cdel1:
-    to_delete = st.multiselect(
-        "",
-        options=unique_tickers,
-        default=ss.get("del_selection", []),
-        key="del_selection",
-        placeholder="Select tickers…",
-        label_visibility="collapsed",
-    )
-with cdel2:
-    if st.button("Delete", use_container_width=True, key="delete_btn", disabled=not to_delete):
-        ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
-        ss.del_selection = []  # reset selection
-        st.success(f"Deleted: {', '.join(to_delete)}")
-        do_rerun()
-
-st.divider()
 
 # ============================== Alignment ==============================
+st.markdown("---")
 st.subheader("Alignment")
 
-# --- controls row: radios (left) + Gain% dropdown (right) ---
+# --- mode + Gain% ---
 col_mode, col_gain = st.columns([2.8, 1.0])
 with col_mode:
     mode = st.radio(
@@ -557,6 +532,47 @@ with col_gain:
         label_visibility="collapsed",
     )
 
+# ============================== Delete (top-right, no expander) ==============================
+# Build unique tickers preserving order
+tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
+unique_tickers, _seen = [], set()
+for t in tickers:
+    if t and t not in _seen:
+        unique_tickers.append(t); _seen.add(t)
+
+def _handle_delete():
+    sel = st.session_state.get("del_selection", [])
+    if sel:
+        ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(sel)]
+        st.session_state["del_selection"] = []
+        st.session_state["__delete_msg"] = f"Deleted: {', '.join(sel)}"
+    else:
+        st.session_state["__delete_msg"] = "No tickers selected."
+
+cdel1, cdel2 = st.columns([4, 1])
+with cdel1:
+    _ = st.multiselect(
+        "",
+        options=unique_tickers,
+        default=ss.get("del_selection", []),
+        key="del_selection",
+        placeholder="Select tickers…",
+        label_visibility="collapsed",
+    )
+with cdel2:
+    st.button(
+        "Delete",
+        use_container_width=True,
+        key="delete_btn",
+        disabled=not bool(ss.get("del_selection")),
+        on_click=_handle_delete,
+    )
+
+# flash message
+_msg = st.session_state.pop("__delete_msg", None)
+if _msg:
+    (st.success if _msg.startswith("Deleted:") else st.info)(_msg)
+
 # --- base data guardrails ---
 base_df = ss.get("base_df", pd.DataFrame()).copy()
 if base_df.empty:
@@ -573,29 +589,27 @@ if "FT01" not in base_df.columns:
     st.error("FT01 column not found (expected after load).")
     st.stop()
 
-# ---------- build comparison dataframe + group labels (RESTORED) ----------
+# ---------- build comparison dataframe + group labels ----------
 df_cmp = base_df.copy()
 thr = float(gain_min)
 
 if mode == "Gain% vs Rest":
     df_cmp["__Group__"] = np.where(pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr, f"≥{int(thr)}%", "Rest")
     gA, gB = f"≥{int(thr)}%", "Rest"
-    status_line = f"Gain% split at ≥ {int(thr)}%."
-
+    status_line = f"Gain% split at ≥ {int(thr)}%"
 elif mode == "FT=1 (High vs Low cutoff)":
     df_cmp = df_cmp[df_cmp["FT01"] == 1].copy()
     gain_val = pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce")
     df_cmp["__Group__"] = np.where(gain_val >= thr, f"FT=1 ≥{int(thr)}%", f"FT=1 <{int(thr)}%")
     gA, gB = f"FT=1 ≥{int(thr)}%", f"FT=1 <{int(thr)}%"
-    status_line = f"FT=1 split at Gain% ≥ {int(thr)}% (NaNs treated as Low)."
-
+    status_line = f"FT=1 split at Gain% ≥ {int(thr)}% (NaNs treated as Low)"
 else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
     a_mask = (df_cmp["FT01"] == 1) & (pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr)
     b_mask = (df_cmp["FT01"] == 0)
     df_cmp = df_cmp[a_mask | b_mask].copy()
     df_cmp["__Group__"] = np.where(df_cmp["FT01"] == 1, f"FT=1 ≥{int(thr)}%", "FT=0 (all)")
     gA, gB = f"FT=1 ≥{int(thr)}%", "FT=0 (all)"
-    status_line = f"A: FT=1 with Gain% ≥ {int(thr)}% • B: all FT=0 (no cutoff)."
+    status_line = f"A: FT=1 with Gain% ≥ {int(thr)}% • B: all FT=0 (no cutoff)"
 
 st.caption(status_line)
 
@@ -623,7 +637,7 @@ def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col
 summ = _summaries_median_and_mad(df_cmp, var_all, "__Group__")
 med_tbl = summ["med_tbl"]; mad_tbl = summ["mad_tbl"] * 1.4826  # MAD → σ
 
-# ensure exactly two groups exist (reorder as A|B and drop extras)
+# ensure exactly two groups exist
 if med_tbl.empty or med_tbl.shape[1] < 2:
     st.info("Not enough data to form two groups with the current mode/threshold. Adjust settings.")
     st.stop()
@@ -641,7 +655,7 @@ else:
 
 mad_tbl = mad_tbl.reindex(index=med_tbl.index)[[gA, gB]]
 
-# ============================== NCA training (only live features; excludes PredVol_M / PM_Vol_% / Daily_Vol_M) ==============================
+# ============================== NCA training (live features only) ==============================
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
 
@@ -695,7 +709,7 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         z = -z
         if w_vec is not None: w_vec = -w_vec
 
-    # Calibration: isotonic preferred; Platt-ish fallback
+    # Calibration: isotonic preferred; Platt fallback
     zf = z[np.isfinite(z)]; yf = y[np.isfinite(z)]
     iso_bx, iso_by = np.array([]), np.array([])
     platt_params = None
@@ -740,7 +754,7 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
         if w is None or not np.isfinite(w).all(): return np.nan
         z = float(xs @ w)
     else:
-        # simple, stable 1D probe if sklearn NCA used (no stored transform)
+        # simple probe if sklearn NCA used (no stored transform)
         z = float(xs.sum())
 
     iso_bx = np.array(model.get("iso_bx", []), dtype=float)
@@ -754,8 +768,8 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
         pA = 1.0 / (1.0 + np.exp(-k*(z - m)))
     return float(np.clip(pA, 0.0, 1.0))
 
-# Train (or retrain) NCA model on current split
-features_for_nca = VAR_ALL[:]  # filtered inside trainer to live features
+# Train NCA on current split
+features_for_nca = var_all[:]  # filtered in trainer to live features
 ss.nca_model = _train_nca_or_lda(df_cmp, gA, gB, features_for_nca) or {}
 
 # ---------- alignment computation for entered rows ----------
@@ -814,15 +828,15 @@ centers_tbl = med_tbl.copy()
 disp_tbl = mad_tbl.copy()
 
 summary_rows, detail_map = [], {}
-detail_order = [("Core variables", ss.get("var_core", [])),
-                ("Moderate variables", ss.get("var_moderate", []) + (["PredVol_M"] if "PredVol_M" not in ss.get("var_moderate", []) else []))]
+detail_order = [("Core variables", var_core),
+                ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
 
 mt_index = set(centers_tbl.index); dt_index = set(disp_tbl.index)
 
 for row in ss.rows:
     stock = dict(row); tkr = stock.get("Ticker") or "—"
     counts = _compute_alignment_counts_weighted(
-        stock_row=stock, centers_tbl=centers_tbl, var_core=ss.get("var_core", []), var_mod=ss.get("var_moderate", []),
+        stock_row=stock, centers_tbl=centers_tbl, var_core=var_core, var_mod=var_mod,
         w_core=1.0, w_mod=0.5, tie_mode="split",
     )
     if not counts: continue
@@ -878,7 +892,7 @@ for row in ss.rows:
                 "sB":  None if not np.isfinite(sB) else float(sB),
                 "d_vs_A": None if dA is None else dA,
                 "d_vs_B": None if dB is None else dB,
-                "is_core": (v in ss.get("var_core", [])),
+                "is_core": (v in var_core),
             })
     detail_map[tkr] = drows_grouped
 
@@ -905,7 +919,9 @@ html = """
   .bar>span{position:absolute;left:0;top:0;bottom:0;width:0%}
   .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:28px;text-align:center}
   .blue>span{background:#3b82f6}.red>span{background:#ef4444}.green>span{background:#10b981}
-  #align td:nth-child(2),#align th:nth-child(2),#align td:nth-child(3),#align th:nth-child(3),#align td:nth-child(4),#align th:nth-child(4){text-align:center}
+  #align td:nth-child(2),#align th:nth-child(2),
+  #align td:nth-child(3),#align th:nth-child(3),
+  #align td:nth-child(4),#align th:nth-child(4){text-align:center}
   .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
   .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .child-table th:first-child,.child-table td:first-child{text-align:left}
@@ -1018,39 +1034,45 @@ html = """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=620, scrolling=True)
 
-# ============================== Distributions across all Gain% cutoffs (select stocks + color-matched bars) ==============================
+# ============================== Distributions across Gain% cutoffs ==============================
 import altair as alt
 
-st.subheader("Distributions")
+st.markdown("---")
+st.subheader("Distributions across Gain% cutoffs")
 
 if not ss.rows:
     st.info("Add at least one stock to see distributions across cutoffs.")
 else:
-    # --- choose which added stocks to include ---
+    # choose which added stocks to include
     all_tickers = [(r.get("Ticker") or "—") for r in ss.rows]
     seen = set(); all_tickers = [t for t in all_tickers if not (t in seen or seen.add(t))]
 
-    with st.container():
-        csel1, csel2 = st.columns([4,1])
-        with csel1:
-            stocks_selected = st.multiselect(
-                "",
-                options=all_tickers,
-                default=all_tickers,
-                help="This controls which of your added stocks are used to compute the averages at each Gain% cutoff.",
-                label_visibility="collapsed",
-            )
-        with csel2:
-            if st.button("Select all", use_container_width=True):
-                stocks_selected = all_tickers
-            if st.button("Clear", use_container_width=True):
-                stocks_selected = []
+    csel1, csel2, csel3 = st.columns([4,1.2,1.2])
+    with csel1:
+        stocks_selected = st.multiselect(
+            "",
+            options=all_tickers,
+            default=all_tickers,
+            help="Which of your added stocks are used to compute the roll-up per cutoff.",
+            label_visibility="collapsed",
+            key="dist_stock_sel",
+        )
+    with csel2:
+        agg_choice = st.radio(
+            "Rollup",
+            ["Mean", "Median"],
+            horizontal=True,
+            key="dist_rollup"
+        )
+    with csel3:
+        st.caption("Colors match the table: blue=A, red=B, green=NCA")
 
     rows_for_dist = [r for r in ss.rows if (r.get("Ticker") or "—") in stocks_selected]
 
     if not rows_for_dist:
         st.info("No stocks selected.")
     else:
+        # Helper: recompute split + medians + NCA for each threshold; aggregate over selected rows
         def _make_split(df_base: pd.DataFrame, thr_val: float, mode_val: str):
             df_tmp = df_base.copy()
             if mode_val == "Gain% vs Rest":
@@ -1079,12 +1101,14 @@ else:
             mad_tbl_ = df_in.groupby(grp_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad_local)).T * 1.4826
             return med_tbl_, mad_tbl_
 
-        thr_labels, series_A_means, series_B_means, series_N_means = [], [], [], []
+        thr_labels, series_A_vals, series_B_vals, series_N_vals = [], [], [], []
         per_thr_details = []
+
+        agg_fn = np.nanmean if agg_choice == "Mean" else np.nanmedian
 
         for thr_val in gain_choices:
             df_split, gA2, gB2 = _make_split(base_df, float(thr_val), mode)
-            med_tbl2, mad_tbl2 = _summaries(df_split, VAR_ALL, "__Group__")
+            med_tbl2, mad_tbl2 = _summaries(df_split, var_all, "__Group__")
 
             if med_tbl2.empty or med_tbl2.shape[1] < 2:
                 continue
@@ -1101,12 +1125,12 @@ else:
                 med_tbl2 = med_tbl2[[gA2, gB2]]
                 mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
 
-            nca_model2 = _train_nca_or_lda(df_split, gA2, gB2, VAR_ALL) or {}
+            nca_model2 = _train_nca_or_lda(df_split, gA2, gB2, var_all) or {}
 
             As, Bs, Ns = [], [], []
             for row in rows_for_dist:
                 counts2 = _compute_alignment_counts_weighted(
-                    stock_row=row, centers_tbl=med_tbl2, var_core=ss.get("var_core", []), var_mod=ss.get("var_moderate", []),
+                    stock_row=row, centers_tbl=med_tbl2, var_core=var_core, var_mod=var_mod,
                     w_core=1.0, w_mod=0.5, tie_mode="split",
                 )
                 a = counts2.get("A_pct_raw", np.nan) if counts2 else np.nan
@@ -1125,32 +1149,37 @@ else:
                 })
 
             thr_labels.append(int(thr_val))
-            series_A_means.append(float(np.nanmean(As)) if len(As) else np.nan)
-            series_B_means.append(float(np.nanmean(Bs)) if len(Bs) else np.nan)
-            series_N_means.append(float(np.nanmean(Ns)) if len(Ns) else np.nan)
+            series_A_vals.append(float(agg_fn(As)) if len(As) else np.nan)
+            series_B_vals.append(float(agg_fn(Bs)) if len(Bs) else np.nan)
+            series_N_vals.append(float(agg_fn(Ns)) if len(Ns) else np.nan)
 
         if not thr_labels:
             st.info("Not enough data across cutoffs to form two groups — broaden your DB or change mode.")
         else:
-            # tidy frame for Altair
+            # labels reflect median centers; roll-up label follows agg_choice
+            roll = "mean" if agg_choice == "Mean" else "median"
+            series_A_label = f"A {roll} align% (median centers → {gA})"
+            series_B_label = f"B {roll} align% (median centers → {gB})"
+            series_N_label = f"NCA {roll}: P({gA})"
+
             dist_df = pd.DataFrame({
                 "GainCutoff_%": thr_labels,
-                f"Median centers: ({gA})": series_A_means,
-                f"Median centers: ({gB})": series_B_means,
-                f"NCA: P({gA})": series_N_means,
+                series_A_label: series_A_vals,
+                series_B_label: series_B_vals,
+                series_N_label: series_N_vals,
             })
 
             df_long = dist_df.melt(id_vars="GainCutoff_%", var_name="Series", value_name="Value")
 
-            color_domain = [f"Median centers: ({gA})", f"Median centers: ({gB})", f"NCA: P({gA})"]
-            color_range  = ["#3b82f6", "#ef4444", "#10b981"]  # blue, red, green (match table bars)
+            color_domain = [series_A_label, series_B_label, series_N_label]
+            color_range  = ["#3b82f6", "#ef4444", "#10b981"]  # blue, red, green
 
             chart = (
                 alt.Chart(df_long)
                 .mark_bar()
                 .encode(
                     x=alt.X("GainCutoff_%:O", title="Gain% cutoff"),
-                    y=alt.Y("Value:Q", title="Average (%)", scale=alt.Scale(domain=[0,100])),
+                    y=alt.Y("Value:Q", title="Value (%)", scale=alt.Scale(domain=[0,100])),
                     color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Series")),
                     xOffset="Series:N",
                     tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")]
@@ -1158,3 +1187,14 @@ else:
                 .properties(height=320)
             )
             st.altair_chart(chart, use_container_width=True)
+
+            if agg_choice == "Mean":
+                st.caption(
+                    f"Each bar = **average alignment** computed vs **median** group centers across the selected stocks at that cutoff. "
+                    f"Colors: **{gA}**=blue, **{gB}**=red, **NCA**=green."
+                )
+            else:
+                st.caption(
+                    f"Each bar = **median alignment** computed vs **median** group centers across the selected stocks at that cutoff. "
+                    f"Colors: **{gA}**=blue, **{gB}**=red, **NCA**=green."
+                )
