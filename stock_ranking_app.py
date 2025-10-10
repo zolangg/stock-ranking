@@ -1034,12 +1034,12 @@ html = """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=620, scrolling=True)
 
-# ============================== Alignment exports (CSV + Markdown) ==============================
+# ============================== Alignment exports (CSV full + Markdown compact) ==============================
 import math
 
-# Build a simple DataFrame from summary_rows for export
 if summary_rows:
-    df_align = pd.DataFrame(summary_rows)[
+    # ---------- Markdown (compact summary) ----------
+    df_align_md = pd.DataFrame(summary_rows)[
         ["Ticker", "A_label", "A_val_int", "B_label", "B_val_int", "NCA_int"]
     ].rename(
         columns={
@@ -1067,25 +1067,80 @@ if summary_rows:
             lines.append("| " + " | ".join(cells) + " |")
         return "\n".join(lines)
 
-    st.markdown("##### Export alignment table")
+    # ---------- CSV (full with child rows) ----------
+    full_rows = []
+    # Build a quick index from ticker → summary row
+    sum_by_ticker = {s["Ticker"]: s for s in summary_rows}
+
+    for tkr, rows in detail_map.items():
+        s = sum_by_ticker.get(tkr, {})
+        # Add a section marker row for readability (optional; keeps a blank Variable)
+        # You can comment this out if you don't want section rows in CSV.
+        section = ""
+        for r in rows:
+            if r.get("__group__"):
+                section = r["__group__"]
+                # Optional explicit section row:
+                full_rows.append({
+                    "Ticker": tkr,
+                    "Section": section,
+                    "Variable": "",
+                    "Value": "",
+                    "A center": "",
+                    "B center": "",
+                    "Δ vs A": "",
+                    "Δ vs B": "",
+                    "σ(A)": "",
+                    "σ(B)": "",
+                    "Is core": "",
+                    "A group": s.get("A_label", ""),
+                    "B group": s.get("B_label", ""),
+                    "A (%) — Median centers": s.get("A_val_int", ""),
+                    "B (%) — Median centers": s.get("B_val_int", ""),
+                    "NCA (%)": s.get("NCA_int", ""),
+                })
+                continue
+
+            full_rows.append({
+                "Ticker": tkr,
+                "Section": section,
+                "Variable": r.get("Variable", ""),
+                "Value": ("" if pd.isna(r.get("Value")) else r.get("Value")),
+                "A center": ("" if pd.isna(r.get("A")) else r.get("A")),
+                "B center": ("" if pd.isna(r.get("B")) else r.get("B")),
+                "Δ vs A": ("" if (r.get("d_vs_A") is None or pd.isna(r.get("d_vs_A"))) else r.get("d_vs_A")),
+                "Δ vs B": ("" if (r.get("d_vs_B") is None or pd.isna(r.get("d_vs_B"))) else r.get("d_vs_B")),
+                "σ(A)": ("" if (r.get("sA") is None or pd.isna(r.get("sA"))) else r.get("sA")),
+                "σ(B)": ("" if (r.get("sB") is None or pd.isna(r.get("sB"))) else r.get("sB")),
+                "Is core": bool(r.get("is_core", False)),
+                "A group": s.get("A_label", ""),
+                "B group": s.get("B_label", ""),
+                "A (%) — Median centers": s.get("A_val_int", ""),
+                "B (%) — Median centers": s.get("B_val_int", ""),
+                "NCA (%)": s.get("NCA_int", ""),
+            })
+
+    df_align_csv_full = pd.DataFrame(full_rows)
+
+    st.markdown("##### Export alignment")
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
-            "Download CSV (alignment)",
-            data=df_align.to_csv(index=False).encode("utf-8"),
-            file_name="alignment_table.csv",
+            "Download CSV (full, with child rows)",
+            data=df_align_csv_full.to_csv(index=False).encode("utf-8"),
+            file_name="alignment_full_with_children.csv",
             mime="text/csv",
             use_container_width=True,
-            key="dl_align_csv",
+            key="dl_align_csv_full",
         )
     with c2:
         st.download_button(
-            "Download Markdown (alignment)",
-            data=_df_to_markdown_simple(df_align, float_fmt=".0f").encode("utf-8"),
-            file_name="alignment_table.md",
+            "Download Markdown (summary only)",
+            data=_df_to_markdown_simple(df_align_md, float_fmt=".0f").encode("utf-8"),
+            file_name="alignment_summary.md",
             mime="text/markdown",
             use_container_width=True,
-            key="dl_align_md",
+            key="dl_align_md_summary",
         )
 
 # ============================== Distributions across Gain% cutoffs ==============================
