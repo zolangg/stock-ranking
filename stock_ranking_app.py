@@ -1,4 +1,4 @@
-# app.py — Premarket Stock Ranking (Median-only centers; Group UI + Gain% filter; 3σ coloring; delete UI + NCA bar)
+# app.py — Premarket Stock Ranking (Median-only centers; Group UI + Gain% filter; 3σ coloring; delete UI + NCA bar w/ live features only)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,7 +16,7 @@ ss.setdefault("lassoA", {})
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("var_core", [])
 ss.setdefault("var_moderate", [])
-ss.setdefault("nca_model", {})  # <— NCA model stash
+ss.setdefault("nca_model", {})  # stash for NCA
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -135,6 +135,14 @@ VAR_MODERATE = [
     "Float_M",
 ]
 VAR_ALL = VAR_CORE + VAR_MODERATE
+
+# NCA feature policy: only features you can actually enter in the Add Stock form (live),
+# excluding PredVol_M / PM_Vol_% / Daily_Vol_M (explicitly).
+ALLOWED_LIVE_FEATURES = [
+    "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
+    "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
+]
+EXCLUDE_FOR_NCA = {"PredVol_M","PM_Vol_%","Daily_Vol_M"}
 
 # ============================== LASSO (unchanged) ==============================
 def _kfold_indices(n, k=5, seed=42):
@@ -604,69 +612,84 @@ else:
 
 mad_tbl = mad_tbl.reindex(index=med_tbl.index)[[gA, gB]]
 
-# ============================== NCA training (excludes PredVol_M & PM_Vol_%) ==============================
+# ============================== NCA training (only live features; excludes PredVol_M / PM_Vol_% / Daily_Vol_M) ==============================
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
-    # Build X, y over two groups
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
-    feats = [f for f in features if f in df2.columns and f not in {"PredVol_M", "PM_Vol_%"}]
+
+    feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
     if not feats:
         return {}
+
+    Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
+    # drop degenerate columns
+    good_cols = []
+    for c in feats:
+        col = Xdf[c].values
+        col = col[np.isfinite(col)]
+        if col.size == 0: continue
+        if np.nanstd(col) < 1e-9: continue
+        good_cols.append(c)
+    feats = good_cols
+    if not feats:
+        return {}
+
     X = df2[feats].apply(pd.to_numeric, errors="coerce").values
     y = (df2["__Group__"].values == gA_label).astype(int)
     mask = np.isfinite(X).all(axis=1)
     X = X[mask]; y = y[mask]
     if X.shape[0] < 20 or np.unique(y).size < 2:
         return {}
+
     # standardize
     mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0] = 1.0
     Xs = (X - mu) / sd
 
-    # Try sklearn NCA
-    w_vec = None; used = "lda"
+    used = "lda"; w_vec = None
     try:
         from sklearn.neighbors import NeighborhoodComponentsAnalysis
         nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=250)
-        X_emb = nca.fit_transform(Xs, y)   # shape (n,1)
-        z = X_emb.ravel()
+        z = nca.fit_transform(Xs, y).ravel()
         used = "nca"
     except Exception:
-        # Fisher LDA fallback (1D)
+        # Fisher LDA fallback
         X0 = Xs[y==0]; X1 = Xs[y==1]
         if X0.shape[0] < 2 or X1.shape[0] < 2: return {}
         m0 = X0.mean(axis=0); m1 = X1.mean(axis=0)
         S0 = np.cov(X0, rowvar=False); S1 = np.cov(X1, rowvar=False)
-        Sw = S0 + S1
-        # Regularize for stability
-        lam = 1e-3
-        Sw_reg = Sw + lam * np.eye(Sw.shape[0])
-        w_vec = np.linalg.solve(Sw_reg, (m1 - m0))
+        Sw = S0 + S1 + 1e-3*np.eye(Xs.shape[1])
+        w_vec = np.linalg.solve(Sw, (m1 - m0))
         w_vec = w_vec / (np.linalg.norm(w_vec) + 1e-12)
         z = (Xs @ w_vec)
 
-    # Orient axis so that larger -> more A
+    # Orient so larger → A
     if np.nanmean(z[y==1]) < np.nanmean(z[y==0]):
         z = -z
         if w_vec is not None: w_vec = -w_vec
 
-    # Calibrate to probability of A via isotonic
-    zf = z[np.isfinite(z)]
-    yf = y[np.isfinite(z)]
-    if zf.size < 8 or np.unique(zf).size < 3:
-        return {}
-
-    iso_bx, iso_by = _pav_isotonic(zf, yf.astype(float))
+    # Calibration: isotonic preferred; Platt-ish fallback
+    zf = z[np.isfinite(z)]; yf = y[np.isfinite(z)]
+    iso_bx, iso_by = np.array([]), np.array([])
+    platt_params = None
+    if zf.size >= 8 and np.unique(zf).size >= 3:
+        bx, by = _pav_isotonic(zf, yf.astype(float))
+        if len(bx) >= 2:
+            iso_bx, iso_by = np.array(bx), np.array(by)
+    if iso_bx.size < 2:
+        z0 = zf[yf==0]; z1 = zf[yf==1]
+        if z0.size and z1.size:
+            m0, m1 = float(np.mean(z0)), float(np.mean(z1))
+            s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
+            m = 0.5*(m0+m1)
+            k = 2.0 / (0.5*(s0+s1) + 1e-6)
+            platt_params = (m, k)
 
     return {
-        "ok": True,
-        "kind": used,            # "nca" or "lda"
-        "feats": feats,
-        "mu": mu.tolist(),
-        "sd": sd.tolist(),
-        "w_vec": (None if used=="nca" else w_vec.tolist()),
-        "iso_bx": iso_bx.tolist(),
-        "iso_by": iso_by.tolist(),
-        "gA": gA_label,
-        "gB": gB_label,
+        "ok": True, "kind": used, "feats": feats,
+        "mu": mu.tolist(), "sd": sd.tolist(),
+        "w_vec": (None if used=="nca" else (w_vec.tolist() if w_vec is not None else None)),
+        "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(),
+        "platt": (platt_params if platt_params is not None else None),
+        "gA": gA_label, "gB": gB_label,
     }
 
 def _nca_predict_proba(row: dict, model: dict) -> float:
@@ -678,28 +701,32 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
         if not np.isfinite(v): return np.nan
         x.append(float(v))
     x = np.array(x, dtype=float)
+
     mu = np.array(model["mu"], dtype=float)
-    sd = np.array(model["sd"], dtype=float)
-    x = (x - mu) / sd
+    sd = np.array(model["sd"], dtype=float); sd[sd==0] = 1.0
+    xs = (x - mu) / sd
 
     if model["kind"] == "lda":
-        w = np.array(model["w_vec"], dtype=float)
-        z = float(x @ w)
+        w = np.array(model.get("w_vec"), dtype=float)
+        if w is None or not np.isfinite(w).all(): return np.nan
+        z = float(xs @ w)
     else:
-        # When sklearn NCA is used, we don't have direct components — emulate with a simple 1D linear probe
-        # Fit a tiny projection from feats->1D using the iso breakpoints as anchor:
-        # Use the mean direction between class means in standardized space.
-        # (This is only used when no direct transform is available, keeps things stable.)
-        # Compute direction from stored iso to orient; here we just sum(x) as a simple probe.
-        z = float(np.sum(x))
+        # simple, stable 1D probe if sklearn NCA used (no stored transform)
+        z = float(xs.sum())
 
-    # Orient: larger should mean more A; iso learned in that orientation already.
-    pA = float(_iso_predict(np.array(model["iso_bx"]), np.array(model["iso_by"]), np.array([z]))[0])
-    pA = float(np.clip(pA, 0.0, 1.0))
-    return pA
+    iso_bx = np.array(model.get("iso_bx", []), dtype=float)
+    iso_by = np.array(model.get("iso_by", []), dtype=float)
+    if iso_bx.size >= 2 and iso_by.size >= 2:
+        pA = float(_iso_predict(iso_bx, iso_by, np.array([z]))[0])
+    else:
+        pl = model.get("platt")
+        if not pl: return np.nan
+        m, k = pl
+        pA = 1.0 / (1.0 + np.exp(-k*(z - m)))
+    return float(np.clip(pA, 0.0, 1.0))
 
 # Train (or retrain) NCA model on current split
-features_for_nca = var_all[:]  # we'll exclude inside the trainer
+features_for_nca = var_all[:]  # filtered inside trainer to live features
 ss.nca_model = _train_nca_or_lda(df_cmp, gA, gB, features_for_nca) or {}
 
 # ---------- alignment computation for entered rows ----------
@@ -872,8 +899,7 @@ html = """
     document.getElementById('hdrN').textContent = 'NCA: P(' + data.gA + ')';
 
     function barCellLabeled(valRaw,label,valInt,clsOverride){
-      const strong=(label==='FT=1' || label?.startsWith?.('FT=1') || label?.startsWith?.('≥'));
-      const cls=clsOverride || (strong?'blue':'red');
+      const cls=clsOverride || 'blue';
       const w=(valRaw==null||isNaN(valRaw))?0:Math.max(0,Math.min(100,valRaw));
       const text=(valInt==null||isNaN(valInt))?Math.round(w):valInt;
       return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
