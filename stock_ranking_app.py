@@ -1162,10 +1162,3 @@ else:
                 f"Bars are color-matched to the alignment table: **{gA}** = blue, **{gB}** = red, **NCA** = green. "
                 f"Values show the mean across the selected stocks for each Gain% cutoff."
             )
-
-            with st.expander("Per-ticker values by cutoff"):
-                st.caption(
-                    f"Each row shows a selected ticker’s alignment at a specific cutoff. "
-                    f"A% is toward **{gA}**, B% toward **{gB}**, and NCA is the calibrated P({gA})."
-                )
-                st.dataframe(pd.DataFrame(per_thr_details))
