@@ -1058,15 +1058,9 @@ else:
             key="dist_stock_sel",
         )
     with csel2:
-        cbtn1, cbtn2 = st.columns(2)
-        with cbtn1:
-            if st.button("Select all", use_container_width=True, key="dist_sel_all"):
-                st.session_state["dist_stock_sel"] = all_tickers
-                do_rerun()
-        with cbtn2:
-            if st.button("Clear", use_container_width=True, key="dist_sel_clear"):
-                st.session_state["dist_stock_sel"] = []
-                do_rerun()
+        if st.button("Clear", use_container_width=True, key="dist_sel_clear"):
+            st.session_state["dist_stock_sel"] = []
+            do_rerun()
 
     rows_for_dist = [r for r in ss.rows if (r.get("Ticker") or "—") in stocks_selected]
 
