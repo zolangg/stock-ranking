@@ -1121,18 +1121,61 @@ if summary_rows:
             })
 
     df_align_csv_full = pd.DataFrame(full_rows)
-
+    
+    # ---------- Make CSV "presentable": rounding & clean blanks ----------
+    def _fmt_num(x, fmt=".2f"):
+        if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) or x == "":
+            return ""
+        try:
+            return format(float(x), fmt)
+        except Exception:
+            return ""
+    
+    def _fmt_int(x):
+        if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) or x == "":
+            return ""
+        try:
+            return f"{int(round(float(x)))}"
+        except Exception:
+            return ""
+    
+    # Columns to format
+    two_dec_cols = ["Value", "A center", "B center", "Δ vs A", "Δ vs B"]
+    sigma_cols   = ["σ(A)", "σ(B)"]              # 2 decimals as well
+    pct_cols     = ["A (%) — Median centers", "B (%) — Median centers", "NCA (%)"]  # integers
+    
+    for col in two_dec_cols:
+        if col in df_align_csv_full.columns:
+            df_align_csv_full[col] = df_align_csv_full[col].apply(lambda v: _fmt_num(v, ".2f"))
+    
+    for col in sigma_cols:
+        if col in df_align_csv_full.columns:
+            df_align_csv_full[col] = df_align_csv_full[col].apply(lambda v: _fmt_num(v, ".2f"))
+    
+    for col in pct_cols:
+        if col in df_align_csv_full.columns:
+            df_align_csv_full[col] = df_align_csv_full[col].apply(_fmt_int)
+    
+    # Optional: enforce a clean column order
+    col_order = [
+        "Ticker", "Section", "Variable",
+        "Value", "A center", "B center", "Δ vs A", "Δ vs B", "σ(A)", "σ(B)", "Is core",
+        "A group", "B group",
+        "A (%) — Median centers", "B (%) — Median centers", "NCA (%)",
+    ]
+    df_align_csv_pretty = df_align_csv_full[[c for c in col_order if c in df_align_csv_full.columns]]
+    
     st.markdown("##### Export alignment")
     c1, c2 = st.columns(2)
     with c1:
-        st.download_button(
-            "Download CSV (full, with child rows)",
-            data=df_align_csv_full.to_csv(index=False).encode("utf-8"),
-            file_name="alignment_full_with_children.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="dl_align_csv_full",
-        )
+    st.download_button(
+        "Download CSV (full, with child rows)",
+        data=df_align_csv_pretty.to_csv(index=False).encode("utf-8"),
+        file_name="alignment_full_with_children.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="dl_align_csv_full",
+    )
     with c2:
         st.download_button(
             "Download Markdown (summary only)",
