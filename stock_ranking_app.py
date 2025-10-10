@@ -1033,6 +1033,7 @@ html = """
 """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=620, scrolling=True)
+
 # ============================== Distributions across Gain% cutoffs ==============================
 import altair as alt
 
@@ -1188,52 +1189,58 @@ else:
             )
             st.altair_chart(chart, use_container_width=True)
 
-# ---------------- Export: PNG / SVG / Markdown / CSV ----------------
+# ---------------- Export: PNG / Markdown / CSV (no tabulate required) ----------------
 import io
 from datetime import datetime
+import math
 
-# Base filename (customizable by user)
+def _df_to_markdown_simple(df: pd.DataFrame, float_fmt=".2f") -> str:
+    # format floats, leave NaNs blank
+    def _fmt(x):
+        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+            return ""
+        if isinstance(x, float):
+            return format(x, float_fmt)
+        return str(x)
+
+    cols = list(df.columns)
+    header = "| " + " | ".join(cols) + " |"
+    sep    = "| " + " | ".join("---" for _ in cols) + " |"
+
+    lines = [header, sep]
+    for _, row in df.iterrows():
+        cells = [_fmt(v) for v in row.tolist()]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+# base filename (user editable)
 default_name = f"distributions_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 fname = st.text_input("File name (no extension)", value=default_name, key="dist_export_name")
 
-# Prepare data exports
-md_bytes = dist_df.to_markdown(index=False).encode("utf-8")
+# data exports
+md_bytes  = _df_to_markdown_simple(dist_df, float_fmt=".2f").encode("utf-8")
 csv_bytes = dist_df.to_csv(index=False).encode("utf-8")
 
-# Prepare image exports (PNG/SVG)
-png_bytes, svg_bytes = None, None
-
-# Preferred: vl-convert (fast & headless). pip install vl-convert-python
+# image export (PNG) – try vl-convert first, altair_saver second
+png_bytes = None
 try:
-    from vl_convert import vlc
+    from vl_convert import vlc  # pip install vl-convert-python
     png_bytes = vlc.vegalite_to_png(chart.to_dict())
-    # SVG optional; comment out if you don't need it
-    # svg_bytes = vlc.vegalite_to_svg(chart.to_dict())
 except Exception:
-    # Fallback: altair_saver. Requires: pip install altair_saver
-    # Preferably with 'vl-convert' under the hood; otherwise needs Chrome or node.
     try:
-        from altair_saver import save
+        from altair_saver import save  # pip install altair_saver
         import tempfile, os
-        # PNG
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_name = tmp.name
-        save(chart, tmp_name)  # writes file
+        save(chart, tmp_name)
         with open(tmp_name, "rb") as f:
             png_bytes = f.read()
         os.remove(tmp_name)
-        # SVG (optional)
-        # with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp2:
-        #     tmp2_name = tmp2.name
-        # save(chart, tmp2_name)
-        # with open(tmp2_name, "rb") as f2:
-        #     svg_bytes = f2.read()
-        # os.remove(tmp2_name)
     except Exception:
-        pass  # If both methods fail, we’ll just hide the PNG/SVG buttons.
+        png_bytes = None  # neither backend available
 
 st.markdown("##### Export")
-exp_cols = st.columns(4)
+exp_cols = st.columns(3)
 
 with exp_cols[0]:
     st.download_button(
@@ -1267,16 +1274,3 @@ with exp_cols[2]:
         )
     else:
         st.caption("PNG export unavailable (install `vl-convert-python` or `altair_saver`).")
-
-with exp_cols[3]:
-    if svg_bytes is not None:
-        st.download_button(
-            "Download SVG",
-            data=svg_bytes,
-            file_name=f"{fname}.svg",
-            mime="image/svg+xml",
-            use_container_width=True,
-            key="dist_dl_svg",
-        )
-    else:
-        st.caption("SVG export optional (enable in code & install converter).")
