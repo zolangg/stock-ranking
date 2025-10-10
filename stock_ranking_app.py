@@ -1279,3 +1279,5 @@ if png_bytes is not None:
     )
 else:
     st.caption("PNG export unavailable — install `vl-convert-python` (recommended) or `altair_saver`.")
+
+chart.save("chart.png")  # requires altair_saver + chromium
