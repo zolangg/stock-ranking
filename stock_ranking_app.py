@@ -1,4 +1,5 @@
-# app.py — Premarket Stock Ranking (Median-only centers; Group UI + Gain% filter; 3σ coloring; delete UI + NCA bar w/ live features only)
+# app.py — Premarket Stock Ranking
+# (Median-only centers; Group UI + Gain% filter; 3σ coloring; delete UI + NCA bar w/ live features only)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -340,7 +341,7 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     return float(PM * cal_mult)
 
 # ============================== Upload / Build ==============================
-st.subheader("Upload Database")
+st.subheader("1) Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
 build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
 
@@ -454,9 +455,10 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# ============================== Add Stock ==============================
-st.markdown("---")
-st.subheader("Add Stock")
+st.divider()
+
+# ============================== Add Stock + Manage ==============================
+st.subheader("2) Add Stock")
 
 with st.form("add_form", clear_on_submit=True):
     c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
@@ -500,10 +502,36 @@ if submitted and ticker:
     ss.rows.append(row); ss.last = row
     st.success(f"Saved {ticker}."); do_rerun()
 
-# ============================== Alignment ==============================
-st.markdown("### Alignment")
+with st.expander("Manage added tickers", expanded=False):
+    tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
+    unique_tickers, _seen = [], set()
+    for t in tickers:
+        if t and t not in _seen:
+            unique_tickers.append(t); _seen.add(t)
+    cdel1, cdel2 = st.columns([4,1])
+    with cdel1:
+        to_delete = st.multiselect(
+            "Delete tickers",
+            options=unique_tickers,
+            default=[],
+            key="del_selection",
+            placeholder="Select tickers…",
+        )
+    with cdel2:
+        if st.button("Delete", use_container_width=True, key="delete_btn"):
+            if to_delete:
+                ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
+                st.success(f"Deleted: {', '.join(to_delete)}")
+                do_rerun()
+            else:
+                st.info("No tickers selected.")
 
-# --- compact top row: radios (left) + Gain% dropdown (right) ---
+st.divider()
+
+# ============================== Alignment ==============================
+st.subheader("3) Alignment")
+
+# --- controls row: radios (left) + Gain% dropdown (right) ---
 col_mode, col_gain = st.columns([2.8, 1.0])
 with col_mode:
     mode = st.radio(
@@ -528,58 +556,6 @@ with col_gain:
         label_visibility="collapsed",
     )
 
-# ============================== Delete Control (below table; no title) ==============================
-tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-unique_tickers, _seen = [], set()
-for t in tickers:
-    if t and t not in _seen:
-        unique_tickers.append(t); _seen.add(t)
-
-del_cols = st.columns([4, 1])
-with del_cols[0]:
-    to_delete = st.multiselect(
-        "",
-        options=unique_tickers,
-        default=[],
-        key="del_selection",
-        placeholder="Select tickers…",
-        label_visibility="collapsed",
-    )
-with del_cols[1]:
-    if st.button("Delete", use_container_width=True, key="delete_btn"):
-        if to_delete:
-            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(to_delete)]
-            st.success(f"Deleted: {', '.join(to_delete)}")
-            do_rerun()
-        else:
-            st.info("No tickers selected.")
-
-# ---------- build comparison dataframe + group labels ----------
-df_cmp = base_df.copy()
-thr = float(gain_min)
-
-if mode == "Gain% vs Rest":
-    df_cmp["__Group__"] = np.where(pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr, f"≥{int(thr)}%", "Rest")
-    gA, gB = f"≥{int(thr)}%", "Rest"
-    status_line = f"Gain% split at ≥ {int(thr)}%"
-
-elif mode == "FT=1 (High vs Low cutoff)":
-    df_cmp = df_cmp[df_cmp["FT01"] == 1].copy()
-    gain_val = pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce")
-    df_cmp["__Group__"] = np.where(gain_val >= thr, f"FT=1 ≥{int(thr)}%", "FT=1 <{int_thr}%".format(int_thr=int(thr)))
-    gA, gB = f"FT=1 ≥{int(thr)}%", f"FT=1 <{int(thr)}%"
-    status_line = f"FT=1 split at Gain% ≥ {int(thr)}% (NaNs treated as Low)"
-
-else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
-    a_mask = (df_cmp["FT01"] == 1) & (pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr)
-    b_mask = (df_cmp["FT01"] == 0)
-    df_cmp = df_cmp[a_mask | b_mask].copy()
-    df_cmp["__Group__"] = np.where(df_cmp["FT01"] == 1, f"FT=1 ≥{int(thr)}%", "FT=0 (all)")
-    gA, gB = f"FT=1 ≥{int(thr)}%", "FT=0 (all)"
-    status_line = f"A: FT=1 with Gain% ≥ {int(thr)}% • B: all FT=0 (no cutoff)"
-
-st.caption(status_line)
-
 # --- base data guardrails ---
 base_df = ss.get("base_df", pd.DataFrame()).copy()
 if base_df.empty:
@@ -595,6 +571,32 @@ if "Max_Push_Daily_%" not in base_df.columns:
 if "FT01" not in base_df.columns:
     st.error("FT01 column not found (expected after load).")
     st.stop()
+
+# ---------- build comparison dataframe + group labels (RESTORED) ----------
+df_cmp = base_df.copy()
+thr = float(gain_min)
+
+if mode == "Gain% vs Rest":
+    df_cmp["__Group__"] = np.where(pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr, f"≥{int(thr)}%", "Rest")
+    gA, gB = f"≥{int(thr)}%", "Rest"
+    status_line = f"Gain% split at ≥ {int(thr)}%."
+
+elif mode == "FT=1 (High vs Low cutoff)":
+    df_cmp = df_cmp[df_cmp["FT01"] == 1].copy()
+    gain_val = pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce")
+    df_cmp["__Group__"] = np.where(gain_val >= thr, f"FT=1 ≥{int(thr)}%", f"FT=1 <{int(thr)}%")
+    gA, gB = f"FT=1 ≥{int(thr)}%", f"FT=1 <{int(thr)}%"
+    status_line = f"FT=1 split at Gain% ≥ {int(thr)}% (NaNs treated as Low)."
+
+else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
+    a_mask = (df_cmp["FT01"] == 1) & (pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr)
+    b_mask = (df_cmp["FT01"] == 0)
+    df_cmp = df_cmp[a_mask | b_mask].copy()
+    df_cmp["__Group__"] = np.where(df_cmp["FT01"] == 1, f"FT=1 ≥{int(thr)}%", "FT=0 (all)")
+    gA, gB = f"FT=1 ≥{int(thr)}%", "FT=0 (all)"
+    status_line = f"A: FT=1 with Gain% ≥ {int(thr)}% • B: all FT=0 (no cutoff)."
+
+st.caption(status_line)
 
 # ---------- summaries (median centers + MAD→σ for 3σ highlighting) ----------
 var_core = ss.get("var_core", [])
@@ -752,7 +754,7 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
     return float(np.clip(pA, 0.0, 1.0))
 
 # Train (or retrain) NCA model on current split
-features_for_nca = var_all[:]  # filtered inside trainer to live features
+features_for_nca = VAR_ALL[:]  # filtered inside trainer to live features
 ss.nca_model = _train_nca_or_lda(df_cmp, gA, gB, features_for_nca) or {}
 
 # ---------- alignment computation for entered rows ----------
@@ -811,15 +813,15 @@ centers_tbl = med_tbl.copy()
 disp_tbl = mad_tbl.copy()
 
 summary_rows, detail_map = [], {}
-detail_order = [("Core variables", var_core),
-                ("Moderate variables", var_mod + (["PredVol_M"] if "PredVol_M" not in var_mod else []))]
+detail_order = [("Core variables", ss.get("var_core", [])),
+                ("Moderate variables", ss.get("var_moderate", []) + (["PredVol_M"] if "PredVol_M" not in ss.get("var_moderate", []) else []))]
 
 mt_index = set(centers_tbl.index); dt_index = set(disp_tbl.index)
 
 for row in ss.rows:
     stock = dict(row); tkr = stock.get("Ticker") or "—"
     counts = _compute_alignment_counts_weighted(
-        stock_row=stock, centers_tbl=centers_tbl, var_core=var_core, var_mod=var_mod,
+        stock_row=stock, centers_tbl=centers_tbl, var_core=ss.get("var_core", []), var_mod=ss.get("var_moderate", []),
         w_core=1.0, w_mod=0.5, tie_mode="split",
     )
     if not counts: continue
@@ -875,7 +877,7 @@ for row in ss.rows:
                 "sB":  None if not np.isfinite(sB) else float(sB),
                 "d_vs_A": None if dA is None else dA,
                 "d_vs_B": None if dB is None else dB,
-                "is_core": (v in var_core),
+                "is_core": (v in ss.get("var_core", [])),
             })
     detail_map[tkr] = drows_grouped
 
@@ -1018,14 +1020,13 @@ components.html(html, height=620, scrolling=True)
 # ============================== Distributions across all Gain% cutoffs (select stocks + color-matched bars) ==============================
 import altair as alt
 
-st.markdown("### Distributions across Gain% cutoffs")
+st.subheader("4) Distributions across Gain% cutoffs")
 
 if not ss.rows:
     st.info("Add at least one stock to see distributions across cutoffs.")
 else:
     # --- choose which added stocks to include ---
     all_tickers = [(r.get("Ticker") or "—") for r in ss.rows]
-    # keep original order but unique
     seen = set(); all_tickers = [t for t in all_tickers if not (t in seen or seen.add(t))]
 
     with st.container():
@@ -1038,7 +1039,6 @@ else:
                 help="This controls which of your added stocks are used to compute the averages at each Gain% cutoff."
             )
         with csel2:
-            # quick toggles
             if st.button("Select all", use_container_width=True):
                 stocks_selected = all_tickers
             if st.button("Clear", use_container_width=True):
@@ -1049,7 +1049,6 @@ else:
     if not rows_for_dist:
         st.info("No stocks selected.")
     else:
-        # Helper: recompute split + medians + NCA for each threshold; aggregate over selected rows
         def _make_split(df_base: pd.DataFrame, thr_val: float, mode_val: str):
             df_tmp = df_base.copy()
             if mode_val == "Gain% vs Rest":
@@ -1083,7 +1082,7 @@ else:
 
         for thr_val in gain_choices:
             df_split, gA2, gB2 = _make_split(base_df, float(thr_val), mode)
-            med_tbl2, mad_tbl2 = _summaries(df_split, var_all, "__Group__")
+            med_tbl2, mad_tbl2 = _summaries(df_split, VAR_ALL, "__Group__")
 
             if med_tbl2.empty or med_tbl2.shape[1] < 2:
                 continue
@@ -1100,12 +1099,12 @@ else:
                 med_tbl2 = med_tbl2[[gA2, gB2]]
                 mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
 
-            nca_model2 = _train_nca_or_lda(df_split, gA2, gB2, var_all) or {}
+            nca_model2 = _train_nca_or_lda(df_split, gA2, gB2, VAR_ALL) or {}
 
             As, Bs, Ns = [], [], []
             for row in rows_for_dist:
                 counts2 = _compute_alignment_counts_weighted(
-                    stock_row=row, centers_tbl=med_tbl2, var_core=var_core, var_mod=var_mod,
+                    stock_row=row, centers_tbl=med_tbl2, var_core=ss.get("var_core", []), var_mod=ss.get("var_moderate", []),
                     w_core=1.0, w_mod=0.5, tie_mode="split",
                 )
                 a = counts2.get("A_pct_raw", np.nan) if counts2 else np.nan
