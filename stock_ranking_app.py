@@ -988,124 +988,6 @@ html = """
 """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=620, scrolling=True)
-
-# ============================== Distributions across all Gain% cutoffs ==============================
-st.markdown("### Distributions across Gain% cutoffs")
-
-if not ss.rows:
-    st.info("Add at least one stock to see distributions across cutoffs.")
-else:
-    # Recompute split + medians + NCA for each threshold; aggregate over entered rows
-    dist_rows = []
-    per_thr_details = []  # optional table
-
-    def _make_split(df_base: pd.DataFrame, thr_val: float, mode_val: str):
-        df_tmp = df_base.copy()
-        if mode_val == "Gain% vs Rest":
-            df_tmp["__Group__"] = np.where(pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val,
-                                           f"≥{int(thr_val)}%", "Rest")
-            gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
-        elif mode_val == "FT=1 (High vs Low cutoff)":
-            df_tmp = df_tmp[df_tmp["FT01"] == 1].copy()
-            gain_val = pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce")
-            df_tmp["__Group__"] = np.where(gain_val >= thr_val, f"FT=1 ≥{int(thr_val)}%", f"FT=1 <{int(thr_val)}%")
-            gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", f"FT=1 <{int(thr_val)}%"
-        else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
-            a_mask = (df_tmp["FT01"] == 1) & (pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val)
-            b_mask = (df_tmp["FT01"] == 0)
-            df_tmp = df_tmp[a_mask | b_mask].copy()
-            df_tmp["__Group__"] = np.where(df_tmp["FT01"] == 1, f"FT=1 ≥{int(thr_val)}%", "FT=0 (all)")
-            gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0 (all)"
-        return df_tmp, gA_, gB_
-
-    def _summaries(df_in, vars_all, grp_col):
-        avail = [v for v in vars_all if v in df_in.columns]
-        if not avail:
-            return pd.DataFrame(), pd.DataFrame()
-        g = df_in.groupby(grp_col, observed=True)[avail]
-        med_tbl_ = g.median(numeric_only=True).T
-        mad_tbl_ = df_in.groupby(grp_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad_local)).T * 1.4826
-        return med_tbl_, mad_tbl_
-
-    # Iterate through the same choices shown in the UI
-    series_A_means, series_B_means, series_N_means = [], [], []
-    thr_labels = []
-
-    for thr_val in gain_choices:
-        df_split, gA2, gB2 = _make_split(base_df, float(thr_val), mode)
-        med_tbl2, mad_tbl2 = _summaries(df_split, var_all, "__Group__")
-
-        # Need exactly two groups
-        if med_tbl2.empty or med_tbl2.shape[1] < 2:
-            # skip this threshold (no bars)
-            continue
-
-        # Column ordering to gA2|gB2 if possible
-        cols2 = list(med_tbl2.columns)
-        if (gA2 in cols2) and (gB2 in cols2):
-            med_tbl2 = med_tbl2[[gA2, gB2]]
-            mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
-        else:
-            top2 = df_split["__Group__"].value_counts().index[:2].tolist()
-            if len(top2) < 2:
-                continue
-            gA2, gB2 = top2[0], top2[1]
-            med_tbl2 = med_tbl2[[gA2, gB2]]
-            mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
-
-        # Train NCA for this split
-        nca_model2 = _train_nca_or_lda(df_split, gA2, gB2, var_all) or {}
-
-        # Compute per-entered-row A/B alignment and NCA
-        As, Bs, Ns = [], [], []
-        for row in ss.rows:
-            counts2 = _compute_alignment_counts_weighted(
-                stock_row=row, centers_tbl=med_tbl2, var_core=var_core, var_mod=var_mod,
-                w_core=1.0, w_mod=0.5, tie_mode="split",
-            )
-            if counts2:
-                a = counts2.get("A_pct_raw", np.nan)
-                b = counts2.get("B_pct_raw", np.nan)
-            else:
-                a = b = np.nan
-
-            pA = _nca_predict_proba(row, nca_model2)
-            n = (float(pA) * 100.0) if np.isfinite(pA) else np.nan
-
-            As.append(a); Bs.append(b); Ns.append(n)
-
-            per_thr_details.append({
-                "GainCutoff_%": int(thr_val),
-                "Ticker": row.get("Ticker","—"),
-                "A_pct": a, "B_pct": b, "NCA_pct": n
-            })
-
-        # Aggregate (mean) for the chart
-        A_mean = float(np.nanmean(As)) if len(As) else np.nan
-        B_mean = float(np.nanmean(Bs)) if len(Bs) else np.nan
-        N_mean = float(np.nanmean(Ns)) if len(Ns) else np.nan
-
-        thr_labels.append(int(thr_val))
-        series_A_means.append(A_mean)
-        series_B_means.append(B_mean)
-        series_N_means.append(N_mean)
-
-    if not thr_labels:
-        st.info("Not enough data across cutoffs to form two groups — broaden your DB or change mode.")
-    else:
-        # Build a wide DataFrame for a grouped column chart
-        dist_df = pd.DataFrame({
-            "GainCutoff_%": thr_labels,
-            "A_mean": series_A_means,
-            "B_mean": series_B_means,
-            "NCA_mean": series_N_means,
-        }).set_index("GainCutoff_%")
-
-        st.caption("Average alignment across your added stocks versus each Gain% cutoff (current mode).")
-        st.bar_chart(dist_df)  # grouped bars: A_mean, B_mean, NCA_mean
-
-        with st.expander("Show per-ticker values by cutoff"):
-            st.dataframe(pd.DataFrame(per_thr_details))
             
 # ============================== Delete Control (below table; no title) ==============================
 tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
@@ -1132,3 +1014,158 @@ with del_cols[1]:
             do_rerun()
         else:
             st.info("No tickers selected.")
+
+# ============================== Distributions across all Gain% cutoffs (select stocks + color-matched bars) ==============================
+import altair as alt
+
+st.markdown("### Distributions across Gain% cutoffs")
+
+if not ss.rows:
+    st.info("Add at least one stock to see distributions across cutoffs.")
+else:
+    # --- choose which added stocks to include ---
+    all_tickers = [(r.get("Ticker") or "—") for r in ss.rows]
+    # keep original order but unique
+    seen = set(); all_tickers = [t for t in all_tickers if not (t in seen or seen.add(t))]
+
+    with st.container():
+        csel1, csel2 = st.columns([4,1])
+        with csel1:
+            stocks_selected = st.multiselect(
+                "Stocks to include",
+                options=all_tickers,
+                default=all_tickers,
+                help="This controls which of your added stocks are used to compute the averages at each Gain% cutoff."
+            )
+        with csel2:
+            # quick toggles
+            if st.button("Select all", use_container_width=True):
+                stocks_selected = all_tickers
+            if st.button("Clear", use_container_width=True):
+                stocks_selected = []
+
+    rows_for_dist = [r for r in ss.rows if (r.get("Ticker") or "—") in stocks_selected]
+
+    if not rows_for_dist:
+        st.info("No stocks selected.")
+    else:
+        # Helper: recompute split + medians + NCA for each threshold; aggregate over selected rows
+        def _make_split(df_base: pd.DataFrame, thr_val: float, mode_val: str):
+            df_tmp = df_base.copy()
+            if mode_val == "Gain% vs Rest":
+                df_tmp["__Group__"] = np.where(pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val,
+                                               f"≥{int(thr_val)}%", "Rest")
+                gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
+            elif mode_val == "FT=1 (High vs Low cutoff)":
+                df_tmp = df_tmp[df_tmp["FT01"] == 1].copy()
+                gain_val = pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce")
+                df_tmp["__Group__"] = np.where(gain_val >= thr_val, f"FT=1 ≥{int(thr_val)}%", f"FT=1 <{int(thr_val)}%")
+                gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", f"FT=1 <{int(thr_val)}%"
+            else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
+                a_mask = (df_tmp["FT01"] == 1) & (pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val)
+                b_mask = (df_tmp["FT01"] == 0)
+                df_tmp = df_tmp[a_mask | b_mask].copy()
+                df_tmp["__Group__"] = np.where(df_tmp["FT01"] == 1, f"FT=1 ≥{int(thr_val)}%", "FT=0 (all)")
+                gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0 (all)"
+            return df_tmp, gA_, gB_
+
+        def _summaries(df_in, vars_all, grp_col):
+            avail = [v for v in vars_all if v in df_in.columns]
+            if not avail:
+                return pd.DataFrame(), pd.DataFrame()
+            g = df_in.groupby(grp_col, observed=True)[avail]
+            med_tbl_ = g.median(numeric_only=True).T
+            mad_tbl_ = df_in.groupby(grp_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad_local)).T * 1.4826
+            return med_tbl_, mad_tbl_
+
+        thr_labels, series_A_means, series_B_means, series_N_means = [], [], [], []
+        per_thr_details = []
+
+        for thr_val in gain_choices:
+            df_split, gA2, gB2 = _make_split(base_df, float(thr_val), mode)
+            med_tbl2, mad_tbl2 = _summaries(df_split, var_all, "__Group__")
+
+            if med_tbl2.empty or med_tbl2.shape[1] < 2:
+                continue
+
+            cols2 = list(med_tbl2.columns)
+            if (gA2 in cols2) and (gB2 in cols2):
+                med_tbl2 = med_tbl2[[gA2, gB2]]
+                mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
+            else:
+                top2 = df_split["__Group__"].value_counts().index[:2].tolist()
+                if len(top2) < 2:
+                    continue
+                gA2, gB2 = top2[0], top2[1]
+                med_tbl2 = med_tbl2[[gA2, gB2]]
+                mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
+
+            nca_model2 = _train_nca_or_lda(df_split, gA2, gB2, var_all) or {}
+
+            As, Bs, Ns = [], [], []
+            for row in rows_for_dist:
+                counts2 = _compute_alignment_counts_weighted(
+                    stock_row=row, centers_tbl=med_tbl2, var_core=var_core, var_mod=var_mod,
+                    w_core=1.0, w_mod=0.5, tie_mode="split",
+                )
+                a = counts2.get("A_pct_raw", np.nan) if counts2 else np.nan
+                b = counts2.get("B_pct_raw", np.nan) if counts2 else np.nan
+
+                pA = _nca_predict_proba(row, nca_model2)
+                n = (float(pA) * 100.0) if np.isfinite(pA) else np.nan
+
+                As.append(a); Bs.append(b); Ns.append(n)
+                per_thr_details.append({
+                    "GainCutoff_%": int(thr_val),
+                    "Ticker": row.get("Ticker","—"),
+                    f"A% ({gA2})": a,
+                    f"B% ({gB2})": b,
+                    f"NCA: P({gA2}) %": n,
+                })
+
+            thr_labels.append(int(thr_val))
+            series_A_means.append(float(np.nanmean(As)) if len(As) else np.nan)
+            series_B_means.append(float(np.nanmean(Bs)) if len(Bs) else np.nan)
+            series_N_means.append(float(np.nanmean(Ns)) if len(Ns) else np.nan)
+
+        if not thr_labels:
+            st.info("Not enough data across cutoffs to form two groups — broaden your DB or change mode.")
+        else:
+            # tidy frame for Altair
+            dist_df = pd.DataFrame({
+                "GainCutoff_%": thr_labels,
+                f"A mean ({gA})": series_A_means,
+                f"B mean ({gB})": series_B_means,
+                f"NCA mean: P({gA})": series_N_means,
+            })
+
+            df_long = dist_df.melt(id_vars="GainCutoff_%", var_name="Series", value_name="Value")
+
+            color_domain = [f"A mean ({gA})", f"B mean ({gB})", f"NCA mean: P({gA})"]
+            color_range  = ["#3b82f6", "#ef4444", "#10b981"]  # blue, red, green (match table bars)
+
+            chart = (
+                alt.Chart(df_long)
+                .mark_bar()
+                .encode(
+                    x=alt.X("GainCutoff_%:O", title="Gain% cutoff"),
+                    y=alt.Y("Value:Q", title="Average (%)", scale=alt.Scale(domain=[0,100])),
+                    color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Series")),
+                    xOffset="Series:N",
+                    tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")]
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+            st.caption(
+                f"Bars are color-matched to the alignment table: **{gA}** = blue, **{gB}** = red, **NCA** = green. "
+                f"Values show the mean across the selected stocks for each Gain% cutoff."
+            )
+
+            with st.expander("Per-ticker values by cutoff"):
+                st.caption(
+                    f"Each row shows a selected ticker’s alignment at a specific cutoff. "
+                    f"A% is toward **{gA}**, B% toward **{gB}**, and NCA is the calibrated P({gA})."
+                )
+                st.dataframe(pd.DataFrame(per_thr_details))
