@@ -812,17 +812,15 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
 
     model = CatBoostClassifier(
         loss_function="Logloss",
-        eval_metric="Logloss",          # or "AUC" if you care more about ranking
-        iterations=300,                 # 300–800 is a sweet spot; use early stopping
-        learning_rate=0.04,             # small enough to generalize with ~500 trees
-        depth=3,                        # 4–6 keeps variance in check for low-dim data
-        l2_leaf_reg=6,                  # 3–10 typical; 6 is a safe middle
+        eval_metric="Logloss",          
+        iterations=200,                 
+        learning_rate=0.04,             
+        depth=4,                        
+        l2_leaf_reg=6,                  
         random_seed=42,
-        bootstrap_type="Bayesian",      # smoother than Poisson/No for small data
-        bagging_temperature=0.5,        # mild stochasticity → better generalization
-        auto_class_weights="Balanced",  # handles FT split imbalance automatically
-        od_type="Iter",                 # early stopping by iterations
-        od_wait=40,                     # patience; pairs well with 500 iterations
+        bootstrap_type="Bayesian",     
+        bagging_temperature=0.5,        
+        auto_class_weights="Balanced",  
         verbose=False,
         allow_writing_files=False
     )
