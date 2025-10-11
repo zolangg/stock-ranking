@@ -6,6 +6,9 @@ import pandas as pd
 import numpy as np
 import re, json, hashlib
 
+from catboost import CatBoostClassifier, Pool
+from sklearn.metrics import roc_auc_score
+
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
@@ -774,9 +777,80 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
         pA = 1.0 / (1.0 + np.exp(-k*(z - m)))
     return float(np.clip(pA, 0.0, 1.0))
 
-# Train NCA on current split
-features_for_nca = var_all[:]  # filtered in trainer to live features
-ss.nca_model = _train_nca_or_lda(df_cmp, gA, gB, features_for_nca) or {}
+# ============================== CatBoost (binary P(FT)) ==============================
+CB_FEATS = [
+    "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
+    "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
+]
+
+def _train_catboost(df_groups: pd.DataFrame, gA_label: str, gB_label: str) -> dict:
+    df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
+    if df2.empty: return {}
+
+    feats = [f for f in CB_FEATS if f in df2.columns]
+    if not feats: return {}
+
+    X = df2[feats].apply(pd.to_numeric, errors="coerce")
+    y = (df2["__Group__"] == gA_label).astype(int)
+
+    mask = np.isfinite(X).all(axis=1)
+    X, y = X[mask], y[mask]
+    if len(X) < 40 or y.nunique() < 2:
+        return {}
+
+    # nearly balanced, class weights optional:
+    pos = int(y.sum()); neg = int(len(y) - pos)
+    scale_pos_weight = (neg / max(pos, 1)) if pos and neg else 1.0
+
+    train_pool = Pool(X, y)
+
+    model = CatBoostClassifier(
+        loss_function="Logloss",
+        eval_metric="AUC",
+        depth=4,
+        learning_rate=0.08,
+        l2_leaf_reg=6.0,
+        subsample=0.9,
+        colsample_bylevel=0.9,
+        iterations=2000,
+        early_stopping_rounds=70,
+        random_seed=42,
+        verbose=False,
+        class_weights=[1.0, float(scale_pos_weight)]
+    )
+    model.fit(train_pool, use_best_model=True)
+
+    # (optional) quick diagnostic
+    try:
+        auc = roc_auc_score(y, model.predict_proba(train_pool)[:,1])
+        print(f"[CatBoost] AUC (train diag): {auc:.3f}, best_iter={model.get_best_iteration()}")
+    except Exception:
+        pass
+
+    return {"ok": True, "model": model, "feats": feats, "gA": gA_label, "gB": gB_label}
+
+def _catboost_predict_proba(row: dict, bundle: dict) -> float:
+    if not bundle or not bundle.get("ok"): return np.nan
+    model = bundle["model"]; feats = bundle["feats"]
+    x = [pd.to_numeric(row.get(f), errors="coerce") for f in feats]
+    if any((not np.isfinite(v)) for v in x): return np.nan
+    p = float(model.predict_proba([x])[0][1])  # P(group=gA)
+    return float(np.clip(p, 0.0, 1.0))
+
+# -------- Choose probability model for P(FT) bars / distributions --------
+clf_choice = st.radio(
+    "Classifier for P(FT)",
+    ["NCA/LDA", "CatBoost"],
+    horizontal=True,
+    key="clf_choice"
+)
+
+# Train selected classifier on current split
+if clf_choice == "CatBoost":
+    ss.nca_model = _train_catboost(df_cmp, gA, gB) or {}
+else:
+    features_for_nca = var_all[:]  # filtered in trainer to live features
+    ss.nca_model = _train_nca_or_lda(df_cmp, gA, gB, features_for_nca) or {}
 
 # ---------- alignment computation for entered rows ----------
 def _compute_alignment_counts_weighted(
@@ -848,7 +922,11 @@ for row in ss.rows:
     if not counts: continue
 
     # NCA probability (A)
-    pA = _nca_predict_proba(stock, ss.get("nca_model", {}))
+    # Probability (A) from selected classifier
+    if clf_choice == "CatBoost":
+        pA = _catboost_predict_proba(stock, ss.get("nca_model", {}))
+    else:
+        pA = _nca_predict_proba(stock, ss.get("nca_model", {}))
     nca_raw = float(pA)*100.0 if np.isfinite(pA) else np.nan
     nca_int = int(round(nca_raw)) if np.isfinite(nca_raw) else None
 
@@ -1289,23 +1367,15 @@ else:
                 med_tbl2 = med_tbl2[[gA2, gB2]]
                 mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
 
-            # fresh NCA for this cutoff (trainer already filters to live features)
-            nca_model2 = _train_nca_or_lda(df_split, gA2, gB2, var_all) or {}
-
-            As, Bs, Ns = [], [], []
-            for row in rows_for_dist:
-                counts2 = _compute_alignment_counts_weighted(
-                    stock_row=row,
-                    centers_tbl=med_tbl2,
-                    var_core=ss.var_core,
-                    var_mod=ss.var_moderate,
-                    w_core=1.0, w_mod=0.5, tie_mode="split",
-                )
-                a = counts2.get("A_pct_raw", np.nan) if counts2 else np.nan
-                b = counts2.get("B_pct_raw", np.nan) if counts2 else np.nan
-
-                pA = _nca_predict_proba(row, nca_model2)
-                n = (float(pA) * 100.0) if np.isfinite(pA) else np.nan
+            # fresh model for this cutoff
+            if clf_choice == "CatBoost":
+                model2 = _train_catboost(df_split, gA2, gB2) or {}
+                pA = _catboost_predict_proba(row, model2)
+            else:
+                model2 = _train_nca_or_lda(df_split, gA2, gB2, var_all) or {}
+                pA = _nca_predict_proba(row, model2)
+            
+            n = (float(pA) * 100.0) if np.isfinite(pA) else np.nan
 
                 As.append(a); Bs.append(b); Ns.append(n)
 
