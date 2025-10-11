@@ -785,12 +785,19 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
 
 # ============================== CatBoost training (same live features; once per split) ==============================
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
+    """Train CatBoost on live features for this split with strong guards:
+       - numeric-only, finite, float32 features
+       - stratified split with both classes in train/val when possible
+       - safe fallback when val is degenerate
+       - probability calibration (isotonic → Platt)
+    """
     if not _CATBOOST_OK:
         if not ss.get("__catboost_warned", False):
             st.info("CatBoost is not installed. Run `pip install catboost` to enable the purple CatBoost column/series.")
             ss["__catboost_warned"] = True
         return {}
 
+    # 1) Select rows & features
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
     feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
     if not feats:
@@ -799,50 +806,123 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
     y = (df2["__Group__"].values == gA_label).astype(int)
 
-    mask = np.isfinite(Xdf.values).all(axis=1)
-    X = Xdf.values[mask]; yy = y[mask]
-    if X.shape[0] < 40 or np.unique(yy).size < 2:
+    # 2) Drop any rows with non-finite values
+    mask_finite = np.isfinite(Xdf.values).all(axis=1)
+    Xdf = Xdf.loc[mask_finite]
+    y = y[mask_finite]
+
+    # Need enough data and two classes
+    n = len(y)
+    if n < 40 or np.unique(y).size < 2:
         return {}
 
-    # simple train/val split
-    n = X.shape[0]
-    split = max(10, int(n * 0.8))
-    Xtr, Xva = X[:split], X[split:]
-    ytr, yva = yy[:split], yy[split:]
+    # Cast to float32 for CatBoost stability on numeric features
+    X_all = Xdf.values.astype(np.float32, copy=False)
+    y_all = y.astype(np.int32, copy=False)
 
-    model = CatBoostClassifier(
+    # 3) Stratified split (try to ensure both classes in val)
+    from sklearn.model_selection import StratifiedShuffleSplit
+    test_size = 0.2 if n >= 100 else max(0.15, min(0.25, 20 / n))  # 15–25% val; ensure some samples on small sets
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
+    tr_idx, va_idx = next(sss.split(X_all, y_all))
+    Xtr, Xva = X_all[tr_idx], X_all[va_idx]
+    ytr, yva = y_all[tr_idx], y_all[va_idx]
+
+    # Check class coverage in train/val
+    def _has_both_classes(arr): 
+        u = np.unique(arr)
+        return (u.size == 2)
+
+    eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
+
+    # 4) Build model (enable early stopping only if eval_set is valid)
+    params = dict(
         loss_function="Logloss",
-        eval_metric="Logloss",          
-        iterations=200,                 
-        learning_rate=0.04,             
-        depth=4,                        
-        l2_leaf_reg=6,                  
+        eval_metric="Logloss",
+        iterations=500,
+        learning_rate=0.05,
+        depth=6,
+        l2_leaf_reg=6,
+        bootstrap_type="Bayesian",
+        bagging_temperature=0.5,
+        auto_class_weights="Balanced",
         random_seed=42,
-        bootstrap_type="Bayesian",     
-        bagging_temperature=0.5,        
-        auto_class_weights="Balanced",  
+        allow_writing_files=False,
         verbose=False,
-        allow_writing_files=False
     )
-    model.fit(Xtr, ytr, eval_set=(Xva, yva))
+    if eval_ok:
+        params.update(dict(od_type="Iter", od_wait=40))
+    else:
+        # No reliable eval → disable early stopping
+        params.update(dict(od_type="None"))
 
-    # Validation for calibration
+    model = CatBoostClassifier(**params)
+
+    # 5) Fit with safe fallbacks
+    try:
+        if eval_ok:
+            model.fit(Xtr, ytr, eval_set=(Xva, yva))
+        else:
+            model.fit(Xtr, ytr)
+    except Exception:
+        # Retry: train on all data without early stopping
+        try:
+            model = CatBoostClassifier(**{**params, "od_type": "None"})
+            model.fit(X_all, y_all)
+            # If we trained on all data, we won't have a clean val for isotonic. We'll use Platt later.
+            eval_ok = False
+        except Exception:
+            return {}
+
+    # 6) Calibration
     iso_bx = np.array([]); iso_by = np.array([]); platt = None
-    if Xva.shape[0] >= 8:
-        p_raw = model.predict_proba(Xva)[:, 1].astype(float)
-        yf = yva.astype(int)
-        if np.unique(p_raw).size >= 3:
-            bx, by = _pav_isotonic(p_raw, yf.astype(float))
-            if len(bx) >= 2:
-                iso_bx, iso_by = np.array(bx), np.array(by)
-        if iso_bx.size < 2:
-            z0 = p_raw[yf==0]; z1 = p_raw[yf==1]
-            if z0.size and z1.size:
-                m0, m1 = float(np.mean(z0)), float(np.mean(z1))
-                s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
-                m = 0.5*(m0+m1)
-                k = 2.0 / (0.5*(s0+s1) + 1e-6)
+    if eval_ok:
+        try:
+            p_raw = model.predict_proba(Xva)[:, 1].astype(float)
+            # Need variety & both classes for isotonic
+            if np.unique(p_raw).size >= 3 and _has_both_classes(yva):
+                bx, by = _pav_isotonic(p_raw, yva.astype(float))
+                if len(bx) >= 2:
+                    iso_bx, iso_by = np.array(bx), np.array(by)
+            if iso_bx.size < 2:
+                # Platt from validation
+                z0 = p_raw[yva==0]; z1 = p_raw[yva==1]
+                if z0.size and z1.size:
+                    m0, m1 = float(np.mean(z0)), float(np.mean(z1))
+                    s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
+                    m = 0.5*(m0+m1)
+                    k = 2.0 / (0.5*(s0+s1) + 1e-6)
+                    platt = (m, k)
+        except Exception:
+            # Fallback: simple Platt using train split
+            try:
+                p_raw = model.predict_proba(Xtr)[:, 1].astype(float)
+                if _has_both_classes(ytr):
+                    m0, m1 = float(np.mean(p_raw[ytr==0])), float(np.mean(p_raw[ytr==1]))
+                    s0, s1 = float(np.std(p_raw[ytr==0])+1e-9), float(np.std(p_raw[ytr==1])+1e-9)
+                    m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
+                    platt = (m, k)
+            except Exception:
+                pass
+    else:
+        # No eval set: Platt from a small internal split on train if possible
+        try:
+            from sklearn.model_selection import StratifiedShuffleSplit
+            sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=7)
+            tr2, va2 = next(sss2.split(X_all, y_all))
+            pr = model.predict_proba(X_all[va2])[:, 1].astype(float)
+            yv2 = y_all[va2]
+            if np.unique(pr).size >= 3 and _has_both_classes(yv2):
+                bx, by = _pav_isotonic(pr, yv2.astype(float))
+                if len(bx) >= 2:
+                    iso_bx, iso_by = np.array(bx), np.array(by)
+            if iso_bx.size < 2:
+                m0, m1 = float(np.mean(pr[yv2==0])), float(np.mean(pr[yv2==1]))
+                s0, s1 = float(np.std(pr[yv2==0])+1e-9), float(np.std(pr[yv2==1])+1e-9)
+                m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
                 platt = (m, k)
+        except Exception:
+            pass
 
     return {
         "ok": True,
