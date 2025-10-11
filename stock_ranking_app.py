@@ -811,18 +811,18 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     ytr, yva = yy[:split], yy[split:]
 
     model = CatBoostClassifier(
-        iterations=200,
-        depth=3,
-        learning_rate=0.04,
         loss_function="Logloss",
-        eval_metric="Logloss",
+        eval_metric="Logloss",          
+        iterations=200,                 
+        learning_rate=0.04,             
+        depth=3,                        
+        l2_leaf_reg=6,                  
         random_seed=42,
+        bootstrap_type="Bayesian",      
+        bagging_temperature=0.5,       
+        auto_class_weights="Balanced",                     
         verbose=False,
-        allow_writing_files=False,
-        l2_leaf_reg=6,
-        bootstrap_type="Bayesian",
-        bagging_temperature=0.5,
-        auto_class_weights="Balanced",
+        allow_writing_files=False
     )
     model.fit(Xtr, ytr, eval_set=(Xva, yva))
 
