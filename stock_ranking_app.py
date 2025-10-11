@@ -814,8 +814,8 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         loss_function="Logloss",
         eval_metric="Logloss",          # or "AUC" if you care more about ranking
         iterations=300,                 # 300–800 is a sweet spot; use early stopping
-        learning_rate=0.05,             # small enough to generalize with ~500 trees
-        depth=4,                        # 4–6 keeps variance in check for low-dim data
+        learning_rate=0.04,             # small enough to generalize with ~500 trees
+        depth=3,                        # 4–6 keeps variance in check for low-dim data
         l2_leaf_reg=6,                  # 3–10 typical; 6 is a safe middle
         random_seed=42,
         bootstrap_type="Bayesian",      # smoother than Poisson/No for small data
