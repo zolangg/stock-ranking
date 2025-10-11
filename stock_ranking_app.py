@@ -706,7 +706,7 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
     used = "lda"; w_vec = None
     try:
         from sklearn.neighbors import NeighborhoodComponentsAnalysis
-        nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=250)
+        nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=400)
         z = nca.fit_transform(Xs, y).ravel()
         used = "nca"
     except Exception:
@@ -811,14 +811,18 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     ytr, yva = yy[:split], yy[split:]
 
     model = CatBoostClassifier(
-        iterations=400,
-        depth=6,
-        learning_rate=0.05,
+        iterations=200,
+        depth=3,
+        learning_rate=0.04,
         loss_function="Logloss",
         eval_metric="Logloss",
         random_seed=42,
         verbose=False,
-        allow_writing_files=False
+        allow_writing_files=False,
+        l2_leaf_reg=6,
+        bootstrap_type="Bayesian",
+        bagging_temperature=0.5,
+        auto_class_weights="Balanced",
     )
     model.fit(Xtr, ytr, eval_set=(Xva, yva))
 
