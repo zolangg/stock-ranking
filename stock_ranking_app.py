@@ -789,12 +789,12 @@ def _train_catboost(df_groups: pd.DataFrame, gA_label: str, gB_label: str, featu
 
     mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0] = 1.0
     Xs = (X - mu) / sd
-    
+
     model = CatBoostClassifier(
         n_estimators=250, learning_rate=0.05, verbose=0, random_state=42, allow_writing_files=False
     )
     model.fit(Xs, y)
-    
+
     return {
         "ok": True, "model": model, "feats": feats,
         "mu": mu.tolist(), "sd": sd.tolist(),
@@ -806,7 +806,7 @@ def _catboost_predict_proba(row: dict, model_dict: dict) -> float:
     if not model_dict or not model_dict.get("ok"): return np.nan
     model = model_dict["model"]
     feats = model_dict["feats"]
-    
+
     x = []
     for f in feats:
         v = pd.to_numeric(row.get(f), errors="coerce")
@@ -817,7 +817,7 @@ def _catboost_predict_proba(row: dict, model_dict: dict) -> float:
     mu = np.array(model_dict["mu"], dtype=float)
     sd = np.array(model_dict["sd"], dtype=float); sd[sd==0] = 1.0
     xs = ((x - mu) / sd).reshape(1, -1)
-    
+
     try:
         # predict_proba returns [[P(class 0), P(class 1)]]
         proba = model.predict_proba(xs)[0][1]
@@ -903,7 +903,7 @@ for row in ss.rows:
     pA_nca = _nca_predict_proba(stock, ss.get("nca_model", {}))
     nca_raw = float(pA_nca)*100.0 if np.isfinite(pA_nca) else np.nan
     nca_int = int(round(nca_raw)) if np.isfinite(nca_raw) else None
-    
+
     # CB-ADD: CatBoost probability (A)
     pA_cb = _catboost_predict_proba(stock, ss.get("catboost_model", {}))
     cb_raw = float(pA_cb)*100.0 if np.isfinite(pA_cb) else np.nan
@@ -1194,7 +1194,7 @@ if summary_rows:
             })
 
     df_align_csv_full = pd.DataFrame(full_rows)
-    
+
     # ---------- Make CSV "presentable": rounding & clean blanks ----------
     def _fmt_num(x, fmt=".2f"):
         if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) or x == "":
@@ -1203,7 +1203,7 @@ if summary_rows:
             return format(float(x), fmt)
         except Exception:
             return ""
-    
+
     def _fmt_int(x):
         if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) or x == "":
             return ""
@@ -1211,24 +1211,24 @@ if summary_rows:
             return f"{int(round(float(x)))}"
         except Exception:
             return ""
-    
+
     # Columns to format
     two_dec_cols = ["Value", "A center", "B center", "Δ vs A", "Δ vs B"]
     sigma_cols   = ["σ(A)", "σ(B)"]              # 2 decimals as well
     pct_cols     = ["A (%) — Median centers", "B (%) — Median centers", "NCA (%)", "CatBoost (%)"]  # CB-ADD: Add CB to formatting
-    
+
     for col in two_dec_cols:
         if col in df_align_csv_full.columns:
             df_align_csv_full[col] = df_align_csv_full[col].apply(lambda v: _fmt_num(v, ".2f"))
-    
+
     for col in sigma_cols:
         if col in df_align_csv_full.columns:
             df_align_csv_full[col] = df_align_csv_full[col].apply(lambda v: _fmt_num(v, ".2f"))
-    
+
     for col in pct_cols:
         if col in df_align_csv_full.columns:
             df_align_csv_full[col] = df_align_csv_full[col].apply(_fmt_int)
-    
+
     # Optional: enforce a clean column order
     col_order = [
         "Ticker", "Section", "Variable",
@@ -1237,7 +1237,7 @@ if summary_rows:
         "A (%) — Median centers", "B (%) — Median centers", "NCA (%)", "CatBoost (%)", # CB-ADD
     ]
     df_align_csv_pretty = df_align_csv_full[[c for c in col_order if c in df_align_csv_full.columns]]
-    
+
     st.markdown("##### Export alignment")
     c1, c2 = st.columns(2)
     with c1:
@@ -1374,7 +1374,7 @@ else:
 
                 pA_nca = _nca_predict_proba(row, nca_model2)
                 n = (float(pA_nca) * 100.0) if np.isfinite(pA_nca) else np.nan
-                
+
                 pA_cb = _catboost_predict_proba(row, cb_model2) # CB-ADD
                 c = (float(pA_cb) * 100.0) if np.isfinite(pA_cb) else np.nan # CB-ADD
 
@@ -1506,7 +1506,7 @@ vegaEmbed("#vis", spec, {{actions: true}});
         "Download HTML (interactive distribution)",
         data=html_tpl.encode("utf-8"),
         file_name="distribution_chart.html",
-        mime="text/html,
+        mime="text/html",
         use_container_width=True,
         key="dl_dist_html",
     )
