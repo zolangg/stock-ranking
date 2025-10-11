@@ -690,7 +690,13 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
     used = "lda"; w_vec = None
     try:
         from sklearn.neighbors import NeighborhoodComponentsAnalysis
-        nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=250)
+        nca = NeighborhoodComponentsAnalysis(
+            n_components=1,
+            random_state=42,
+            max_iter=400,     
+            tol=1e-6,
+            init="pca"        
+        )
         z = nca.fit_transform(Xs, y).ravel()
         used = "nca"
     except Exception:
