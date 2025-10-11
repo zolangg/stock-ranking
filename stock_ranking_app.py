@@ -1425,6 +1425,7 @@ else:
 
             As, Bs, Ns, Cs = [], [], [], []
             nca_model2 = _train_nca_or_lda(df_split, gA2, gB2, var_all) or {}
+            cat_model2 = _train_catboost_once(df_split, gA2, gB2, var_all) or {}
 
             for row in rows_for_dist:
                 counts2 = _compute_alignment_counts_weighted(
@@ -1438,7 +1439,7 @@ else:
                 b = counts2.get("B_pct_raw", np.nan) if counts2 else np.nan
 
                 pA = _nca_predict_proba(row, nca_model2)
-                pC = _cat_predict_proba(row, ss.get("cat_model", {}))  # CatBoost once per split
+                pC = _cat_predict_proba(row, cat_model2)  # ← use the per-cutoff CatBoost
 
                 Ns.append((float(pA)*100.0) if np.isfinite(pA) else np.nan)
                 Cs.append((float(pC)*100.0) if np.isfinite(pC) else np.nan)
