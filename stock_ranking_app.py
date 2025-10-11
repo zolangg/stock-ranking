@@ -1,13 +1,13 @@
 # app.py — Premarket Stock Ranking
-# (Median-only centers; Gain% filter; 3σ coloring; delete UI callback-safe; NCA bar w/ live features; distributions w/ clear labels)
+# (Median-only centers; Gain% filter; 3σ coloring; delete UI callback-safe;
+#  NCA bar w/ live features + CatBoost as 4th bar; distributions show both NCA & CatBoost;
+#  CSV/Markdown exports)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re, json, hashlib
-
-from catboost import CatBoostClassifier, Pool
-from sklearn.metrics import roc_auc_score
+import re, json, hashlib, math, tempfile, os
+from datetime import datetime
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
@@ -21,9 +21,10 @@ ss.setdefault("lassoA", {})
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("var_core", [])
 ss.setdefault("var_moderate", [])
-ss.setdefault("nca_model", {})
-ss.setdefault("del_selection", [])       # for delete UI
-ss.setdefault("__delete_msg", None)      # flash msg
+ss.setdefault("nca_model", {})       # for NCA/LDA
+ss.setdefault("cb_model", {})        # for CatBoost
+ss.setdefault("del_selection", [])   # for delete UI
+ss.setdefault("__delete_msg", None)  # flash msg
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -143,14 +144,14 @@ VAR_MODERATE = [
 ]
 VAR_ALL = VAR_CORE + VAR_MODERATE
 
-# NCA: only “live” features from Add Stock (exclude PredVol_M / PM_Vol_% / Daily_Vol_M)
+# NCA & CatBoost: only “live” features from Add Stock (exclude PredVol_M / PM_Vol_% / Daily_Vol_M)
 ALLOWED_LIVE_FEATURES = [
     "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
     "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
 ]
 EXCLUDE_FOR_NCA = {"PredVol_M","PM_Vol_%","Daily_Vol_M"}
 
-# ============================== LASSO (unchanged core) ==============================
+# ============================== LASSO (core) ==============================
 def _kfold_indices(n, k=5, seed=42):
     rng = np.random.default_rng(seed)
     idx = np.arange(n); rng.shuffle(idx)
@@ -511,7 +512,7 @@ st.markdown("---")
 st.subheader("Alignment")
 
 # --- mode + Gain% ---
-col_mode, col_gain = st.columns([2.8, 1.0])
+col_mode, col_gain = st.columns([2.8, 1.2])
 with col_mode:
     mode = st.radio(
         "",
@@ -538,10 +539,10 @@ with col_gain:
 # ============================== Delete (top-right, no expander) ==============================
 # Build unique tickers preserving order
 tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-unique_tickers, _seen = [], set()
+unique_tickers, _seen_t = [], set()
 for t in tickers:
-    if t and t not in _seen:
-        unique_tickers.append(t); _seen.add(t)
+    if t and t not in _seen_t:
+        unique_tickers.append(t); _seen_t.add(t)
 
 def _handle_delete():
     sel = st.session_state.get("del_selection", [])
@@ -658,16 +659,13 @@ else:
 
 mad_tbl = mad_tbl.reindex(index=med_tbl.index)[[gA, gB]]
 
-# ============================== NCA training (live features only) ==============================
+# ============================== NCA/LDA training ==============================
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
-
     feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
-    if not feats:
-        return {}
+    if not feats: return {}
 
     Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
-    # drop degenerate columns
     good_cols = []
     for c in feats:
         col = Xdf[c].values
@@ -676,8 +674,7 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         if np.nanstd(col) < 1e-9: continue
         good_cols.append(c)
     feats = good_cols
-    if not feats:
-        return {}
+    if not feats: return {}
 
     X = df2[feats].apply(pd.to_numeric, errors="coerce").values
     y = (df2["__Group__"].values == gA_label).astype(int)
@@ -686,24 +683,16 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
     if X.shape[0] < 20 or np.unique(y).size < 2:
         return {}
 
-    # standardize
     mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0] = 1.0
     Xs = (X - mu) / sd
 
     used = "lda"; w_vec = None
     try:
         from sklearn.neighbors import NeighborhoodComponentsAnalysis
-        nca = NeighborhoodComponentsAnalysis(
-            n_components=1,
-            random_state=42,
-            max_iter=400,     
-            tol=1e-6,
-            init="pca"        
-        )
+        nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=250)
         z = nca.fit_transform(Xs, y).ravel()
         used = "nca"
     except Exception:
-        # Fisher LDA fallback
         X0 = Xs[y==0]; X1 = Xs[y==1]
         if X0.shape[0] < 2 or X1.shape[0] < 2: return {}
         m0 = X0.mean(axis=0); m1 = X1.mean(axis=0)
@@ -713,12 +702,10 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         w_vec = w_vec / (np.linalg.norm(w_vec) + 1e-12)
         z = (Xs @ w_vec)
 
-    # Orient so larger → A
     if np.nanmean(z[y==1]) < np.nanmean(z[y==0]):
         z = -z
         if w_vec is not None: w_vec = -w_vec
 
-    # Calibration: isotonic preferred; Platt fallback
     zf = z[np.isfinite(z)]; yf = y[np.isfinite(z)]
     iso_bx, iso_by = np.array([]), np.array([])
     platt_params = None
@@ -763,7 +750,6 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
         if w is None or not np.isfinite(w).all(): return np.nan
         z = float(xs @ w)
     else:
-        # simple probe if sklearn NCA used (no stored transform)
         z = float(xs.sum())
 
     iso_bx = np.array(model.get("iso_bx", []), dtype=float)
@@ -777,7 +763,10 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
         pA = 1.0 / (1.0 + np.exp(-k*(z - m)))
     return float(np.clip(pA, 0.0, 1.0))
 
-# ============================== CatBoost (binary P(FT)) ==============================
+# ============================== CatBoost ==============================
+from catboost import CatBoostClassifier, Pool
+from sklearn.metrics import roc_auc_score
+
 CB_FEATS = [
     "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
     "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
@@ -786,24 +775,20 @@ CB_FEATS = [
 def _train_catboost(df_groups: pd.DataFrame, gA_label: str, gB_label: str) -> dict:
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
     if df2.empty: return {}
-
     feats = [f for f in CB_FEATS if f in df2.columns]
     if not feats: return {}
 
     X = df2[feats].apply(pd.to_numeric, errors="coerce")
     y = (df2["__Group__"] == gA_label).astype(int)
-
     mask = np.isfinite(X).all(axis=1)
     X, y = X[mask], y[mask]
     if len(X) < 40 or y.nunique() < 2:
         return {}
 
-    # nearly balanced, class weights optional:
     pos = int(y.sum()); neg = int(len(y) - pos)
     scale_pos_weight = (neg / max(pos, 1)) if pos and neg else 1.0
 
     train_pool = Pool(X, y)
-
     model = CatBoostClassifier(
         loss_function="Logloss",
         eval_metric="AUC",
@@ -820,13 +805,11 @@ def _train_catboost(df_groups: pd.DataFrame, gA_label: str, gB_label: str) -> di
     )
     model.fit(train_pool, use_best_model=True)
 
-    # (optional) quick diagnostic
     try:
         auc = roc_auc_score(y, model.predict_proba(train_pool)[:,1])
-        print(f"[CatBoost] AUC (train diag): {auc:.3f}, best_iter={model.get_best_iteration()}")
+        print(f"[CatBoost] AUC(train): {auc:.3f}, best_iter={model.get_best_iteration()}")
     except Exception:
         pass
-
     return {"ok": True, "model": model, "feats": feats, "gA": gA_label, "gB": gB_label}
 
 def _catboost_predict_proba(row: dict, bundle: dict) -> float:
@@ -834,23 +817,13 @@ def _catboost_predict_proba(row: dict, bundle: dict) -> float:
     model = bundle["model"]; feats = bundle["feats"]
     x = [pd.to_numeric(row.get(f), errors="coerce") for f in feats]
     if any((not np.isfinite(v)) for v in x): return np.nan
-    p = float(model.predict_proba([x])[0][1])  # P(group=gA)
+    p = float(model.predict_proba([x])[0][1])
     return float(np.clip(p, 0.0, 1.0))
 
-# -------- Choose probability model for P(FT) bars / distributions --------
-clf_choice = st.radio(
-    "Classifier for P(FT)",
-    ["NCA/LDA", "CatBoost"],
-    horizontal=True,
-    key="clf_choice"
-)
-
-# Train selected classifier on current split
-if clf_choice == "CatBoost":
-    ss.nca_model = _train_catboost(df_cmp, gA, gB) or {}
-else:
-    features_for_nca = var_all[:]  # filtered in trainer to live features
-    ss.nca_model = _train_nca_or_lda(df_cmp, gA, gB, features_for_nca) or {}
+# Train both models on current split
+features_for_nca = VAR_ALL[:]  # filtered in trainer to live features
+ss.nca_model = _train_nca_or_lda(df_cmp, gA, gB, features_for_nca) or {}
+ss.cb_model  = _train_catboost(df_cmp, gA, gB) or {}
 
 # ---------- alignment computation for entered rows ----------
 def _compute_alignment_counts_weighted(
@@ -921,14 +894,14 @@ for row in ss.rows:
     )
     if not counts: continue
 
-    # NCA probability (A)
-    # Probability (A) from selected classifier
-    if clf_choice == "CatBoost":
-        pA = _catboost_predict_proba(stock, ss.get("nca_model", {}))
-    else:
-        pA = _nca_predict_proba(stock, ss.get("nca_model", {}))
-    nca_raw = float(pA)*100.0 if np.isfinite(pA) else np.nan
+    # Probabilities from both models (A= gA)
+    pN = _nca_predict_proba(stock, ss.get("nca_model", {}))
+    pC = _catboost_predict_proba(stock, ss.get("cb_model", {}))
+
+    nca_raw = float(pN)*100.0 if np.isfinite(pN) else np.nan
+    cb_raw  = float(pC)*100.0 if np.isfinite(pC) else np.nan
     nca_int = int(round(nca_raw)) if np.isfinite(nca_raw) else None
+    cb_int  = int(round(cb_raw))  if np.isfinite(cb_raw)  else None
 
     summary_rows.append({
         "Ticker": tkr,
@@ -946,6 +919,8 @@ for row in ss.rows:
         "B_mod": counts.get("B_mod", 0.0),
         "NCA_raw": nca_raw,
         "NCA_int": nca_int,
+        "CB_raw": cb_raw,
+        "CB_int": cb_int,
     })
 
     drows_grouped = []
@@ -991,6 +966,7 @@ def _round_rec(o):
 
 payload = _round_rec({"rows": summary_rows, "details": detail_map, "gA": gA, "gB": gB})
 
+# Add a 4th column for CatBoost
 html = """
 <!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css"/>
@@ -1002,10 +978,11 @@ html = """
   .bar{height:12px;width:120px;border-radius:8px;background:#eee;position:relative;overflow:hidden}
   .bar>span{position:absolute;left:0;top:0;bottom:0;width:0%}
   .bar-label{font-size:11px;white-space:nowrap;color:#374151;min-width:28px;text-align:center}
-  .blue>span{background:#3b82f6}.red>span{background:#ef4444}.green>span{background:#10b981}
+  .blue>span{background:#3b82f6}.red>span{background:#ef4444}.green>span{background:#10b981}.purple>span{background:#8b5cf6}
   #align td:nth-child(2),#align th:nth-child(2),
   #align td:nth-child(3),#align th:nth-child(3),
-  #align td:nth-child(4),#align th:nth-child(4){text-align:center}
+  #align td:nth-child(4),#align th:nth-child(4),
+  #align td:nth-child(5),#align th:nth-child(5){text-align:center}
   .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
   .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .child-table th:first-child,.child-table td:first-child{text-align:left}
@@ -1016,7 +993,7 @@ html = """
   .sig-lo{background:rgba(239,68,68,0.18)!important}
 </style></head><body>
   <table id="align" class="display nowrap stripe" style="width:100%">
-    <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th><th id="hdrN"></th></tr></thead>
+    <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th><th id="hdrN"></th><th id="hdrC"></th></tr></thead>
   </table>
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
@@ -1026,6 +1003,7 @@ html = """
     document.getElementById('hdrA').textContent = data.gA;
     document.getElementById('hdrB').textContent = data.gB;
     document.getElementById('hdrN').textContent = 'NCA: P(' + data.gA + ')';
+    document.getElementById('hdrC').textContent = 'CatBoost: P(' + data.gA + ')';
 
     function barCellLabeled(valRaw,label,valInt,clsOverride){
       const cls=clsOverride || 'blue';
@@ -1103,7 +1081,8 @@ html = """
           {data:'Ticker'},
           {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int,'blue')},
           {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int,'red')},
-          {data:null, render:(row)=>barCellLabeled(row.NCA_raw,'NCA',row.NCA_int,'green')}
+          {data:null, render:(row)=>barCellLabeled(row.NCA_raw,'NCA',row.NCA_int,'green')},
+          {data:null, render:(row)=>barCellLabeled(row.CB_raw,'CatBoost',row.CB_int,'purple')}
         ]
       });
       $('#align tbody').on('click','tr',function(){
@@ -1118,13 +1097,11 @@ html = """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=620, scrolling=True)
 
-# ============================== Alignment exports (CSV full + Markdown compact) ==============================
-import math
-
+# ============================== Alignment exports (CSV + Markdown) ==============================
+# Simple export DataFrame (rounded)
 if summary_rows:
-    # ---------- Markdown (compact summary) ----------
-    df_align_md = pd.DataFrame(summary_rows)[
-        ["Ticker", "A_label", "A_val_int", "B_label", "B_val_int", "NCA_int"]
+    df_align = pd.DataFrame(summary_rows)[
+        ["Ticker", "A_label", "A_val_int", "B_label", "B_val_int", "NCA_int", "CB_int"]
     ].rename(
         columns={
             "A_label": "A group",
@@ -1132,6 +1109,7 @@ if summary_rows:
             "B_label": "B group",
             "B_val_int": "B (%) — Median centers",
             "NCA_int": "NCA (%)",
+            "CB_int":  "CatBoost (%)",
         }
     )
 
@@ -1151,158 +1129,56 @@ if summary_rows:
             lines.append("| " + " | ".join(cells) + " |")
         return "\n".join(lines)
 
-    # ---------- CSV (full with child rows) ----------
-    full_rows = []
-    # Build a quick index from ticker → summary row
-    sum_by_ticker = {s["Ticker"]: s for s in summary_rows}
-
-    for tkr, rows in detail_map.items():
-        s = sum_by_ticker.get(tkr, {})
-        # Add a section marker row for readability (optional; keeps a blank Variable)
-        # You can comment this out if you don't want section rows in CSV.
-        section = ""
-        for r in rows:
-            if r.get("__group__"):
-                section = r["__group__"]
-                # Optional explicit section row:
-                full_rows.append({
-                    "Ticker": tkr,
-                    "Section": section,
-                    "Variable": "",
-                    "Value": "",
-                    "A center": "",
-                    "B center": "",
-                    "Δ vs A": "",
-                    "Δ vs B": "",
-                    "σ(A)": "",
-                    "σ(B)": "",
-                    "Is core": "",
-                    "A group": s.get("A_label", ""),
-                    "B group": s.get("B_label", ""),
-                    "A (%) — Median centers": s.get("A_val_int", ""),
-                    "B (%) — Median centers": s.get("B_val_int", ""),
-                    "NCA (%)": s.get("NCA_int", ""),
-                })
-                continue
-
-            full_rows.append({
-                "Ticker": tkr,
-                "Section": section,
-                "Variable": r.get("Variable", ""),
-                "Value": ("" if pd.isna(r.get("Value")) else r.get("Value")),
-                "A center": ("" if pd.isna(r.get("A")) else r.get("A")),
-                "B center": ("" if pd.isna(r.get("B")) else r.get("B")),
-                "Δ vs A": ("" if (r.get("d_vs_A") is None or pd.isna(r.get("d_vs_A"))) else r.get("d_vs_A")),
-                "Δ vs B": ("" if (r.get("d_vs_B") is None or pd.isna(r.get("d_vs_B"))) else r.get("d_vs_B")),
-                "σ(A)": ("" if (r.get("sA") is None or pd.isna(r.get("sA"))) else r.get("sA")),
-                "σ(B)": ("" if (r.get("sB") is None or pd.isna(r.get("sB"))) else r.get("sB")),
-                "Is core": bool(r.get("is_core", False)),
-                "A group": s.get("A_label", ""),
-                "B group": s.get("B_label", ""),
-                "A (%) — Median centers": s.get("A_val_int", ""),
-                "B (%) — Median centers": s.get("B_val_int", ""),
-                "NCA (%)": s.get("NCA_int", ""),
-            })
-
-    df_align_csv_full = pd.DataFrame(full_rows)
-    
-    # ---------- Make CSV "presentable": rounding & clean blanks ----------
-    def _fmt_num(x, fmt=".2f"):
-        if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) or x == "":
-            return ""
-        try:
-            return format(float(x), fmt)
-        except Exception:
-            return ""
-    
-    def _fmt_int(x):
-        if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) or x == "":
-            return ""
-        try:
-            return f"{int(round(float(x)))}"
-        except Exception:
-            return ""
-    
-    # Columns to format
-    two_dec_cols = ["Value", "A center", "B center", "Δ vs A", "Δ vs B"]
-    sigma_cols   = ["σ(A)", "σ(B)"]              # 2 decimals as well
-    pct_cols     = ["A (%) — Median centers", "B (%) — Median centers", "NCA (%)"]  # integers
-    
-    for col in two_dec_cols:
-        if col in df_align_csv_full.columns:
-            df_align_csv_full[col] = df_align_csv_full[col].apply(lambda v: _fmt_num(v, ".2f"))
-    
-    for col in sigma_cols:
-        if col in df_align_csv_full.columns:
-            df_align_csv_full[col] = df_align_csv_full[col].apply(lambda v: _fmt_num(v, ".2f"))
-    
-    for col in pct_cols:
-        if col in df_align_csv_full.columns:
-            df_align_csv_full[col] = df_align_csv_full[col].apply(_fmt_int)
-    
-    # Optional: enforce a clean column order
-    col_order = [
-        "Ticker", "Section", "Variable",
-        "Value", "A center", "B center", "Δ vs A", "Δ vs B", "σ(A)", "σ(B)", "Is core",
-        "A group", "B group",
-        "A (%) — Median centers", "B (%) — Median centers", "NCA (%)",
-    ]
-    df_align_csv_pretty = df_align_csv_full[[c for c in col_order if c in df_align_csv_full.columns]]
-    
-    st.markdown("##### Export alignment")
+    st.markdown("##### Export alignment table")
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
-            "Download CSV (full, with child rows)",
-            data=df_align_csv_pretty.to_csv(index=False).encode("utf-8"),
-            file_name="alignment_full_with_children.csv",
+            "Download CSV (alignment)",
+            data=df_align.to_csv(index=False).encode("utf-8"),
+            file_name="alignment_table.csv",
             mime="text/csv",
             use_container_width=True,
-            key="dl_align_csv_full",
+            key="dl_align_csv",
         )
     with c2:
         st.download_button(
-            "Download Markdown (summary only)",
-            data=_df_to_markdown_simple(df_align_md, float_fmt=".0f").encode("utf-8"),
-            file_name="alignment_summary.md",
+            "Download Markdown (alignment)",
+            data=_df_to_markdown_simple(df_align, float_fmt=".0f").encode("utf-8"),
+            file_name="alignment_table.md",
             mime="text/markdown",
             use_container_width=True,
-            key="dl_align_md_summary",
+            key="dl_align_md",
         )
 
-# ============================== Distributions across Gain% cutoffs ==============================
+# ============================== Distributions across Gain% cutoffs (NCA + CatBoost) ==============================
 import altair as alt
-
 st.markdown("---")
 st.subheader("Distributions across Gain% cutoffs")
 
 if not ss.rows:
     st.info("Add at least one stock to see distributions across cutoffs.")
 else:
-    # unique tickers, preserve first-seen order
+    # unique tickers (first-seen order)
     all_tickers = [(r.get("Ticker") or "—") for r in ss.rows]
     _seen = set()
     all_tickers = [t for t in all_tickers if not (t in _seen or _seen.add(t))]
 
-    # --- init state BEFORE widgets ---
+    # init state
     if "dist_stock_sel" not in st.session_state:
-        st.session_state["dist_stock_sel"] = all_tickers[:]  # default = all
+        st.session_state["dist_stock_sel"] = all_tickers[:]
 
-    # callback for Clear
     def _clear_dist_sel():
         st.session_state["dist_stock_sel"] = []
 
     csel1, csel2 = st.columns([4, 1])
-
     with csel2:
         st.button("Clear", use_container_width=True, key="dist_sel_clear", on_click=_clear_dist_sel)
-
     with csel1:
         stocks_selected = st.multiselect(
             "",
             options=all_tickers,
-            default=st.session_state["dist_stock_sel"],   # only used on first mount
-            key="dist_stock_sel",                         # bind widget ↔ state
+            default=st.session_state["dist_stock_sel"],
+            key="dist_stock_sel",
             label_visibility="collapsed",
             help="Which added stocks are used to compute the distribution at each cutoff.",
         )
@@ -1312,7 +1188,6 @@ else:
     if not rows_for_dist:
         st.info("No stocks selected.")
     else:
-        # ---------- helpers (reuse your split + summary approach) ----------
         def _make_split(df_base: pd.DataFrame, thr_val: float, mode_val: str):
             df_tmp = df_base.copy()
             if mode_val == "Gain% vs Rest":
@@ -1328,7 +1203,7 @@ else:
                     gain_val >= thr_val, f"FT=1 ≥{int(thr_val)}%", f"FT=1 <{int(thr_val)}%"
                 )
                 gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", f"FT=1 <{int(thr_val)}%"
-            else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
+            else:
                 a_mask = (df_tmp["FT01"] == 1) & (pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val)
                 b_mask = (df_tmp["FT01"] == 0)
                 df_tmp = df_tmp[a_mask | b_mask].copy()
@@ -1345,63 +1220,76 @@ else:
             mad_tbl_ = df_in.groupby(grp_col, observed=True)[avail].apply(lambda gg: gg.apply(_mad_local)).T * 1.4826
             return med_tbl_, mad_tbl_
 
-        # ---------- compute series: medians across selected stocks ----------
         thr_labels = []
-        series_A_med, series_B_med, series_N_med = [], [], []
+        series_A_med, series_B_med = [], []
+        series_N_med, series_C_med = [], []  # NCA + CatBoost
 
         for thr_val in gain_choices:
             df_split, gA2, gB2 = _make_split(base_df, float(thr_val), mode)
-            med_tbl2, mad_tbl2 = _summaries(df_split, var_all, "__Group__")
+            med_tbl2, _mad2 = _summaries(df_split, var_all, "__Group__")
             if med_tbl2.empty or med_tbl2.shape[1] < 2:
                 continue
 
             cols2 = list(med_tbl2.columns)
             if (gA2 in cols2) and (gB2 in cols2):
                 med_tbl2 = med_tbl2[[gA2, gB2]]
-                mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
             else:
                 top2 = df_split["__Group__"].value_counts().index[:2].tolist()
                 if len(top2) < 2:
                     continue
                 gA2, gB2 = top2[0], top2[1]
                 med_tbl2 = med_tbl2[[gA2, gB2]]
-                mad_tbl2 = mad_tbl2.reindex(index=med_tbl2.index)[[gA2, gB2]]
 
-            # fresh model for this cutoff
-            if clf_choice == "CatBoost":
-                model2 = _train_catboost(df_split, gA2, gB2) or {}
-                pA = _catboost_predict_proba(row, model2)
-            else:
-                model2 = _train_nca_or_lda(df_split, gA2, gB2, var_all) or {}
-                pA = _nca_predict_proba(row, model2)
-            
-            n = (float(pA) * 100.0) if np.isfinite(pA) else np.nan
+            # train both models for this cutoff
+            nca_model2 = _train_nca_or_lda(df_split, gA2, gB2, VAR_ALL) or {}
+            cb_model2  = _train_catboost(df_split, gA2, gB2) or {}
 
-                As.append(a); Bs.append(b); Ns.append(n)
+            As, Bs, Ns, Cs = [], [], [], []
+            for row in rows_for_dist:
+                counts2 = _compute_alignment_counts_weighted(
+                    stock_row=row,
+                    centers_tbl=med_tbl2,
+                    var_core=ss.var_core,
+                    var_mod=ss.var_moderate,
+                    w_core=1.0, w_mod=0.5, tie_mode="split",
+                )
+                a = counts2.get("A_pct_raw", np.nan) if counts2 else np.nan
+                b = counts2.get("B_pct_raw", np.nan) if counts2 else np.nan
+                pN = _nca_predict_proba(row, nca_model2)
+                pC = _catboost_predict_proba(row, cb_model2)
+                n = (float(pN) * 100.0) if np.isfinite(pN) else np.nan
+                c = (float(pC) * 100.0) if np.isfinite(pC) else np.nan
+
+                As.append(a); Bs.append(b); Ns.append(n); Cs.append(c)
 
             thr_labels.append(int(thr_val))
-            series_A_med.append(float(np.nanmedian(As)) if len(As) else np.nan)  # A: median across selected stocks
-            series_B_med.append(float(np.nanmedian(Bs)) if len(Bs) else np.nan)  # B: median across selected stocks
-            series_N_med.append(float(np.nanmedian(Ns)) if len(Ns) else np.nan)  # NCA: median probability
+            series_A_med.append(float(np.nanmedian(As)) if len(As) else np.nan)
+            series_B_med.append(float(np.nanmedian(Bs)) if len(Bs) else np.nan)
+            series_N_med.append(float(np.nanmedian(Ns)) if len(Ns) else np.nan)
+            series_C_med.append(float(np.nanmedian(Cs)) if len(Cs) else np.nan)
 
         if not thr_labels:
             st.info("Not enough data across cutoffs to form two groups — broaden your DB or change mode.")
         else:
-            # Labels exactly per your spec
+            import altair as alt
+            alt.data_transformers.disable_max_rows()
+
             labA = f"{gA} (Median centers)"
             labB = f"{gB} (Median centers)"
             labN = f"NCA: P({gA})"
+            labC = f"CatBoost: P({gA})"
 
             dist_df = pd.DataFrame({
                 "GainCutoff_%": thr_labels,
                 labA: series_A_med,
                 labB: series_B_med,
                 labN: series_N_med,
+                labC: series_C_med,
             })
             df_long = dist_df.melt(id_vars="GainCutoff_%", var_name="Series", value_name="Value")
 
-            color_domain = [labA, labB, labN]
-            color_range  = ["#3b82f6", "#ef4444", "#10b981"]  # blue, red, green (match table bars)
+            color_domain = [labA, labB, labN, labC]
+            color_range  = ["#3b82f6", "#ef4444", "#10b981", "#8b5cf6"]  # blue, red, green, purple
 
             chart = (
                 alt.Chart(df_long)
@@ -1417,91 +1305,32 @@ else:
             )
             st.altair_chart(chart, use_container_width=True)
 
-# ============================== Distribution chart export (PNG via Matplotlib fallback) ==============================
-import io
-import math
-import matplotlib.pyplot as plt
-import numpy as np
+            # Export PNG (if vl-convert-python or altair_saver installed)
+            png_bytes = None
+            try:
+                from vl_convert import vlc
+                png_bytes = vlc.vegalite_to_png(chart.to_dict())
+            except Exception:
+                try:
+                    from altair_saver import save
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        tmp_name = tmp.name
+                    save(chart, tmp_name)
+                    with open(tmp_name, "rb") as f:
+                        png_bytes = f.read()
+                    os.remove(tmp_name)
+                except Exception:
+                    png_bytes = None
 
-st.markdown("##### Export distribution chart")
-
-png_bytes = None
-if "df_long" in locals() and not df_long.empty:
-    try:
-        # Prepare pivot for grouped bars: rows = thresholds, cols = series
-        pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
-        series_names = list(pivot.columns)
-
-        # Colors aligned with your Altair chart
-        color_map = {
-            f"{gA} (Median centers)": "#3b82f6",   # blue
-            f"{gB} (Median centers)": "#ef4444",   # red
-            f"NCA: P({gA})": "#10b981",            # green
-        }
-        colors = [color_map.get(s, "#999999") for s in series_names]
-
-        # Build grouped bars
-        thresholds = pivot.index.tolist()
-        n_groups = len(thresholds)
-        n_series = len(series_names)
-        x = np.arange(n_groups)
-        width = 0.8 / max(n_series, 1)
-
-        fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4))
-        for i, s in enumerate(series_names):
-            vals = pivot[s].values.astype(float)
-            ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
-
-        ax.set_xticks(x)
-        ax.set_xticklabels([str(t) for t in thresholds])
-        ax.set_ylim(0, 100)
-        ax.set_xlabel("Gain% cutoff")
-        ax.set_ylabel("Median across selected stocks (%)")
-        ax.legend(loc="upper left", frameon=False)
-
-        buf = io.BytesIO()
-        fig.tight_layout()
-        fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-        plt.close(fig)
-        png_bytes = buf.getvalue()
-    except Exception:
-        png_bytes = None
-
-if png_bytes:
-    from datetime import datetime
-    st.download_button(
-        "Download PNG (distribution)",
-        data=png_bytes,
-        file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-        mime="image/png",
-        use_container_width=True,
-        key="dl_dist_png_matplotlib",
-    )
-else:
-    st.caption("PNG export fallback failed (Matplotlib). Make sure df_long exists above.")
-
-# ============================== Distribution chart export (HTML, no extra deps) ==============================
-import json
-
-if "chart" in locals():
-    spec = chart.to_dict()
-    html_tpl = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Distribution</title>
-<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
-</head><body>
-<div id="vis"></div>
-<script>
-const spec = {json.dumps(spec)};
-vegaEmbed("#vis", spec, {{actions: true}});
-</script>
-</body></html>"""
-    st.download_button(
-        "Download HTML (interactive distribution)",
-        data=html_tpl.encode("utf-8"),
-        file_name="distribution_chart.html",
-        mime="text/html",
-        use_container_width=True,
-        key="dl_dist_html",
-    )
+            st.markdown("##### Export distribution chart")
+            if png_bytes is not None:
+                st.download_button(
+                    "Download PNG (distribution)",
+                    data=png_bytes,
+                    file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    key="dl_dist_png",
+                )
+            else:
+                st.caption("PNG export unavailable — install `vl-convert-python` (recommended) or `altair_saver`.")
