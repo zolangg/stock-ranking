@@ -22,8 +22,8 @@ except Exception:
     _CATBOOST_OK = False
     
 # ============================== Page ==============================
-st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
-st.title("Premarket Stock Ranking")
+st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
+st.title("Premarket Stock Analysis")
 
 # ============================== Session ==============================
 ss = st.session_state
