@@ -1764,7 +1764,22 @@ vegaEmbed("#vis", spec, {{actions: true}});
                 fig, ax = plt.subplots(subplot_kw=dict(polar=True), figsize=(6.5, 6.5))
                 ax.set_theta_offset(np.pi / 2)
                 ax.set_theta_direction(-1)
-                ax.set_thetagrids(angles * 180/np.pi, labels=axes)
+                # ---------- Which group has higher median per feature
+                higher_group = {}
+                for f in axes:
+                    try:
+                        valA = float(med_tbl.at[f, gA]) if f in med_tbl.index else np.nan
+                        valB = float(med_tbl.at[f, gB]) if f in med_tbl.index else np.nan
+                        if np.isfinite(valA) and np.isfinite(valB):
+                            higher_group[f] = gA if valA > valB else gB
+                        else:
+                            higher_group[f] = ""
+                    except Exception:
+                        higher_group[f] = ""
+                ax.set_thetagrids(
+                    angles * 180/np.pi,
+                    labels=[f"{f}\n({higher_group.get(f, '')})↑" for f in axes]
+                )
                 ax.set_ylim(0, 1)
                 ax.set_yticks([0.25, 0.5, 0.75, 1.0])
                 ax.set_yticklabels(["0.25","0.5","0.75","1.0"])
