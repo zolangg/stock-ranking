@@ -1568,7 +1568,7 @@ else:
             
             # ============================== Radar — centers vs stocks (Matplotlib, with toggles) ==============================
             st.markdown("---")
-            st.subheader("Radar — centers vs stocks (Matplotlib)")
+            st.subheader("Radar")
             
             def _available_live_axes_mpl():
                 axes = [f for f in ALLOWED_LIVE_FEATURES if f in med_tbl.index]
