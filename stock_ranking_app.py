@@ -1620,9 +1620,6 @@ else:
                 st.caption("PNG export fallback failed (Matplotlib). Make sure df_long exists above.")
 
             # ============================== Radar (Plotly) ==============================
-            st.markdown("---")
-            st.subheader("Radar — centers vs stocks (Plotly)")
-
             def _hex_to_rgba(hex_color: str, alpha: float = 0.2) -> str:
                 """Convert '#RRGGBB' to 'rgba(r,g,b,a)'. Ignores alpha if already rgba()."""
                 if not isinstance(hex_color, str):
@@ -1637,6 +1634,9 @@ else:
                     return f"rgba({r},{g},{b},{alpha})"
                 # fallback
                 return "rgba(0,0,0,0.2)"
+                
+            st.markdown("---")
+            st.subheader("Radar — centers vs stocks (Plotly)")
             
             # Helpers for feature selection and normalization
             def _available_live_axes():
