@@ -1848,7 +1848,6 @@ else:
             except Exception:
                 png_bytes = None
 
-            st.markdown("##### Export distribution chart")
             if png_bytes:
                 st.download_button(
                     "Download PNG (distribution)",
