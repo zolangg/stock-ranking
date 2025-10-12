@@ -11,6 +11,7 @@ import numpy as np
 import re, json, hashlib, io, math
 import altair as alt
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 from datetime import datetime
 
 # CatBoost import (graceful if unavailable)
@@ -1618,6 +1619,219 @@ else:
             else:
                 st.caption("PNG export fallback failed (Matplotlib). Make sure df_long exists above.")
 
+            # ============================== Radar (Plotly) ==============================
+            st.markdown("---")
+            st.subheader("Radar — centers vs stocks (Plotly)")
+            
+            # Helpers for feature selection and normalization
+            def _available_live_axes():
+                # Use only live features that exist in your centers table
+                axes = [f for f in ALLOWED_LIVE_FEATURES if f in med_tbl.index]
+                # Keep the same order you generally reason about
+                order_hint = [
+                    "Gap_%","FR_x","PM$Vol/MC_%","Catalyst","PM_Vol_%","Max_Pull_PM_%","RVOL_Max_PM_cum",
+                    "MC_PM_Max_M","Float_PM_Max_M","PM_Vol_M","PM_$Vol_M$","ATR_$","MarketCap_M$","Float_M"
+                ]
+                axes = [a for a in order_hint if a in axes] + [a for a in axes if a not in order_hint]
+                return axes
+            
+            def _catboost_topk_features(model: dict, k: int = 6) -> list[str]:
+                if not (model and model.get("ok") and model.get("cb")):
+                    return []
+                try:
+                    cb = model["cb"]
+                    feats = model["feats"]
+                    imps = np.array(cb.get_feature_importance(), dtype=float)
+                    order = np.argsort(imps)[::-1]
+                    top = [feats[i] for i in order[:k] if feats[i] in med_tbl.index]
+                    return top
+                except Exception:
+                    return []
+            
+            def _norm_minmax_between_centers(values: dict[str, float], a_center: dict[str, float], b_center: dict[str, float]) -> dict[str, float]:
+                """Normalize each feature to [0,1] using the min/max of the two centers for that axis.
+                   If the span is zero or NaN, fall back to a robust span based on disp_tbl (≈σ) or to 1.
+                """
+                out = {}
+                eps = 1e-9
+                for f, x in values.items():
+                    a = a_center.get(f, np.nan)
+                    b = b_center.get(f, np.nan)
+                    lo = np.nanmin([a, b])
+                    hi = np.nanmax([a, b])
+                    span = hi - lo
+                    if not np.isfinite(span) or span <= eps:
+                        # Fallback: 6σ window around the midpoint if available
+                        try:
+                            sA = float(disp_tbl.at[f, gA]) if f in disp_tbl.index else np.nan
+                            sB = float(disp_tbl.at[f, gB]) if f in disp_tbl.index else np.nan
+                        except Exception:
+                            sA, sB = np.nan, np.nan
+                        s = np.nanmax([sA, sB])
+                        mid = np.nanmean([a, b])
+                        if np.isfinite(s) and s > 0:
+                            lo, hi = mid - 3*s, mid + 3*s
+                            span = hi - lo
+                        else:
+                            lo, span = (0.0, 1.0)  # last resort
+                    v = (x - lo) / (span + eps)
+                    out[f] = float(np.clip(v, 0.0, 1.0)) if np.isfinite(v) else np.nan
+                return out
+            
+            # --- UI ---
+            axes_all = _available_live_axes()
+            if not axes_all:
+                st.info("No live features available for radar plotting with current split.")
+            else:
+                # Defaults
+                default_axes = [f for f in VAR_CORE if f in axes_all]
+                if not default_axes:
+                    default_axes = axes_all[:6]
+            
+                col_r1, col_r2, col_r3 = st.columns([1.5, 1.3, 1.2])
+            
+                with col_r1:
+                    feat_mode = st.radio(
+                        "Features",
+                        ["Core", "All live", "Top-6 CatBoost importances"],
+                        horizontal=False,
+                        help="Pick which axes to plot on the radar.",
+                        index=0,
+                        key="radar_feat_mode",
+                    )
+            
+                with col_r2:
+                    # Multiselect stocks to overlay; default to all current rows
+                    all_tickers_radar = [(r.get("Ticker") or "—") for r in ss.rows]
+                    _seen_radar = set()
+                    all_tickers_radar = [t for t in all_tickers_radar if not (t in _seen_radar or _seen_radar.add(t))]
+                    stocks_overlay = st.multiselect(
+                        "Stocks to overlay",
+                        options=all_tickers_radar,
+                        default=all_tickers_radar[:5],  # keep initial clutter low
+                        key="radar_stock_sel",
+                        help="Polygons for these added stocks are overlaid on the same axes.",
+                    )
+            
+                with col_r3:
+                    show_cb_importance = st.checkbox(
+                        "Show CatBoost feature importance",
+                        value=True,
+                        key="radar_show_cb_importance",
+                        help="Adds a purple polygon showing normalized CatBoost feature importance.",
+                    )
+            
+                # Decide axes by mode
+                if feat_mode == "Core":
+                    axes = default_axes
+                elif feat_mode == "All live":
+                    axes = axes_all
+                else:
+                    axes = _catboost_topk_features(ss.get("cat_model", {}), k=6) or default_axes
+            
+                # Build centers dicts
+                centerA = {f: (float(med_tbl.at[f, gA]) if (f in med_tbl.index and pd.notna(med_tbl.at[f, gA])) else np.nan) for f in axes}
+                centerB = {f: (float(med_tbl.at[f, gB]) if (f in med_tbl.index and pd.notna(med_tbl.at[f, gB])) else np.nan) for f in axes}
+            
+                # Prepare Plotly radar (polar)
+                fig = go.Figure()
+            
+                # Add centers first (thin borders, no fill)
+                normA = _norm_minmax_between_centers(centerA, centerA, centerB)
+                normB = _norm_minmax_between_centers(centerB, centerA, centerB)
+            
+                fig.add_trace(go.Scatterpolar(
+                    r=[normA[f] for f in axes] + [normA[axes[0]]],
+                    theta=axes + [axes[0]],
+                    name=f"{gA} center",
+                    mode="lines",
+                    line=dict(color="#3b82f6", width=2),
+                    fill=None,
+                    hovertemplate="%{theta}: %{r:.2f}<extra></extra>",
+                ))
+                fig.add_trace(go.Scatterpolar(
+                    r=[normB[f] for f in axes] + [normB[axes[0]]],
+                    theta=axes + [axes[0]],
+                    name=f"{gB} center",
+                    mode="lines",
+                    line=dict(color="#ef4444", width=2),
+                    fill=None,
+                    hovertemplate="%{theta}: %{r:.2f}<extra></extra>",
+                ))
+            
+                # Add stocks (semi-transparent fill)
+                stock_color_cycle = ["#10b981", "#6366f1", "#f59e0b", "#06b6d4", "#a3e635", "#fb7185", "#14b8a6"]
+                stock_lookup = { (r.get("Ticker") or "—"): r for r in ss.rows }
+            
+                for i, tkr in enumerate(stocks_overlay):
+                    row = stock_lookup.get(tkr)
+                    if not row: 
+                        continue
+                    # Gather values for the selected axes
+                    vals = {}
+                    for f in axes:
+                        v = pd.to_numeric(row.get(f), errors="coerce")
+                        vals[f] = float(v) if np.isfinite(v) else np.nan
+                    norm = _norm_minmax_between_centers(vals, centerA, centerB)
+                    color = stock_color_cycle[i % len(stock_color_cycle)]
+                    fig.add_trace(go.Scatterpolar(
+                        r=[norm[f] for f in axes] + [norm[axes[0]]],
+                        theta=axes + [axes[0]],
+                        name=tkr,
+                        mode="lines",
+                        line=dict(color=color, width=2),
+                        fill="toself",
+                        fillcolor=color+"33",  # ~20% alpha
+                        hovertemplate="%{theta}: %{r:.2f}<extra>"+tkr+"</extra>",
+                    ))
+            
+                # Optional CatBoost feature-importance polygon (normalized to [0,1] across chosen axes)
+                if show_cb_importance and ss.get("cat_model", {}).get("ok"):
+                    try:
+                        cb = ss["cat_model"]["cb"]
+                        feats_cb = ss["cat_model"]["feats"]
+                        imp_vals = np.array(cb.get_feature_importance(), dtype=float)
+                        # Map importances to current axes; missing → 0
+                        imp_map = {f:0.0 for f in axes}
+                        for f, v in zip(feats_cb, imp_vals):
+                            if f in imp_map: imp_map[f] = float(v)
+                        arr = np.array([imp_map[f] for f in axes], dtype=float)
+                        if np.isfinite(arr).any():
+                            # Normalize to [0,1] across the chosen axes
+                            mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
+                            norm_imp = (arr - mn) / (mx - mn + 1e-9) if np.isfinite(mx - mn) and (mx - mn) > 0 else np.zeros_like(arr)
+                            # Close the loop
+                            norm_imp_closed = list(norm_imp) + [norm_imp[0]]
+                            axes_closed = axes + [axes[0]]
+                            fig.add_trace(go.Scatterpolar(
+                                r=norm_imp_closed,
+                                theta=axes_closed,
+                                name="CatBoost importance",
+                                mode="lines",
+                                line=dict(color="#8b5cf6", width=2),
+                                fill="toself",
+                                fillcolor="#8b5cf633",
+                                hovertemplate="%{theta}: %{r:.2f}<extra>CatBoost importance</extra>",
+                            ))
+                    except Exception:
+                        pass
+                elif show_cb_importance and not ss.get("cat_model", {}).get("ok"):
+                    st.caption("CatBoost importance unavailable for this split.")
+            
+                fig.update_layout(
+                    polar=dict(
+                        radialaxis=dict(range=[0,1], showticklabels=True, tick0=0, dtick=0.25, gridcolor="rgba(0,0,0,0.08)"),
+                        angularaxis=dict(gridcolor="rgba(0,0,0,0.08)")
+                    ),
+                    showlegend=True,
+                    legend=dict(orientation="h"),
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    height=520,
+                )
+            
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("Values are normalized per feature using the A/B centers (0 = closer to the smaller center value, 1 = closer to the larger).")
+            
             # ============================== Distribution chart export (HTML) ==============================
             spec = chart.to_dict()
             html_tpl = f"""<!doctype html>
