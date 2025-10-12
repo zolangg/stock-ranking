@@ -1565,6 +1565,81 @@ else:
                 .properties(height=320)
             )
             st.altair_chart(chart, use_container_width=True)
+
+            # ============================== Distribution chart export (PNG via Matplotlib) ==============================
+            png_bytes = None
+            try:
+                pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
+                series_names = list(pivot.columns)
+
+                color_map = {
+                    f"{gA} (Median centers)": "#3b82f6",   # blue
+                    f"{gB} (Median centers)": "#ef4444",   # red
+                    f"NCA: P({gA})": "#10b981",            # green
+                    f"CatBoost: P({gA})": "#8b5cf6",       # purple
+                }
+                colors = [color_map.get(s, "#999999") for s in series_names]
+
+                thresholds = pivot.index.tolist()
+                n_groups = len(thresholds)
+                n_series = len(series_names)
+                x = np.arange(n_groups)
+                width = 0.8 / max(n_series, 1)
+
+                fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4))
+                for i, s in enumerate(series_names):
+                    vals = pivot[s].values.astype(float)
+                    ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
+
+                ax.set_xticks(x)
+                ax.set_xticklabels([str(t) for t in thresholds])
+                ax.set_ylim(0, 100)
+                ax.set_xlabel("Gain% cutoff")
+                ax.set_ylabel("Median across selected stocks (%)")
+                ax.legend(loc="upper left", frameon=False)
+
+                buf = io.BytesIO()
+                fig.tight_layout()
+                fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+                plt.close(fig)
+                png_bytes = buf.getvalue()
+            except Exception:
+                png_bytes = None
+
+            if png_bytes:
+                st.download_button(
+                    "Download PNG (distribution)",
+                    data=png_bytes,
+                    file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    key="dl_dist_png_matplotlib",
+                )
+            else:
+                st.caption("PNG export fallback failed (Matplotlib). Make sure df_long exists above.")
+            
+            # ============================== Distribution chart export (HTML) ==============================
+            spec = chart.to_dict()
+            html_tpl = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Distribution</title>
+<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+</head><body>
+<div id="vis"></div>
+<script>
+const spec = {json.dumps(spec)};
+vegaEmbed("#vis", spec, {{actions: true}});
+</script>
+</body></html>"""
+            st.download_button(
+                "Download HTML (interactive distribution)",
+                data=html_tpl.encode("utf-8"),
+                file_name="distribution_chart.html",
+                mime="text/html",
+                use_container_width=True,
+                key="dl_dist_html",
+            )
             
             # ============================== Radar — centers vs stocks (Matplotlib, with toggles) ==============================
             st.markdown("---")
@@ -1807,78 +1882,57 @@ else:
             
                 st.pyplot(fig, use_container_width=True)
                 st.caption("Normalized per feature using A/B centers (0 = closer to lower center, 1 = closer to higher).")
-
-            # ============================== Distribution chart export (PNG via Matplotlib) ==============================
-            png_bytes = None
-            try:
-                pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
-                series_names = list(pivot.columns)
-
-                color_map = {
-                    f"{gA} (Median centers)": "#3b82f6",   # blue
-                    f"{gB} (Median centers)": "#ef4444",   # red
-                    f"NCA: P({gA})": "#10b981",            # green
-                    f"CatBoost: P({gA})": "#8b5cf6",       # purple
-                }
-                colors = [color_map.get(s, "#999999") for s in series_names]
-
-                thresholds = pivot.index.tolist()
-                n_groups = len(thresholds)
-                n_series = len(series_names)
-                x = np.arange(n_groups)
-                width = 0.8 / max(n_series, 1)
-
-                fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4))
-                for i, s in enumerate(series_names):
-                    vals = pivot[s].values.astype(float)
-                    ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
-
-                ax.set_xticks(x)
-                ax.set_xticklabels([str(t) for t in thresholds])
-                ax.set_ylim(0, 100)
-                ax.set_xlabel("Gain% cutoff")
-                ax.set_ylabel("Median across selected stocks (%)")
-                ax.legend(loc="upper left", frameon=False)
-
-                buf = io.BytesIO()
-                fig.tight_layout()
-                fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-                plt.close(fig)
-                png_bytes = buf.getvalue()
-            except Exception:
-                png_bytes = None
-
-            if png_bytes:
-                st.download_button(
-                    "Download PNG (distribution)",
-                    data=png_bytes,
-                    file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                    mime="image/png",
-                    use_container_width=True,
-                    key="dl_dist_png_matplotlib",
-                )
-            else:
-                st.caption("PNG export fallback failed (Matplotlib). Make sure df_long exists above.")
-            
-            # ============================== Distribution chart export (HTML) ==============================
-            spec = chart.to_dict()
-            html_tpl = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Distribution</title>
-<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
-</head><body>
-<div id="vis"></div>
-<script>
-const spec = {json.dumps(spec)};
-vegaEmbed("#vis", spec, {{actions: true}});
-</script>
-</body></html>"""
-            st.download_button(
-                "Download HTML (interactive distribution)",
-                data=html_tpl.encode("utf-8"),
-                file_name="distribution_chart.html",
-                mime="text/html",
-                use_container_width=True,
-                key="dl_dist_html",
-            )
+                
+                # ---- Export radar: PNG + standalone HTML (base64) ----
+                import base64
+                
+                radar_png_bytes = None
+                try:
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+                    radar_png_bytes = buf.getvalue()
+                except Exception:
+                    radar_png_bytes = None
+                
+                st.markdown("##### Export radar")
+                col_png, col_html = st.columns(2)
+                
+                with col_png:
+                    if radar_png_bytes:
+                        st.download_button(
+                            "Download PNG (radar)",
+                            data=radar_png_bytes,
+                            file_name=f"radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                            key="dl_radar_png",
+                        )
+                    else:
+                        st.caption("PNG export failed — could not capture the figure.")
+                
+                with col_html:
+                    if radar_png_bytes:
+                        b64 = base64.b64encode(radar_png_bytes).decode("ascii")
+                        html_doc = f"""<!doctype html>
+                <html><head><meta charset="utf-8"><title>Radar</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                  body {{ margin: 0; padding: 1rem; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
+                  .wrap {{ display: flex; justify-content: center; }}
+                  img {{ max-width: 100%; height: auto; }}
+                </style>
+                </head><body>
+                  <div class="wrap">
+                    <img alt="Radar" src="data:image/png;base64,{b64}">
+                  </div>
+                </body></html>"""
+                        st.download_button(
+                            "Download HTML (radar)",
+                            data=html_doc.encode("utf-8"),
+                            file_name="radar.html",
+                            mime="text/html",
+                            use_container_width=True,
+                            key="dl_radar_html",
+                        )
+                    else:
+                        st.caption("HTML export unavailable — no PNG image to embed.")
