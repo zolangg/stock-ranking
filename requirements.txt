@@ -7,3 +7,4 @@ scipy>=1.11
 openpyxl>=3.1
 altair>=5.2.0
 vl-convert-python
+plotly>=5.18
