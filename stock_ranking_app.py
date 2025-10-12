@@ -11,7 +11,6 @@ import numpy as np
 import re, json, hashlib, io, math
 import altair as alt
 import matplotlib.pyplot as plt
-import plotly.graph_objects as go
 from datetime import datetime
 
 # CatBoost import (graceful if unavailable)
@@ -21,6 +20,28 @@ try:
 except Exception:
     _CATBOOST_OK = False
 
+import plotly.graph_objects as go
+
+# ---- Transparent color helper (global scope; define once) ----
+def _hex_to_rgba(hex_color: str, alpha: float = 0.2) -> str:
+    """Convert '#RRGGBB' to 'rgba(r,g,b,a)' for Plotly fillcolor."""
+    if not isinstance(hex_color, str):
+        return "rgba(0,0,0,0.2)"
+    s = hex_color.strip()
+    if s.startswith("rgba"):
+        return s
+    if s.startswith("#"):
+        s = s[1:]
+    if len(s) == 6:
+        try:
+            r = int(s[0:2], 16)
+            g = int(s[2:4], 16)
+            b = int(s[4:6], 16)
+            return f"rgba({r},{g},{b},{alpha})"
+        except Exception:
+            pass
+    return "rgba(0,0,0,0.2)"
+    
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Ranking", layout="wide")
 st.title("Premarket Stock Ranking")
@@ -1762,7 +1783,7 @@ else:
                     mode="lines",
                     line=dict(color="#3b82f6", width=2),
                     fill="toself",
-                    fillcolor=_hex_to_rgba(color, 0.2),   # <- was color+"33"
+                    fillcolor=_hex_to_rgba(color, 0.2),
                     hovertemplate="%{theta}: %{r:.2f}<extra></extra>",
                 ))
                 fig.add_trace(go.Scatterpolar(
@@ -1772,7 +1793,7 @@ else:
                     mode="lines",
                     line=dict(color="#ef4444", width=2),
                     fill="toself",
-                    fillcolor=_hex_to_rgba(color, 0.2),   # <- was color+"33"
+                    fillcolor=_hex_to_rgba(color, 0.2),
                     hovertemplate="%{theta}: %{r:.2f}<extra></extra>",
                 ))
             
@@ -1798,7 +1819,7 @@ else:
                         mode="lines",
                         line=dict(color=color, width=2),
                         fill="toself",
-                        fillcolor=_hex_to_rgba(color, 0.2),  # ~20% alpha
+                        fillcolor=_hex_to_rgba(color, 0.2),
                         hovertemplate="%{theta}: %{r:.2f}<extra>"+tkr+"</extra>",
                     ))
             
