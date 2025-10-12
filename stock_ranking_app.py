@@ -1416,7 +1416,7 @@ if summary_rows:
 
 # ============================== Distributions across Gain% cutoffs ==============================
 st.markdown("---")
-st.subheader("Distributions across Gain% cutoffs")
+st.subheader("Distributions)
 
 if not ss.rows:
     st.info("Add at least one stock to see distributions across cutoffs.")
