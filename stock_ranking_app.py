@@ -1700,27 +1700,65 @@ else:
                 if show_B:
                     ax.plot(angles_close, rB_close, color="#ef4444", linewidth=2, label=f"{gB} center")
             
-                # ---------- NCA polygon (optional)
+                # ---------- NCA polygon (optional; smarter importances)
                 if show_nca and ss.get("nca_model", {}).get("ok"):
                     try:
-                        feats_nca = ss["nca_model"]["feats"]
-                        # project each axis feature to a pseudo-importance via |w| if LDA, else equal weights
-                        if ss["nca_model"]["kind"] == "lda" and ss["nca_model"].get("w_vec") is not None:
-                            w = np.array(ss["nca_model"]["w_vec"], dtype=float)
-                            # Map weights to current axes order (may not align fully)
-                            w_map = {f:0.0 for f in axes}
-                            for f, wi in zip(feats_nca, w):
-                                if f in w_map:
-                                    w_map[f] = abs(float(wi))
-                            arr = np.array([w_map[f] for f in axes], dtype=float)
-                        else:
-                            arr = np.ones(len(axes), dtype=float)
-                        if np.isfinite(arr).any():
-                            mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
-                            norm_imp = (arr - mn) / (mx - mn + 1e-9) if mx > mn else np.zeros_like(arr)
-                            rN_close = np.concatenate([norm_imp, [norm_imp[0]]])
-                            ax.plot(angles_close, rN_close, color="#10b981", linewidth=2, label="NCA (scaled)")
-                            ax.fill(angles_close, rN_close, color="#10b981", alpha=0.18)
+                        ncam = ss["nca_model"]
+                        feats_nca = ncam["feats"]
+                
+                        # Build a clean matrix X and labels y from the current split for these features
+                        df2 = df_cmp[df_cmp["__Group__"].isin([gA, gB])].copy()
+                        Xdf = df2[feats_nca].apply(pd.to_numeric, errors="coerce")
+                        ybin = (df2["__Group__"].values == gA).astype(int)
+                        mask = np.isfinite(Xdf.values).all(axis=1)
+                        X = Xdf.values[mask]
+                        y = ybin[mask]
+                        if X.shape[0] >= 20 and np.unique(y).size == 2:
+                            # standardize using model's mu/sd so alignment matches training
+                            mu = np.array(ncam["mu"], dtype=float)
+                            sd = np.array(ncam["sd"], dtype=float); sd[sd==0] = 1.0
+                            Xs = (X - mu) / sd
+                
+                            if ncam["kind"] == "lda" and ncam.get("w_vec") is not None:
+                                # LDA: absolute weights as importances
+                                w = np.array(ncam["w_vec"], dtype=float)
+                                imp_map = {f:0.0 for f in axes}
+                                for f, wi in zip(feats_nca, w):
+                                    if f in imp_map:
+                                        imp_map[f] = abs(float(wi))
+                            else:
+                                # True NCA path: derive proxy importances from abs corr with the 1-D embedding
+                                try:
+                                    from sklearn.neighbors import NeighborhoodComponentsAnalysis
+                                    # Refit a tiny NCA on Xs,y to get the 1-D z for correlations (cheap; only for display)
+                                    nca_tmp = NeighborhoodComponentsAnalysis(n_components=1, random_state=0, max_iter=200)
+                                    z = nca_tmp.fit_transform(Xs, y).ravel()
+                                    # abs Pearson corr(feature_j, z)
+                                    imp = []
+                                    for j, f in enumerate(feats_nca):
+                                        xj = Xs[:, j]
+                                        # handle constant columns
+                                        if np.std(xj) < 1e-9:
+                                            imp.append(0.0)
+                                        else:
+                                            r = np.corrcoef(xj, z)[0, 1]
+                                            imp.append(abs(float(r)) if np.isfinite(r) else 0.0)
+                                    imp_map = {f:0.0 for f in axes}
+                                    for f, v in zip(feats_nca, imp):
+                                        if f in imp_map:
+                                            imp_map[f] = v
+                                except Exception:
+                                    # fallback: equal weights
+                                    imp_map = {f:1.0 for f in axes}
+                
+                            arr = np.array([imp_map[f] for f in axes], dtype=float)
+                            # normalize to [0,1] for plotting
+                            if np.isfinite(arr).any():
+                                mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
+                                norm_imp = (arr - mn) / (mx - mn + 1e-9) if mx > mn else np.zeros_like(arr)
+                                rN_close = np.concatenate([norm_imp, [norm_imp[0]]])
+                                ax.plot(angles_close, rN_close, color="#10b981", linewidth=2, label="NCA (scaled)")
+                                ax.fill(angles_close, rN_close, color="#10b981", alpha=0.18)
                     except Exception:
                         pass
             
