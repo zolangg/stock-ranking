@@ -1798,7 +1798,7 @@ else:
                         mode="lines",
                         line=dict(color=color, width=2),
                         fill="toself",
-                        fillcolor=color+"33",  # ~20% alpha
+                        fillcolor=_hex_to_rgba(color, 0.2),  # ~20% alpha
                         hovertemplate="%{theta}: %{r:.2f}<extra>"+tkr+"</extra>",
                     ))
             
