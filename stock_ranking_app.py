@@ -1565,61 +1565,8 @@ else:
                 .properties(height=320)
             )
             st.altair_chart(chart, use_container_width=True)
-
-            # ============================== Distribution chart export (PNG via Matplotlib) ==============================
-            png_bytes = None
-            try:
-                pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
-                series_names = list(pivot.columns)
-
-                color_map = {
-                    f"{gA} (Median centers)": "#3b82f6",   # blue
-                    f"{gB} (Median centers)": "#ef4444",   # red
-                    f"NCA: P({gA})": "#10b981",            # green
-                    f"CatBoost: P({gA})": "#8b5cf6",       # purple
-                }
-                colors = [color_map.get(s, "#999999") for s in series_names]
-
-                thresholds = pivot.index.tolist()
-                n_groups = len(thresholds)
-                n_series = len(series_names)
-                x = np.arange(n_groups)
-                width = 0.8 / max(n_series, 1)
-
-                fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4))
-                for i, s in enumerate(series_names):
-                    vals = pivot[s].values.astype(float)
-                    ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
-
-                ax.set_xticks(x)
-                ax.set_xticklabels([str(t) for t in thresholds])
-                ax.set_ylim(0, 100)
-                ax.set_xlabel("Gain% cutoff")
-                ax.set_ylabel("Median across selected stocks (%)")
-                ax.legend(loc="upper left", frameon=False)
-
-                buf = io.BytesIO()
-                fig.tight_layout()
-                fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-                plt.close(fig)
-                png_bytes = buf.getvalue()
-            except Exception:
-                png_bytes = None
-
-            st.markdown("##### Export distribution chart")
-            if png_bytes:
-                st.download_button(
-                    "Download PNG (distribution)",
-                    data=png_bytes,
-                    file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                    mime="image/png",
-                    use_container_width=True,
-                    key="dl_dist_png_matplotlib",
-                )
-            else:
-                st.caption("PNG export fallback failed (Matplotlib). Make sure df_long exists above.")
             
-            # ============================== Radar — centers vs stocks (Matplotlib) ==============================
+            # ============================== Radar — centers vs stocks (Matplotlib, with toggles) ==============================
             st.markdown("---")
             st.subheader("Radar — centers vs stocks (Matplotlib)")
             
@@ -1674,52 +1621,63 @@ else:
             if not axes_all:
                 st.info("No live features available for radar plotting with current split.")
             else:
-                # UI
-                default_axes = [f for f in VAR_CORE if f in axes_all] or axes_all[:6]
-                col_r1, col_r2, col_r3 = st.columns([1.5, 1.3, 1.2])
-                with col_r1:
+                # ---------- Controls
+                c1, c2, c3, c4 = st.columns([1.4, 1.4, 1.1, 1.3])
+                with c1:
                     feat_mode = st.radio(
                         "Features",
                         ["Core", "All live", "Top-6 CatBoost importances"],
                         index=0,
-                        help="Pick which axes to plot on the radar.",
                         key="radar_feat_mode_mpl",
+                        help="Pick which axes to plot.",
+                        horizontal=False,
                     )
-                with col_r2:
+                with c2:
+                    show_A = st.checkbox(f"Show {gA} center", value=True, key="radar_show_A")
+                    show_B = st.checkbox(f"Show {gB} center", value=True, key="radar_show_B")
+                    show_cb = st.checkbox("Show CatBoost polygon", value=True, key="radar_show_cb")
+                    show_nca = st.checkbox("Show NCA polygon", value=False, key="radar_show_nca")
+                with c3:
+                    # quick selectors for stocks
                     all_tickers_radar = [(r.get("Ticker") or "—") for r in ss.rows]
                     _seen_radar = set()
                     all_tickers_radar = [t for t in all_tickers_radar if not (t in _seen_radar or _seen_radar.add(t))]
+                    if "radar_stock_sel_mpl" not in st.session_state:
+                        st.session_state["radar_stock_sel_mpl"] = all_tickers_radar[:5]
+                    col_btn1, col_btn2 = st.columns(2)
+                    with col_btn1:
+                        if st.button("Select none", key="radar_none"):
+                            st.session_state["radar_stock_sel_mpl"] = []
+                    with col_btn2:
+                        if st.button("Select all", key="radar_all"):
+                            st.session_state["radar_stock_sel_mpl"] = all_tickers_radar[:]
+                with c4:
                     stocks_overlay = st.multiselect(
                         "Stocks to overlay",
                         options=all_tickers_radar,
-                        default=all_tickers_radar[:5],
+                        default=st.session_state.get("radar_stock_sel_mpl", []),
                         key="radar_stock_sel_mpl",
-                        help="Polygons for these added stocks are overlaid.",
-                    )
-                with col_r3:
-                    show_cb_importance = st.checkbox(
-                        "Show CatBoost feature importance",
-                        value=True,
-                        key="radar_show_cb_importance_mpl",
+                        help="Turn individual stock polygons on/off.",
                     )
             
+                # ---------- Axes selection
                 if feat_mode == "Core":
-                    axes = default_axes
+                    axes = [f for f in VAR_CORE if f in axes_all] or axes_all[:6]
                 elif feat_mode == "All live":
                     axes = axes_all
                 else:
-                    axes = _catboost_topk_features_mpl(ss.get("cat_model", {}), k=6) or default_axes
+                    axes = _catboost_topk_features_mpl(ss.get("cat_model", {}), k=6) or [f for f in VAR_CORE if f in axes_all] or axes_all[:6]
             
-                # Centers
+                # ---------- Centers dicts
                 centerA = {f: (float(med_tbl.at[f, gA]) if (f in med_tbl.index and pd.notna(med_tbl.at[f, gA])) else np.nan) for f in axes}
                 centerB = {f: (float(med_tbl.at[f, gB]) if (f in med_tbl.index and pd.notna(med_tbl.at[f, gB])) else np.nan) for f in axes}
             
-                # Angles
+                # ---------- Angles
                 N = len(axes)
                 angles = np.linspace(0, 2*np.pi, N, endpoint=False)
                 angles_close = np.concatenate([angles, [angles[0]]])
             
-                # Normalize centers
+                # ---------- Normalize centers on chosen axes
                 normA = _norm_minmax_between_centers_mpl(centerA, centerA, centerB)
                 normB = _norm_minmax_between_centers_mpl(centerB, centerA, centerB)
                 rA = np.array([normA[f] for f in axes], dtype=float)
@@ -1727,7 +1685,7 @@ else:
                 rA_close = np.concatenate([rA, [rA[0]]])
                 rB_close = np.concatenate([rB, [rB[0]]])
             
-                # Figure
+                # ---------- Figure
                 fig, ax = plt.subplots(subplot_kw=dict(polar=True), figsize=(6.5, 6.5))
                 ax.set_theta_offset(np.pi / 2)
                 ax.set_theta_direction(-1)
@@ -1736,31 +1694,38 @@ else:
                 ax.set_yticks([0.25, 0.5, 0.75, 1.0])
                 ax.set_yticklabels(["0.25","0.5","0.75","1.0"])
             
-                # Plot centers (lines only)
-                ax.plot(angles_close, rA_close, color="#3b82f6", linewidth=2, label=f"{gA} center")
-                ax.plot(angles_close, rB_close, color="#ef4444", linewidth=2, label=f"{gB} center")
+                # ---------- Centers (optional)
+                if show_A:
+                    ax.plot(angles_close, rA_close, color="#3b82f6", linewidth=2, label=f"{gA} center")
+                if show_B:
+                    ax.plot(angles_close, rB_close, color="#ef4444", linewidth=2, label=f"{gB} center")
             
-                # Stocks (filled polygons)
-                stock_color_cycle = ["#10b981", "#6366f1", "#f59e0b", "#06b6d4", "#a3e635", "#fb7185", "#14b8a6"]
-                stock_lookup = { (r.get("Ticker") or "—"): r for r in ss.rows }
+                # ---------- NCA polygon (optional)
+                if show_nca and ss.get("nca_model", {}).get("ok"):
+                    try:
+                        feats_nca = ss["nca_model"]["feats"]
+                        # project each axis feature to a pseudo-importance via |w| if LDA, else equal weights
+                        if ss["nca_model"]["kind"] == "lda" and ss["nca_model"].get("w_vec") is not None:
+                            w = np.array(ss["nca_model"]["w_vec"], dtype=float)
+                            # Map weights to current axes order (may not align fully)
+                            w_map = {f:0.0 for f in axes}
+                            for f, wi in zip(feats_nca, w):
+                                if f in w_map:
+                                    w_map[f] = abs(float(wi))
+                            arr = np.array([w_map[f] for f in axes], dtype=float)
+                        else:
+                            arr = np.ones(len(axes), dtype=float)
+                        if np.isfinite(arr).any():
+                            mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
+                            norm_imp = (arr - mn) / (mx - mn + 1e-9) if mx > mn else np.zeros_like(arr)
+                            rN_close = np.concatenate([norm_imp, [norm_imp[0]]])
+                            ax.plot(angles_close, rN_close, color="#10b981", linewidth=2, label="NCA (scaled)")
+                            ax.fill(angles_close, rN_close, color="#10b981", alpha=0.18)
+                    except Exception:
+                        pass
             
-                for i, tkr in enumerate(stocks_overlay):
-                    row = stock_lookup.get(tkr)
-                    if not row:
-                        continue
-                    vals = {}
-                    for f in axes:
-                        v = pd.to_numeric(row.get(f), errors="coerce")
-                        vals[f] = float(v) if np.isfinite(v) else np.nan
-                    norm = _norm_minmax_between_centers_mpl(vals, centerA, centerB)
-                    rS = np.array([norm[f] for f in axes], dtype=float)
-                    rS_close = np.concatenate([rS, [rS[0]]])
-                    color = stock_color_cycle[i % len(stock_color_cycle)]
-                    ax.plot(angles_close, rS_close, color=color, linewidth=2, label=tkr)
-                    ax.fill(angles_close, rS_close, color=color, alpha=0.2)
-            
-                # CatBoost importance polygon (optional)
-                if show_cb_importance and ss.get("cat_model", {}).get("ok"):
+                # ---------- CatBoost polygon (optional)
+                if show_cb and ss.get("cat_model", {}).get("ok"):
                     try:
                         cb = ss["cat_model"]["cb"]
                         feats_cb = ss["cat_model"]["feats"]
@@ -1772,19 +1737,91 @@ else:
                         if np.isfinite(arr).any():
                             mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
                             norm_imp = (arr - mn) / (mx - mn + 1e-9) if mx > mn else np.zeros_like(arr)
-                            norm_imp_close = np.concatenate([norm_imp, [norm_imp[0]]])
-                            ax.plot(angles_close, norm_imp_close, color="#8b5cf6", linewidth=2, label="CatBoost importance")
-                            ax.fill(angles_close, norm_imp_close, color="#8b5cf6", alpha=0.20)
+                            rC_close = np.concatenate([norm_imp, [norm_imp[0]]])
+                            ax.plot(angles_close, rC_close, color="#8b5cf6", linewidth=2, label="CatBoost (scaled)")
+                            ax.fill(angles_close, rC_close, color="#8b5cf6", alpha=0.20)
                     except Exception:
                         pass
-                elif show_cb_importance and not ss.get("cat_model", {}).get("ok"):
-                    st.caption("CatBoost importance unavailable for this split.")
+                elif show_cb and not ss.get("cat_model", {}).get("ok"):
+                    st.caption("CatBoost polygon unavailable for this split.")
             
-                ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.05), frameon=False)
+                # ---------- Stocks (multi-toggle)
+                stock_color_cycle = ["#06b6d4", "#6366f1", "#f59e0b", "#10b981", "#a3e635", "#fb7185", "#14b8a6"]
+                stock_lookup = { (r.get("Ticker") or "—"): r for r in ss.rows }
+            
+                for i, tkr in enumerate(stocks_overlay):
+                    row = stock_lookup.get(tkr)
+                    if not row:
+                        continue
+                    vals = {}
+                    for f in axes:
+                        v = pd.to_numeric(row.get(f), errors="coerce")
+                        vals[f] = float(v) if np.isfinite(v) else np.nan
+                    normS = _norm_minmax_between_centers_mpl(vals, centerA, centerB)
+                    rS = np.array([normS[f] for f in axes], dtype=float)
+                    rS_close = np.concatenate([rS, [rS[0]]])
+                    color = stock_color_cycle[i % len(stock_color_cycle)]
+                    ax.plot(angles_close, rS_close, color=color, linewidth=2, label=tkr)
+                    ax.fill(angles_close, rS_close, color=color, alpha=0.20)
+            
+                ax.legend(loc="upper right", bbox_to_anchor=(1.28, 1.05), frameon=False)
                 fig.tight_layout()
             
                 st.pyplot(fig, use_container_width=True)
-                st.caption("Values normalized per feature using the A/B centers (0 = closer to the lower center value, 1 = closer to the higher).")
+                st.caption("Normalized per feature using A/B centers (0 = closer to lower center, 1 = closer to higher).")
+
+            # ============================== Distribution chart export (PNG via Matplotlib) ==============================
+            png_bytes = None
+            try:
+                pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
+                series_names = list(pivot.columns)
+
+                color_map = {
+                    f"{gA} (Median centers)": "#3b82f6",   # blue
+                    f"{gB} (Median centers)": "#ef4444",   # red
+                    f"NCA: P({gA})": "#10b981",            # green
+                    f"CatBoost: P({gA})": "#8b5cf6",       # purple
+                }
+                colors = [color_map.get(s, "#999999") for s in series_names]
+
+                thresholds = pivot.index.tolist()
+                n_groups = len(thresholds)
+                n_series = len(series_names)
+                x = np.arange(n_groups)
+                width = 0.8 / max(n_series, 1)
+
+                fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4))
+                for i, s in enumerate(series_names):
+                    vals = pivot[s].values.astype(float)
+                    ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
+
+                ax.set_xticks(x)
+                ax.set_xticklabels([str(t) for t in thresholds])
+                ax.set_ylim(0, 100)
+                ax.set_xlabel("Gain% cutoff")
+                ax.set_ylabel("Median across selected stocks (%)")
+                ax.legend(loc="upper left", frameon=False)
+
+                buf = io.BytesIO()
+                fig.tight_layout()
+                fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+                plt.close(fig)
+                png_bytes = buf.getvalue()
+            except Exception:
+                png_bytes = None
+
+            st.markdown("##### Export distribution chart")
+            if png_bytes:
+                st.download_button(
+                    "Download PNG (distribution)",
+                    data=png_bytes,
+                    file_name=f"distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    key="dl_dist_png_matplotlib",
+                )
+            else:
+                st.caption("PNG export fallback failed (Matplotlib). Make sure df_long exists above.")
             
             # ============================== Distribution chart export (HTML) ==============================
             spec = chart.to_dict()
