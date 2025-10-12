@@ -1622,6 +1622,21 @@ else:
             # ============================== Radar (Plotly) ==============================
             st.markdown("---")
             st.subheader("Radar — centers vs stocks (Plotly)")
+
+            def _hex_to_rgba(hex_color: str, alpha: float = 0.2) -> str:
+                """Convert '#RRGGBB' to 'rgba(r,g,b,a)'. Ignores alpha if already rgba()."""
+                if not isinstance(hex_color, str):
+                    return "rgba(0,0,0,0.2)"
+                if hex_color.startswith("rgba"):
+                    return hex_color  # assume valid
+                hex_color = hex_color.lstrip("#")
+                if len(hex_color) == 6:
+                    r = int(hex_color[0:2], 16)
+                    g = int(hex_color[2:4], 16)
+                    b = int(hex_color[4:6], 16)
+                    return f"rgba({r},{g},{b},{alpha})"
+                # fallback
+                return "rgba(0,0,0,0.2)"
             
             # Helpers for feature selection and normalization
             def _available_live_axes():
@@ -1746,7 +1761,8 @@ else:
                     name=f"{gA} center",
                     mode="lines",
                     line=dict(color="#3b82f6", width=2),
-                    fill=None,
+                    fill="toself",
+                    fillcolor=_hex_to_rgba(color, 0.2),   # <- was color+"33"
                     hovertemplate="%{theta}: %{r:.2f}<extra></extra>",
                 ))
                 fig.add_trace(go.Scatterpolar(
@@ -1755,7 +1771,8 @@ else:
                     name=f"{gB} center",
                     mode="lines",
                     line=dict(color="#ef4444", width=2),
-                    fill=None,
+                    fill="toself",
+                    fillcolor=_hex_to_rgba(color, 0.2),   # <- was color+"33"
                     hovertemplate="%{theta}: %{r:.2f}<extra></extra>",
                 ))
             
@@ -1810,7 +1827,7 @@ else:
                                 mode="lines",
                                 line=dict(color="#8b5cf6", width=2),
                                 fill="toself",
-                                fillcolor="#8b5cf633",
+                                fillcolor=_hex_to_rgba("#8b5cf6", 0.2),
                                 hovertemplate="%{theta}: %{r:.2f}<extra>CatBoost importance</extra>",
                             ))
                     except Exception:
