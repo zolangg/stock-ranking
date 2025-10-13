@@ -697,12 +697,14 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
     mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0] = 1.0
     Xs = (X - mu) / sd
 
-    used = "lda"; w_vec = None
+    used = "lda"; w_vec = None; components = None
     try:
         from sklearn.neighbors import NeighborhoodComponentsAnalysis
         nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=400)
         z = nca.fit_transform(Xs, y).ravel()
         used = "nca"
+        # FIX: Save the learned transformation components
+        components = nca.components_
     except Exception:
         # Fisher LDA fallback
         X0 = Xs[y==0]; X1 = Xs[y==1]
@@ -718,6 +720,7 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
     if np.nanmean(z[y==1]) < np.nanmean(z[y==0]):
         z = -z
         if w_vec is not None: w_vec = -w_vec
+        if components is not None: components = -components
 
     # Calibration: isotonic preferred; Platt fallback
     zf = z[np.isfinite(z)]; yf = y[np.isfinite(z)]
@@ -739,7 +742,8 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
     return {
         "ok": True, "kind": used, "feats": feats,
         "mu": mu.tolist(), "sd": sd.tolist(),
-        "w_vec": (None if used=="nca" else (w_vec.tolist() if w_vec is not None else None)),
+        "w_vec": (w_vec.tolist() if w_vec is not None else None),
+        "components": (components.tolist() if components is not None else None), # FIX: Add components to model dict
         "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(),
         "platt": (platt_params if platt_params is not None else None),
         "gA": gA_label, "gB": gB_label,
@@ -759,12 +763,20 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
     sd = np.array(model["sd"], dtype=float); sd[sd==0] = 1.0
     xs = (x - mu) / sd
 
+    z = np.nan
     if model["kind"] == "lda":
         w = np.array(model.get("w_vec"), dtype=float)
         if w is None or not np.isfinite(w).all(): return np.nan
         z = float(xs @ w)
-    else:
-        z = float(xs.sum())
+    else: # kind == "nca"
+        # FIX: Use the saved transformation components for prediction
+        comp = model.get("components")
+        if comp is None: return np.nan
+        w = np.array(comp, dtype=float).ravel()
+        if w.size != xs.size: return np.nan # Guardrail
+        z = float(xs @ w)
+
+    if not np.isfinite(z): return np.nan
 
     iso_bx = np.array(model.get("iso_bx", []), dtype=float)
     iso_by = np.array(model.get("iso_by", []), dtype=float)
@@ -1386,6 +1398,7 @@ if summary_rows:
     ]
     df_align_csv_pretty = df_align_csv_full[[c for c in col_order if c in df_align_csv_full.columns]]
 
+    st.markdown("##### Export alignment")
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
@@ -1687,6 +1700,7 @@ else:
         except Exception:
             radar_png_bytes = None
 
+        st.markdown("##### Export radar")
         col_png, col_html = st.columns(2)
 
         with col_png:
@@ -1915,6 +1929,7 @@ else:
                 png_bytes = None
 
             # ============================== Distribution chart export (HTML + PNG side-by-side) ==============================
+            st.markdown("##### Export distribution chart")
             dl_c1, dl_c2 = st.columns(2)
             with dl_c1:
                 if png_bytes:
