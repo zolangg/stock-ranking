@@ -1257,25 +1257,10 @@ html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 # Force refresh of the HTML table when split/rows change
 cache_bust = f"{gA}|{gB}|{int(thr)}|{len(summary_rows)}"
 
-# Robust call: try rich signature first, then degrade to avoid TypeError in some Streamlit builds
-_rendered = False
-for kwargs in [
-    dict(height=620, scrolling=True, key=f"align_{cache_bust}"),
-    dict(height=620, key=f"align_{cache_bust}"),
-    dict(height=620),
-]:
-    try:
-        components.html(html, **kwargs)
-        _rendered = True
-        break
-    except TypeError:
-        continue
+# FIX: Replaced the faulty, complex try-except block with a single, reliable call.
+# This ensures that the scrolling functionality is correctly enabled in modern Streamlit versions.
+components.html(html, height=800, scrolling=True)
 
-if not _rendered:
-    try:
-        components.html(html)
-    except TypeError:
-        st.error("Unable to render the alignment table. Your Streamlit build may lack components.html compatibility.")
 
 # ============================== Alignment exports (CSV full + Markdown compact) ==============================
 if summary_rows:
