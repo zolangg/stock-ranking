@@ -1386,7 +1386,6 @@ if summary_rows:
     ]
     df_align_csv_pretty = df_align_csv_full[[c for c in col_order if c in df_align_csv_full.columns]]
 
-    st.markdown("##### Export alignment")
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
@@ -1688,7 +1687,6 @@ else:
         except Exception:
             radar_png_bytes = None
 
-        st.markdown("##### Export radar")
         col_png, col_html = st.columns(2)
 
         with col_png:
@@ -1917,7 +1915,6 @@ else:
                 png_bytes = None
 
             # ============================== Distribution chart export (HTML + PNG side-by-side) ==============================
-            st.markdown("##### Export distribution chart")
             dl_c1, dl_c2 = st.columns(2)
             with dl_c1:
                 if png_bytes:
