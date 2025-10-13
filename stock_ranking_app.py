@@ -1553,11 +1553,12 @@ else:
                     higher_group[f] = ""
             except Exception:
                 higher_group[f] = ""
-        
-        # FIX: Escape '$' for Matplotlib labels to prevent misinterpretation as math formatting
-        clean_labels = [f"{f.replace('$', '$\\$')}\n({higher_group.get(f, '')})↑" for f in axes]
+
+        # FIX: Resolve SyntaxError by separating string replacement from f-string formatting.
+        # This also correctly escapes '$' for Matplotlib labels.
+        clean_labels = [f.replace('$', r'\$') + f"\n({higher_group.get(f, '')})↑" for f in axes]
         ax.set_thetagrids(angles * 180/np.pi, labels=clean_labels)
-        
+
         ax.set_ylim(0, 1)
         ax.set_yticks([0.25, 0.5, 0.75, 1.0])
         ax.set_yticklabels(["0.25","0.5","0.75","1.0"])
@@ -1952,4 +1953,4 @@ vegaEmbed("#vis", spec, {{actions: true}});
                     mime="text/html",
                     use_container_width=True,
                     key="dl_dist_html",
-                )```
+                )
