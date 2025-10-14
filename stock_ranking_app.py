@@ -333,12 +333,16 @@ if build_btn:
             else:
                 df["Max_Push_Daily_%"] = np.nan
 
+            # --- Store in Streamlit session safely (no alias issues)
+            st.session_state.setdefault("base_df", pd.DataFrame())
+            st.session_state.setdefault("var_core", [])
+            st.session_state.setdefault("var_moderate", [])
+            st.session_state.setdefault("lassoA", {})
+            
             st.session_state["base_df"] = df
-            ss.var_core = [v for v in VAR_CORE if v in df.columns]
-            ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
-
-            # train model once (on full base)
-            ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
+            st.session_state["var_core"] = [v for v in VAR_CORE if v in df.columns]
+            st.session_state["var_moderate"] = [v for v in VAR_MODERATE if v in df.columns]
+            st.session_state["lassoA"] = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
 
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
             do_rerun()
