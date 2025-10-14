@@ -304,7 +304,7 @@ if build_btn:
             else:
                 df["Max_Push_Daily_%"] = np.nan
 
-            ss.base_df = df
+            st.session_state["base_df"] = df
             ss.var_core = [v for v in VAR_CORE if v in df.columns]
             ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
 
