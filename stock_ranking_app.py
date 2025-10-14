@@ -26,7 +26,7 @@ st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
 st.title("Premarket Stock Analysis")
 
 # ============================== Helpers ==============================
-    _norm_cache = {}
+_norm_cache = {}
 def _norm(s: str) -> str:
     if s in _norm_cache: return _norm_cache[s]
     v = re.sub(r"\s+", " ", str(s).strip().lower())
