@@ -25,6 +25,121 @@ except Exception:
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
 st.title("Premarket Stock Analysis")
 
+    # ============================== Upload / Build ==============================
+    st.subheader("Upload Database")
+    uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
+    build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
+    
+    @st.cache_data(show_spinner=False)
+    def _hash_bytes(b: bytes) -> str:
+        return hashlib.sha256(b).hexdigest()
+    
+    @st.cache_data(show_spinner=True)
+    def _load_sheet(file_bytes: bytes):
+        xls = pd.ExcelFile(file_bytes)
+        sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
+        sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
+        raw = pd.read_excel(xls, sheet)
+        return raw, sheet, tuple(xls.sheet_names)
+    
+    if build_btn:
+        if not uploaded:
+            st.error("Please upload an Excel workbook first.")
+        else:
+            try:
+                file_bytes = uploaded.getvalue()
+                _ = _hash_bytes(file_bytes)
+                raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
+    
+                # detect FT column
+                possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
+                col_group = possible[0] if possible else None
+                if col_group is None:
+                    for c in raw.columns:
+                        vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
+                        if len(vals) and vals.isin(["0","1","true","false","yes","no"]).all():
+                            col_group = c; break
+                if col_group is None:
+                    st.error("Could not detect FT (0/1) column."); st.stop()
+    
+                df = pd.DataFrame()
+                df["GroupRaw"] = raw[col_group]
+    
+                def add_num(dfout, name, src_candidates):
+                    src = _pick(raw, src_candidates)
+                    if src: dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
+    
+                # map fields
+                add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
+                add_num(df, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
+                add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
+                add_num(df, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
+                add_num(df, "Gap_%",            ["gap %","gap%","premarket gap","gap","gap_percent"])
+                add_num(df, "ATR_$",            ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
+                add_num(df, "PM_Vol_M",         ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
+                add_num(df, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
+                add_num(df, "PM_Vol_%",         ["pm vol (%)","pm_vol_%","pm vol percent","pm volume (%)","pm_vol_percent"])
+                add_num(df, "Daily_Vol_M",      ["daily vol (m)","daily_vol_m","day volume (m)","dvol_m"])
+                add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
+                add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
+    
+                # catalyst
+                cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
+                def _to_binary_local(v):
+                    sv = str(v).strip().lower()
+                    if sv in {"1","true","yes","y","t"}: return 1.0
+                    if sv in {"0","false","no","n","f"}: return 0.0
+                    try:
+                        fv = float(sv); return 1.0 if fv >= 0.5 else 0.0
+                    except: return np.nan
+                if cand_catalyst: df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
+    
+                # derived
+                float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
+                if {"PM_Vol_M", float_basis}.issubset(df.columns):
+                    df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
+                mcap_basis = "MC_PM_Max_M" if "MC_PM_Max_M" in df.columns and df["MC_PM_Max_M"].notna().any() else "MarketCap_M$"
+                if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
+                    df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
+    
+                # scale % fields (DB stores fractions)
+                if "Gap_%" in df.columns:            df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
+                if "PM_Vol_%" in df.columns:         df["PM_Vol_%"] = pd.to_numeric(df["PM_Vol_%"], errors="coerce") * 100.0
+                if "Max_Pull_PM_%" in df.columns:    df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
+    
+                # FT groups
+                def _to_binary(v):
+                    sv = str(v).strip().lower()
+                    if sv in {"1","true","yes","y","t"}: return 1
+                    if sv in {"0","false","no","n","f"}: return 0
+                    try:
+                        fv = float(sv); return 1 if fv >= 0.5 else 0
+                    except: return np.nan
+                df["FT01"] = df["GroupRaw"].map(_to_binary)
+                df = df[df["FT01"].isin([0,1])].copy()
+                df["GroupFT"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
+    
+                # Max Push Daily (%) fraction -> %
+                pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
+                if pmh_col is not None:
+                    pmh_raw = pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce")
+                    df["Max_Push_Daily_%"] = pmh_raw * 100.0
+                else:
+                    df["Max_Push_Daily_%"] = np.nan
+    
+                ss.base_df = df
+                ss.var_core = [v for v in VAR_CORE if v in df.columns]
+                ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
+    
+                # train model once (on full base)
+                ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
+    
+                st.success(f"Loaded “{sel_sheet}”. Base ready.")
+                do_rerun()
+            except Exception as e:
+                st.error("Loading/processing failed.")
+                st.exception(e)
+
 tab_align, tab_season = st.tabs(["Alignment", "Seasonality"])
 
 with tab_align:   
@@ -204,6 +319,19 @@ with tab_align:
     
     def _fmt_num(x):
         return "" if not np.isfinite(x) else f"{x:.2f}"
+
+    # ============================== Upload Section Helper ==============================
+    def render_upload_section():
+        st.subheader("Upload Database")
+    
+        uploaded = st.file_uploader(
+            "Upload .xlsx with your DB", 
+            type=["xlsx"], 
+            key="db_upl"
+        )
+        build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
+    
+        return uploaded, build_btn
     
     # ============================== Variables ==============================
     VAR_CORE = [
@@ -428,121 +556,6 @@ with tab_align:
         PM = float(row.get("PM_Vol_M") or np.nan)
         if not np.isfinite(PM) or PM <= 0: return np.nan
         return float(PM * cal_mult)
-    
-    # ============================== Upload / Build ==============================
-    st.subheader("Upload Database")
-    uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
-    build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
-    
-    @st.cache_data(show_spinner=False)
-    def _hash_bytes(b: bytes) -> str:
-        return hashlib.sha256(b).hexdigest()
-    
-    @st.cache_data(show_spinner=True)
-    def _load_sheet(file_bytes: bytes):
-        xls = pd.ExcelFile(file_bytes)
-        sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
-        sheet = sheet_candidates[0] if sheet_candidates else xls.sheet_names[0]
-        raw = pd.read_excel(xls, sheet)
-        return raw, sheet, tuple(xls.sheet_names)
-    
-    if build_btn:
-        if not uploaded:
-            st.error("Please upload an Excel workbook first.")
-        else:
-            try:
-                file_bytes = uploaded.getvalue()
-                _ = _hash_bytes(file_bytes)
-                raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
-    
-                # detect FT column
-                possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
-                col_group = possible[0] if possible else None
-                if col_group is None:
-                    for c in raw.columns:
-                        vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
-                        if len(vals) and vals.isin(["0","1","true","false","yes","no"]).all():
-                            col_group = c; break
-                if col_group is None:
-                    st.error("Could not detect FT (0/1) column."); st.stop()
-    
-                df = pd.DataFrame()
-                df["GroupRaw"] = raw[col_group]
-    
-                def add_num(dfout, name, src_candidates):
-                    src = _pick(raw, src_candidates)
-                    if src: dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
-    
-                # map fields
-                add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
-                add_num(df, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
-                add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
-                add_num(df, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
-                add_num(df, "Gap_%",            ["gap %","gap%","premarket gap","gap","gap_percent"])
-                add_num(df, "ATR_$",            ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
-                add_num(df, "PM_Vol_M",         ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
-                add_num(df, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
-                add_num(df, "PM_Vol_%",         ["pm vol (%)","pm_vol_%","pm vol percent","pm volume (%)","pm_vol_percent"])
-                add_num(df, "Daily_Vol_M",      ["daily vol (m)","daily_vol_m","day volume (m)","dvol_m"])
-                add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
-                add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
-    
-                # catalyst
-                cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
-                def _to_binary_local(v):
-                    sv = str(v).strip().lower()
-                    if sv in {"1","true","yes","y","t"}: return 1.0
-                    if sv in {"0","false","no","n","f"}: return 0.0
-                    try:
-                        fv = float(sv); return 1.0 if fv >= 0.5 else 0.0
-                    except: return np.nan
-                if cand_catalyst: df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
-    
-                # derived
-                float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
-                if {"PM_Vol_M", float_basis}.issubset(df.columns):
-                    df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
-                mcap_basis = "MC_PM_Max_M" if "MC_PM_Max_M" in df.columns and df["MC_PM_Max_M"].notna().any() else "MarketCap_M$"
-                if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
-                    df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
-    
-                # scale % fields (DB stores fractions)
-                if "Gap_%" in df.columns:            df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
-                if "PM_Vol_%" in df.columns:         df["PM_Vol_%"] = pd.to_numeric(df["PM_Vol_%"], errors="coerce") * 100.0
-                if "Max_Pull_PM_%" in df.columns:    df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
-    
-                # FT groups
-                def _to_binary(v):
-                    sv = str(v).strip().lower()
-                    if sv in {"1","true","yes","y","t"}: return 1
-                    if sv in {"0","false","no","n","f"}: return 0
-                    try:
-                        fv = float(sv); return 1 if fv >= 0.5 else 0
-                    except: return np.nan
-                df["FT01"] = df["GroupRaw"].map(_to_binary)
-                df = df[df["FT01"].isin([0,1])].copy()
-                df["GroupFT"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
-    
-                # Max Push Daily (%) fraction -> %
-                pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
-                if pmh_col is not None:
-                    pmh_raw = pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce")
-                    df["Max_Push_Daily_%"] = pmh_raw * 100.0
-                else:
-                    df["Max_Push_Daily_%"] = np.nan
-    
-                ss.base_df = df
-                ss.var_core = [v for v in VAR_CORE if v in df.columns]
-                ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
-    
-                # train model once (on full base)
-                ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
-    
-                st.success(f"Loaded “{sel_sheet}”. Base ready.")
-                do_rerun()
-            except Exception as e:
-                st.error("Loading/processing failed.")
-                st.exception(e)
     
     # ============================== Add Stock ==============================
     st.markdown("---")
