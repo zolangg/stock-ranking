@@ -202,6 +202,35 @@ def render_upload_section():
 
     return uploaded, build_btn
 
+# ============================== Variables ==============================
+VAR_CORE = [
+    "Gap_%",
+    "FR_x",
+    "PM$Vol/MC_%",
+    "Catalyst",
+    "PM_Vol_%",
+    "Max_Pull_PM_%",
+    "RVOL_Max_PM_cum",
+]
+VAR_MODERATE = [
+    "MC_PM_Max_M",
+    "Float_PM_Max_M",
+    "PM_Vol_M",
+    "PM_$Vol_M$",
+    "ATR_$",
+    "Daily_Vol_M",
+    "MarketCap_M$",
+    "Float_M",
+]
+VAR_ALL = VAR_CORE + VAR_MODERATE
+
+# NCA/CatBoost: only “live” features from Add Stock (exclude PredVol_M / PM_Vol_% / Daily_Vol_M)
+ALLOWED_LIVE_FEATURES = [
+    "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
+    "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
+]
+EXCLUDE_FOR_NCA = {"PredVol_M","PM_Vol_%","Daily_Vol_M"}
+
 # ============================== Upload / Build ==============================
 st.subheader("Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
@@ -335,36 +364,6 @@ with tab_align:
     ss.setdefault("del_selection", [])       # for delete UI
     ss.setdefault("__delete_msg", None)      # flash msg
     ss.setdefault("__catboost_warned", False)
-    
-    
-    # ============================== Variables ==============================
-    VAR_CORE = [
-        "Gap_%",
-        "FR_x",
-        "PM$Vol/MC_%",
-        "Catalyst",
-        "PM_Vol_%",
-        "Max_Pull_PM_%",
-        "RVOL_Max_PM_cum",
-    ]
-    VAR_MODERATE = [
-        "MC_PM_Max_M",
-        "Float_PM_Max_M",
-        "PM_Vol_M",
-        "PM_$Vol_M$",
-        "ATR_$",
-        "Daily_Vol_M",
-        "MarketCap_M$",
-        "Float_M",
-    ]
-    VAR_ALL = VAR_CORE + VAR_MODERATE
-    
-    # NCA/CatBoost: only “live” features from Add Stock (exclude PredVol_M / PM_Vol_% / Daily_Vol_M)
-    ALLOWED_LIVE_FEATURES = [
-        "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
-        "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
-    ]
-    EXCLUDE_FOR_NCA = {"PredVol_M","PM_Vol_%","Daily_Vol_M"}
     
     # ============================== LASSO (unchanged core) ==============================
     def _kfold_indices(n, k=5, seed=42):
