@@ -424,6 +424,11 @@ if build_btn:
             df = pd.DataFrame()
             df["GroupRaw"] = raw[col_group]
 
+            # --- Date (copy & coerce to datetime) ---
+            date_src = _pick(raw, ["Date","Trade Date","TradeDate","Session Date","Session","Datetime","Timestamp"])
+            if date_src is not None:
+                df["Date"] = pd.to_datetime(raw[date_src], errors="coerce")
+
             def add_num(dfout, name, src_candidates):
                 src = _pick(raw, src_candidates)
                 if src: dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
