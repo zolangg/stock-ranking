@@ -26,10 +26,6 @@ st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
 st.title("Premarket Stock Analysis")
 
 # ============================== Helpers ==============================
-def do_rerun():
-    if hasattr(st, "rerun"): st.rerun()
-    elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
-
     _norm_cache = {}
 def _norm(s: str) -> str:
     if s in _norm_cache: return _norm_cache[s]
@@ -37,6 +33,10 @@ def _norm(s: str) -> str:
     v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
     _norm_cache[s] = v
     return v
+
+def do_rerun():
+    if hasattr(st, "rerun"): st.rerun()
+    elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
 
 def SAFE_JSON_DUMPS(obj) -> str:
     class NpEncoder(json.JSONEncoder):
