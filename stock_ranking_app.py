@@ -25,6 +25,183 @@ except Exception:
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
 st.title("Premarket Stock Analysis")
 
+# ============================== Helpers ==============================
+def do_rerun():
+    if hasattr(st, "rerun"): st.rerun()
+    elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
+
+    _norm_cache = {}
+def _norm(s: str) -> str:
+    if s in _norm_cache: return _norm_cache[s]
+    v = re.sub(r"\s+", " ", str(s).strip().lower())
+    v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
+    _norm_cache[s] = v
+    return v
+
+def SAFE_JSON_DUMPS(obj) -> str:
+    class NpEncoder(json.JSONEncoder):
+        def default(self, o):
+            if isinstance(o, (np.integer,)): return int(o)
+            if isinstance(o, (np.floating,)): return float(o)
+            if isinstance(o, (np.ndarray,)): return o.tolist()
+            return super().default(o)
+    s = json.dumps(obj, cls=NpEncoder, ensure_ascii=False, separators=(",", ":"))
+    return s.replace("</script>", "<\\/script>")
+
+
+def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    if df is None or df.empty: return None
+    cols = list(df.columns)
+    cols_lc = {c: c.strip().lower() for c in cols}
+    nm = {c: _norm(c) for c in cols}
+    for cand in candidates:
+        lc = cand.strip().lower()
+        for c in cols:
+            if cols_lc[c] == lc: return c
+    for cand in candidates:
+        n = _norm(cand)
+        for c in cols:
+            if nm[c] == n: return c
+    for cand in candidates:
+        n = _norm(cand)
+        for c in cols:
+            if n in nm[c]: return c
+    return None
+
+def _to_float(s):
+    if pd.isna(s): return np.nan
+    try:
+        ss_ = str(s).strip().replace(" ", "")
+        if "," in ss_ and "." not in ss_: ss_ = ss_.replace(",", ".")
+        else: ss_ = ss_.replace(",", "")
+        return float(ss_)
+    except Exception:
+        return np.nan
+
+def _mad(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty: return np.nan
+    med = float(np.median(s))
+    return float(np.median(np.abs(s - med)))
+
+# ---------- Winsorization ----------
+def _compute_bounds(arr: np.ndarray, lo_q=0.01, hi_q=0.99):
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0: return (np.nan, np.nan)
+    return (float(np.quantile(arr, lo_q)), float(np.quantile(arr, hi_q)))
+
+def _apply_bounds(arr: np.ndarray, lo: float, hi: float):
+    out = arr.copy()
+    if np.isfinite(lo): out = np.maximum(out, lo)
+    if np.isfinite(hi): out = np.minimum(out, hi)
+    return out
+
+# ---------- Isotonic Regression ----------
+def _pav_isotonic(x: np.ndarray, y: np.ndarray):
+    order = np.argsort(x)
+    xs = x[order]; ys = y[order]
+    level_y = ys.astype(float).copy(); level_n = np.ones_like(level_y)
+    i = 0
+    while i < len(level_y) - 1:
+        if level_y[i] > level_y[i+1]:
+            new_y = (level_y[i]*level_n[i] + level_y[i+1]*level_n[i+1]) / (level_n[i] + level_n[i+1])
+            new_n = level_n[i] + level_n[i+1]
+            level_y[i] = new_y; level_n[i] = new_n
+            level_y = np.delete(level_y, i+1)
+            level_n = np.delete(level_n, i+1)
+            xs = np.delete(xs, i+1)
+            if i > 0: i -= 1
+        else:
+            i += 1
+    return xs, level_y
+
+def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
+    if break_x.size == 0: return np.full_like(x_new, np.nan, dtype=float)
+    idx = np.argsort(break_x)
+    bx = break_x[idx]; by = break_y[idx]
+    if bx.size == 1: return np.full_like(x_new, by[0], dtype=float)
+    return np.interp(x_new, bx, by, left=by[0], right=by[-1])
+
+# ====== Seasonality helpers ======
+def _pick_date_col(df: pd.DataFrame) -> str | None:
+    cands = ["Date","Trade Date","TradeDate","Session Date","Session","Datetime","Timestamp"]
+    hit = _pick(df, cands)
+    if hit: return hit
+    for c in df.columns:
+        if "date" in str(c).lower(): return c
+    return None
+
+def _coerce_date_col(df: pd.DataFrame, col: str) -> pd.Series:
+    return pd.to_datetime(df[col], errors="coerce")
+
+def _mad_sigma(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty: return np.nan
+    med = np.median(s)
+    return 1.4826 * np.median(np.abs(s - med))
+
+def _wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float,float]:
+    # 95% Wilson interval by default
+    if n <= 0: return (np.nan, np.nan)
+    p = k / n
+    denom = 1 + z**2/n
+    center = (p + z**2/(2*n)) / denom
+    half = z*np.sqrt((p*(1-p) + z**2/(4*n))/n) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
+
+# Optional winsorization
+def _winsor(s: pd.Series, lo_q=0.01, hi_q=0.99):
+    x = pd.to_numeric(s, errors="coerce")
+    lo, hi = np.nanquantile(x, lo_q), np.nanquantile(x, hi_q)
+    return x.clip(lo, hi)
+
+# Smoothing (Savitzky–Golay / LOESS) with safe fallbacks
+def _smooth_series(x_ord: np.ndarray, y_vals: np.ndarray, mode: str, sg_window=7, sg_poly=2, loess_span=0.25):
+    y = y_vals.astype(float)
+    if mode == "None" or len(y) < 3: 
+        return y
+    # try SciPy SG
+    if mode == "Savitzky–Golay":
+        try:
+            from scipy.signal import savgol_filter
+            win = min(len(y) - (1 - len(y)%2), sg_window)  # odd <= len(y)
+            if win < 3: return y
+            if sg_poly >= win: sg_poly = max(1, win-1)
+            return savgol_filter(y, window_length=win, polyorder=sg_poly, mode="wrap")
+        except Exception:
+            return y
+    # try statsmodels LOESS
+    if mode == "LOESS":
+        try:
+            from statsmodels.nonparametric.smoothers_lowess import lowess
+            # normalize x to [0,1] for numerical stability
+            x = x_ord.astype(float)
+            x0 = (x - x.min()) / max(1e-9, (x.max() - x.min()))
+            yy = lowess(y, x0, frac=float(loess_span), return_sorted=False)
+            return np.asarray(yy, dtype=float)
+        except Exception:
+            return y
+    return y
+
+def _fmt_pct(x):
+    return "" if not np.isfinite(x) else f"{x:.1f}%"
+
+def _fmt_num(x):
+    return "" if not np.isfinite(x) else f"{x:.2f}"
+
+# ============================== Upload Section Helper ==============================
+def render_upload_section():
+    st.subheader("Upload Database")
+
+    uploaded = st.file_uploader(
+        "Upload .xlsx with your DB", 
+        type=["xlsx"], 
+        key="db_upl"
+    )
+    build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
+
+    return uploaded, build_btn
+
 # ============================== Upload / Build ==============================
 st.subheader("Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
@@ -159,181 +336,6 @@ with tab_align:
     ss.setdefault("__delete_msg", None)      # flash msg
     ss.setdefault("__catboost_warned", False)
     
-    # ============================== Helpers ==============================
-    def do_rerun():
-        if hasattr(st, "rerun"): st.rerun()
-        elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
-    
-    def SAFE_JSON_DUMPS(obj) -> str:
-        class NpEncoder(json.JSONEncoder):
-            def default(self, o):
-                if isinstance(o, (np.integer,)): return int(o)
-                if isinstance(o, (np.floating,)): return float(o)
-                if isinstance(o, (np.ndarray,)): return o.tolist()
-                return super().default(o)
-        s = json.dumps(obj, cls=NpEncoder, ensure_ascii=False, separators=(",", ":"))
-        return s.replace("</script>", "<\\/script>")
-    
-    _norm_cache = {}
-    def _norm(s: str) -> str:
-        if s in _norm_cache: return _norm_cache[s]
-        v = re.sub(r"\s+", " ", str(s).strip().lower())
-        v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
-        _norm_cache[s] = v
-        return v
-    
-    def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
-        if df is None or df.empty: return None
-        cols = list(df.columns)
-        cols_lc = {c: c.strip().lower() for c in cols}
-        nm = {c: _norm(c) for c in cols}
-        for cand in candidates:
-            lc = cand.strip().lower()
-            for c in cols:
-                if cols_lc[c] == lc: return c
-        for cand in candidates:
-            n = _norm(cand)
-            for c in cols:
-                if nm[c] == n: return c
-        for cand in candidates:
-            n = _norm(cand)
-            for c in cols:
-                if n in nm[c]: return c
-        return None
-    
-    def _to_float(s):
-        if pd.isna(s): return np.nan
-        try:
-            ss_ = str(s).strip().replace(" ", "")
-            if "," in ss_ and "." not in ss_: ss_ = ss_.replace(",", ".")
-            else: ss_ = ss_.replace(",", "")
-            return float(ss_)
-        except Exception:
-            return np.nan
-    
-    def _mad(series: pd.Series) -> float:
-        s = pd.to_numeric(series, errors="coerce").dropna()
-        if s.empty: return np.nan
-        med = float(np.median(s))
-        return float(np.median(np.abs(s - med)))
-    
-    # ---------- Winsorization ----------
-    def _compute_bounds(arr: np.ndarray, lo_q=0.01, hi_q=0.99):
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0: return (np.nan, np.nan)
-        return (float(np.quantile(arr, lo_q)), float(np.quantile(arr, hi_q)))
-    
-    def _apply_bounds(arr: np.ndarray, lo: float, hi: float):
-        out = arr.copy()
-        if np.isfinite(lo): out = np.maximum(out, lo)
-        if np.isfinite(hi): out = np.minimum(out, hi)
-        return out
-    
-    # ---------- Isotonic Regression ----------
-    def _pav_isotonic(x: np.ndarray, y: np.ndarray):
-        order = np.argsort(x)
-        xs = x[order]; ys = y[order]
-        level_y = ys.astype(float).copy(); level_n = np.ones_like(level_y)
-        i = 0
-        while i < len(level_y) - 1:
-            if level_y[i] > level_y[i+1]:
-                new_y = (level_y[i]*level_n[i] + level_y[i+1]*level_n[i+1]) / (level_n[i] + level_n[i+1])
-                new_n = level_n[i] + level_n[i+1]
-                level_y[i] = new_y; level_n[i] = new_n
-                level_y = np.delete(level_y, i+1)
-                level_n = np.delete(level_n, i+1)
-                xs = np.delete(xs, i+1)
-                if i > 0: i -= 1
-            else:
-                i += 1
-        return xs, level_y
-    
-    def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
-        if break_x.size == 0: return np.full_like(x_new, np.nan, dtype=float)
-        idx = np.argsort(break_x)
-        bx = break_x[idx]; by = break_y[idx]
-        if bx.size == 1: return np.full_like(x_new, by[0], dtype=float)
-        return np.interp(x_new, bx, by, left=by[0], right=by[-1])
-
-    # ====== Seasonality helpers ======
-    def _pick_date_col(df: pd.DataFrame) -> str | None:
-        cands = ["Date","Trade Date","TradeDate","Session Date","Session","Datetime","Timestamp"]
-        hit = _pick(df, cands)
-        if hit: return hit
-        for c in df.columns:
-            if "date" in str(c).lower(): return c
-        return None
-    
-    def _coerce_date_col(df: pd.DataFrame, col: str) -> pd.Series:
-        return pd.to_datetime(df[col], errors="coerce")
-    
-    def _mad_sigma(series: pd.Series) -> float:
-        s = pd.to_numeric(series, errors="coerce").dropna()
-        if s.empty: return np.nan
-        med = np.median(s)
-        return 1.4826 * np.median(np.abs(s - med))
-    
-    def _wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float,float]:
-        # 95% Wilson interval by default
-        if n <= 0: return (np.nan, np.nan)
-        p = k / n
-        denom = 1 + z**2/n
-        center = (p + z**2/(2*n)) / denom
-        half = z*np.sqrt((p*(1-p) + z**2/(4*n))/n) / denom
-        return (max(0.0, center - half), min(1.0, center + half))
-    
-    # Optional winsorization
-    def _winsor(s: pd.Series, lo_q=0.01, hi_q=0.99):
-        x = pd.to_numeric(s, errors="coerce")
-        lo, hi = np.nanquantile(x, lo_q), np.nanquantile(x, hi_q)
-        return x.clip(lo, hi)
-    
-    # Smoothing (Savitzky–Golay / LOESS) with safe fallbacks
-    def _smooth_series(x_ord: np.ndarray, y_vals: np.ndarray, mode: str, sg_window=7, sg_poly=2, loess_span=0.25):
-        y = y_vals.astype(float)
-        if mode == "None" or len(y) < 3: 
-            return y
-        # try SciPy SG
-        if mode == "Savitzky–Golay":
-            try:
-                from scipy.signal import savgol_filter
-                win = min(len(y) - (1 - len(y)%2), sg_window)  # odd <= len(y)
-                if win < 3: return y
-                if sg_poly >= win: sg_poly = max(1, win-1)
-                return savgol_filter(y, window_length=win, polyorder=sg_poly, mode="wrap")
-            except Exception:
-                return y
-        # try statsmodels LOESS
-        if mode == "LOESS":
-            try:
-                from statsmodels.nonparametric.smoothers_lowess import lowess
-                # normalize x to [0,1] for numerical stability
-                x = x_ord.astype(float)
-                x0 = (x - x.min()) / max(1e-9, (x.max() - x.min()))
-                yy = lowess(y, x0, frac=float(loess_span), return_sorted=False)
-                return np.asarray(yy, dtype=float)
-            except Exception:
-                return y
-        return y
-    
-    def _fmt_pct(x):
-        return "" if not np.isfinite(x) else f"{x:.1f}%"
-    
-    def _fmt_num(x):
-        return "" if not np.isfinite(x) else f"{x:.2f}"
-
-    # ============================== Upload Section Helper ==============================
-    def render_upload_section():
-        st.subheader("Upload Database")
-    
-        uploaded = st.file_uploader(
-            "Upload .xlsx with your DB", 
-            type=["xlsx"], 
-            key="db_upl"
-        )
-        build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
-    
-        return uploaded, build_btn
     
     # ============================== Variables ==============================
     VAR_CORE = [
