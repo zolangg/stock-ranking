@@ -4,6 +4,7 @@
 # + Robust components.html() try-chain
 # + Horizontal scroll & fixed widths so columns always visible
 # + Light efficiency passes without changing behavior
+# + Dilution algorithm integration with UI, SRS calculation, and display.
 
 import streamlit as st
 import pandas as pd
@@ -12,7 +13,7 @@ import re, json, hashlib, io, math
 import altair as alt
 import matplotlib.pyplot as plt
 import matplotlib.path as mpath
-from datetime import datetime
+from datetime import datetime, date
 
 # CatBoost import (graceful if unavailable)
 try:
@@ -38,6 +39,81 @@ ss.setdefault("cat_model", {})           # CatBoost model per current split
 ss.setdefault("del_selection", [])       # for delete UI
 ss.setdefault("__delete_msg", None)      # flash msg
 ss.setdefault("__catboost_warned", False)
+
+# ============================== Dilution Algorithm ==============================
+def clamp(x, a, b):
+    return max(a, min(b, x))
+
+def calculate_srs(data: dict) -> dict:
+    """Calculates the Structural Risk Score (SRS) based on dilution inputs."""
+    # Step 1A: Funding Pressure F
+    r = data.get("runway_months", 0)
+    F = 0
+    if r < 3: F -= 2
+    elif 3 <= r < 6: F -= 1
+    elif 12 <= r < 18: F += 1
+    elif r >= 18: F += 2
+    if data.get("atm_active"): F -= 1
+    if data.get("equity_line_active"): F -= 0.5
+    if data.get("shelf_raisable_usd", 0) > 0 and data.get("baby_shelf"): F -= 0.25
+    F = clamp(F, -2, 2)
+
+    # Step 1B: Instrument Pressure I
+    I = 0
+    spot_price = data.get("spot_price", 0)
+    os = data.get("outstanding_shares", 1)
+    if spot_price > 0 and os > 0:
+        for w in data.get("warrants", []):
+            strike = w.get("strike", 0)
+            if strike > 0:
+                moneyness = spot_price / strike
+                w_score = 0
+                if moneyness < 0.67: w_score = 0.5
+                elif moneyness < 0.9: w_score = 0.0
+                elif moneyness <= 1.1: w_score = -1.0
+                else: w_score = -1.5 if w.get("registered") else -1.0
+                coverage_weight = min(1.0, w.get("remaining", 0) / (0.30 * os))
+                weighted = w_score * max(0.4, coverage_weight)
+                I += weighted
+    I = clamp(I, -2, 1)
+
+    # Step 1C: Promotion Pressure P
+    P = 0
+    if data.get("pr_count_90d", 0) <= 2: P += 0.5
+    elif data.get("pr_count_90d", 0) > 6: P -= 0.5
+    P += 0.5 if data.get("filing_attached_prs", 0) >= 1 else -0.5
+    
+    prospectus_date = data.get("prospectus_date")
+    if prospectus_date:
+        days_since = (date.today() - prospectus_date).days
+        if data.get("prospectus_type") in {"resale/ATM", "underwritten"} and 0 < days_since <= 21:
+            P -= 0.5
+    P = clamp(P, -1, 1)
+
+    # Step 1D: Float/Supply Stress S
+    S = 0
+    rs_date = data.get("rs_date")
+    if rs_date:
+        days_since_rs = (date.today() - rs_date).days
+        if days_since_rs < 30: S -= 2
+        elif 30 <= days_since_rs < 90: S -= 1
+        elif 90 <= days_since_rs < 180: S -= 0.5
+    as_used_pct = data.get("as_used_pct", 0)
+    if as_used_pct >= 0.9: S -= 1
+    elif 0.75 <= as_used_pct < 0.9: S -= 0.5
+    S = clamp(S, -2, 1)
+
+    # Step 2: Composite SRS
+    srs_score = 0.35 * F + 0.25 * I + 0.20 * P + 0.20 * S
+
+    # Step 3: Structural Class
+    if srs_score >= 1.0: srs_class = "Clean"
+    elif 0 <= srs_score < 1: srs_class = "Balanced"
+    elif -0.5 <= srs_score < 0: srs_class = "Fragile"
+    else: srs_class = "Toxic"
+    
+    return {"SRS": srs_score, "SRS_Class": srs_class}
+
 
 # ============================== Helpers ==============================
 def do_rerun():
@@ -478,47 +554,131 @@ if build_btn:
 st.markdown("---")
 st.subheader("Add Stock")
 
-with st.form("add_form", clear_on_submit=True):
-    c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
-    with c1:
-        ticker      = st.text_input("Ticker", "").strip().upper()
-        mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
-        float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
-        gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")
-        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")
-    with c2:
-        atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
-        pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
-        pm_dol      = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
-        rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
-    with c3:
-        catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
-    submitted = st.form_submit_button("Add to Table", use_container_width=True)
+tab1, tab2 = st.tabs(["Premarket", "Dilution"])
 
-if submitted and ticker:
-    fr   = (pm_vol / float_pm) if float_pm > 0 else 0.0
-    pmmc = (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else 0.0
-    row = {
-        "Ticker": ticker,
-        "MC_PM_Max_M": mc_pmmax,
-        "Float_PM_Max_M": float_pm,
-        "Gap_%": gap_pct,
-        "ATR_$": atr_usd,
-        "PM_Vol_M": pm_vol,
-        "PM_$Vol_M$": pm_dol,
-        "FR_x": fr,
-        "PM$Vol/MC_%": pmmc,
-        "Max_Pull_PM_%": max_pull_pm,
-        "RVOL_Max_PM_cum": rvol_pm_cum,
-        "CatalystYN": catalyst_yn,
-        "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
-    }
-    pred = predict_daily_calibrated(row, ss.get("lassoA", {}))
-    row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
-    denom = row["PredVol_M"]
-    row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
-    ss.rows.append(row); ss.last = row
-    st.success(f"Saved {ticker}."); do_rerun()
+with tab1:
+    with st.form("add_form_pm", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
+        with c1:
+            ticker      = st.text_input("Ticker", "").strip().upper()
+            mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
+            float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
+            gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")
+            max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")
+        with c2:
+            atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
+            pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
+            pm_dol      = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
+            rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
+        with c3:
+            catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
+        submitted_pm = st.form_submit_button("Add to Table", use_container_width=True)
+
+    if submitted_pm and ticker:
+        fr   = (pm_vol / float_pm) if float_pm > 0 else 0.0
+        pmmc = (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else 0.0
+        row = {
+            "Ticker": ticker,
+            "MC_PM_Max_M": mc_pmmax,
+            "Float_PM_Max_M": float_pm,
+            "Gap_%": gap_pct,
+            "ATR_$": atr_usd,
+            "PM_Vol_M": pm_vol,
+            "PM_$Vol_M$": pm_dol,
+            "FR_x": fr,
+            "PM$Vol/MC_%": pmmc,
+            "Max_Pull_PM_%": max_pull_pm,
+            "RVOL_Max_PM_cum": rvol_pm_cum,
+            "CatalystYN": catalyst_yn,
+            "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
+            "SRS": np.nan, "SRS_Class": "N/A", # Default for non-dilution entry
+        }
+        pred = predict_daily_calibrated(row, ss.get("lassoA", {}))
+        row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
+        denom = row["PredVol_M"]
+        row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
+        ss.rows.append(row); ss.last = row
+        st.success(f"Saved {ticker}."); do_rerun()
+
+with tab2:
+    with st.form("add_form_dilution", clear_on_submit=True):
+        st.markdown("###### Core Inputs")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            ticker_d = st.text_input("Ticker", "").strip().upper()
+            runway_months = st.number_input("Runway (months)", min_value=0.0, step=0.1, format="%.1f")
+            spot_price = st.number_input("Current Spot Price ($)", min_value=0.0, step=0.01, format="%.2f")
+        with c2:
+            os_d = st.number_input("Outstanding Shares (M)", min_value=0.0, step=0.01, format="%.2f", help="In millions, e.g., 10.5 for 10,500,000") * 1_000_000
+            as_used_pct = st.number_input("AS Used % (OS/AS)", min_value=0.0, max_value=1.0, step=0.01, format="%.2f")
+            rs_date_d = st.date_input("Last R/S Date", value=None)
+        with c3:
+            pr_count_90d = st.number_input("PRs (last 90d)", min_value=0, step=1)
+            filing_attached_prs = st.number_input("PRs with filings (90d)", min_value=0, step=1)
+            prospectus_date_d = st.date_input("Last Prospectus Date", value=None)
+            prospectus_type = st.selectbox("Prospectus Type", ["none", "resale/ATM", "underwritten"])
+
+        st.markdown("###### Funding & Shelves")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            atm_active = st.checkbox("ATM Active?")
+        with c2:
+            equity_line_active = st.checkbox("Equity Line Active?")
+        with c3:
+            shelf_raisable_usd = st.number_input("Shelf Raisable ($M)", min_value=0.0, step=0.1, format="%.1f") * 1_000_000
+        with c4:
+            baby_shelf = st.checkbox("Baby Shelf?")
+
+        st.markdown("###### Warrant Tranches (enter up to 2)")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            w1_strike = st.number_input("W1 Strike ($)", min_value=0.0, step=0.01, format="%.2f")
+            w2_strike = st.number_input("W2 Strike ($)", min_value=0.0, step=0.01, format="%.2f")
+        with c2:
+            w1_remaining = st.number_input("W1 Remaining (Shares)", min_value=0, step=1000)
+            w2_remaining = st.number_input("W2 Remaining (Shares)", min_value=0, step=1000)
+        with c3:
+            w1_registered = st.checkbox("W1 Registered?", key="w1r")
+            w2_registered = st.checkbox("W2 Registered?", key="w2r")
+
+        submitted_d = st.form_submit_button("Calculate SRS & Add to Table", use_container_width=True)
+
+    if submitted_d and ticker_d:
+        warrants = []
+        if w1_strike > 0 and w1_remaining > 0:
+            warrants.append({"strike": w1_strike, "remaining": w1_remaining, "registered": w1_registered})
+        if w2_strike > 0 and w2_remaining > 0:
+            warrants.append({"strike": w2_strike, "remaining": w2_remaining, "registered": w2_registered})
+
+        dilution_data = {
+            "runway_months": runway_months,
+            "atm_active": atm_active,
+            "equity_line_active": equity_line_active,
+            "shelf_raisable_usd": shelf_raisable_usd,
+            "baby_shelf": baby_shelf,
+            "warrants": warrants,
+            "rs_date": rs_date_d,
+            "as_used_pct": as_used_pct,
+            "pr_count_90d": pr_count_90d,
+            "filing_attached_prs": filing_attached_prs,
+            "prospectus_date": prospectus_date_d,
+            "prospectus_type": prospectus_type,
+            "spot_price": spot_price,
+            "outstanding_shares": os_d,
+        }
+        srs_results = calculate_srs(dilution_data)
+        
+        # Create a row with NaN for premarket fields but with SRS data
+        row = {
+            "Ticker": ticker_d,
+            "MC_PM_Max_M": np.nan, "Float_PM_Max_M": np.nan, "Gap_%": np.nan,
+            "ATR_$": np.nan, "PM_Vol_M": np.nan, "PM_$Vol_M$": np.nan, "FR_x": np.nan,
+            "PM$Vol/MC_%": np.nan, "Max_Pull_PM_%": np.nan, "RVOL_Max_PM_cum": np.nan,
+            "CatalystYN": "No", "Catalyst": 0.0, "PredVol_M": np.nan, "PM_Vol_%": np.nan,
+            **srs_results
+        }
+        ss.rows.append(row); ss.last = row
+        st.success(f"Saved {ticker_d} with SRS: {srs_results['SRS']:.2f} ({srs_results['SRS_Class']})"); do_rerun()
 
 # ============================== Alignment ==============================
 st.markdown("---")
@@ -1067,6 +1227,8 @@ for row in ss.rows:
         "NCA_int": nca_int,
         "CAT_raw": cat_raw,
         "CAT_int": cat_int,
+        "SRS": stock.get("SRS"),
+        "SRS_Class": stock.get("SRS_Class"),
     })
 
     drows_grouped = []
@@ -1127,7 +1289,8 @@ html = """
   #align td:nth-child(2),#align th:nth-child(2),
   #align td:nth-child(3),#align th:nth-child(3),
   #align td:nth-child(4),#align th:nth-child(4),
-  #align td:nth-child(5),#align th:nth-child(5){text-align:center}
+  #align td:nth-child(5),#align th:nth-child(5),
+  #align td:nth-child(6),#align th:nth-child(6){text-align:center}
   .child-table{width:100%;border-collapse:collapse;margin:2px 0 2px 24px;table-layout:fixed}
   .child-table th,.child-table td{font-size:11px;padding:3px 6px;border-bottom:1px solid #e5e7eb;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .child-table th:first-child,.child-table td:first-child{text-align:left}
@@ -1136,14 +1299,13 @@ html = """
   .pos{color:#059669}.neg{color:#dc2626}
   .sig-hi{background:rgba(250,204,21,0.18)!important}
   .sig-lo{background:rgba(239,68,68,0.18)!important}
-
   /* Ensure horizontal scroll with fixed min-width so columns never hide */
-  #align { min-width: 1060px; } /* tweak if you change column widths below */
+  #align { min-width: 1200px; } /* Tweak if you change column widths below */
   #align-wrap { overflow:auto; width:100%; }
 </style></head><body>
   <div id="align-wrap">
     <table id="align" class="display nowrap stripe" style="width:100%">
-      <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th><th id="hdrN"></th><th id="hdrC"></th></tr></thead>
+      <thead><tr><th>Ticker</th><th id="hdrA"></th><th id="hdrB"></th><th id="hdrN"></th><th id="hdrC"></th><th>SRS</th></tr></thead>
     </table>
   </div>
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
@@ -1163,6 +1325,17 @@ html = """
       return `<div class="bar-wrap"><div class="bar ${cls}"><span style="width:${w}%"></span></div><div class="bar-label">${text}</div></div>`;
     }
     function formatVal(x){return (x==null||isNaN(x))?'':Number(x).toFixed(2);}
+    function formatSRS(srs, srsClass) {
+        if (srs == null || isNaN(srs)) return 'N/A';
+        const score = Number(srs).toFixed(2);
+        const cls = srsClass || '';
+        let color = '#374151'; // default gray
+        if (cls === 'Clean') color = '#10b981';
+        else if (cls === 'Balanced') color = '#3b82f6';
+        else if (cls === 'Fragile') color = '#f59e0b';
+        else if (cls === 'Toxic') color = '#ef4444';
+        return `<div style="font-weight:500;color:${color};">${score} <span style="font-size:0.8em;opacity:0.8;">(${cls})</span></div>`;
+    }
 
     function childTableHTML(ticker){
       const rows=(data.details||{})[ticker]||[];
@@ -1229,15 +1402,16 @@ html = """
       const table=$('#align').DataTable({
         data: data.rows||[],
         paging:false, info:false, searching:false, order:[[0,'asc']],
-        responsive:false,   // keep all columns visible
-        scrollX:true,       // enable horizontal scroll inside wrapper
-        autoWidth:false,    // we set widths manually
+        responsive:false,
+        scrollX:true,
+        autoWidth:false,
         columns:[
-          {data:'Ticker', width:'140px'},
-          {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int,'blue'),   width:'220px'},
-          {data:null, render:(row)=>barCellLabeled(row.B_val_raw,row.B_label,row.B_val_int,'red'),    width:'220px'},
-          {data:null, render:(row)=>barCellLabeled(row.NCA_raw,'NCA',row.NCA_int,'green'),            width:'220px'},
-          {data:null, render:(row)=>barCellLabeled(row.CAT_raw,'CatBoost',row.CAT_int,'purple'),      width:'220px'}
+          {data:'Ticker', width:'120px'},
+          {data:null, render:(d,t,r)=>barCellLabeled(r.A_val_raw,r.A_label,r.A_val_int,'blue'),   width:'200px'},
+          {data:null, render:(d,t,r)=>barCellLabeled(r.B_val_raw,r.B_label,r.B_val_int,'red'),    width:'200px'},
+          {data:null, render:(d,t,r)=>barCellLabeled(r.NCA_raw,'NCA',r.NCA_int,'green'),            width:'200px'},
+          {data:null, render:(d,t,r)=>barCellLabeled(r.CAT_raw,'CatBoost',r.CAT_int,'purple'),      width:'200px'},
+          {data:null, render:(d,t,r)=>formatSRS(r.SRS, r.SRS_Class), width:'150px'}
         ]
       });
       table.columns.adjust().draw();
@@ -1254,12 +1428,8 @@ html = """
 """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 
-# Force refresh of the HTML table when split/rows change
-cache_bust = f"{gA}|{gB}|{int(thr)}|{len(summary_rows)}"
-
-# FIX: Replaced the faulty, complex try-except block with a single, reliable call.
-# This ensures that the scrolling functionality is correctly enabled in modern Streamlit versions.
-components.html(html, height=800, scrolling=True)
+# Reduced height for a more compact layout
+components.html(html, height=600, scrolling=True)
 
 
 # ============================== Alignment exports (CSV full + Markdown compact) ==============================
@@ -1282,7 +1452,7 @@ if summary_rows:
         return "\n".join(lines)
 
     df_align_md = pd.DataFrame(summary_rows)[
-        ["Ticker", "A_label", "A_val_int", "B_label", "B_val_int", "NCA_int", "CAT_int"]
+        ["Ticker", "A_label", "A_val_int", "B_label", "B_val_int", "NCA_int", "CAT_int", "SRS", "SRS_Class"]
     ].rename(
         columns={
             "A_label": "A group",
@@ -1291,6 +1461,7 @@ if summary_rows:
             "B_val_int": "B (%) — Median centers",
             "NCA_int": "NCA (%)",
             "CAT_int": "CatBoost (%)",
+            "SRS_Class": "Dilution Class",
         }
     )
 
@@ -1307,27 +1478,21 @@ if summary_rows:
                 full_rows.append({
                     "Ticker": tkr,
                     "Section": section,
-                    "Variable": "",
-                    "Value": "",
-                    "A center": "",
-                    "B center": "",
-                    "Δ vs A": "",
-                    "Δ vs B": "",
-                    "σ(A)": "",
-                    "σ(B)": "",
-                    "Is core": "",
+                    "Variable": "", "Value": "", "A center": "", "B center": "", "Δ vs A": "", "Δ vs B": "",
+                    "σ(A)": "", "σ(B)": "", "Is core": "",
                     "A group": s.get("A_label", ""),
                     "B group": s.get("B_label", ""),
                     "A (%) — Median centers": s.get("A_val_int", ""),
                     "B (%) — Median centers": s.get("B_val_int", ""),
                     "NCA (%)": s.get("NCA_int", ""),
                     "CatBoost (%)": s.get("CAT_int", ""),
+                    "SRS": s.get("SRS"),
+                    "SRS_Class": s.get("SRS_Class"),
                 })
                 continue
 
             full_rows.append({
-                "Ticker": tkr,
-                "Section": section,
+                "Ticker": tkr, "Section": section,
                 "Variable": r.get("Variable", ""),
                 "Value": ("" if pd.isna(r.get("Value")) else r.get("Value")),
                 "A center": ("" if pd.isna(r.get("A")) else r.get("A")),
@@ -1337,12 +1502,13 @@ if summary_rows:
                 "σ(A)": ("" if (r.get("sA") is None or pd.isna(r.get("sA"))) else r.get("sA")),
                 "σ(B)": ("" if (r.get("sB") is None or pd.isna(r.get("sB"))) else r.get("sB")),
                 "Is core": bool(r.get("is_core", False)),
-                "A group": s.get("A_label", ""),
-                "B group": s.get("B_label", ""),
+                "A group": s.get("A_label", ""), "B group": s.get("B_label", ""),
                 "A (%) — Median centers": s.get("A_val_int", ""),
                 "B (%) — Median centers": s.get("B_val_int", ""),
                 "NCA (%)": s.get("NCA_int", ""),
                 "CatBoost (%)": s.get("CAT_int", ""),
+                "SRS": s.get("SRS"),
+                "SRS_Class": s.get("SRS_Class"),
             })
 
     df_align_csv_full = pd.DataFrame(full_rows)
@@ -1364,7 +1530,7 @@ if summary_rows:
             return ""
 
     # Columns to format
-    two_dec_cols = ["Value", "A center", "B center", "Δ vs A", "Δ vs B"]
+    two_dec_cols = ["Value", "A center", "B center", "Δ vs A", "Δ vs B", "SRS"]
     sigma_cols   = ["σ(A)", "σ(B)"]
     pct_cols     = ["A (%) — Median centers", "B (%) — Median centers", "NCA (%)", "CatBoost (%)"]
 
@@ -1380,6 +1546,7 @@ if summary_rows:
         "Value", "A center", "B center", "Δ vs A", "Δ vs B", "σ(A)", "σ(B)", "Is core",
         "A group", "B group",
         "A (%) — Median centers", "B (%) — Median centers", "NCA (%)", "CatBoost (%)",
+        "SRS", "SRS_Class",
     ]
     df_align_csv_pretty = df_align_csv_full[[c for c in col_order if c in df_align_csv_full.columns]]
 
@@ -1395,9 +1562,12 @@ if summary_rows:
             key="dl_align_csv_full",
         )
     with c2:
+        # Format SRS for markdown export
+        md_df_copy = df_align_md.copy()
+        md_df_copy["SRS"] = md_df_copy["SRS"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "")
         st.download_button(
             "Download Markdown (summary only)",
-            data=_df_to_markdown_simple(df_align_md, float_fmt=".0f").encode("utf-8"),
+            data=_df_to_markdown_simple(md_df_copy).encode("utf-8"),
             file_name="alignment_summary.md",
             mime="text/markdown",
             use_container_width=True,
@@ -1534,8 +1704,8 @@ else:
         rA_close = np.concatenate([rA, [rA[0]]])
         rB_close = np.concatenate([rB, [rB[0]]])
 
-        # ---------- Figure
-        fig, ax = plt.subplots(subplot_kw=dict(polar=True), figsize=(6.5, 6.5))
+        # ---------- Figure (Resized)
+        fig, ax = plt.subplots(subplot_kw=dict(polar=True), figsize=(5, 5))
         ax.set_theta_offset(np.pi / 2)
         ax.set_theta_direction(-1)
         # ---------- Which group has higher median per feature
