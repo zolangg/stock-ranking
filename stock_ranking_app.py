@@ -4,7 +4,8 @@
 # + Robust components.html() try-chain
 # + Horizontal scroll & fixed widths so columns always visible
 # + Light efficiency passes without changing behavior
-# + Dilution algorithm integration with UI, SRS calculation, and display.
+# + Dilution algorithm integrated into a single, unified input form.
+# + Compact radar chart and refined layout.
 
 import streamlit as st
 import pandas as pd
@@ -84,7 +85,7 @@ def calculate_srs(data: dict) -> dict:
     P += 0.5 if data.get("filing_attached_prs", 0) >= 1 else -0.5
     
     prospectus_date = data.get("prospectus_date")
-    if prospectus_date:
+    if prospectus_date and isinstance(prospectus_date, date):
         days_since = (date.today() - prospectus_date).days
         if data.get("prospectus_type") in {"resale/ATM", "underwritten"} and 0 < days_since <= 21:
             P -= 0.5
@@ -93,7 +94,7 @@ def calculate_srs(data: dict) -> dict:
     # Step 1D: Float/Supply Stress S
     S = 0
     rs_date = data.get("rs_date")
-    if rs_date:
+    if rs_date and isinstance(rs_date, date):
         days_since_rs = (date.today() - rs_date).days
         if days_since_rs < 30: S -= 2
         elif 30 <= days_since_rs < 90: S -= 1
@@ -126,6 +127,7 @@ def SAFE_JSON_DUMPS(obj) -> str:
             if isinstance(o, (np.integer,)): return int(o)
             if isinstance(o, (np.floating,)): return float(o)
             if isinstance(o, (np.ndarray,)): return o.tolist()
+            if isinstance(o, (date,)): return o.isoformat()
             return super().default(o)
     s = json.dumps(obj, cls=NpEncoder, ensure_ascii=False, separators=(",", ":"))
     return s.replace("</script>", "<\\/script>")
@@ -550,112 +552,105 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# ============================== Add Stock ==============================
+# ============================== Add Stock (Unified Form) ==============================
 st.markdown("---")
 st.subheader("Add Stock")
 
-tab1, tab2 = st.tabs(["Premarket", "Dilution"])
+with st.form("add_stock_form", clear_on_submit=True):
+    # --- Top row: Ticker is primary key ---
+    ticker = st.text_input("Ticker", "", help="Enter the stock ticker. It's the only required field to add a row.").strip().upper()
 
-with tab1:
-    with st.form("add_form_pm", clear_on_submit=True):
-        c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
-        with c1:
-            ticker      = st.text_input("Ticker", "").strip().upper()
-            mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
-            float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
-            gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")
-            max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")
-        with c2:
-            atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
-            pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
-            pm_dol      = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
-            rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
-        with c3:
-            catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
-        submitted_pm = st.form_submit_button("Add to Table", use_container_width=True)
+    st.markdown("###### Premarket Data")
+    c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
+    with c1:
+        mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
+        float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
+        gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")
+        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")
+    with c2:
+        atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
+        pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
+        pm_dol      = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
+        rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
+    with c3:
+        catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
 
-    if submitted_pm and ticker:
-        fr   = (pm_vol / float_pm) if float_pm > 0 else 0.0
-        pmmc = (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else 0.0
-        row = {
-            "Ticker": ticker,
-            "MC_PM_Max_M": mc_pmmax,
-            "Float_PM_Max_M": float_pm,
-            "Gap_%": gap_pct,
-            "ATR_$": atr_usd,
-            "PM_Vol_M": pm_vol,
-            "PM_$Vol_M$": pm_dol,
-            "FR_x": fr,
-            "PM$Vol/MC_%": pmmc,
-            "Max_Pull_PM_%": max_pull_pm,
-            "RVOL_Max_PM_cum": rvol_pm_cum,
-            "CatalystYN": catalyst_yn,
-            "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
-            "SRS": np.nan, "SRS_Class": "N/A", # Default for non-dilution entry
-        }
-        pred = predict_daily_calibrated(row, ss.get("lassoA", {}))
-        row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
-        denom = row["PredVol_M"]
-        row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
-        ss.rows.append(row); ss.last = row
-        st.success(f"Saved {ticker}."); do_rerun()
-
-with tab2:
-    with st.form("add_form_dilution", clear_on_submit=True):
+    # --- Dilution data inside an expander ---
+    with st.expander("Add Dilution / Structural Risk Data (Optional)"):
         st.markdown("###### Core Inputs")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            ticker_d = st.text_input("Ticker", "").strip().upper()
-            runway_months = st.number_input("Runway (months)", min_value=0.0, step=0.1, format="%.1f")
-            spot_price = st.number_input("Current Spot Price ($)", min_value=0.0, step=0.01, format="%.2f")
-        with c2:
-            os_d = st.number_input("Outstanding Shares (M)", min_value=0.0, step=0.01, format="%.2f", help="In millions, e.g., 10.5 for 10,500,000") * 1_000_000
-            as_used_pct = st.number_input("AS Used % (OS/AS)", min_value=0.0, max_value=1.0, step=0.01, format="%.2f")
-            rs_date_d = st.date_input("Last R/S Date", value=None)
-        with c3:
-            pr_count_90d = st.number_input("PRs (last 90d)", min_value=0, step=1)
-            filing_attached_prs = st.number_input("PRs with filings (90d)", min_value=0, step=1)
-            prospectus_date_d = st.date_input("Last Prospectus Date", value=None)
-            prospectus_type = st.selectbox("Prospectus Type", ["none", "resale/ATM", "underwritten"])
+        dc1, dc2, dc3 = st.columns(3)
+        with dc1:
+            runway_months = st.number_input("Runway (months)", min_value=0.0, step=0.1, format="%.1f", key="d_runway")
+            spot_price = st.number_input("Current Spot Price ($)", min_value=0.0, step=0.01, format="%.2f", key="d_spot")
+        with dc2:
+            os_d = st.number_input("Outstanding Shares (M)", min_value=0.0, step=0.01, format="%.2f", help="In millions", key="d_os") * 1_000_000
+            as_used_pct = st.number_input("AS Used % (OS/AS)", min_value=0.0, max_value=1.0, step=0.01, format="%.2f", key="d_as")
+            rs_date_d = st.date_input("Last R/S Date", value=None, key="d_rs")
+        with dc3:
+            pr_count_90d = st.number_input("PRs (last 90d)", min_value=0, step=1, key="d_pr")
+            filing_attached_prs = st.number_input("PRs with filings (90d)", min_value=0, step=1, key="d_filing_pr")
+            prospectus_date_d = st.date_input("Last Prospectus Date", value=None, key="d_prosp_date")
+            prospectus_type = st.selectbox("Prospectus Type", ["none", "resale/ATM", "underwritten"], key="d_prosp_type")
 
         st.markdown("###### Funding & Shelves")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            atm_active = st.checkbox("ATM Active?")
-        with c2:
-            equity_line_active = st.checkbox("Equity Line Active?")
-        with c3:
-            shelf_raisable_usd = st.number_input("Shelf Raisable ($M)", min_value=0.0, step=0.1, format="%.1f") * 1_000_000
-        with c4:
-            baby_shelf = st.checkbox("Baby Shelf?")
-
+        dc1, dc2, dc3, dc4 = st.columns(4)
+        dc1.checkbox("ATM Active?", key="d_atm")
+        dc2.checkbox("Equity Line Active?", key="d_eql")
+        shelf_raisable_usd = dc3.number_input("Shelf Raisable ($M)", min_value=0.0, step=0.1, format="%.1f", key="d_shelf") * 1_000_000
+        dc4.checkbox("Baby Shelf?", key="d_baby")
+        
         st.markdown("###### Warrant Tranches (enter up to 2)")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            w1_strike = st.number_input("W1 Strike ($)", min_value=0.0, step=0.01, format="%.2f")
-            w2_strike = st.number_input("W2 Strike ($)", min_value=0.0, step=0.01, format="%.2f")
-        with c2:
-            w1_remaining = st.number_input("W1 Remaining (Shares)", min_value=0, step=1000)
-            w2_remaining = st.number_input("W2 Remaining (Shares)", min_value=0, step=1000)
-        with c3:
-            w1_registered = st.checkbox("W1 Registered?", key="w1r")
-            w2_registered = st.checkbox("W2 Registered?", key="w2r")
+        wc1, wc2, wc3 = st.columns(3)
+        w1_strike = wc1.number_input("W1 Strike ($)", min_value=0.0, step=0.01, format="%.2f", key="w1s")
+        w1_remaining = wc2.number_input("W1 Remaining (Shares)", min_value=0, step=1000, key="w1rem")
+        w1_registered = wc3.checkbox("W1 Registered?", key="w1r_")
+        
+        w2_strike = wc1.number_input("W2 Strike ($)", min_value=0.0, step=0.01, format="%.2f", key="w2s")
+        w2_remaining = wc2.number_input("W2 Remaining (Shares)", min_value=0, step=1000, key="w2rem")
+        w2_registered = wc3.checkbox("W2 Registered?", key="w2r_")
+    
+    submitted = st.form_submit_button("Add Stock to Table", use_container_width=True)
 
-        submitted_d = st.form_submit_button("Calculate SRS & Add to Table", use_container_width=True)
+if submitted and ticker:
+    # --- Collect Premarket Data ---
+    row = {
+        "Ticker": ticker,
+        "MC_PM_Max_M": mc_pmmax if mc_pmmax > 0 else np.nan,
+        "Float_PM_Max_M": float_pm if float_pm > 0 else np.nan,
+        "Gap_%": gap_pct,
+        "ATR_$": atr_usd if atr_usd > 0 else np.nan,
+        "PM_Vol_M": pm_vol if pm_vol > 0 else np.nan,
+        "PM_$Vol_M$": pm_dol if pm_dol > 0 else np.nan,
+        "Max_Pull_PM_%": max_pull_pm,
+        "RVOL_Max_PM_cum": rvol_pm_cum if rvol_pm_cum > 0 else np.nan,
+        "CatalystYN": catalyst_yn,
+        "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
+    }
+    # Calculate derived premarket metrics
+    fr = (pm_vol / float_pm) if float_pm > 0 else np.nan
+    pmmc = (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else np.nan
+    row.update({"FR_x": fr, "PM$Vol/MC_%": pmmc})
 
-    if submitted_d and ticker_d:
+    pred = predict_daily_calibrated(row, ss.get("lassoA", {}))
+    row["PredVol_M"] = float(pred) if np.isfinite(pred) else np.nan
+    denom = row["PredVol_M"]
+    row["PM_Vol_%"] = (row["PM_Vol_M"] / denom) * 100.0 if np.isfinite(denom) and denom > 0 else np.nan
+
+    # --- Collect and Process Dilution Data ---
+    srs_results = {"SRS": np.nan, "SRS_Class": "N/A"}
+    if runway_months > 0 and spot_price > 0: # Use runway as a proxy for intent to fill dilution data
         warrants = []
         if w1_strike > 0 and w1_remaining > 0:
             warrants.append({"strike": w1_strike, "remaining": w1_remaining, "registered": w1_registered})
         if w2_strike > 0 and w2_remaining > 0:
             warrants.append({"strike": w2_strike, "remaining": w2_remaining, "registered": w2_registered})
-
+        
         dilution_data = {
             "runway_months": runway_months,
-            "atm_active": atm_active,
-            "equity_line_active": equity_line_active,
+            "atm_active": st.session_state.d_atm,
+            "equity_line_active": st.session_state.d_eql,
             "shelf_raisable_usd": shelf_raisable_usd,
-            "baby_shelf": baby_shelf,
+            "baby_shelf": st.session_state.d_baby,
             "warrants": warrants,
             "rs_date": rs_date_d,
             "as_used_pct": as_used_pct,
@@ -667,18 +662,15 @@ with tab2:
             "outstanding_shares": os_d,
         }
         srs_results = calculate_srs(dilution_data)
-        
-        # Create a row with NaN for premarket fields but with SRS data
-        row = {
-            "Ticker": ticker_d,
-            "MC_PM_Max_M": np.nan, "Float_PM_Max_M": np.nan, "Gap_%": np.nan,
-            "ATR_$": np.nan, "PM_Vol_M": np.nan, "PM_$Vol_M$": np.nan, "FR_x": np.nan,
-            "PM$Vol/MC_%": np.nan, "Max_Pull_PM_%": np.nan, "RVOL_Max_PM_cum": np.nan,
-            "CatalystYN": "No", "Catalyst": 0.0, "PredVol_M": np.nan, "PM_Vol_%": np.nan,
-            **srs_results
-        }
-        ss.rows.append(row); ss.last = row
-        st.success(f"Saved {ticker_d} with SRS: {srs_results['SRS']:.2f} ({srs_results['SRS_Class']})"); do_rerun()
+        st.success(f"Calculated SRS for {ticker}: {srs_results['SRS']:.2f} ({srs_results['SRS_Class']})")
+
+    row.update(srs_results)
+    
+    # Add the final combined row
+    ss.rows.append(row)
+    ss.last = row
+    st.success(f"Added {ticker} to the analysis table."); do_rerun()
+
 
 # ============================== Alignment ==============================
 st.markdown("---")
@@ -1721,8 +1713,6 @@ else:
             except Exception:
                 higher_group[f] = ""
 
-        # FIX: Resolve SyntaxError by separating string replacement from f-string formatting.
-        # This also correctly escapes '$' for Matplotlib labels.
         clean_labels = [f.replace('$', r'\$') + f"\n({higher_group.get(f, '')})↑" for f in axes]
         ax.set_thetagrids(angles * 180/np.pi, labels=clean_labels)
 
@@ -1756,24 +1746,19 @@ else:
                     Xs = (X - mu) / sd
 
                     if ncam["kind"] == "lda" and ncam.get("w_vec") is not None:
-                        # LDA: absolute weights as importances
                         w = np.array(ncam["w_vec"], dtype=float)
                         imp_map = {f:0.0 for f in axes}
                         for f, wi in zip(feats_nca, w):
                             if f in imp_map:
                                 imp_map[f] = abs(float(wi))
                     else:
-                        # True NCA path: derive proxy importances from abs corr with the 1-D embedding
                         try:
                             from sklearn.neighbors import NeighborhoodComponentsAnalysis
-                            # Refit a tiny NCA on Xs,y to get the 1-D z for correlations (cheap; only for display)
                             nca_tmp = NeighborhoodComponentsAnalysis(n_components=1, random_state=0, max_iter=200)
                             z = nca_tmp.fit_transform(Xs, y).ravel()
-                            # abs Pearson corr(feature_j, z)
                             imp = []
                             for j, f in enumerate(feats_nca):
                                 xj = Xs[:, j]
-                                # handle constant columns
                                 if np.std(xj) < 1e-9:
                                     imp.append(0.0)
                                 else:
@@ -1784,11 +1769,9 @@ else:
                                 if f in imp_map:
                                     imp_map[f] = v
                         except Exception:
-                            # fallback: equal weights
                             imp_map = {f:1.0 for f in axes}
 
                     arr = np.array([imp_map.get(f, 0.0) for f in axes], dtype=float)
-                    # normalize to [0,1] for plotting
                     if np.isfinite(arr).any():
                         mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
                         norm_imp = (arr - mn) / (mx - mn + 1e-9) if mx > mn else np.zeros_like(arr)
@@ -1838,7 +1821,7 @@ else:
             ax.plot(angles_close, rS_close, color=color, linewidth=2, label=tkr)
             ax.fill(angles_close, rS_close, color=color, alpha=0.20)
 
-        ax.legend(loc="upper right", bbox_to_anchor=(1.28, 1.05), frameon=False)
+        ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.05), frameon=False, fontsize='small')
         fig.tight_layout()
 
         st.pyplot(fig, use_container_width=True)
