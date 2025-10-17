@@ -1404,40 +1404,39 @@ if summary_rows:
             key="dl_align_md_summary",
         )
 
-# ============================== Radar — centers vs stocks (Matplotlib, with toggles) ==============================
+# ============================== Bar Chart — centers vs stocks (Altair replacement for Radar) ==============================
 st.markdown("---")
-st.subheader("Radar")
+st.subheader("Characteristic Profile (Bar Chart)")
 
 if not ss.rows:
-    st.info("Add at least one stock to see the radar chart.")
+    st.info("Add at least one stock to see the characteristic profile chart.")
 else:
-    def _available_live_axes_mpl():
-        # Correctly use ALLOWED_LIVE_FEATURES and EXCLUDE_FOR_NCA for axis selection
+    # This helper function determines which "live" features are available to plot
+    def _available_live_axes():
         axes = [f for f in ALLOWED_LIVE_FEATURES if f in med_tbl.index and f not in EXCLUDE_FOR_NCA]
         order_hint = [
             "Gap_%","FR_x","PM$Vol/MC_%","Catalyst","Max_Pull_PM_%","RVOL_Max_PM_cum",
             "MC_PM_Max_M","Float_PM_Max_M","PM_Vol_M","PM_$Vol_M$","ATR_$"
         ]
-        # Keep order while filtering
         ordered_axes = [a for a in order_hint if a in axes]
-        # Add any remaining valid axes that weren't in the hint
         remaining_axes = [a for a in axes if a not in ordered_axes]
         return ordered_axes + remaining_axes
 
-    def _catboost_topk_features_mpl(model: dict, k: int = 6) -> list[str]:
+    # This helper function finds the top N most important features from the CatBoost model
+    def _catboost_topk_features(model: dict, k: int = 6) -> list[str]:
         if not (model and model.get("ok") and model.get("cb")):
             return []
         try:
             cb = model["cb"]
-            feats = model["feats"] # These are already filtered correctly
+            feats = model["feats"]
             imps = np.array(cb.get_feature_importance(), dtype=float)
             order = np.argsort(imps)[::-1]
-            # Ensure features are also in the median table to be plottable
             return [feats[i] for i in order[:k] if feats[i] in med_tbl.index]
         except Exception:
             return []
 
-    def _norm_minmax_between_centers_mpl(values: dict, a_center: dict, b_center: dict) -> dict:
+    # This crucial helper function normalizes values to a 0-1 scale based on the A and B centers
+    def _norm_minmax_between_centers(values: dict, a_center: dict, b_center: dict) -> dict:
         out = {}
         eps = 1e-9
         for f, x in values.items():
@@ -1446,6 +1445,7 @@ else:
             lo = np.nanmin([a, b])
             hi = np.nanmax([a, b])
             span = hi - lo
+            # Fallback if centers are identical: use standard deviation to create a range
             if not np.isfinite(span) or span <= eps:
                 try:
                     sA = float(disp_tbl.at[f, gA]) if f in disp_tbl.index else np.nan
@@ -1458,276 +1458,138 @@ else:
                     lo, hi = mid - 3*s, mid + 3*s
                     span = hi - lo
                 else:
-                    lo, span = 0.0, 1.0
+                    lo, span = 0.0, 1.0 # Absolute fallback
             v = (x - lo) / (span + eps)
-            out[f] = float(np.clip(v, 0.0, 1.0)) if np.isfinite(v) else np.nan
+            out[f] = float(np.clip(v, 0.0, 1.0)) if np.isfinite(v) else 0.5 # Use midpoint for NaNs
         return out
 
-    axes_all = _available_live_axes_mpl()
+    axes_all = _available_live_axes()
     if not axes_all:
-        st.info("No live features available for radar plotting with current split.")
+        st.info("No live features available for plotting with current split.")
     else:
         # ---------- Controls
-        c1, c2, c3, c4 = st.columns([1.4, 1.4, 1.1, 1.3])
+        c1, c2, c3 = st.columns([1.2, 1.8, 1.8])
         with c1:
             feat_mode = st.radio(
                 "Features",
-                ["Core", "All live", "Top-6 CatBoost importances"],
+                ["Core", "All live", "Top-6 CatBoost"],
                 index=0,
-                key="radar_feat_mode_mpl",
-                help="Pick which axes to plot.",
-                horizontal=False,
+                key="barchart_feat_mode",
+                help="Pick which characteristics to plot.",
             )
+            show_A = st.checkbox(f"Show {gA} center", value=True, key="barchart_show_A")
+            show_B = st.checkbox(f"Show {gB} center", value=True, key="barchart_show_B")
         with c2:
-            show_A = st.checkbox(f"Show {gA} center", value=True, key="radar_show_A")
-            show_B = st.checkbox(f"Show {gB} center", value=True, key="radar_show_B")
-            show_cb = st.checkbox("Show CatBoost polygon", value=True, key="radar_show_cb")
-            show_nca = st.checkbox("Show NCA polygon", value=False, key="radar_show_nca")
-        with c3:
-            # quick selectors for stocks
-            all_tickers_radar = [(r.get("Ticker") or "—") for r in ss.rows]
-            _seen_radar = set()
-            all_tickers_radar = [t for t in all_tickers_radar if not (t in _seen_radar or _seen_radar.add(t))]
-            if "radar_stock_sel_mpl" not in st.session_state:
-                st.session_state["radar_stock_sel_mpl"] = all_tickers_radar[:5]
-            col_btn1, col_btn2 = st.columns(2)
-            with col_btn1:
-                if st.button("Select none", key="radar_none"):
-                    st.session_state["radar_stock_sel_mpl"] = []
-                    do_rerun()
-            with col_btn2:
-                if st.button("Select all", key="radar_all"):
-                    st.session_state["radar_stock_sel_mpl"] = all_tickers_radar[:]
-                    do_rerun()
-        with c4:
+            all_tickers_chart = [(r.get("Ticker") or "—") for r in ss.rows]
+            _seen_chart = set()
+            all_tickers_chart = [t for t in all_tickers_chart if not (t in _seen_chart or _seen_chart.add(t))]
             stocks_overlay = st.multiselect(
                 "Stocks to overlay",
-                options=all_tickers_radar,
-                default=st.session_state.get("radar_stock_sel_mpl", []),
-                key="radar_stock_sel_mpl",
-                help="Turn individual stock polygons on/off.",
+                options=all_tickers_chart,
+                default=all_tickers_chart[:3], # Default to showing the first 3 stocks
+                key="barchart_stock_sel",
             )
+        with c3:
+            st.caption(" ")
+            st.caption(" ")
+            if st.button("Select all stocks", key="br_all"):
+                st.session_state["barchart_stock_sel"] = all_tickers_chart[:]
+                do_rerun()
+            if st.button("Select none", key="br_none"):
+                st.session_state["barchart_stock_sel"] = []
+                do_rerun()
 
-        # ---------- Axes selection
+
+        # ---------- Axes selection based on user choice
         core_live_features = [f for f in VAR_CORE if f in axes_all]
         if feat_mode == "Core":
             axes = core_live_features or axes_all[:6]
         elif feat_mode == "All live":
             axes = axes_all
-        else:
-            axes = _catboost_topk_features_mpl(ss.get("cat_model", {}), k=6) or core_live_features or axes_all[:6]
+        else: # Top-6 CatBoost
+            axes = _catboost_topk_features(ss.get("cat_model", {}), k=6) or core_live_features or axes_all[:6]
 
-        # ---------- Centers dicts
-        centerA = {f: (float(med_tbl.at[f, gA]) if (f in med_tbl.index and pd.notna(med_tbl.at[f, gA])) else np.nan) for f in axes}
-        centerB = {f: (float(med_tbl.at[f, gB]) if (f in med_tbl.index and pd.notna(med_tbl.at[f, gB])) else np.nan) for f in axes}
-
-        # ---------- Angles
-        N = len(axes)
-        angles = np.linspace(0, 2*np.pi, N, endpoint=False)
-        angles_close = np.concatenate([angles, [angles[0]]])
-
-        # ---------- Normalize centers on chosen axes
-        normA = _norm_minmax_between_centers_mpl(centerA, centerA, centerB)
-        normB = _norm_minmax_between_centers_mpl(centerB, centerA, centerB)
-        rA = np.array([normA.get(f, 0.5) for f in axes], dtype=float)
-        rB = np.array([normB.get(f, 0.5) for f in axes], dtype=float)
-        rA_close = np.concatenate([rA, [rA[0]]])
-        rB_close = np.concatenate([rB, [rB[0]]])
-
-        # ---------- Figure
-        fig, ax = plt.subplots(subplot_kw=dict(polar=True), figsize=(6.5, 6.5))
-        ax.set_theta_offset(np.pi / 2)
-        ax.set_theta_direction(-1)
-        # ---------- Which group has higher median per feature
-        higher_group = {}
-        for f in axes:
-            try:
-                valA = float(med_tbl.at[f, gA]) if f in med_tbl.index else np.nan
-                valB = float(med_tbl.at[f, gB]) if f in med_tbl.index else np.nan
-                if np.isfinite(valA) and np.isfinite(valB):
-                    higher_group[f] = gA if valA > valB else gB
-                else:
-                    higher_group[f] = ""
-            except Exception:
-                higher_group[f] = ""
-
-        # FIX: Resolve SyntaxError by separating string replacement from f-string formatting.
-        # This also correctly escapes '$' for Matplotlib labels.
-        clean_labels = [f.replace('$', r'\$') + f"\n({higher_group.get(f, '')})↑" for f in axes]
-        ax.set_thetagrids(angles * 180/np.pi, labels=clean_labels)
-
-        ax.set_ylim(0, 1)
-        ax.set_yticks([0.25, 0.5, 0.75, 1.0])
-        ax.set_yticklabels(["0.25","0.5","0.75","1.0"])
-
-        # ---------- Centers (optional)
-        if show_A:
-            ax.plot(angles_close, rA_close, color="#3b82f6", linewidth=2, label=f"{gA} center")
-        if show_B:
-            ax.plot(angles_close, rB_close, color="#ef4444", linewidth=2, label=f"{gB} center")
-
-        # ---------- NCA polygon (optional; smarter importances)
-        if show_nca and ss.get("nca_model", {}).get("ok"):
-            try:
-                ncam = ss["nca_model"]
-                feats_nca = ncam["feats"]
-
-                # Build a clean matrix X and labels y from the current split for these features
-                df2 = df_cmp[df_cmp["__Group__"].isin([gA, gB])].copy()
-                Xdf = df2[feats_nca].apply(pd.to_numeric, errors="coerce")
-                ybin = (df2["__Group__"].values == gA).astype(int)
-                mask = np.isfinite(Xdf.values).all(axis=1)
-                X = Xdf.values[mask]
-                y = ybin[mask]
-                if X.shape[0] >= 20 and np.unique(y).size == 2:
-                    # standardize using model's mu/sd so alignment matches training
-                    mu = np.array(ncam["mu"], dtype=float)
-                    sd = np.array(ncam["sd"], dtype=float); sd[sd==0] = 1.0
-                    Xs = (X - mu) / sd
-
-                    if ncam["kind"] == "lda" and ncam.get("w_vec") is not None:
-                        # LDA: absolute weights as importances
-                        w = np.array(ncam["w_vec"], dtype=float)
-                        imp_map = {f:0.0 for f in axes}
-                        for f, wi in zip(feats_nca, w):
-                            if f in imp_map:
-                                imp_map[f] = abs(float(wi))
-                    else:
-                        # True NCA path: derive proxy importances from abs corr with the 1-D embedding
-                        try:
-                            from sklearn.neighbors import NeighborhoodComponentsAnalysis
-                            # Refit a tiny NCA on Xs,y to get the 1-D z for correlations (cheap; only for display)
-                            nca_tmp = NeighborhoodComponentsAnalysis(n_components=1, random_state=0, max_iter=200)
-                            z = nca_tmp.fit_transform(Xs, y).ravel()
-                            # abs Pearson corr(feature_j, z)
-                            imp = []
-                            for j, f in enumerate(feats_nca):
-                                xj = Xs[:, j]
-                                # handle constant columns
-                                if np.std(xj) < 1e-9:
-                                    imp.append(0.0)
-                                else:
-                                    r = np.corrcoef(xj, z)[0, 1]
-                                    imp.append(abs(float(r)) if np.isfinite(r) else 0.0)
-                            imp_map = {f:0.0 for f in axes}
-                            for f, v in zip(feats_nca, imp):
-                                if f in imp_map:
-                                    imp_map[f] = v
-                        except Exception:
-                            # fallback: equal weights
-                            imp_map = {f:1.0 for f in axes}
-
-                    arr = np.array([imp_map.get(f, 0.0) for f in axes], dtype=float)
-                    # normalize to [0,1] for plotting
-                    if np.isfinite(arr).any():
-                        mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
-                        norm_imp = (arr - mn) / (mx - mn + 1e-9) if mx > mn else np.zeros_like(arr)
-                        rN_close = np.concatenate([norm_imp, [norm_imp[0]]])
-                        ax.plot(angles_close, rN_close, color="#10b981", linewidth=2, label="NCA (scaled)")
-                        ax.fill(angles_close, rN_close, color="#10b981", alpha=0.18)
-            except Exception:
-                pass
-
-        # ---------- CatBoost polygon (optional)
-        if show_cb and ss.get("cat_model", {}).get("ok"):
-            try:
-                cb = ss["cat_model"]["cb"]
-                feats_cb = ss["cat_model"]["feats"]
-                imp_vals = np.array(cb.get_feature_importance(), dtype=float)
-                imp_map = {f:0.0 for f in axes}
-                for f, v in zip(feats_cb, imp_vals):
-                    if f in imp_map: imp_map[f] = float(v)
-                arr = np.array([imp_map.get(f, 0.0) for f in axes], dtype=float)
-                if np.isfinite(arr).any():
-                    mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
-                    norm_imp = (arr - mn) / (mx - mn + 1e-9) if mx > mn else np.zeros_like(arr)
-                    rC_close = np.concatenate([norm_imp, [norm_imp[0]]])
-                    ax.plot(angles_close, rC_close, color="#8b5cf6", linewidth=2, label="CatBoost (scaled)")
-                    ax.fill(angles_close, rC_close, color="#8b5cf6", alpha=0.20)
-            except Exception:
-                pass
-        elif show_cb and not ss.get("cat_model", {}).get("ok"):
-            st.caption("CatBoost polygon unavailable for this split.")
-
-        # ---------- Stocks (multi-toggle)
-        stock_color_cycle = ["#06b6d4", "#6366f1", "#f59e0b", "#10b981", "#a3e635", "#fb7185", "#14b8a6"]
+        # ---------- Prepare data for Altair
+        centerA_raw = {f: med_tbl.at[f, gA] for f in axes if f in med_tbl.index}
+        centerB_raw = {f: med_tbl.at[f, gB] for f in axes if f in med_tbl.index}
+        
+        chart_data = []
         stock_lookup = { (r.get("Ticker") or "—"): r for r in ss.rows }
 
-        for i, tkr in enumerate(stocks_overlay):
+        # Normalize and add model centers to data
+        normA = _norm_minmax_between_centers(centerA_raw, centerA_raw, centerB_raw)
+        normB = _norm_minmax_between_centers(centerB_raw, centerA_raw, centerB_raw)
+        
+        for f in axes:
+            if show_A:
+                chart_data.append({"Feature": f, "Entity": f"{gA} center", "Value": normA.get(f, 0.5), "RawValue": centerA_raw.get(f)})
+            if show_B:
+                chart_data.append({"Feature": f, "Entity": f"{gB} center", "Value": normB.get(f, 0.5), "RawValue": centerB_raw.get(f)})
+
+        # Normalize and add selected stocks to data
+        for tkr in stocks_overlay:
             row = stock_lookup.get(tkr)
-            if not row:
-                continue
-            vals = {}
+            if not row: continue
+            
+            stock_vals_raw = {f: pd.to_numeric(row.get(f), errors="coerce") for f in axes}
+            stock_vals_norm = _norm_minmax_between_centers(stock_vals_raw, centerA_raw, centerB_raw)
+
             for f in axes:
-                v = pd.to_numeric(row.get(f), errors="coerce")
-                vals[f] = float(v) if np.isfinite(v) else np.nan
-            normS = _norm_minmax_between_centers_mpl(vals, centerA, centerB)
-            rS = np.array([normS.get(f, 0.5) for f in axes], dtype=float)
-            rS_close = np.concatenate([rS, [rS[0]]])
-            color = stock_color_cycle[i % len(stock_color_cycle)]
-            ax.plot(angles_close, rS_close, color=color, linewidth=2, label=tkr)
-            ax.fill(angles_close, rS_close, color=color, alpha=0.20)
+                chart_data.append({"Feature": f, "Entity": tkr, "Value": stock_vals_norm.get(f, 0.5), "RawValue": stock_vals_raw.get(f)})
 
-        ax.legend(loc="upper right", bbox_to_anchor=(1.28, 1.05), frameon=False)
-        fig.tight_layout()
+        if not chart_data:
+            st.info("Select at least one stock or model center to display the chart.")
+        else:
+            df_chart = pd.DataFrame(chart_data)
 
-        st.pyplot(fig, use_container_width=True)
-        st.caption("Normalized per feature using A/B centers (0 = closer to lower center, 1 = closer to higher).")
+            # Define custom colors for entities
+            # We create a dynamic color scale to handle stocks and the two fixed centers
+            domain = [f"{gA} center", f"{gB} center"] + stocks_overlay
+            range_ = ["#3b82f6", "#ef4444"] + ["#06b6d4", "#6366f1", "#f59e0b", "#10b981", "#a3e635"]
+            
+            # Build the Altair Chart
+            chart = alt.Chart(df_chart).mark_bar().encode(
+                x=alt.X('Feature:N', title=None, sort=axes), # Sort bars by predefined axis order
+                y=alt.Y('Value:Q', title='Normalized Value', scale=alt.Scale(domain=[0, 1])),
+                color=alt.Color('Entity:N', scale=alt.Scale(domain=domain, range=range_), legend=alt.Legend(title="Entity")),
+                xOffset='Entity:N',
+                tooltip=[
+                    alt.Tooltip('Feature:N'),
+                    alt.Tooltip('Entity:N'),
+                    alt.Tooltip('Value:Q', format='.3f', title='Normalized Value'),
+                    alt.Tooltip('RawValue:Q', format=',.2f', title='Raw Value')
+                ]
+            ).properties(
+                height=400
+            ).configure_axis(
+                labelAngle=-45
+            ).configure_view(
+                stroke=None # Remove chart border
+            )
 
-        # ---- Export radar: PNG + standalone HTML (base64) ----
-        import base64
+            st.altair_chart(chart, use_container_width=True)
+            st.caption("Values are normalized for each feature. 0 represents the lower model center, and 1 represents the higher model center.")
 
-        radar_png_bytes = None
-        try:
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-            radar_png_bytes = buf.getvalue()
-        except Exception:
-            radar_png_bytes = None
-
-        st.markdown("##### Export radar")
-        col_png, col_html = st.columns(2)
-
-        with col_png:
-            if radar_png_bytes:
+            # ---- Export chart data and interactive HTML ----
+            st.markdown("##### Export chart")
+            c1, c2 = st.columns(2)
+            with c1:
                 st.download_button(
-                    "Download PNG (radar)",
-                    data=radar_png_bytes,
-                    file_name=f"radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                    mime="image/png",
+                    "Download Chart Data (CSV)",
+                    data=df_chart.to_csv(index=False).encode('utf-8'),
+                    file_name="characteristic_profile_data.csv",
+                    mime="text/csv",
                     use_container_width=True,
-                    key="dl_radar_png",
                 )
-            else:
-                st.caption("PNG export failed — could not capture the figure.")
-
-        with col_html:
-            if radar_png_bytes:
-                b64 = base64.b64encode(radar_png_bytes).decode("ascii")
-                html_doc = f"""<!doctype html>
-        <html><head><meta charset="utf-8"><title>Radar</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-          body {{ margin: 0; padding: 1rem; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
-          .wrap {{ display: flex; justify-content: center; }}
-          img {{ max-width: 100%; height: auto; }}
-        </style>
-        </head><body>
-          <div class="wrap">
-            <img alt="Radar" src="data:image/png;base64,{b64}">
-          </div>
-        </body></html>"""
+            with c2:
                 st.download_button(
-                    "Download HTML (radar)",
-                    data=html_doc.encode("utf-8"),
-                    file_name="radar.html",
+                    "Download Chart (HTML)",
+                    data=chart.to_html().encode('utf-8'),
+                    file_name="characteristic_profile_chart.html",
                     mime="text/html",
                     use_container_width=True,
-                    key="dl_radar_html",
                 )
-            else:
-                st.caption("HTML export unavailable — no PNG image to embed.")
-
+                
 # ============================== Distributions across Gain% cutoffs ==============================
 st.markdown("---")
 st.subheader("Distributions")
