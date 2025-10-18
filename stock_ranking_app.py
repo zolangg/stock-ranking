@@ -1628,197 +1628,145 @@ vegaEmbed("#vis", spec, {{actions: true}});
                     key="dl_dist_html",
                 )
 
-# ============================== Stock "Face" (Chernoff Faces) ==============================
+# ============================== Dumbbell: A–B–Stock (+ NCA/Cat markers) ==============================
 st.markdown("---")
-st.subheader("Stock Face (Chernoff visualization)")
+st.subheader("Characteristics — Dumbbell (A–B–Stock) with model markers")
 
-# Guardrails
-if med_tbl.empty or med_tbl.shape[1] < 2:
-    st.info("Load DB and form two groups first.")
+if med_tbl.empty or med_tbl.shape[1] < 2 or not ss.rows:
+    st.info("Load DB, form two groups, and add at least one stock.")
 else:
-    # Variables to use (keep it small & meaningful)
-    vars_available = [v for v in ss.var_core if v in med_tbl.index]
-    default_vars = vars_available[:6] if len(vars_available) >= 6 else vars_available
-    if not default_vars:
-        st.info("No overlapping VAR_CORE variables.")
-    else:
-        with st.expander("Variables & selection", expanded=True):
-            chosen_vars = st.multiselect(
-                "Variables (6–9 works best)",
-                options=vars_available,
-                default=default_vars
-            )
+    import pandas as pd, numpy as np, altair as alt, io, matplotlib.pyplot as plt, json
+    from datetime import datetime
 
-            # pick tickers
-            all_tickers = [(r.get("Ticker") or "—") for r in ss.rows]
-            seen = set(); all_tickers = [t for t in all_tickers if not (t in seen or seen.add(t))]
-            tickers_sel = st.multiselect(
-                "Tickers to render",
-                options=all_tickers,
-                default=all_tickers[: min(6, len(all_tickers))]
-            )
+    # pick a ticker
+    tickers = [(r.get("Ticker") or "—") for r in ss.rows]
+    seen=set(); tickers=[t for t in tickers if not (t in seen or seen.add(t))]
+    t_sel = st.selectbox("Ticker", options=tickers, index=0, key="db_ticker")
 
-        if chosen_vars:
-            import numpy as np, pandas as pd, matplotlib.pyplot as plt, io, json
-            from matplotlib.patches import Ellipse, Arc
+    # choose variables
+    vars_avail = [v for v in (ss.var_core + ss.var_moderate) if v in med_tbl.index]
+    default_vars = ss.var_core or vars_avail[:10]
+    chosen_vars = st.multiselect("Variables", options=vars_avail, default=default_vars, key="db_vars")
 
-            # ---------- Build a small table of series we will render ----------
-            # A/B medians as "reference faces"
-            def _series_from_centers(label):
-                return pd.Series(
-                    {v: (med_tbl.at[v, label] if v in med_tbl.index else np.nan) for v in chosen_vars},
-                    name=f"{label} median"
-                )
+    # fetch latest row for selected ticker
+    row_latest = None
+    for r in reversed(ss.rows):
+        if (r.get("Ticker") or "—") == t_sel:
+            row_latest = r; break
 
-            series_list = [_series_from_centers(gA), _series_from_centers(gB)]
+    if chosen_vars and row_latest:
+        # model scores for this ticker
+        nca_pct = None; cat_pct = None
+        for s in summary_rows:
+            if s.get("Ticker")==t_sel:
+                nca_pct = s.get("NCA_raw"); cat_pct = s.get("CAT_raw"); break
+        nca_t = None if nca_pct is None or not np.isfinite(nca_pct) else float(nca_pct)/100.0
+        cat_t = None if cat_pct is None or not np.isfinite(cat_pct) else float(cat_pct)/100.0
 
-            # latest values for each selected ticker from ss.rows
-            latest = {}
-            for r in reversed(ss.rows):
-                t = r.get("Ticker")
-                if t and t not in latest:
-                    latest[t] = r
-            for t in tickers_sel:
-                row = latest.get(t, {})
-                series_list.append(pd.Series({v: pd.to_numeric(row.get(v), errors="coerce") for v in chosen_vars}, name=t))
-
-            df = pd.DataFrame(series_list)
-
-            # ---------- Normalize each variable to [0,1] with robust bounds ----------
-            def _robust_minmax(col: pd.Series):
-                x = pd.to_numeric(col, errors="coerce")
-                q1, q99 = np.nanquantile(x, 0.01), np.nanquantile(x, 0.99)
-                lo, hi = (q1, q99) if np.isfinite(q1) and np.isfinite(q99) and q1 < q99 else (np.nanmin(x), np.nanmax(x))
-                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                    return x*0 + 0.5
-                return np.clip((x - lo) / (hi - lo), 0, 1)
-
-            df_norm = df.apply(_robust_minmax, axis=0)
-
-            # ---------- Map variables -> facial features ----------
-            # Feel free to reorder/match your intuition:
-            #  head_size, face_elongation, eye_size, eye_sep, pupil, brow, mouth_curve, mouth_width, nose_len
-            # We’ll use up to 9; if fewer provided, some reuse gracefully.
-            feat_names = [
-                "head_size","face_elong","eye_size","eye_sep",
-                "pupil_size","brow_angle","mouth_curve","mouth_width","nose_len"
-            ]
-            # repeat chosen_vars to cover all features
-            var_cycle = (chosen_vars * ((len(feat_names)+len(chosen_vars)-1)//len(chosen_vars)))[:len(feat_names)]
-            mapping = dict(zip(feat_names, var_cycle))
-
-            st.caption("Feature mapping: " + ", ".join([f"{k}←{v}" for k,v in mapping.items()]))
-
-            # Helper: draw a single face on given axes from normalized 0..1 features
-            def draw_face(ax, feats: dict, title=""):
-                ax.set_aspect('equal'); ax.axis('off')
-                # canvas coords: center (0,0), use radius 1.0
-                # Head
-                head_w = 1.2 + 0.6*(feats["head_size"]-0.5)    # 0.9..1.5x
-                head_h = 1.2 + 0.8*(feats["face_elong"]-0.5)   # 0.8..1.6x
-                face = Ellipse((0,0), width=2*head_w, height=2*head_h, facecolor="#f3f4f6", edgecolor="#374151", lw=1.5)
-                ax.add_patch(face)
-
-                # Eyes
-                eye_y = 0.35*head_h
-                eye_sep = 0.4 + 0.4*feats["eye_sep"]          # 0.4..0.8
-                eye_rx = 0.16 + 0.14*feats["eye_size"]        # width radius
-                eye_ry = 0.10 + 0.10*feats["eye_size"]        # height radius
-                for sx in (-1, +1):
-                    cx = sx*eye_sep
-                    eye = Ellipse((cx, eye_y), width=eye_rx*2, height=eye_ry*2, facecolor="white", edgecolor="#111827", lw=1.0)
-                    ax.add_patch(eye)
-                    pupil_r = 0.03 + 0.05*feats["pupil_size"]
-                    ax.add_patch(Ellipse((cx, eye_y), width=2*pupil_r, height=2*pupil_r, facecolor="#111827", edgecolor="#111827"))
-
-                # Brows (angle)
-                brow_span = 0.24
-                ang = (feats["brow_angle"] - 0.5) * 50  # -25..+25 degrees
-                for sx in (-1, +1):
-                    x0, x1 = sx*(eye_sep - brow_span), sx*(eye_sep + brow_span)
-                    y0 = eye_y + 0.18 + (ang/50.0)*0.10*sx  # slight asym for fun
-                    y1 = y0 + (ang/50.0)*(-0.18)
-                    ax.plot([x0, x1], [y0, y1], color="#374151", lw=2, solid_capstyle="round")
-
-                # Mouth
-                mw = 0.6 + 0.6*feats["mouth_width"]           # 0.6..1.2
-                smile = (feats["mouth_curve"] - 0.5) * 1.4    # -0.7..+0.7 (down..up)
-                # Use an arc: center at (0, -0.45), radius= mw/2, angle by smile
-                y_mouth = -0.55*head_h
-                start, stop = (200 - smile*80, 340 + smile*80) if smile >= 0 else (200 + smile*80, 340 - smile*80)
-                ax.add_patch(Arc((0, y_mouth), mw, mw*0.7, angle=0, theta1=start, theta2=stop, color="#111827", lw=2))
-
-                # Nose
-                nose_len = 0.12 + 0.25*feats["nose_len"]      # 0.12..0.37
-                ax.plot([0, 0], [0.1, 0.1 - nose_len], color="#111827", lw=1.8)
-
-                # Title
-                ax.text(0, -1.25*head_h, title, ha="center", va="top", fontsize=10)
-
-            # Convert each row’s normalized values into features
-            def row_to_feats(row_norm: pd.Series) -> dict:
-                d = {}
-                for fname, vname in mapping.items():
-                    val = float(row_norm.get(vname, 0.5))
-                    if not np.isfinite(val): val = 0.5
-                    d[fname] = np.clip(val, 0, 1)
-                return d
-
-            # Prepare a grid (2 columns if many)
-            n = df_norm.shape[0]
-            ncols = 3 if n >= 6 else 2
-            nrows = int(np.ceil(n / ncols))
-            fig, axs = plt.subplots(nrows, ncols, figsize=(3.2*ncols, 3.7*nrows))
-            axs = np.array(axs).reshape(-1)
-
-            for i, (name, row) in enumerate(df_norm.iterrows()):
-                feats = row_to_feats(row)
-                draw_face(axs[i], feats, title=str(name))
-            # turn off any leftover axes
-            for j in range(i+1, len(axs)):
-                axs[j].axis('off')
-
-            fig.tight_layout()
-            st.pyplot(fig, use_container_width=True)
-
-            # ===================== EXPORTS =====================
-            st.markdown("##### Export Stock Faces")
-            # PNG
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-            png_bytes = buf.getvalue()
-            plt.close(fig)
-
-            # Simple HTML export: render a small HTML page with an embedded PNG
-            import base64
-            b64 = base64.b64encode(png_bytes).decode("ascii")
-            html_simple = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Stock Faces</title></head>
-<body><img alt="stock faces" src="data:image/png;base64,{b64}"/></body></html>"""
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "Download PNG (faces)",
-                    data=png_bytes,
-                    file_name=f"stock_faces_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                    mime="image/png",
-                    use_container_width=True,
-                    key="dl_faces_png"
-                )
-            with c2:
-                st.download_button(
-                    "Download HTML (static image)",
-                    data=html_simple.encode("utf-8"),
-                    file_name="stock_faces.html",
-                    mime="text/html",
-                    use_container_width=True,
-                    key="dl_faces_html"
-                )
-
-            st.caption(
-                "Chernoff Faces map your chosen variables to facial features. "
-                "A/B medians give two reference ‘looks’; candidate tickers reveal how their ‘face’ compares at a glance."
-            )
+        # build tidy frame
+        rows=[]
+        for v in chosen_vars:
+            if v not in med_tbl.index: continue
+            a = float(med_tbl.at[v, gA]) if v in med_tbl.index else np.nan
+            b = float(med_tbl.at[v, gB]) if v in med_tbl.index else np.nan
+            x = pd.to_numeric(row_latest.get(v), errors="coerce")
+            denom = (a - b)
+            t = np.nan
+            if np.isfinite(a) and np.isfinite(b) and np.isfinite(x) and abs(denom) > 1e-12:
+                t = float((x - b) / denom)
+            t_clamped = float(np.clip(t, 0.0, 1.0)) if np.isfinite(t) else np.nan
+            rows.append({"Variable": v, "A_center": a, "B_center": b, "Stock_value": float(x) if np.isfinite(x) else np.nan, "t_stock": t_clamped})
+        df = pd.DataFrame(rows)
+        if df.empty:
+            st.info("No overlapping variables to plot.")
         else:
-            st.info("Choose at least one variable.")
+            df["abs_from_mid"]=np.abs(df["t_stock"] - 0.5)
+            df = df.sort_values("abs_from_mid", ascending=False)
+
+            endA = df.assign(Series="A center", t=1.0, Val=df["A_center"])
+            endB = df.assign(Series="B center", t=0.0, Val=df["B_center"])
+            stk  = df.assign(Series=t_sel,      t=df["t_stock"], Val=df["Stock_value"])
+            base = pd.concat([endA, endB, stk], ignore_index=True)
+
+            extras=[]
+            if nca_t is not None: extras.append(df.assign(Series="NCA P(A)", t=nca_t, Val=np.nan))
+            if cat_t is not None: extras.append(df.assign(Series="CatBoost P(A)", t=cat_t, Val=np.nan))
+            extra_df = pd.concat(extras, ignore_index=True) if extras else pd.DataFrame(columns=base.columns)
+
+            color_domain = ["B center","A center", t_sel, "NCA P(A)", "CatBoost P(A)"]
+            color_range  = ["#ef4444","#3b82f6","#111827","#10b981","#8b5cf6"]
+
+            rule = alt.Chart(df).mark_rule().encode(
+                y=alt.Y("Variable:N", sort=list(df["Variable"][::-1])),
+                x=alt.X("x0:Q", title=f"Closer to {gB}  ←  Stock position  →  Closer to {gA}", scale=alt.Scale(domain=[0,1])),
+                x2="x1:Q",
+                tooltip=[alt.Tooltip("B_center:Q", title=f"{gB} center", format=".3f"),
+                         alt.Tooltip("A_center:Q", title=f"{gA} center", format=".3f")]
+            ).transform_calculate(x0="0", x1="1")
+
+            pts = alt.Chart(base).mark_point(size=70, filled=True).encode(
+                y=alt.Y("Variable:N", sort=list(df["Variable"][::-1])),
+                x=alt.X("t:Q", scale=alt.Scale(domain=[0,1])),
+                color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range),
+                                legend=alt.Legend(title="", columns=3)),
+                tooltip=["Series:N","Variable:N", alt.Tooltip("Val:Q", title="Value", format=".3f"),
+                         alt.Tooltip("t:Q",   title="Position (0=B,1=A)", format=".2f")]
+            )
+
+            model_pts = alt.Chart(extra_df).mark_point(size=40, filled=True, opacity=0.85).encode(
+                y=alt.Y("Variable:N", sort=list(df["Variable"][::-1])),
+                x=alt.X("t:Q", scale=alt.Scale(domain=[0,1])),
+                color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
+                tooltip=["Series:N", alt.Tooltip("t:Q", title="P(A)", format=".2f")]
+            ) if not extra_df.empty else alt.Chart(pd.DataFrame({"t":[],"Variable":[]})).mark_point()
+
+            chart = (rule + pts + model_pts).properties(height=max(320, 18*len(df)))
+            st.altair_chart(chart, use_container_width=True)
+
+            # --------- EXPORTS ---------
+            # PNG via Matplotlib
+            try:
+                fig, ax = plt.subplots(figsize=(10, max(2.5, 0.32*len(df))))
+                y = np.arange(len(df))[::-1]
+                ax.hlines(y, 0, 1, color="#e5e7eb", linewidth=1.0)
+                ax.scatter([0]*len(y), y, color="#ef4444", label=f"{gB} center", zorder=3)
+                ax.scatter([1]*len(y), y, color="#3b82f6", label=f"{gA} center", zorder=3)
+                xs = df["t_stock"].values
+                ax.scatter(xs, y, color="#111827", label=t_sel, zorder=4)
+                if nca_t is not None: ax.scatter([nca_t]*len(y), y, color="#10b981", s=20, label="NCA P(A)", zorder=3)
+                if cat_t is not None: ax.scatter([cat_t]*len(y), y, color="#8b5cf6", s=20, label="CatBoost P(A)", zorder=3)
+                ax.set_yticks(y); ax.set_yticklabels(list(df["Variable"][::-1]))
+                ax.set_xlim(0,1); ax.set_xlabel(f"0 = closer to {gB}   |   1 = closer to {gA}")
+                ax.legend(loc="upper center", ncols=5, frameon=False, fontsize=8)
+                fig.tight_layout()
+                buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=160, bbox_inches="tight"); plt.close(fig)
+                png_bytes = buf.getvalue()
+            except Exception:
+                png_bytes=None
+
+            # HTML (interactive Altair)
+            try:
+                spec = chart.to_dict()
+                html = f"""<!doctype html><html><head><meta charset="utf-8"><title>Dumbbell</title>
+<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head>
+<body><div id="vis"></div>
+<script>const spec={json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions:true}});</script>
+</body></html>""".encode("utf-8")
+            except Exception:
+                html=None
+
+            c1,c2 = st.columns(2)
+            with c1:
+                st.download_button("Download PNG (dumbbell)", data=png_bytes or b"", disabled=not bool(png_bytes),
+                                   file_name=f"dumbbell_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                                   mime="image/png", use_container_width=True, key="dl_dumbbell_png")
+            with c2:
+                st.download_button("Download HTML (interactive)", data=html or b"", disabled=not bool(html),
+                                   file_name="dumbbell_interactive.html",
+                                   mime="text/html", use_container_width=True, key="dl_dumbbell_html")
+
+            st.caption("Line shows B→A span per variable. Black = stock; green/purple = NCA/CatBoost P(A) projected onto the same 0–1 axis.")
+    else:
+        st.info("Pick at least one variable and a ticker.")
