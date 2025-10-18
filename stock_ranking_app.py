@@ -1628,126 +1628,124 @@ vegaEmbed("#vis", spec, {{actions: true}});
                     key="dl_dist_html",
                 )
 
-# ============================== Dumbbell: A–B–Stock (+ NCA/Cat markers) ==============================
+# ============================== Heatmap: Profile Tiles (A/B/Stock + Models) ==============================
 st.markdown("---")
-st.subheader("Characteristics — Dumbbell (A–B–Stock) with model markers")
+st.subheader("Characteristics — Heatmap (A/B/Stock + model scores)")
 
 if med_tbl.empty or med_tbl.shape[1] < 2 or not ss.rows:
     st.info("Load DB, form two groups, and add at least one stock.")
 else:
-    import pandas as pd, numpy as np, altair as alt, io, matplotlib.pyplot as plt, json
+    import pandas as pd, numpy as np, altair as alt, io, matplotlib.pyplot as plt, seaborn as sns, json  # seaborn only for raster export
     from datetime import datetime
 
-    # pick a ticker
+    # pick ticker & variables
     tickers = [(r.get("Ticker") or "—") for r in ss.rows]
     seen=set(); tickers=[t for t in tickers if not (t in seen or seen.add(t))]
-    t_sel = st.selectbox("Ticker", options=tickers, index=0, key="db_ticker")
+    t_sel = st.selectbox("Ticker (heatmap)", options=tickers, index=0, key="hm_ticker_2")
 
-    # choose variables
     vars_avail = [v for v in (ss.var_core + ss.var_moderate) if v in med_tbl.index]
-    default_vars = ss.var_core or vars_avail[:10]
-    chosen_vars = st.multiselect("Variables", options=vars_avail, default=default_vars, key="db_vars")
+    default_vars = ss.var_core or vars_avail[:14]
+    chosen_vars = st.multiselect("Variables (heatmap)", options=vars_avail, default=default_vars, key="hm_vars_2")
 
-    # fetch latest row for selected ticker
-    row_latest = None
-    for r in reversed(ss.rows):
-        if (r.get("Ticker") or "—") == t_sel:
-            row_latest = r; break
-
-    if chosen_vars and row_latest:
-        # model scores for this ticker
-        nca_pct = None; cat_pct = None
-        for s in summary_rows:
-            if s.get("Ticker")==t_sel:
-                nca_pct = s.get("NCA_raw"); cat_pct = s.get("CAT_raw"); break
-        nca_t = None if nca_pct is None or not np.isfinite(nca_pct) else float(nca_pct)/100.0
-        cat_t = None if cat_pct is None or not np.isfinite(cat_pct) else float(cat_pct)/100.0
-
-        # build tidy frame
-        rows=[]
-        for v in chosen_vars:
-            if v not in med_tbl.index: continue
-            a = float(med_tbl.at[v, gA]) if v in med_tbl.index else np.nan
-            b = float(med_tbl.at[v, gB]) if v in med_tbl.index else np.nan
-            x = pd.to_numeric(row_latest.get(v), errors="coerce")
-            denom = (a - b)
-            t = np.nan
-            if np.isfinite(a) and np.isfinite(b) and np.isfinite(x) and abs(denom) > 1e-12:
-                t = float((x - b) / denom)
-            t_clamped = float(np.clip(t, 0.0, 1.0)) if np.isfinite(t) else np.nan
-            rows.append({"Variable": v, "A_center": a, "B_center": b, "Stock_value": float(x) if np.isfinite(x) else np.nan, "t_stock": t_clamped})
-        df = pd.DataFrame(rows)
-        if df.empty:
-            st.info("No overlapping variables to plot.")
+    if chosen_vars:
+        # latest row of that ticker
+        latest=None
+        for r in reversed(ss.rows):
+            if (r.get("Ticker") or "—")==t_sel:
+                latest=r; break
+        if latest is None:
+            st.info("No data for the selected ticker.")
         else:
-            df["abs_from_mid"]=np.abs(df["t_stock"] - 0.5)
-            df = df.sort_values("abs_from_mid", ascending=False)
+            # values table
+            data=[]
+            for v in chosen_vars:
+                a = float(med_tbl.at[v, gA]) if v in med_tbl.index else np.nan
+                b = float(med_tbl.at[v, gB]) if v in med_tbl.index else np.nan
+                x = pd.to_numeric(latest.get(v), errors="coerce")
+                data.extend([(v, "A median", a), (v, "B median", b), (v, t_sel, float(x) if np.isfinite(x) else np.nan)])
+            df_val = pd.DataFrame(data, columns=["Variable","Series","Value"])
 
-            endA = df.assign(Series="A center", t=1.0, Val=df["A_center"])
-            endB = df.assign(Series="B center", t=0.0, Val=df["B_center"])
-            stk  = df.assign(Series=t_sel,      t=df["t_stock"], Val=df["Stock_value"])
-            base = pd.concat([endA, endB, stk], ignore_index=True)
+            # z-score per variable for A/B/Stock
+            def _zrow(g):
+                vals = pd.to_numeric(g["Value"], errors="coerce")
+                mu, sd = np.nanmean(vals), np.nanstd(vals)
+                if not np.isfinite(sd) or sd==0: z = (vals*0.0)
+                else: z = (vals - mu) / sd
+                g = g.copy(); g["Z"] = z
+                return g
+            df_val = df_val.groupby("Variable", observed=True).apply(_zrow).reset_index(drop=True)
 
-            extras=[]
-            if nca_t is not None: extras.append(df.assign(Series="NCA P(A)", t=nca_t, Val=np.nan))
-            if cat_t is not None: extras.append(df.assign(Series="CatBoost P(A)", t=cat_t, Val=np.nan))
-            extra_df = pd.concat(extras, ignore_index=True) if extras else pd.DataFrame(columns=base.columns)
+            # model columns
+            nca_pct = None; cat_pct=None
+            for s in summary_rows:
+                if s.get("Ticker")==t_sel:
+                    nca_pct=s.get("NCA_raw"); cat_pct=s.get("CAT_raw"); break
+            model_rows=[]
+            if nca_pct is not None and np.isfinite(nca_pct):
+                for v in chosen_vars: model_rows.append((v, "NCA P(A)", float(nca_pct)/100.0, float(nca_pct)/100.0))
+            if cat_pct is not None and np.isfinite(cat_pct):
+                for v in chosen_vars: model_rows.append((v, "CatBoost P(A)", float(cat_pct)/100.0, float(cat_pct)/100.0))
+            df_mod = pd.DataFrame(model_rows, columns=["Variable","Series","Value","Z"])
 
-            color_domain = ["B center","A center", t_sel, "NCA P(A)", "CatBoost P(A)"]
-            color_range  = ["#ef4444","#3b82f6","#111827","#10b981","#8b5cf6"]
+            df_all = pd.concat([df_val, df_mod], ignore_index=True)
 
-            rule = alt.Chart(df).mark_rule().encode(
-                y=alt.Y("Variable:N", sort=list(df["Variable"][::-1])),
-                x=alt.X("x0:Q", title=f"Closer to {gB}  ←  Stock position  →  Closer to {gA}", scale=alt.Scale(domain=[0,1])),
-                x2="x1:Q",
-                tooltip=[alt.Tooltip("B_center:Q", title=f"{gB} center", format=".3f"),
-                         alt.Tooltip("A_center:Q", title=f"{gA} center", format=".3f")]
-            ).transform_calculate(x0="0", x1="1")
+            # Altair chart
+            rect = alt.Chart(df_all).transform_calculate(
+                isModel="indexof(['NCA P(A)','CatBoost P(A)'], datum.Series) >= 0"
+            ).mark_rect().encode(
+                y=alt.Y("Variable:N", sort=chosen_vars[::-1], title=None),
+                x=alt.X("Series:N",
+                        sort=["B median","A median", t_sel, "NCA P(A)","CatBoost P(A)"],
+                        title=None),
+                color=alt.condition(
+                    alt.datum.isModel,
+                    alt.Color("Value:Q", scale=alt.Scale(domain=[0,1], scheme="greenblue"), title="P(A)"),
+                    alt.Color("Z:Q",     scale=alt.Scale(scheme="redblue"), title="z-score")
+                ),
+                tooltip=["Variable:N","Series:N", alt.Tooltip("Value:Q", format=".3f"), alt.Tooltip("Z:Q", format=".2f", title="z-score")]
+            ).properties(height=max(320, 18*len(chosen_vars)))
 
-            pts = alt.Chart(base).mark_point(size=70, filled=True).encode(
-                y=alt.Y("Variable:N", sort=list(df["Variable"][::-1])),
-                x=alt.X("t:Q", scale=alt.Scale(domain=[0,1])),
-                color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range),
-                                legend=alt.Legend(title="", columns=3)),
-                tooltip=["Series:N","Variable:N", alt.Tooltip("Val:Q", title="Value", format=".3f"),
-                         alt.Tooltip("t:Q",   title="Position (0=B,1=A)", format=".2f")]
-            )
+            st.altair_chart(rect, use_container_width=True)
 
-            model_pts = alt.Chart(extra_df).mark_point(size=40, filled=True, opacity=0.85).encode(
-                y=alt.Y("Variable:N", sort=list(df["Variable"][::-1])),
-                x=alt.X("t:Q", scale=alt.Scale(domain=[0,1])),
-                color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
-                tooltip=["Series:N", alt.Tooltip("t:Q", title="P(A)", format=".2f")]
-            ) if not extra_df.empty else alt.Chart(pd.DataFrame({"t":[],"Variable":[]})).mark_point()
-
-            chart = (rule + pts + model_pts).properties(height=max(320, 18*len(df)))
-            st.altair_chart(chart, use_container_width=True)
-
-            # --------- EXPORTS ---------
-            # PNG via Matplotlib
+            # --------- EXPORTS ----------
+            # 1) PNG (Matplotlib raster export)
             try:
-                fig, ax = plt.subplots(figsize=(10, max(2.5, 0.32*len(df))))
-                y = np.arange(len(df))[::-1]
-                ax.hlines(y, 0, 1, color="#e5e7eb", linewidth=1.0)
-                ax.scatter([0]*len(y), y, color="#ef4444", label=f"{gB} center", zorder=3)
-                ax.scatter([1]*len(y), y, color="#3b82f6", label=f"{gA} center", zorder=3)
-                xs = df["t_stock"].values
-                ax.scatter(xs, y, color="#111827", label=t_sel, zorder=4)
-                if nca_t is not None: ax.scatter([nca_t]*len(y), y, color="#10b981", s=20, label="NCA P(A)", zorder=3)
-                if cat_t is not None: ax.scatter([cat_t]*len(y), y, color="#8b5cf6", s=20, label="CatBoost P(A)", zorder=3)
-                ax.set_yticks(y); ax.set_yticklabels(list(df["Variable"][::-1]))
-                ax.set_xlim(0,1); ax.set_xlabel(f"0 = closer to {gB}   |   1 = closer to {gA}")
-                ax.legend(loc="upper center", ncols=5, frameon=False, fontsize=8)
+                # pivot two tables for a static composite PNG
+                # A/B/Stock z-scores
+                pivot_z = df_val.pivot(index="Variable", columns="Series", values="Z").reindex(index=chosen_vars)
+                # Model probs 0-1
+                pivot_p = df_mod.pivot(index="Variable", columns="Series", values="Value").reindex(index=chosen_vars)
+
+                n_rows = len(chosen_vars)
+                fig_h = max(2.5, 0.35*n_rows)
+                fig, axes = plt.subplots(1, 2, figsize=(10, fig_h), gridspec_kw={'width_ratios':[2,1]})
+                # Left: z-scores
+                im0 = axes[0].imshow(pivot_z.values, aspect='auto', cmap='bwr', vmin=-2.5, vmax=2.5)
+                axes[0].set_yticks(np.arange(n_rows)); axes[0].set_yticklabels(chosen_vars)
+                axes[0].set_xticks(np.arange(pivot_z.shape[1])); axes[0].set_xticklabels(pivot_z.columns, rotation=30, ha='right')
+                axes[0].set_title("A/B/Stock (z-score)")
+                plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+                # Right: model probabilities
+                if pivot_p.size:
+                    im1 = axes[1].imshow(pivot_p.values, aspect='auto', cmap='GnBu', vmin=0, vmax=1)
+                    axes[1].set_yticks(np.arange(n_rows)); axes[1].set_yticklabels([])  # share rows
+                    axes[1].set_xticks(np.arange(pivot_p.shape[1])); axes[1].set_xticklabels(pivot_p.columns, rotation=30, ha='right')
+                    axes[1].set_title("Models P(A)")
+                    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+                else:
+                    axes[1].axis('off')
+
                 fig.tight_layout()
                 buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=160, bbox_inches="tight"); plt.close(fig)
                 png_bytes = buf.getvalue()
             except Exception:
                 png_bytes=None
 
-            # HTML (interactive Altair)
+            # 2) HTML (interactive Altair)
             try:
-                spec = chart.to_dict()
-                html = f"""<!doctype html><html><head><meta charset="utf-8"><title>Dumbbell</title>
+                spec = rect.to_dict()
+                html = f"""<!doctype html><html><head><meta charset="utf-8"><title>Profile Heatmap</title>
 <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
 <script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
 <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head>
@@ -1757,16 +1755,28 @@ else:
             except Exception:
                 html=None
 
-            c1,c2 = st.columns(2)
+            c1, c2 = st.columns(2)
             with c1:
-                st.download_button("Download PNG (dumbbell)", data=png_bytes or b"", disabled=not bool(png_bytes),
-                                   file_name=f"dumbbell_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                                   mime="image/png", use_container_width=True, key="dl_dumbbell_png")
+                st.download_button(
+                    "Download PNG (heatmap)",
+                    data=png_bytes or b"",
+                    disabled=not bool(png_bytes),
+                    file_name=f"profile_heatmap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    key="dl_heatmap_png"
+                )
             with c2:
-                st.download_button("Download HTML (interactive)", data=html or b"", disabled=not bool(html),
-                                   file_name="dumbbell_interactive.html",
-                                   mime="text/html", use_container_width=True, key="dl_dumbbell_html")
+                st.download_button(
+                    "Download HTML (interactive heatmap)",
+                    data=html or b"",
+                    disabled=not bool(html),
+                    file_name="profile_heatmap.html",
+                    mime="text/html",
+                    use_container_width=True,
+                    key="dl_heatmap_html_2"
+                )
 
-            st.caption("Line shows B→A span per variable. Black = stock; green/purple = NCA/CatBoost P(A) projected onto the same 0–1 axis.")
+            st.caption("Left: A/B/Stock (z-scored per variable). Right: model probabilities P(A) in 0–1. Columns aligned by variable.")
     else:
-        st.info("Pick at least one variable and a ticker.")
+        st.info("Pick at least one variable.")
