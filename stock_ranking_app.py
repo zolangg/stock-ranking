@@ -1636,105 +1636,140 @@ st.subheader("Characteristics — Heatmap (A/B/Stock + model scores)")
 if med_tbl.empty or med_tbl.shape[1] < 2 or not ss.rows:
     st.info("Load DB, form two groups, and add at least one stock.")
 else:
-    import pandas as pd
-    import numpy as np
-    import altair as alt
-    import matplotlib.pyplot as plt
-    import seaborn as sns  # only for raster export
-    import io
-    import json
+    import pandas as pd, numpy as np, altair as alt, io, matplotlib.pyplot as plt, json
     from datetime import datetime
 
-    # pick ticker & variables
+    # ---- Pick ticker & variables
     tickers = [(r.get("Ticker") or "—") for r in ss.rows]
-    seen=set(); tickers=[t for t in tickers if not (t in seen or seen.add(t))]
-    t_sel = st.selectbox("Ticker (heatmap)", options=tickers, index=0, key="hm_ticker_2")
+    seen = set()
+    tickers = [t for t in tickers if not (t in seen or seen.add(t))]
+    t_sel = st.selectbox("Ticker (heatmap)", options=tickers, index=0, key="hm_ticker")
 
     vars_avail = [v for v in (ss.var_core + ss.var_moderate) if v in med_tbl.index]
     default_vars = ss.var_core or vars_avail[:14]
-    chosen_vars = st.multiselect("Variables (heatmap)", options=vars_avail, default=default_vars, key="hm_vars_2")
+    chosen_vars = st.multiselect("Variables (heatmap)", options=vars_avail, default=default_vars, key="hm_vars")
 
     if chosen_vars:
-        # latest row of that ticker
-        latest=None
+        # ---- Latest row of that ticker
+        latest = None
         for r in reversed(ss.rows):
-            if (r.get("Ticker") or "—")==t_sel:
-                latest=r; break
+            if (r.get("Ticker") or "—") == t_sel:
+                latest = r
+                break
         if latest is None:
             st.info("No data for the selected ticker.")
         else:
-            # values table
-            data=[]
+            # ---- Values table: A, B, Stock
+            data = []
             for v in chosen_vars:
                 a = float(med_tbl.at[v, gA]) if v in med_tbl.index else np.nan
                 b = float(med_tbl.at[v, gB]) if v in med_tbl.index else np.nan
                 x = pd.to_numeric(latest.get(v), errors="coerce")
                 data.extend([(v, "A median", a), (v, "B median", b), (v, t_sel, float(x) if np.isfinite(x) else np.nan)])
-            df_val = pd.DataFrame(data, columns=["Variable","Series","Value"])
+            df_val = pd.DataFrame(data, columns=["Variable", "Series", "Value"])
 
-            # z-score per variable for A/B/Stock
+            # ---- z-score per variable for A/B/Stock
             def _zrow(g):
                 vals = pd.to_numeric(g["Value"], errors="coerce")
                 mu, sd = np.nanmean(vals), np.nanstd(vals)
-                if not np.isfinite(sd) or sd==0: z = (vals*0.0)
-                else: z = (vals - mu) / sd
-                g = g.copy(); g["Z"] = z
+                if not np.isfinite(sd) or sd == 0:
+                    z = vals * 0.0
+                else:
+                    z = (vals - mu) / sd
+                g = g.copy()
+                g["Z"] = z
                 return g
+
             df_val = df_val.groupby("Variable", observed=True).apply(_zrow).reset_index(drop=True)
+            df_val["isModel"] = False
 
-            # model columns
-            nca_pct = None; cat_pct=None
+            # ---- Model columns (probabilities 0–1, one per variable)
+            nca_pct = None
+            cat_pct = None
             for s in summary_rows:
-                if s.get("Ticker")==t_sel:
-                    nca_pct=s.get("NCA_raw"); cat_pct=s.get("CAT_raw"); break
-            model_rows=[]
+                if s.get("Ticker") == t_sel:
+                    nca_pct = s.get("NCA_raw")
+                    cat_pct = s.get("CAT_raw")
+                    break
+
+            model_rows = []
             if nca_pct is not None and np.isfinite(nca_pct):
-                for v in chosen_vars: model_rows.append((v, "NCA P(A)", float(nca_pct)/100.0, float(nca_pct)/100.0))
+                p = float(nca_pct) / 100.0
+                for v in chosen_vars:
+                    model_rows.append((v, "NCA P(A)", p, p, True))
             if cat_pct is not None and np.isfinite(cat_pct):
-                for v in chosen_vars: model_rows.append((v, "CatBoost P(A)", float(cat_pct)/100.0, float(cat_pct)/100.0))
-            df_mod = pd.DataFrame(model_rows, columns=["Variable","Series","Value","Z"])
+                p = float(cat_pct) / 100.0
+                for v in chosen_vars:
+                    model_rows.append((v, "CatBoost P(A)", p, p, True))
 
+            df_mod = pd.DataFrame(model_rows, columns=["Variable", "Series", "Value", "Z", "isModel"]) if model_rows else \
+                     pd.DataFrame(columns=["Variable", "Series", "Value", "Z", "isModel"])
+
+            # ---- Merge and coerce types (schema-safe)
             df_all = pd.concat([df_val, df_mod], ignore_index=True)
+            df_all["Variable"] = df_all["Variable"].astype(str)
+            df_all["Series"]   = df_all["Series"].astype(str)
+            df_all["Value"]    = pd.to_numeric(df_all["Value"], errors="coerce")
+            if "Z" not in df_all.columns:
+                df_all["Z"] = np.nan
+            df_all["isModel"] = df_all["isModel"].fillna(False).astype(bool)
 
-            # Altair chart
-            rect = alt.Chart(df_all).transform_calculate(
-                isModel="indexof(['NCA P(A)','CatBoost P(A)'], datum.Series) >= 0"
-            ).mark_rect().encode(
-                y=alt.Y("Variable:N", sort=chosen_vars[::-1], title=None),
-                x=alt.X("Series:N",
-                        sort=["B median","A median", t_sel, "NCA P(A)","CatBoost P(A)"],
-                        title=None),
-                color=alt.condition(
-                    alt.datum.isModel,
-                    alt.Color("Value:Q", scale=alt.Scale(domain=[0,1], scheme="greenblue"), title="P(A)"),
-                    alt.Color("Z:Q",     scale=alt.Scale(scheme="redblue"), title="z-score")
-                ),
-                tooltip=["Variable:N","Series:N", alt.Tooltip("Value:Q", format=".3f"), alt.Tooltip("Z:Q", format=".2f", title="z-score")]
-            ).properties(height=max(320, 18*len(chosen_vars)))
+            # ---- Sort lists as plain Python lists
+            series_sort = ["B median", "A median", t_sel, "NCA P(A)", "CatBoost P(A)"]
+            var_sort = list(chosen_vars[::-1])
+
+            # =================== Altair Chart ===================
+            rect_data = alt.Chart(df_all.loc[~df_all["isModel"]]).mark_rect().encode(
+                y=alt.Y("Variable:N", sort=var_sort, title=None),
+                x=alt.X("Series:N", sort=series_sort, title=None),
+                color=alt.Color("Z:Q", scale=alt.Scale(scheme="redblue"), title="z-score"),
+                tooltip=[
+                    alt.Tooltip("Variable:N"),
+                    alt.Tooltip("Series:N"),
+                    alt.Tooltip("Value:Q", format=".3f"),
+                    alt.Tooltip("Z:Q", format=".2f", title="z-score")
+                ]
+            )
+
+            rect_models = alt.Chart(df_all.loc[df_all["isModel"]]).mark_rect().encode(
+                y=alt.Y("Variable:N", sort=var_sort, title=None),
+                x=alt.X("Series:N", sort=series_sort, title=None),
+                color=alt.Color("Value:Q", scale=alt.Scale(domain=[0, 1], scheme="greenblue"), title="P(A)"),
+                tooltip=[
+                    alt.Tooltip("Variable:N"),
+                    alt.Tooltip("Series:N"),
+                    alt.Tooltip("Value:Q", format=".3f", title="P(A)")
+                ]
+            )
+
+            rect = (rect_data + rect_models).properties(
+                height=max(320, 18 * len(chosen_vars))
+            ).configure_view(strokeOpacity=0)
 
             st.altair_chart(rect, use_container_width=True)
 
-            # --------- EXPORTS ----------
+            # =================== EXPORTS ===================
             # 1) PNG (Matplotlib raster export)
             try:
-                # pivot two tables for a static composite PNG
-                # A/B/Stock z-scores
+                # A/B/Stock z-scores pivot
                 pivot_z = df_val.pivot(index="Variable", columns="Series", values="Z").reindex(index=chosen_vars)
-                # Model probs 0-1
-                pivot_p = df_mod.pivot(index="Variable", columns="Series", values="Value").reindex(index=chosen_vars)
+                # Model probs pivot (0-1)
+                pivot_p = df_mod.pivot(index="Variable", columns="Series", values="Value").reindex(index=chosen_vars) \
+                          if not df_mod.empty else pd.DataFrame(index=chosen_vars)
 
                 n_rows = len(chosen_vars)
-                fig_h = max(2.5, 0.35*n_rows)
-                fig, axes = plt.subplots(1, 2, figsize=(10, fig_h), gridspec_kw={'width_ratios':[2,1]})
-                # Left: z-scores
+                fig_h = max(2.6, 0.36 * n_rows)
+                fig, axes = plt.subplots(1, 2, figsize=(10, fig_h), gridspec_kw={'width_ratios': [2, 1]})
+
+                # Left: z-scores heatmap
                 im0 = axes[0].imshow(pivot_z.values, aspect='auto', cmap='bwr', vmin=-2.5, vmax=2.5)
                 axes[0].set_yticks(np.arange(n_rows)); axes[0].set_yticklabels(chosen_vars)
                 axes[0].set_xticks(np.arange(pivot_z.shape[1])); axes[0].set_xticklabels(pivot_z.columns, rotation=30, ha='right')
                 axes[0].set_title("A/B/Stock (z-score)")
                 plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
-                # Right: model probabilities
-                if pivot_p.size:
+                # Right: model probabilities 0–1
+                if not pivot_p.empty and pivot_p.size:
                     im1 = axes[1].imshow(pivot_p.values, aspect='auto', cmap='GnBu', vmin=0, vmax=1)
                     axes[1].set_yticks(np.arange(n_rows)); axes[1].set_yticklabels([])  # share rows
                     axes[1].set_xticks(np.arange(pivot_p.shape[1])); axes[1].set_xticklabels(pivot_p.columns, rotation=30, ha='right')
@@ -1744,10 +1779,12 @@ else:
                     axes[1].axis('off')
 
                 fig.tight_layout()
-                buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=160, bbox_inches="tight"); plt.close(fig)
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+                plt.close(fig)
                 png_bytes = buf.getvalue()
             except Exception:
-                png_bytes=None
+                png_bytes = None
 
             # 2) HTML (interactive Altair)
             try:
@@ -1760,8 +1797,9 @@ else:
 <script>const spec={json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions:true}});</script>
 </body></html>""".encode("utf-8")
             except Exception:
-                html=None
+                html = None
 
+            # ---- Download buttons
             c1, c2 = st.columns(2)
             with c1:
                 st.download_button(
@@ -1781,9 +1819,9 @@ else:
                     file_name="profile_heatmap.html",
                     mime="text/html",
                     use_container_width=True,
-                    key="dl_heatmap_html_2"
+                    key="dl_heatmap_html"
                 )
 
-            st.caption("Left: A/B/Stock (z-scored per variable). Right: model probabilities P(A) in 0–1. Columns aligned by variable.")
+            st.caption("Left: A/B/Stock (z-scored per variable). Right: model probabilities P(A) on a 0–1 scale. Columns aligned per variable.")
     else:
         st.info("Pick at least one variable.")
