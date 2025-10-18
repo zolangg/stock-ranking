@@ -1628,169 +1628,197 @@ vegaEmbed("#vis", spec, {{actions: true}});
                     key="dl_dist_html",
                 )
 
-# ============================== Parallel Coordinates (normalized) ==============================
+# ============================== Stock "Face" (Chernoff Faces) ==============================
 st.markdown("---")
-st.subheader("Parallel coordinates (normalized)")
+st.subheader("Stock Face (Chernoff visualization)")
 
+# Guardrails
 if med_tbl.empty or med_tbl.shape[1] < 2:
-    st.info("Load DB and form two groups first to show parallel coordinates.")
+    st.info("Load DB and form two groups first.")
 else:
-    vars_available = [v for v in ss.var_core + ss.var_moderate if v in med_tbl.index]
-    if not vars_available:
-        st.info("No overlapping variables to draw.")
+    # Variables to use (keep it small & meaningful)
+    vars_available = [v for v in ss.var_core if v in med_tbl.index]
+    default_vars = vars_available[:6] if len(vars_available) >= 6 else vars_available
+    if not default_vars:
+        st.info("No overlapping VAR_CORE variables.")
     else:
         with st.expander("Variables & selection", expanded=True):
             chosen_vars = st.multiselect(
-                "Variables", options=vars_available, default=ss.var_core or vars_available[:8]
+                "Variables (6–9 works best)",
+                options=vars_available,
+                default=default_vars
             )
+
+            # pick tickers
             all_tickers = [(r.get("Ticker") or "—") for r in ss.rows]
             seen = set(); all_tickers = [t for t in all_tickers if not (t in seen or seen.add(t))]
             tickers_sel = st.multiselect(
-                "Tickers to compare",
+                "Tickers to render",
                 options=all_tickers,
-                default=all_tickers[: min(5, len(all_tickers))],
-                help="Select a few added stocks to overlay vs group medians."
+                default=all_tickers[: min(6, len(all_tickers))]
             )
-            line_alpha = st.slider("Line opacity", 0.05, 1.0, 0.35, 0.05)
-            line_width = st.slider("Line width", 0.5, 4.0, 2.0, 0.5)
 
         if chosen_vars:
-            import pandas as pd, numpy as np, altair as alt, io, matplotlib.pyplot as plt
+            import numpy as np, pandas as pd, matplotlib.pyplot as plt, io, json
+            from matplotlib.patches import Ellipse, Arc
 
-            # ---- Build tidy frame (Series × Variable) ----
-            rows = []
-            for var in chosen_vars:
-                a_med = med_tbl.at[var, gA] if var in med_tbl.index else np.nan
-                b_med = med_tbl.at[var, gB] if var in med_tbl.index else np.nan
-                rows.append({"Series": "A median", "Variable": var, "Value": a_med})
-                rows.append({"Series": "B median", "Variable": var, "Value": b_med})
+            # ---------- Build a small table of series we will render ----------
+            # A/B medians as "reference faces"
+            def _series_from_centers(label):
+                return pd.Series(
+                    {v: (med_tbl.at[v, label] if v in med_tbl.index else np.nan) for v in chosen_vars},
+                    name=f"{label} median"
+                )
 
-            # Stock rows
-            ticker_to_row = {}
+            series_list = [_series_from_centers(gA), _series_from_centers(gB)]
+
+            # latest values for each selected ticker from ss.rows
+            latest = {}
             for r in reversed(ss.rows):
                 t = r.get("Ticker")
-                if t and t not in ticker_to_row:
-                    ticker_to_row[t] = r
+                if t and t not in latest:
+                    latest[t] = r
             for t in tickers_sel:
-                row = ticker_to_row.get(t, {})
-                for var in chosen_vars:
-                    rows.append({"Series": t, "Variable": var,
-                                 "Value": pd.to_numeric(row.get(var), errors="coerce")})
+                row = latest.get(t, {})
+                series_list.append(pd.Series({v: pd.to_numeric(row.get(v), errors="coerce") for v in chosen_vars}, name=t))
 
-            df = pd.DataFrame(rows)
+            df = pd.DataFrame(series_list)
 
-            # ---- z-score normalization per variable ----
-            z_list = []
-            for v in chosen_vars:
-                sub = df[df["Variable"] == v].copy()
-                vals = pd.to_numeric(sub["Value"], errors="coerce")
-                mu, sd = np.nanmean(vals), np.nanstd(vals)
-                sd = 1.0 if not np.isfinite(sd) or sd == 0 else sd
-                sub["Z"] = (vals - mu) / sd
-                z_list.append(sub)
-            df_z = pd.concat(z_list, ignore_index=True)
+            # ---------- Normalize each variable to [0,1] with robust bounds ----------
+            def _robust_minmax(col: pd.Series):
+                x = pd.to_numeric(col, errors="coerce")
+                q1, q99 = np.nanquantile(x, 0.01), np.nanquantile(x, 0.99)
+                lo, hi = (q1, q99) if np.isfinite(q1) and np.isfinite(q99) and q1 < q99 else (np.nanmin(x), np.nanmax(x))
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    return x*0 + 0.5
+                return np.clip((x - lo) / (hi - lo), 0, 1)
 
-            # Axis positions
-            pos = {v: i for i, v in enumerate(chosen_vars)}
-            df_z["Xpos"] = df_z["Variable"].map(pos)
+            df_norm = df.apply(_robust_minmax, axis=0)
 
-            color_scale = alt.Scale(domain=["A median", "B median"],
-                                    range=["#3b82f6", "#ef4444"])
+            # ---------- Map variables -> facial features ----------
+            # Feel free to reorder/match your intuition:
+            #  head_size, face_elongation, eye_size, eye_sep, pupil, brow, mouth_curve, mouth_width, nose_len
+            # We’ll use up to 9; if fewer provided, some reuse gracefully.
+            feat_names = [
+                "head_size","face_elong","eye_size","eye_sep",
+                "pupil_size","brow_angle","mouth_curve","mouth_width","nose_len"
+            ]
+            # repeat chosen_vars to cover all features
+            var_cycle = (chosen_vars * ((len(feat_names)+len(chosen_vars)-1)//len(chosen_vars)))[:len(feat_names)]
+            mapping = dict(zip(feat_names, var_cycle))
 
-            base = alt.Chart(df_z).properties(height=380)
+            st.caption("Feature mapping: " + ", ".join([f"{k}←{v}" for k,v in mapping.items()]))
 
-            line = base.mark_line(opacity=line_alpha, strokeWidth=line_width).encode(
-                x=alt.X("Xpos:Q", axis=alt.Axis(labels=False, title=None)),
-                y=alt.Y("Z:Q", axis=alt.Axis(title="Normalized (z-score)")),
-                color=alt.Color("Series:N", scale=color_scale,
-                                legend=alt.Legend(title="", orient="top", columns=3)),
-                detail="Series:N",
-                tooltip=["Series:N", "Variable:N", alt.Tooltip("Value:Q", format=".2f")]
-            )
+            # Helper: draw a single face on given axes from normalized 0..1 features
+            def draw_face(ax, feats: dict, title=""):
+                ax.set_aspect('equal'); ax.axis('off')
+                # canvas coords: center (0,0), use radius 1.0
+                # Head
+                head_w = 1.2 + 0.6*(feats["head_size"]-0.5)    # 0.9..1.5x
+                head_h = 1.2 + 0.8*(feats["face_elong"]-0.5)   # 0.8..1.6x
+                face = Ellipse((0,0), width=2*head_w, height=2*head_h, facecolor="#f3f4f6", edgecolor="#374151", lw=1.5)
+                ax.add_patch(face)
 
-            dots = base.mark_point(size=35).encode(
-                x="Xpos:Q", y="Z:Q",
-                color=alt.Color("Series:N", scale=color_scale, legend=None),
-                tooltip=["Series:N","Variable:N", alt.Tooltip("Value:Q", format=".2f")]
-            )
+                # Eyes
+                eye_y = 0.35*head_h
+                eye_sep = 0.4 + 0.4*feats["eye_sep"]          # 0.4..0.8
+                eye_rx = 0.16 + 0.14*feats["eye_size"]        # width radius
+                eye_ry = 0.10 + 0.10*feats["eye_size"]        # height radius
+                for sx in (-1, +1):
+                    cx = sx*eye_sep
+                    eye = Ellipse((cx, eye_y), width=eye_rx*2, height=eye_ry*2, facecolor="white", edgecolor="#111827", lw=1.0)
+                    ax.add_patch(eye)
+                    pupil_r = 0.03 + 0.05*feats["pupil_size"]
+                    ax.add_patch(Ellipse((cx, eye_y), width=2*pupil_r, height=2*pupil_r, facecolor="#111827", edgecolor="#111827"))
 
-            labels = alt.Chart(pd.DataFrame({"Variable": chosen_vars,
-                                             "Xpos": list(range(len(chosen_vars)))})) \
-                .mark_text(dy=-8).encode(x="Xpos:Q", text="Variable:N")
+                # Brows (angle)
+                brow_span = 0.24
+                ang = (feats["brow_angle"] - 0.5) * 50  # -25..+25 degrees
+                for sx in (-1, +1):
+                    x0, x1 = sx*(eye_sep - brow_span), sx*(eye_sep + brow_span)
+                    y0 = eye_y + 0.18 + (ang/50.0)*0.10*sx  # slight asym for fun
+                    y1 = y0 + (ang/50.0)*(-0.18)
+                    ax.plot([x0, x1], [y0, y1], color="#374151", lw=2, solid_capstyle="round")
 
-            vguides = alt.Chart(pd.DataFrame({"Xpos": list(range(len(chosen_vars)))})) \
-                .mark_rule(opacity=0.25).encode(x="Xpos:Q")
+                # Mouth
+                mw = 0.6 + 0.6*feats["mouth_width"]           # 0.6..1.2
+                smile = (feats["mouth_curve"] - 0.5) * 1.4    # -0.7..+0.7 (down..up)
+                # Use an arc: center at (0, -0.45), radius= mw/2, angle by smile
+                y_mouth = -0.55*head_h
+                start, stop = (200 - smile*80, 340 + smile*80) if smile >= 0 else (200 + smile*80, 340 - smile*80)
+                ax.add_patch(Arc((0, y_mouth), mw, mw*0.7, angle=0, theta1=start, theta2=stop, color="#111827", lw=2))
 
-            chart = (vguides + line + dots + labels).configure_view(strokeOpacity=0)
-            st.altair_chart(chart, use_container_width=True)
+                # Nose
+                nose_len = 0.12 + 0.25*feats["nose_len"]      # 0.12..0.37
+                ax.plot([0, 0], [0.1, 0.1 - nose_len], color="#111827", lw=1.8)
+
+                # Title
+                ax.text(0, -1.25*head_h, title, ha="center", va="top", fontsize=10)
+
+            # Convert each row’s normalized values into features
+            def row_to_feats(row_norm: pd.Series) -> dict:
+                d = {}
+                for fname, vname in mapping.items():
+                    val = float(row_norm.get(vname, 0.5))
+                    if not np.isfinite(val): val = 0.5
+                    d[fname] = np.clip(val, 0, 1)
+                return d
+
+            # Prepare a grid (2 columns if many)
+            n = df_norm.shape[0]
+            ncols = 3 if n >= 6 else 2
+            nrows = int(np.ceil(n / ncols))
+            fig, axs = plt.subplots(nrows, ncols, figsize=(3.2*ncols, 3.7*nrows))
+            axs = np.array(axs).reshape(-1)
+
+            for i, (name, row) in enumerate(df_norm.iterrows()):
+                feats = row_to_feats(row)
+                draw_face(axs[i], feats, title=str(name))
+            # turn off any leftover axes
+            for j in range(i+1, len(axs)):
+                axs[j].axis('off')
+
+            fig.tight_layout()
+            st.pyplot(fig, use_container_width=True)
 
             # ===================== EXPORTS =====================
-            st.markdown("##### Export Parallel Coordinates")
+            st.markdown("##### Export Stock Faces")
+            # PNG
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+            png_bytes = buf.getvalue()
+            plt.close(fig)
 
-            # ---- PNG via Matplotlib ----
-            try:
-                pivot = df_z.pivot(index="Series", columns="Variable", values="Z")
-                fig, ax = plt.subplots(figsize=(max(6, len(chosen_vars)*0.8), 4))
-                x = np.arange(len(chosen_vars))
-                for s, row in pivot.iterrows():
-                    ax.plot(x, row.values, label=s,
-                            alpha=line_alpha, linewidth=line_width)
-                ax.set_xticks(x)
-                ax.set_xticklabels(chosen_vars, rotation=30, ha="right")
-                ax.set_ylabel("Normalized (z-score)")
-                ax.legend(frameon=False, fontsize=8)
-                buf = io.BytesIO()
-                fig.tight_layout()
-                fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-                plt.close(fig)
-                png_bytes = buf.getvalue()
-            except Exception:
-                png_bytes = None
-
-            # ---- HTML (interactive Altair spec) ----
-            try:
-                spec = chart.to_dict()
-                html_tpl = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Parallel Coordinates</title>
-<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
-</head><body><div id="vis"></div>
-<script>const spec={json.dumps(spec)};
-vegaEmbed("#vis", spec, {{actions:true}});</script></body></html>"""
-                html_bytes = html_tpl.encode("utf-8")
-            except Exception:
-                html_bytes = None
+            # Simple HTML export: render a small HTML page with an embedded PNG
+            import base64
+            b64 = base64.b64encode(png_bytes).decode("ascii")
+            html_simple = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Stock Faces</title></head>
+<body><img alt="stock faces" src="data:image/png;base64,{b64}"/></body></html>"""
 
             c1, c2 = st.columns(2)
             with c1:
-                if png_bytes:
-                    st.download_button(
-                        "Download PNG (parallel coords)",
-                        data=png_bytes,
-                        file_name=f"parallel_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                        mime="image/png",
-                        use_container_width=True,
-                        key="dl_parallel_png"
-                    )
-                else:
-                    st.caption("PNG export failed.")
+                st.download_button(
+                    "Download PNG (faces)",
+                    data=png_bytes,
+                    file_name=f"stock_faces_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    key="dl_faces_png"
+                )
             with c2:
-                if html_bytes:
-                    st.download_button(
-                        "Download HTML (interactive)",
-                        data=html_bytes,
-                        file_name="parallel_coords.html",
-                        mime="text/html",
-                        use_container_width=True,
-                        key="dl_parallel_html"
-                    )
-                else:
-                    st.caption("HTML export failed.")
+                st.download_button(
+                    "Download HTML (static image)",
+                    data=html_simple.encode("utf-8"),
+                    file_name="stock_faces.html",
+                    mime="text/html",
+                    use_container_width=True,
+                    key="dl_faces_html"
+                )
 
             st.caption(
-                "Each vertical axis represents a variable normalized by z-score. "
-                "Blue/Red = group medians; selected tickers overlay as extra lines."
+                "Chernoff Faces map your chosen variables to facial features. "
+                "A/B medians give two reference ‘looks’; candidate tickers reveal how their ‘face’ compares at a glance."
             )
         else:
             st.info("Choose at least one variable.")
