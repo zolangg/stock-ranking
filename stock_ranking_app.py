@@ -8,7 +8,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import seaborn as sns
 import re, json, hashlib, io, math
 import altair as alt
 import matplotlib.pyplot as plt
@@ -1636,7 +1635,13 @@ st.subheader("Characteristics — Heatmap (A/B/Stock + model scores)")
 if med_tbl.empty or med_tbl.shape[1] < 2 or not ss.rows:
     st.info("Load DB, form two groups, and add at least one stock.")
 else:
-    import pandas as pd, numpy as np, altair as alt, io, matplotlib.pyplot as plt, seaborn as sns, json  # seaborn only for raster export
+    import pandas as pd
+    import numpy as np
+    import altair as alt
+    import matplotlib.pyplot as plt
+    import seaborn as sns  # only for raster export
+    import io
+    import json
     from datetime import datetime
 
     # pick ticker & variables
