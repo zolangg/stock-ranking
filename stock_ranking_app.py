@@ -1627,3 +1627,170 @@ vegaEmbed("#vis", spec, {{actions: true}});
                     use_container_width=True,
                     key="dl_dist_html",
                 )
+
+# ============================== Parallel Coordinates (normalized) ==============================
+st.markdown("---")
+st.subheader("Parallel coordinates (normalized)")
+
+if med_tbl.empty or med_tbl.shape[1] < 2:
+    st.info("Load DB and form two groups first to show parallel coordinates.")
+else:
+    vars_available = [v for v in ss.var_core + ss.var_moderate if v in med_tbl.index]
+    if not vars_available:
+        st.info("No overlapping variables to draw.")
+    else:
+        with st.expander("Variables & selection", expanded=True):
+            chosen_vars = st.multiselect(
+                "Variables", options=vars_available, default=ss.var_core or vars_available[:8]
+            )
+            all_tickers = [(r.get("Ticker") or "—") for r in ss.rows]
+            seen = set(); all_tickers = [t for t in all_tickers if not (t in seen or seen.add(t))]
+            tickers_sel = st.multiselect(
+                "Tickers to compare",
+                options=all_tickers,
+                default=all_tickers[: min(5, len(all_tickers))],
+                help="Select a few added stocks to overlay vs group medians."
+            )
+            line_alpha = st.slider("Line opacity", 0.05, 1.0, 0.35, 0.05)
+            line_width = st.slider("Line width", 0.5, 4.0, 2.0, 0.5)
+
+        if chosen_vars:
+            import pandas as pd, numpy as np, altair as alt, io, matplotlib.pyplot as plt
+
+            # ---- Build tidy frame (Series × Variable) ----
+            rows = []
+            for var in chosen_vars:
+                a_med = med_tbl.at[var, gA] if var in med_tbl.index else np.nan
+                b_med = med_tbl.at[var, gB] if var in med_tbl.index else np.nan
+                rows.append({"Series": "A median", "Variable": var, "Value": a_med})
+                rows.append({"Series": "B median", "Variable": var, "Value": b_med})
+
+            # Stock rows
+            ticker_to_row = {}
+            for r in reversed(ss.rows):
+                t = r.get("Ticker")
+                if t and t not in ticker_to_row:
+                    ticker_to_row[t] = r
+            for t in tickers_sel:
+                row = ticker_to_row.get(t, {})
+                for var in chosen_vars:
+                    rows.append({"Series": t, "Variable": var,
+                                 "Value": pd.to_numeric(row.get(var), errors="coerce")})
+
+            df = pd.DataFrame(rows)
+
+            # ---- z-score normalization per variable ----
+            z_list = []
+            for v in chosen_vars:
+                sub = df[df["Variable"] == v].copy()
+                vals = pd.to_numeric(sub["Value"], errors="coerce")
+                mu, sd = np.nanmean(vals), np.nanstd(vals)
+                sd = 1.0 if not np.isfinite(sd) or sd == 0 else sd
+                sub["Z"] = (vals - mu) / sd
+                z_list.append(sub)
+            df_z = pd.concat(z_list, ignore_index=True)
+
+            # Axis positions
+            pos = {v: i for i, v in enumerate(chosen_vars)}
+            df_z["Xpos"] = df_z["Variable"].map(pos)
+
+            color_scale = alt.Scale(domain=["A median", "B median"],
+                                    range=["#3b82f6", "#ef4444"])
+
+            base = alt.Chart(df_z).properties(height=380)
+
+            line = base.mark_line(opacity=line_alpha, strokeWidth=line_width).encode(
+                x=alt.X("Xpos:Q", axis=alt.Axis(labels=False, title=None)),
+                y=alt.Y("Z:Q", axis=alt.Axis(title="Normalized (z-score)")),
+                color=alt.Color("Series:N", scale=color_scale,
+                                legend=alt.Legend(title="", orient="top", columns=3)),
+                detail="Series:N",
+                tooltip=["Series:N", "Variable:N", alt.Tooltip("Value:Q", format=".2f")]
+            )
+
+            dots = base.mark_point(size=35).encode(
+                x="Xpos:Q", y="Z:Q",
+                color=alt.Color("Series:N", scale=color_scale, legend=None),
+                tooltip=["Series:N","Variable:N", alt.Tooltip("Value:Q", format=".2f")]
+            )
+
+            labels = alt.Chart(pd.DataFrame({"Variable": chosen_vars,
+                                             "Xpos": list(range(len(chosen_vars)))})) \
+                .mark_text(dy=-8).encode(x="Xpos:Q", text="Variable:N")
+
+            vguides = alt.Chart(pd.DataFrame({"Xpos": list(range(len(chosen_vars)))})) \
+                .mark_rule(opacity=0.25).encode(x="Xpos:Q")
+
+            chart = (vguides + line + dots + labels).configure_view(strokeOpacity=0)
+            st.altair_chart(chart, use_container_width=True)
+
+            # ===================== EXPORTS =====================
+            st.markdown("##### Export Parallel Coordinates")
+
+            # ---- PNG via Matplotlib ----
+            try:
+                pivot = df_z.pivot(index="Series", columns="Variable", values="Z")
+                fig, ax = plt.subplots(figsize=(max(6, len(chosen_vars)*0.8), 4))
+                x = np.arange(len(chosen_vars))
+                for s, row in pivot.iterrows():
+                    ax.plot(x, row.values, label=s,
+                            alpha=line_alpha, linewidth=line_width)
+                ax.set_xticks(x)
+                ax.set_xticklabels(chosen_vars, rotation=30, ha="right")
+                ax.set_ylabel("Normalized (z-score)")
+                ax.legend(frameon=False, fontsize=8)
+                buf = io.BytesIO()
+                fig.tight_layout()
+                fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+                plt.close(fig)
+                png_bytes = buf.getvalue()
+            except Exception:
+                png_bytes = None
+
+            # ---- HTML (interactive Altair spec) ----
+            try:
+                spec = chart.to_dict()
+                html_tpl = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Parallel Coordinates</title>
+<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+</head><body><div id="vis"></div>
+<script>const spec={json.dumps(spec)};
+vegaEmbed("#vis", spec, {{actions:true}});</script></body></html>"""
+                html_bytes = html_tpl.encode("utf-8")
+            except Exception:
+                html_bytes = None
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if png_bytes:
+                    st.download_button(
+                        "Download PNG (parallel coords)",
+                        data=png_bytes,
+                        file_name=f"parallel_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                        mime="image/png",
+                        use_container_width=True,
+                        key="dl_parallel_png"
+                    )
+                else:
+                    st.caption("PNG export failed.")
+            with c2:
+                if html_bytes:
+                    st.download_button(
+                        "Download HTML (interactive)",
+                        data=html_bytes,
+                        file_name="parallel_coords.html",
+                        mime="text/html",
+                        use_container_width=True,
+                        key="dl_parallel_html"
+                    )
+                else:
+                    st.caption("HTML export failed.")
+
+            st.caption(
+                "Each vertical axis represents a variable normalized by z-score. "
+                "Blue/Red = group medians; selected tickers overlay as extra lines."
+            )
+        else:
+            st.info("Choose at least one variable.")
