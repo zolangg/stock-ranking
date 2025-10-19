@@ -1,7 +1,7 @@
 # stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
 # - Add Stock form (no table)
 # - Alignment shows median P(A) over SELECTED added stocks across Gain% cutoffs (0..600 step 25)
-# - Models (NCA [req] & CatBoost [req] & LightGBM [req]) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
+# - Models (NCA [required] & CatBoost [required] & LightGBM [required]) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
 # - Simplified: one unified variables list for all models (no core/moderate split)
 
 import streamlit as st
@@ -13,9 +13,9 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 # ===== Required model libs =====
-from catboost import CatBoostClassifier            # required
-from lightgbm import LGBMClassifier                # required
-from sklearn.neighbors import NeighborhoodComponentsAnalysis  # required for NCA
+from catboost import CatBoostClassifier
+from lightgbm import LGBMClassifier
+from sklearn.neighbors import NeighborhoodComponentsAnalysis
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
@@ -241,7 +241,7 @@ def _iso_predict(bx, by, xq):
         out[i] = by[k]
     return out
 
-# ============================== NCA (required; with LDA fallback if NCA fails to run) ==============================
+# ============================== NCA (required; LDA fallback) ==============================
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
@@ -568,7 +568,7 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- choose which added stocks to include (final, robust, no value=) ---
+# --- choose which added stocks to include (final-safe pattern: sanitize BEFORE, don't assign AFTER) ---
 sel_key = "align_sel_tickers"
 
 # Build clean, deduped options list (UPPERCASE strings)
@@ -581,24 +581,23 @@ _seen = set()
 all_added_tickers = [t for t in all_added_tickers if t not in _seen and not _seen.add(t)]
 valid_set = set(all_added_tickers)
 
-# Sanitize session state BEFORE rendering the widget
+# 1) Sanitize session state BEFORE rendering the widget
 cur = st.session_state.get(sel_key, [])
 if not isinstance(cur, list):
     cur = []
 cur = [
-    str(t).strip().upper()
-    for t in cur
-    if t is not None and str(t).strip().upper() in valid_set
+    s for s in (str(t).strip().upper() for t in cur)
+    if s in valid_set
 ]
-# If nothing selected (first run or options changed), default to ALL (or [] if no options)
 if not cur:
-    cur = all_added_tickers[:] if all_added_tickers else []
-st.session_state[sel_key] = cur  # write back sanitized state
+    cur = all_added_tickers[:]  # default to ALL if empty
+# Write once BEFORE widget is created
+st.session_state[sel_key] = cur
 
 csel1, csel2 = st.columns([4, 1])
 with csel1:
-    # IMPORTANT: no 'value=' here; the widget binds to st.session_state[sel_key]
-    selected_tickers = st.multiselect(
+    # 2) Render widget (binds to state). IMPORTANT: no `value=`.
+    st.multiselect(
         label="",
         options=all_added_tickers,
         key=sel_key,
@@ -606,15 +605,16 @@ with csel1:
         placeholder="Select added tickers…",
     )
 with csel2:
+    # Any mutation of the widget state must happen in a callback
     def _clear_sel():
         st.session_state[sel_key] = []
     st.button("Clear", use_container_width=True, on_click=_clear_sel)
 
-# Final guardrail after user interaction
+# 3) Read only — DO NOT assign back to st.session_state[sel_key] here
 selected_tickers = [
-    str(t).strip().upper() for t in st.session_state[sel_key] if str(t).strip().upper() in valid_set
+    s for s in (str(t).strip().upper() for t in st.session_state.get(sel_key, []))
+    if s in valid_set
 ]
-st.session_state[sel_key] = selected_tickers
 
 if not selected_tickers:
     st.info("No stocks selected. Pick at least one added ticker above.")
@@ -645,7 +645,7 @@ def _make_split(df_base: pd.DataFrame, thr_val: float):
     return df_tmp, gA_, gB_
 
 # Build a DataFrame of SELECTED added stocks for prediction
-added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
+added_df = pd.DataFrame([r for r in ss.rows if str(r.get("Ticker")).strip().upper() in set(selected_tickers)])
 
 thr_labels = []
 series_N_med, series_C_med, series_L_med = [], [], []
@@ -699,7 +699,7 @@ for thr_val in gain_cutoffs:
 if not thr_labels:
     st.info("Not enough data across cutoffs (or model(s) couldn’t train/predict) for your selected stocks.")
 else:
-    # Build tidy frame for Altair (all three series are required)
+    # Build tidy frame for Altair (all three series are expected)
     data = []
     for i, thr in enumerate(thr_labels):
         data.append({"GainCutoff_%": thr, "Series": "NCA: P(A)", "Value": series_N_med[i]})
