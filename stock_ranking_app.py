@@ -2,8 +2,7 @@
 # - Add Stock form (no table)
 # - Alignment shows median P(A) over SELECTED added stocks across Gain% cutoffs (0..600 step 25)
 # - Models (NCA & CatBoost & LightGBM) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
-# - CatBoost is required; LightGBM is optional (auto-skip if unavailable)
-# - No daily-volume prediction anywhere
+# - CatBoost is required; LightGBM optional (auto-skip if unavailable)
 # - Simplified: one unified variables list for all models (no core/moderate split)
 
 import streamlit as st
@@ -13,7 +12,7 @@ import re, json
 import altair as alt
 import matplotlib.pyplot as plt
 from datetime import datetime
-from catboost import CatBoostClassifier  # CatBoost is required
+from catboost import CatBoostClassifier  # required
 
 # LightGBM optional
 try:
@@ -427,7 +426,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     try:
         if eval_ok:
             p_raw = model.predict_proba(Xva)[:, 1].astype(float)
-            if np.unique(p_raw).size >= 3 and _has_both_classes(yva):
+            if np.unique(p_raw).size >= 3 and (np.unique(yva).size == 2):
                 bx, by = _pav_isotonic(p_raw, yva.astype(float))
                 if len(bx) >= 2: iso_bx, iso_by = np.array(bx), np.array(by)
             if iso_bx.size < 2:
@@ -499,7 +498,6 @@ def _train_lgbm_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, feat
     def _has_both(arr): return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both(yva) and _has_both(ytr)
 
-    # conservative, small model (fast & stable)
     params = dict(
         objective="binary",
         n_estimators=300,
@@ -525,7 +523,7 @@ def _train_lgbm_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, feat
     try:
         if eval_ok:
             p_raw = model.predict_proba(Xva)[:, 1].astype(float)
-            if np.unique(p_raw).size >= 3 and _has_both(yva):
+            if np.unique(p_raw).size >= 3 and (np.unique(yva).size == 2):
                 bx, by = _pav_isotonic(p_raw, yva.astype(float))
                 if len(bx) >= 2: iso_bx, iso_by = np.array(bx), np.array(by)
             if iso_bx.size < 2:
@@ -580,18 +578,16 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- choose which added stocks to include ---
+# --- choose which added stocks to include (fix warning: use `value=`; don't set default + state) ---
 all_added_tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
 _seen = set(); all_added_tickers = [t for t in all_added_tickers if not (t in _seen or _seen.add(t))]
-if "align_sel_tickers" not in st.session_state:
-    st.session_state["align_sel_tickers"] = all_added_tickers[:]  # default: all
 
 csel1, csel2 = st.columns([4, 1])
 with csel1:
     selected_tickers = st.multiselect(
         "",
         options=all_added_tickers,
-        default=st.session_state["align_sel_tickers"],
+        value=st.session_state.get("align_sel_tickers", all_added_tickers[:]),
         key="align_sel_tickers",
         label_visibility="collapsed",
     )
@@ -694,18 +690,36 @@ for thr_val in gain_cutoffs:
 if not thr_labels:
     st.info("Not enough data across cutoffs (or none selected) to train both classes and evaluate your selected stocks.")
 else:
-    # Build tidy frame for Altair
+    # Build tidy frame; include a series only if it has at least one finite value
+    def _has_finite(arr): 
+        return any(np.isfinite(arr)) if len(arr) else False
+
+    include_N = _has_finite(series_N_med)
+    include_C = _has_finite(series_C_med)
+    include_L = _has_finite(series_L_med)
+
     data = []
     for i, thr in enumerate(thr_labels):
-        data.append({"GainCutoff_%": thr, "Series": "NCA: P(A)", "Value": series_N_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": "CatBoost: P(A)", "Value": series_C_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": "LightGBM: P(A)", "Value": series_L_med[i]})
+        if include_N: data.append({"GainCutoff_%": thr, "Series": "NCA: P(A)", "Value": series_N_med[i]})
+        if include_C: data.append({"GainCutoff_%": thr, "Series": "CatBoost: P(A)", "Value": series_C_med[i]})
+        if include_L: data.append({"GainCutoff_%": thr, "Series": "LightGBM: P(A)", "Value": series_L_med[i]})
     df_long = pd.DataFrame(data)
 
-    # Chart (bars grouped by series at each cutoff)
-    color_domain = ["NCA: P(A)", "CatBoost: P(A)", "LightGBM: P(A)"]
-    color_range  = ["#10b981", "#8b5cf6", "#f59e0b"]  # green, purple, amber
+    if df_long.empty:
+        st.info("Models trained, but no valid predictions for the selected stocks/features.")
+        st.stop()
 
+    # color domain/range built dynamically from what exists
+    series_in_plot = [s for s in ["NCA: P(A)", "CatBoost: P(A)", "LightGBM: P(A)"] if s in df_long["Series"].unique()]
+    color_map = {
+        "NCA: P(A)": "#10b981",
+        "CatBoost: P(A)": "#8b5cf6",
+        "LightGBM: P(A)": "#f59e0b",
+    }
+    color_domain = series_in_plot
+    color_range  = [color_map[s] for s in series_in_plot]
+
+    # Chart (bars grouped by series at each cutoff)
     chart = (
         alt.Chart(df_long)
         .mark_bar()
@@ -720,12 +734,11 @@ else:
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # Optional PNG export via Matplotlib
+    # Optional PNG export via Matplotlib (dynamic legend/colors)
     png_bytes = None
     try:
         pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
         series_names = list(pivot.columns)
-        color_map = {"NCA: P(A)": "#10b981", "CatBoost: P(A)": "#8b5cf6", "LightGBM: P(A)": "#f59e0b"}
         colors = [color_map.get(s, "#999999") for s in series_names]
         thresholds = pivot.index.tolist()
         n_groups = len(thresholds); n_series = len(series_names)
@@ -785,3 +798,7 @@ vegaEmbed("#vis", spec, {{actions: true}});
             use_container_width=True,
             key="dl_html",
         )
+
+# Optional UI hint if LightGBM import failed
+if not _LGB_OK:
+    st.caption("LightGBM not available — that series will be skipped. Install `lightgbm` to enable it.")
