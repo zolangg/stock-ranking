@@ -17,7 +17,6 @@ from catboost import CatBoostClassifier  # CatBoost is required
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
 st.title("Premarket Stock Analysis")
-st.caption("Flow: 1) Upload Excel → Build • 2) Add stocks • 3) Alignment shows NCA/CatBoost median P(A) over your selected added stocks across Gain% cutoffs (0→600).")
 
 # ============================== Session ==============================
 ss = st.session_state
