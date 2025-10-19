@@ -1,8 +1,7 @@
 # stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
 # - Add Stock form (no table)
 # - Alignment shows median P(A) over SELECTED added stocks across Gain% cutoffs (0..600 step 25)
-# - Models (NCA & CatBoost & LightGBM) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
-# - CatBoost is required; LightGBM optional (auto-skip if unavailable)
+# - Models (NCA [req] & CatBoost [req] & LightGBM [req]) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
 # - Simplified: one unified variables list for all models (no core/moderate split)
 
 import streamlit as st
@@ -12,14 +11,11 @@ import re, json
 import altair as alt
 import matplotlib.pyplot as plt
 from datetime import datetime
-from catboost import CatBoostClassifier  # required
 
-# LightGBM optional
-try:
-    from lightgbm import LGBMClassifier
-    _LGB_OK = True
-except Exception:
-    _LGB_OK = False
+# ===== Required model libs =====
+from catboost import CatBoostClassifier            # required
+from lightgbm import LGBMClassifier                # required
+from sklearn.neighbors import NeighborhoodComponentsAnalysis  # required for NCA
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
@@ -36,7 +32,7 @@ UNIFIED_VARS = [
     "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
 ]
 ALLOWED_LIVE_FEATURES = UNIFIED_VARS[:]     # what we will actually try to use
-EXCLUDE_FOR_NCA = []                        # keep hook if you want to drop any later
+EXCLUDE_FOR_NCA = []                        # hook if you want to drop any later
 
 # ============================== Helpers ==============================
 def _norm(s: str) -> str:
@@ -96,7 +92,7 @@ if build_btn:
             file_bytes = uploaded.getvalue()
             raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
 
-            # detect FT column (not used for split, but map for completeness)
+            # detect FT column (not used for split, but mapped for completeness)
             possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
             col_group = possible[0] if possible else None
             if col_group is None:
@@ -245,7 +241,7 @@ def _iso_predict(bx, by, xq):
         out[i] = by[k]
     return out
 
-# ============================== NCA / LDA ==============================
+# ============================== NCA (required; with LDA fallback if NCA fails to run) ==============================
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
@@ -278,11 +274,11 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
 
     used = "lda"; w_vec = None; components = None
     try:
-        from sklearn.neighbors import NeighborhoodComponentsAnalysis
         nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=400)
         z = nca.fit_transform(Xs, y).ravel()
         used = "nca"; components = nca.components_
     except Exception:
+        # fallback LDA
         X0 = Xs[y==0]; X1 = Xs[y==1]
         if X0.shape[0] < 2 or X1.shape[0] < 2: return {}
         m0 = X0.mean(axis=0); m1 = X1.mean(axis=0)
@@ -361,7 +357,7 @@ def _nca_predict_proba_row(xrow: dict, model: dict) -> float:
         pA = 1.0 / (1.0 + np.exp(-k*(z - m)))
     return float(np.clip(pA, 0.0, 1.0))
 
-# ============================== CatBoost ==============================
+# ============================== CatBoost (required) ==============================
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
@@ -387,10 +383,10 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     Xtr, Xva = X_all[tr_idx], X_all[va_idx]
     ytr, yva = y_all[tr_idx], y_all[va_idx]
 
-    def _has_both_classes(arr):
+    def _has_both(arr):
         return np.unique(arr).size == 2
 
-    eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
+    eval_ok = (len(yva) >= 8) and _has_both(yva) and _has_both(ytr)
 
     params = dict(
         loss_function="Logloss",
@@ -414,12 +410,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         if eval_ok: model.fit(Xtr, ytr, eval_set=(Xva, yva))
         else:       model.fit(X_all, y_all)
     except Exception:
-        try:
-            model = CatBoostClassifier(**{**params, "od_type": "None"})
-            model.fit(X_all, y_all)
-            eval_ok = False
-        except Exception:
-            return {}
+        return {}
 
     # Calibration (optional-lite)
     iso_bx = np.array([]); iso_by = np.array([]); platt = None
@@ -468,9 +459,8 @@ def _cat_predict_proba_row(xrow: dict, model: dict) -> float:
         pA = z if not pl else 1.0 / (1.0 + np.exp(-pl[1]*(z - pl[0])))
     return float(np.clip(pA, 0.0, 1.0))
 
-# ============================== LightGBM ==============================
+# ============================== LightGBM (required) ==============================
 def _train_lgbm_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
-    if not _LGB_OK: return {}
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
 
@@ -578,22 +568,37 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- choose which added stocks to include (fix warning: use `value=`; don't set default + state) ---
-all_added_tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-_seen = set(); all_added_tickers = [t for t in all_added_tickers if not (t in _seen or _seen.add(t))]
+# --- choose which added stocks to include (robust vs. options/value mismatch) ---
+all_added_tickers = [str(r.get("Ticker")).strip().upper() for r in ss.rows if r.get("Ticker")]
+_seen = set()
+all_added_tickers = [t for t in all_added_tickers if t and not (t in _seen or _seen.add(t))]
+
+sel_key = "align_sel_tickers"
+cur_state = st.session_state.get(sel_key, None)
+if not isinstance(cur_state, list):
+    cur_state = []
+cur_state = [str(t).strip().upper() for t in cur_state if t and str(t).strip().upper() in set(all_added_tickers)]
+if not cur_state:
+    cur_state = all_added_tickers[:]
+st.session_state[sel_key] = cur_state
 
 csel1, csel2 = st.columns([4, 1])
 with csel1:
     selected_tickers = st.multiselect(
-        "",
+        label="",
         options=all_added_tickers,
-        value=st.session_state.get("align_sel_tickers", all_added_tickers[:]),
-        key="align_sel_tickers",
+        value=st.session_state[sel_key],
+        key=sel_key,
         label_visibility="collapsed",
+        placeholder="Select added tickers…",
     )
 with csel2:
-    def _clear_sel(): st.session_state["align_sel_tickers"] = []
+    def _clear_sel():
+        st.session_state[sel_key] = []
     st.button("Clear", use_container_width=True, on_click=_clear_sel)
+
+selected_tickers = [t for t in st.session_state[sel_key] if t in set(all_added_tickers)]
+st.session_state[sel_key] = selected_tickers
 
 if not selected_tickers:
     st.info("No stocks selected. Pick at least one added ticker above.")
@@ -637,25 +642,20 @@ for thr_val in gain_cutoffs:
     if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
         continue
 
-    # Train models on DB for this cutoff
+    # Train models on DB for this cutoff (all required)
     nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
     cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
     lgb_model = _train_lgbm_once(df_split, gA, gB, var_all) or {}
 
-    # If all models failed to train, skip cutoff
-    if not nca_model and not cat_model and not lgb_model:
+    # If any required model failed to train, skip this cutoff entirely
+    if not nca_model or not cat_model or not lgb_model:
         continue
 
     # Determine required features for predicting on SELECTED ADDED stocks
-    req_feats = []
-    if nca_model: req_feats += nca_model.get("feats", [])
-    if cat_model: req_feats += cat_model.get("feats", [])
-    if lgb_model: req_feats += lgb_model.get("feats", [])
-    req_feats = sorted(set(req_feats))
+    req_feats = sorted(set(nca_model.get("feats", []) + cat_model.get("feats", []) + lgb_model.get("feats", [])))
     if not req_feats:
         continue
 
-    # Filter SELECTED ADDED rows to those with finite values for required feats
     if added_df.empty:
         continue
     Xadd = added_df[req_feats].apply(pd.to_numeric, errors="coerce")
@@ -666,60 +666,39 @@ for thr_val in gain_cutoffs:
 
     # Predict on SELECTED ADDED stocks
     pN, pC, pL = [], [], []
-    if nca_model:
-        for r in pred_rows:
-            p = _nca_predict_proba_row(r, nca_model)
-            if np.isfinite(p): pN.append(p)
-    if cat_model:
-        for r in pred_rows:
-            p = _cat_predict_proba_row(r, cat_model)
-            if np.isfinite(p): pC.append(p)
-    if lgb_model:
-        for r in pred_rows:
-            p = _lgbm_predict_proba_row(r, lgb_model)
-            if np.isfinite(p): pL.append(p)
+    for r in pred_rows:
+        p = _nca_predict_proba_row(r, nca_model);   pN.append(p if np.isfinite(p) else np.nan)
+        p = _cat_predict_proba_row(r, cat_model);   pC.append(p if np.isfinite(p) else np.nan)
+        p = _lgbm_predict_proba_row(r, lgb_model);  pL.append(p if np.isfinite(p) else np.nan)
 
-    if (len(pN) == 0) and (len(pC) == 0) and (len(pL) == 0):
+    # Require at least one finite prediction per model (since all required)
+    if not (np.isfinite(pN).any() and np.isfinite(pC).any() and np.isfinite(pL).any()):
         continue
 
     thr_labels.append(int(thr_val))
-    series_N_med.append(float(np.nanmedian(pN)*100.0) if len(pN) else np.nan)
-    series_C_med.append(float(np.nanmedian(pC)*100.0) if len(pC) else np.nan)
-    series_L_med.append(float(np.nanmedian(pL)*100.0) if len(pL) else np.nan)
+    series_N_med.append(float(np.nanmedian(pN)*100.0))
+    series_C_med.append(float(np.nanmedian(pC)*100.0))
+    series_L_med.append(float(np.nanmedian(pL)*100.0))
 
 if not thr_labels:
-    st.info("Not enough data across cutoffs (or none selected) to train both classes and evaluate your selected stocks.")
+    st.info("Not enough data across cutoffs (or model(s) couldn’t train/predict) for your selected stocks.")
 else:
-    # Build tidy frame; include a series only if it has at least one finite value
-    def _has_finite(arr): 
-        return any(np.isfinite(arr)) if len(arr) else False
-
-    include_N = _has_finite(series_N_med)
-    include_C = _has_finite(series_C_med)
-    include_L = _has_finite(series_L_med)
-
+    # Build tidy frame for Altair (all three series are required)
     data = []
     for i, thr in enumerate(thr_labels):
-        if include_N: data.append({"GainCutoff_%": thr, "Series": "NCA: P(A)", "Value": series_N_med[i]})
-        if include_C: data.append({"GainCutoff_%": thr, "Series": "CatBoost: P(A)", "Value": series_C_med[i]})
-        if include_L: data.append({"GainCutoff_%": thr, "Series": "LightGBM: P(A)", "Value": series_L_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": "NCA: P(A)", "Value": series_N_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": "CatBoost: P(A)", "Value": series_C_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": "LightGBM: P(A)", "Value": series_L_med[i]})
     df_long = pd.DataFrame(data)
 
-    if df_long.empty:
-        st.info("Models trained, but no valid predictions for the selected stocks/features.")
-        st.stop()
-
-    # color domain/range built dynamically from what exists
-    series_in_plot = [s for s in ["NCA: P(A)", "CatBoost: P(A)", "LightGBM: P(A)"] if s in df_long["Series"].unique()]
     color_map = {
-        "NCA: P(A)": "#10b981",
-        "CatBoost: P(A)": "#8b5cf6",
-        "LightGBM: P(A)": "#f59e0b",
+        "NCA: P(A)": "#10b981",        # green
+        "CatBoost: P(A)": "#8b5cf6",   # purple
+        "LightGBM: P(A)": "#f59e0b",   # amber
     }
-    color_domain = series_in_plot
-    color_range  = [color_map[s] for s in series_in_plot]
+    color_domain = ["NCA: P(A)", "CatBoost: P(A)", "LightGBM: P(A)"]
+    color_range  = [color_map[s] for s in color_domain]
 
-    # Chart (bars grouped by series at each cutoff)
     chart = (
         alt.Chart(df_long)
         .mark_bar()
@@ -734,13 +713,13 @@ else:
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # Optional PNG export via Matplotlib (dynamic legend/colors)
+    # PNG export via Matplotlib
     png_bytes = None
     try:
         pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
         series_names = list(pivot.columns)
-        colors = [color_map.get(s, "#999999") for s in series_names]
         thresholds = pivot.index.tolist()
+        colors = [color_map.get(s, "#999999") for s in series_names]
         n_groups = len(thresholds); n_series = len(series_names)
         x = np.arange(n_groups); width = 0.8 / max(n_series, 1)
 
@@ -798,7 +777,3 @@ vegaEmbed("#vis", spec, {{actions: true}});
             use_container_width=True,
             key="dl_html",
         )
-
-# Optional UI hint if LightGBM import failed
-if not _LGB_OK:
-    st.caption("LightGBM not available — that series will be skipped. Install `lightgbm` to enable it.")
