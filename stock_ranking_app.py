@@ -1,8 +1,8 @@
 # stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
 # - Streamlined UI: Add form, and a single line for stock selection and deletion.
-# - Tuned CatBoost Model: Parameters adjusted to be more "open-minded" to outliers.
+# - Tuned CatBoost Model: Parameters adjusted for high sensitivity to outliers.
 # - Analysis is permanently set to "Gain% vs Rest".
-# - ADDED: A second, conditional probability chart for research purposes.
+# - Includes both Absolute and Conditional probability charts.
 
 import streamlit as st
 import pandas as pd
@@ -12,6 +12,7 @@ import altair as alt
 import matplotlib.pyplot as plt
 from datetime import datetime
 from catboost import CatBoostClassifier
+import io
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
@@ -21,7 +22,6 @@ st.title("Premarket Stock Analysis")
 ss = st.session_state
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("rows", [])
-# --- NOTE: del_selection is no longer needed as we use the main multiselect's state ---
 
 # ============================== Unified variables ==============================
 UNIFIED_VARS = [
@@ -32,7 +32,6 @@ ALLOWED_LIVE_FEATURES = UNIFIED_VARS[:]
 EXCLUDE_FOR_NCA = []
 
 # ============================== Helpers ==============================
-# (This section is unchanged)
 def _norm(s: str) -> str:
     v = re.sub(r"\s+", " ", str(s).strip().lower())
     v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
@@ -179,7 +178,6 @@ if submitted and ticker:
     st.success(f"Saved {ticker}.")
 
 # ============================== Isotonic helpers ==============================
-# (This section is unchanged)
 def _pav_isotonic(x, y):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     if x.size == 0: return [], []
@@ -209,7 +207,6 @@ def _iso_predict(bx, by, xq):
     return out
 
 # ============================== NCA / LDA ==============================
-# (This section is unchanged)
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
@@ -326,18 +323,15 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
     
-    # --- MODIFIED: CatBoost parameters are tuned to be more "open-minded" ---
-# --- NEW: High-Sensitivity "Track Car" Parameters ---
-    # Goal: Create a hyper-sensitive model that can detect complex, non-linear
-    # patterns and react strongly to small changes.
-    # WARNING: This model will be more volatile and produce more false alarms.
+    # High-Sensitivity "Track Car" Parameters
     params = dict(
         loss_function="Logloss",
         eval_metric="Logloss",
         iterations=200,
-        learning_rate=0.05,  # Slightly increased to prevent overfitting to tiny details.
-        depth=2,             # From 3 -> 2. FORCES the model to learn simpler, more general rules.
-        l2_leaf_reg=10,      # From 6 -> 10. Increased penalty for being "too certain."
+        learning_rate=0.08,
+        depth=4,
+        l2_leaf_reg=3,
+        min_data_in_leaf=1,
         bootstrap_type="Bayesian",
         bagging_temperature=0.5,
         auto_class_weights="Balanced",
@@ -427,7 +421,6 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         "B_pct": 100.0 * counts[gB_] / total if total > 0 else 0.0,
     }
 
-
 # ============================== Alignment (Distributions for SELECTED added stocks) ==============================
 st.markdown("---")
 st.subheader("Alignment Distribution")
@@ -443,7 +436,6 @@ if not ss.rows:
 
 st.info("This analysis shows the **absolute probability** of a stock reaching a certain gain from pre-market.")
 
-# --- Streamlined UI for stock selection and deletion in one line ---
 all_added_tickers = pd.Series([r.get("Ticker") for r in ss.rows]).dropna().unique().tolist()
 
 if "align_sel_tickers" not in st.session_state:
@@ -461,7 +453,7 @@ def _delete_selected():
 col1, col2, col3 = st.columns([6, 1, 1])
 with col1:
     selected_tickers = st.multiselect(
-        "Select stocks to include in the chart below. The delete button will act on this selection.",
+        "Select stocks to include in the charts below. The delete button will act on this selection.",
         options=all_added_tickers,
         default=st.session_state.get("align_sel_tickers", []),
         key="align_sel_tickers",
@@ -471,7 +463,6 @@ with col2:
     st.button("Clear", use_container_width=True, on_click=_clear_selection, help="Clears the current selection in the box.")
 with col3:
     st.button("Delete", use_container_width=True, on_click=_delete_selected, help="Deletes the stocks currently selected in the box.", disabled=not selected_tickers)
-
 
 if not selected_tickers:
     st.info("No stocks selected. Pick at least one added ticker to display the chart.")
@@ -585,8 +576,7 @@ else:
     )
     st.altair_chart(chart, use_container_width=True)
 
-
-    # (PNG and HTML export sections remain unchanged)
+    # --- Chart Export Section ---
     png_bytes = None
     try:
         pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
@@ -597,7 +587,6 @@ else:
         n_groups = len(thresholds); n_series = len(series_names)
         x = np.arange(n_groups); width = 0.8 / max(n_series, 1)
 
-        import io as _io
         fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4.5))
         for i, s in enumerate(series_names):
             vals = pivot[s].values.astype(float)
@@ -609,7 +598,7 @@ else:
         ax.set_ylabel("Median Alignment / P(A) for selected stocks (%)")
         ax.legend(loc="upper left", frameon=False)
 
-        buf = _io.BytesIO(); fig.tight_layout()
+        buf = io.BytesIO(); fig.tight_layout()
         fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
         plt.close(fig)
         png_bytes = buf.getvalue()
@@ -633,9 +622,9 @@ else:
         spec = chart.to_dict()
         html_tpl = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Alignment Distribution</title>
-<script src="https://cdn.jsdelivr/npm/vega@5"></script>
-<script src="https://cdn.jsdelivr/npm/vega-lite@5"></script>
-<script src="https://cdn.jsdelivr/npm/vega-embed@6"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
 </head><body>
 <div id="vis"></div>
 <script>
@@ -652,7 +641,8 @@ vegaEmbed("#vis", spec, {{actions: true}});
             key="dl_html",
         )
 
-# --- NEW: Calculate and Display Conditional Probability Chart ---
+
+    # --- Conditional Probability Chart Section ---
     st.markdown("---")
     st.subheader("Conditional Probability Analysis")
     st.warning(
@@ -664,9 +654,9 @@ vegaEmbed("#vis", spec, {{actions: true}});
     cond_data = []
     cond_labels = [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
     
-    series_list = [series_A_med, series_B_med, series_N_med, series_C_med]
-    series_names = [gA_label, gB_label, nca_label, cat_label]
-    cond_series_list = [[], [], [], []]
+    series_list = [series_A_med, series_N_med, series_C_med] # NOTE: Removed series_B_med as it's not a probability of success
+    series_names = [gA_label, nca_label, cat_label]
+    cond_series_list = [[], [], []]
 
     for i in range(len(thr_labels) - 1):
         for j in range(len(series_list)):
@@ -675,7 +665,6 @@ vegaEmbed("#vis", spec, {{actions: true}});
             
             cond_prob = np.nan
             if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6:
-                # Calculate conditional probability and cap it at 100%
                 cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100)
             
             cond_series_list[j].append(cond_prob)
@@ -689,13 +678,17 @@ vegaEmbed("#vis", spec, {{actions: true}});
     if cond_data:
         df_cond_long = pd.DataFrame(cond_data)
         
+        # Adjust color domain/range for conditional chart (without 'Rest')
+        cond_color_domain = [gA_label, nca_label, cat_label]
+        cond_color_range  = ["#3b82f6", "#10b981", "#8b5cf6"]
+
         cond_chart = (
             alt.Chart(df_cond_long)
             .mark_bar()
             .encode(
-                x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels), # Ensure correct order
+                x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels),
                 y=alt.Y("Value:Q", title="Conditional Probability (%)", scale=alt.Scale(domain=[0, 100])),
-                color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
+                color=alt.Color("Series:N", scale=alt.Scale(domain=cond_color_domain, range=cond_color_range), legend=alt.Legend(title="Analysis Series")),
                 xOffset="Series:N",
                 tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")],
             )
