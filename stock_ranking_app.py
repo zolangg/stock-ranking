@@ -1,48 +1,35 @@
-# stock_ranking_app.py — Minimal Alignment (Distributions Only)
-# Spec:
-# - Remove prediction daily vol and any data table
-# - Keep only a section named "Alignment" that shows distributions of NCA and CatBoost across Gain% cutoffs
-# - Gain% cutoffs fixed from 0..600 step 25 (no user selection)
-# - Split logic: Gain% >= cutoff  vs  Rest
-# - Robust guards; CatBoost optional (warn if missing)
+# stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
+# - Add Stock form (no table)
+# - Alignment shows median P(A) over ADDED stocks across Gain% cutoffs (0..600 step 25)
+# - Models (NCA & CatBoost) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
+# - CatBoost is required; no optional branches
+# - No daily-volume prediction anywhere
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re, json, hashlib, io
-from datetime import datetime
+import re, json
 import altair as alt
 import matplotlib.pyplot as plt
+from datetime import datetime
+from catboost import CatBoostClassifier  # CatBoost is required
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
 st.title("Premarket Stock Analysis")
-st.info("Upload your Excel and click **Build model stocks**. Then scroll to **Alignment** for NCA/CatBoost distributions across Gain% cutoffs (0 → 600).")
+st.caption("Flow: 1) Upload Excel → Build • 2) Add stocks • 3) Alignment shows NCA/CatBoost median P(A) over your added stocks across Gain% cutoffs (0→600).")
 
 # ============================== Session ==============================
 ss = st.session_state
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("var_core", [])
 ss.setdefault("var_moderate", [])
-ss.setdefault("__catboost_warned", False)
+ss.setdefault("rows", [])  # user-added stocks (list of dicts)
 
 # ============================== Helpers ==============================
-def SAFE_JSON_DUMPS(obj) -> str:
-    class NpEncoder(json.JSONEncoder):
-        def default(self, o):
-            if isinstance(o, (np.integer,)): return int(o)
-            if isinstance(o, (np.floating,)): return float(o)
-            if isinstance(o, (np.ndarray,)): return o.tolist()
-            return super().default(o)
-    s = json.dumps(obj, cls=NpEncoder, ensure_ascii=False, separators=(",", ":"))
-    return s.replace("</script>", "<\\/script>")
-
-_norm_cache = {}
 def _norm(s: str) -> str:
-    if s in _norm_cache: return _norm_cache[s]
     v = re.sub(r"\s+", " ", str(s).strip().lower())
     v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
-    _norm_cache[s] = v
     return v
 
 def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -78,11 +65,6 @@ st.subheader("Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
 build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
 
-@st.cache_data(show_spinner=False)
-def _hash_bytes(b: bytes) -> str:
-    import hashlib as _hashlib
-    return _hashlib.sha256(b).hexdigest()
-
 @st.cache_data(show_spinner=True)
 def _load_sheet(file_bytes: bytes):
     xls = pd.ExcelFile(file_bytes)
@@ -97,10 +79,9 @@ if build_btn:
     else:
         try:
             file_bytes = uploaded.getvalue()
-            _ = _hash_bytes(file_bytes)
             raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
 
-            # detect FT column
+            # detect FT column (not used for split, but map for completeness)
             possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
             col_group = possible[0] if possible else None
             if col_group is None:
@@ -118,7 +99,7 @@ if build_btn:
                 src = _pick(raw, src_candidates)
                 if src: dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-            # map numeric fields (add as needed)
+            # Map numeric fields (same candidates as earlier builds)
             add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
             add_num(df, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
             add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
@@ -132,7 +113,7 @@ if build_btn:
             add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
             add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
 
-            # catalyst
+            # catalyst → binary
             cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
             def _to_binary_local(v):
                 sv = str(v).strip().lower()
@@ -143,7 +124,7 @@ if build_btn:
                 except: return np.nan
             if cand_catalyst: df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
 
-            # derived
+            # derived fields
             float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
             if {"PM_Vol_M", float_basis}.issubset(df.columns):
                 df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
@@ -156,13 +137,12 @@ if build_btn:
                 if pct_col in df.columns:
                     df[pct_col] = pd.to_numeric(df[pct_col], errors="coerce") * 100.0
 
-            # FT groups
+            # FT groups (not used for split here)
             def _to_binary(v):
                 sv = str(v).strip().lower()
                 if sv in {"1","true","yes","y","t"}: return 1
                 if sv in {"0","false","no","n","f"}: return 0
-                try:
-                    fv = float(sv); return 1 if fv >= 0.5 else 0
+                try: return 1 if float(sv) >= 0.5 else 0
                 except: return np.nan
             df["FT01"] = df["GroupRaw"].map(_to_binary)
             df = df[df["FT01"].isin([0,1])].copy()
@@ -177,13 +157,11 @@ if build_btn:
 
             ss.base_df = df
 
-            # Variable lists (fallback if not defined in your environment)
-            try:
-                VAR_CORE
+            # Variable lists (fallback if not defined in your env)
+            try: VAR_CORE
             except NameError:
                 VAR_CORE = ["MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum"]
-            try:
-                VAR_MODERATE
+            try: VAR_MODERATE
             except NameError:
                 VAR_MODERATE = []
 
@@ -195,18 +173,52 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# Unified feature set for models
+# Unified features for models (live features only)
 VAR_ALL = (ss.get("var_core", []) or []) + (ss.get("var_moderate", []) or [])
-try:
-    ALLOWED_LIVE_FEATURES
-except NameError:
-    ALLOWED_LIVE_FEATURES = VAR_ALL[:]  # allow all by default
-try:
-    EXCLUDE_FOR_NCA
-except NameError:
-    EXCLUDE_FOR_NCA = []  # exclude none by default
+ALLOWED_LIVE_FEATURES = VAR_ALL[:] if VAR_ALL else []
+EXCLUDE_FOR_NCA = []  # tweak if needed
 
-# ============================== Simple Isotonic helpers ==============================
+# ============================== Add Stock (no table) ==============================
+st.markdown("---")
+st.subheader("Add Stock")
+
+with st.form("add_form", clear_on_submit=True):
+    c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
+    with c1:
+        ticker      = st.text_input("Ticker", "").strip().upper()
+        mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
+        float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
+        gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")
+        max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")
+    with c2:
+        atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
+        pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
+        pm_dol      = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
+        rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
+    with c3:
+        catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
+    submitted = st.form_submit_button("Add", use_container_width=True)
+
+if submitted and ticker:
+    row = {
+        "Ticker": ticker,
+        "MC_PM_Max_M": mc_pmmax,
+        "Float_PM_Max_M": float_pm,
+        "Gap_%": gap_pct,
+        "ATR_$": atr_usd,
+        "PM_Vol_M": pm_vol,
+        "PM_$Vol_M$": pm_dol,
+        "FR_x": (pm_vol / float_pm) if float_pm > 0 else np.nan,
+        "PM$Vol/MC_%": (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else np.nan,
+        "Max_Pull_PM_%": max_pull_pm,
+        "RVOL_Max_PM_cum": rvol_pm_cum,
+        "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
+        "CatalystYN": catalyst_yn,
+    }
+    ss.rows.append(row)
+    st.success(f"Saved {ticker}.")
+
+# ============================== Isotonic helpers ==============================
 def _pav_isotonic(x, y):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     if x.size == 0: return [], []
@@ -218,12 +230,10 @@ def _pav_isotonic(x, y):
             s1, n1 = blocks.pop()
             s0, n0 = blocks.pop()
             blocks.append([(s0*n0 + s1*n1)/(n0+n1), n0+n1])
-    bx = []; by = []
-    i = 0
+    bx = []; by = []; i = 0
     for mean, n in blocks:
         by.extend([mean]*int(n))
-        bx.extend([x[i + j] for j in range(int(n))])
-        i += int(n)
+        bx.extend([x[i + j] for j in range(int(n))]); i += int(n)
     return bx, by
 
 def _iso_predict(bx, by, xq):
@@ -273,8 +283,7 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         from sklearn.neighbors import NeighborhoodComponentsAnalysis
         nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=400)
         z = nca.fit_transform(Xs, y).ravel()
-        used = "nca"
-        components = nca.components_
+        used = "nca"; components = nca.components_
     except Exception:
         X0 = Xs[y==0]; X1 = Xs[y==1]
         if X0.shape[0] < 2 or X1.shape[0] < 2: return {}
@@ -285,7 +294,7 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         w_vec = w_vec / (np.linalg.norm(w_vec) + 1e-12)
         z = (Xs @ w_vec)
 
-    # Orient so larger → A
+    # Orient larger → A
     if np.nanmean(z[y==1]) < np.nanmean(z[y==0]):
         z = -z
         if w_vec is not None: w_vec = -w_vec
@@ -315,13 +324,13 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         "gA": gA_label, "gB": gB_label,
     }
 
-def _nca_predict_proba_row(xrow: pd.Series, model: dict) -> float:
+def _nca_predict_proba_row(xrow: dict, model: dict) -> float:
     if not model or not model.get("ok"): return np.nan
     feats = model["feats"]
     vals = []
     for f in feats:
-        val = pd.to_numeric(xrow.get(f), errors="coerce")
-        v = float(val) if pd.notna(val) else np.nan
+        v = pd.to_numeric(xrow.get(f), errors="coerce")
+        v = float(v) if pd.notna(v) else np.nan
         if not np.isfinite(v): return np.nan
         vals.append(v)
     x = np.array(vals, dtype=float)
@@ -355,20 +364,9 @@ def _nca_predict_proba_row(xrow: pd.Series, model: dict) -> float:
     return float(np.clip(pA, 0.0, 1.0))
 
 # ============================== CatBoost ==============================
-try:
-    from catboost import CatBoostClassifier
-    _CATBOOST_OK = True
-except Exception:
-    _CATBOOST_OK = False
-
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
-    if not _CATBOOST_OK:
-        if not ss.get("__catboost_warned", False):
-            st.info("CatBoost not installed. Run `pip install catboost` to enable the purple CatBoost series.")
-            ss["__catboost_warned"] = True
-        return {}
 
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
     feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
@@ -425,7 +423,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         except Exception:
             return {}
 
-    # Calibration (optional; use simple Platt-ish if no valid iso)
+    # Calibration (optional-lite)
     iso_bx = np.array([]); iso_by = np.array([]); platt = None
     try:
         if eval_ok:
@@ -446,13 +444,13 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     return {"ok": True, "feats": feats, "gA": gA_label, "gB": gB_label,
             "cb": model, "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(), "platt": platt}
 
-def _cat_predict_proba_row(xrow: pd.Series, model: dict) -> float:
+def _cat_predict_proba_row(xrow: dict, model: dict) -> float:
     if not model or not model.get("ok"): return np.nan
     feats = model["feats"]
     vals = []
     for f in feats:
-        val = pd.to_numeric(xrow.get(f), errors="coerce")
-        v = float(val) if pd.notna(val) else np.nan
+        v = pd.to_numeric(xrow.get(f), errors="coerce")
+        v = float(v) if pd.notna(v) else np.nan
         if not np.isfinite(v): return np.nan
         vals.append(v)
     X = np.array(vals, dtype=float).reshape(1, -1)
@@ -472,7 +470,7 @@ def _cat_predict_proba_row(xrow: pd.Series, model: dict) -> float:
         pA = z if not pl else 1.0 / (1.0 + np.exp(-pl[1]*(z - pl[0])))
     return float(np.clip(pA, 0.0, 1.0))
 
-# ============================== Alignment (Distributions Only) ==============================
+# ============================== Alignment (Distributions for ADDED stocks) ==============================
 st.markdown("---")
 st.subheader("Alignment")
 
@@ -481,15 +479,16 @@ if base_df.empty:
     st.warning("Upload your Excel and click **Build model stocks**. Alignment distributions are disabled until then.")
     st.stop()
 
-# Required columns
-missing = []
-if "Max_Push_Daily_%" not in base_df.columns:
-    missing.append("Max Push Daily (%) → expected as Max_Push_Daily_%")
-if missing:
-    st.error("Your DB is missing required columns:\n- " + "\n- ".join(missing))
-    st.caption("Fix your column headers or add a mapping in the loader helpers.")
+if not ss.rows:
+    st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
+# Required columns on DB side
+if "Max_Push_Daily_%" not in base_df.columns:
+    st.error("Your DB is missing column: Max_Push_Daily_% (Max Push Daily (%) as %).")
+    st.stop()
+
+# Features available in DB (live)
 var_core = ss.get("var_core", [])
 var_mod  = ss.get("var_moderate", [])
 var_all  = [v for v in (var_core + var_mod) if v in base_df.columns]
@@ -497,10 +496,10 @@ if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
     st.stop()
 
-# Cutoffs 0 → 600 step 25
+# Gain% cutoffs 0 → 600 step 25
 gain_cutoffs = list(range(0, 601, 25))
 
-# Utility to split by cutoff
+# Split helper: Gain% ≥ cutoff vs Rest
 def _make_split(df_base: pd.DataFrame, thr_val: float):
     df_tmp = df_base.copy()
     df_tmp["__Group__"] = np.where(
@@ -510,27 +509,29 @@ def _make_split(df_base: pd.DataFrame, thr_val: float):
     gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
     return df_tmp, gA_, gB_
 
-# Compute per-cutoff median predicted probs over the whole base_df
+# Build a DataFrame of added stocks for prediction (we'll use the model feature set per cutoff)
+added_df = pd.DataFrame(ss.rows)
+
 thr_labels = []
 series_N_med, series_C_med = [], []
 
 for thr_val in gain_cutoffs:
     df_split, gA, gB = _make_split(base_df, float(thr_val))
 
-    # Skip thresholds where either class is missing or tiny
+    # need both groups reasonably present
     vc = df_split["__Group__"].value_counts()
     if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
         continue
 
-    # Train both models on the split
+    # Train models on DB for this cutoff
     nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
     cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
 
-    # If both empty, skip
+    # If both models failed to train, skip cutoff
     if not nca_model and not cat_model:
         continue
 
-    # Build prediction frame (finite rows only for required feats)
+    # Determine required features for predicting on ADDED stocks
     req_feats = []
     if nca_model: req_feats += nca_model.get("feats", [])
     if cat_model: req_feats += cat_model.get("feats", [])
@@ -538,30 +539,35 @@ for thr_val in gain_cutoffs:
     if not req_feats:
         continue
 
-    Xdf = df_split[req_feats].apply(pd.to_numeric, errors="coerce")
-    mask = np.isfinite(Xdf.values).all(axis=1)
-    df_pred = df_split.loc[mask].copy()
-    if df_pred.shape[0] < 20:
+    # Filter ADDED rows to those with finite values for required feats
+    if added_df.empty:
+        continue
+    Xadd = added_df[req_feats].apply(pd.to_numeric, errors="coerce")
+    mask = np.isfinite(Xadd.values).all(axis=1)
+    pred_rows = added_df.loc[mask].to_dict(orient="records")
+    if len(pred_rows) == 0:
         continue
 
+    # Predict on ADDED stocks
     pN, pC = [], []
     if nca_model:
-        pN = [ _nca_predict_proba_row(df_pred.iloc[i], nca_model) for i in range(df_pred.shape[0]) ]
+        for r in pred_rows:
+            p = _nca_predict_proba_row(r, nca_model)
+            if np.isfinite(p): pN.append(p)
     if cat_model:
-        pC = [ _cat_predict_proba_row(df_pred.iloc[i], cat_model) for i in range(df_pred.shape[0]) ]
+        for r in pred_rows:
+            p = _cat_predict_proba_row(r, cat_model)
+            if np.isfinite(p): pC.append(p)
 
-    pN = np.array([x for x in pN if np.isfinite(x)], dtype=float)
-    pC = np.array([x for x in pC if np.isfinite(x)], dtype=float)
-
-    if pN.size==0 and pC.size==0:
+    if (len(pN) == 0) and (len(pC) == 0):
         continue
 
     thr_labels.append(int(thr_val))
-    series_N_med.append(float(np.nanmedian(pN)*100.0) if pN.size else np.nan)
-    series_C_med.append(float(np.nanmedian(pC)*100.0) if pC.size else np.nan)
+    series_N_med.append(float(np.nanmedian(pN)*100.0) if len(pN) else np.nan)
+    series_C_med.append(float(np.nanmedian(pC)*100.0) if len(pC) else np.nan)
 
 if not thr_labels:
-    st.info("Not enough data across cutoffs to train both classes. Try a broader DB.")
+    st.info("Not enough data across cutoffs to train both classes and evaluate your added stocks. Add more stocks or broaden the DB.")
 else:
     # Build tidy frame for Altair
     data = []
@@ -579,7 +585,7 @@ else:
         .mark_bar()
         .encode(
             x=alt.X("GainCutoff_%:O", title="Gain% cutoff (0 → 600, step 25)"),
-            y=alt.Y("Value:Q", title="Median predicted probability for class A (%)", scale=alt.Scale(domain=[0, 100])),
+            y=alt.Y("Value:Q", title="Median P(A) for your added stocks (%)", scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="")),
             xOffset="Series:N",
             tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
@@ -588,7 +594,7 @@ else:
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # Optional: PNG export via Matplotlib
+    # Optional PNG export via Matplotlib
     png_bytes = None
     try:
         pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
@@ -608,7 +614,7 @@ else:
         ax.set_xticks(x); ax.set_xticklabels([str(t) for t in thresholds], rotation=0)
         ax.set_ylim(0, 100)
         ax.set_xlabel("Gain% cutoff")
-        ax.set_ylabel("Median predicted probability for class A (%)")
+        ax.set_ylabel("Median P(A) for your added stocks (%)")
         ax.legend(loc="upper left", frameon=False)
 
         buf = _io.BytesIO(); fig.tight_layout()
