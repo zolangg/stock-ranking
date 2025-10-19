@@ -493,11 +493,11 @@ if "align_sel_tickers" not in st.session_state:
 csel1, csel2 = st.columns([4, 1])
 with csel1:
     selected_tickers = st.multiselect(
-        "Select added stocks to include",
+        "",
         options=all_added_tickers,
         default=st.session_state["align_sel_tickers"],
         key="align_sel_tickers",
-        help="Median P(A) will be computed over just these tickers.",
+        label_visibility="collapsed",
     )
 with csel2:
     def _clear_sel(): st.session_state["align_sel_tickers"] = []
