@@ -64,26 +64,6 @@ def _to_float(x):
     except Exception:
         return np.nan
 
-# --- Robustness helpers ---
-EPS = 1e-9
-
-def _winsor(s: pd.Series, p=0.005) -> pd.Series:
-    s = pd.to_numeric(s, errors="coerce")
-    if s.notna().sum() < 5:
-        return s
-    lo, hi = s.quantile(p), s.quantile(1 - p)
-    return s.clip(lo, hi)
-
-def _ensure_percent_once(s: pd.Series) -> pd.Series:
-    x = pd.to_numeric(s, errors="coerce")
-    if x.notna().sum() == 0:
-        return x
-    q01, q99 = x.quantile(0.01), x.quantile(0.99)
-    # If values look like fractions (<= ~1.5), scale to %
-    if 0.0 <= q01 <= 1.0 and 0.0 <= q99 <= 1.5:
-        return x * 100.0
-    return x
-
 # ============================== Upload / Build ==============================
 st.subheader("Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
@@ -104,7 +84,7 @@ if build_btn:
         try:
             file_bytes = uploaded.getvalue()
             raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
-
+            
             df = pd.DataFrame()
 
             def add_num(dfout, name, src_candidates):
@@ -130,38 +110,25 @@ if build_btn:
                 except: return np.nan
             if cand_catalyst: df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
 
-            # Derived metrics with safe divisions
             float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
             if {"PM_Vol_M", float_basis}.issubset(df.columns):
-                df["FR_x"] = (df["PM_Vol_M"] / (df[float_basis] + EPS)).replace([np.inf, -np.inf], np.nan)
-
+                df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
             mcap_basis = "MC_PM_Max_M" if "MC_PM_Max_M" in df.columns and df["MC_PM_Max_M"].notna().any() else "MarketCap_M$"
             if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
-                df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / (df[mcap_basis] + EPS) * 100.0).replace([np.inf, -np.inf], np.nan)
+                df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
 
-            # Remove double scaling; normalize percents once based on distribution
-            # Original block multiplied by 100 unconditionally — risky. Instead:
-            if "Gap_%".strip() in df.columns:
-                df["Gap_%"] = _ensure_percent_once(df["Gap_%"])
-            if "Max_Pull_PM_%".strip() in df.columns:
-                df["Max_Pull_PM_%"] = _ensure_percent_once(df["Max_Pull_PM_%"])
+            for pct_col in ("Gap_%","PM_Vol_%","Max_Pull_PM_%"):
+                if pct_col in df.columns:
+                    df[pct_col] = pd.to_numeric(df[pct_col], errors="coerce") * 100.0
 
             pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
             df["Max_Push_Daily_%"] = (
-                pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce")
+                pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce") * 100.0
                 if pmh_col is not None else np.nan
             )
-            if "Max_Push_Daily_%" in df.columns:
-                df["Max_Push_Daily_%"] = _ensure_percent_once(df["Max_Push_Daily_%"])
-
-            # Keep only relevant columns
+            
             keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%"])
             df = df[[c for c in df.columns if c in keep_cols]].copy()
-
-            # Winsorize heavy-tailed numeric features (not the binary Catalyst)
-            for c in UNIFIED_VARS:
-                if c in df.columns and c != "Catalyst":
-                    df[c] = _winsor(df[c])
 
             ss.base_df = df
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
@@ -199,27 +166,18 @@ if submitted and ticker:
         "ATR_$": atr_usd,
         "PM_Vol_M": pm_vol,
         "PM_$Vol_M$": pm_dol,
-        "FR_x": (pm_vol / (float_pm + EPS)) if float_pm > 0 else np.nan,
-        "PM$Vol/MC_%": (pm_dol / (mc_pmmax + EPS) * 100.0) if mc_pmmax > 0 else np.nan,
+        "FR_x": (pm_vol / float_pm) if float_pm > 0 else np.nan,
+        "PM$Vol/MC_%": (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else np.nan,
         "Max_Pull_PM_%": max_pull_pm,
         "RVOL_Max_PM_cum": rvol_pm_cum,
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
         "CatalystYN": catalyst_yn,
     }
-
-    # Light winsorization for single row to mirror base_df stability
-    def _winsor_one(x):
-        s = pd.Series([pd.to_numeric(x, errors="coerce")])
-        return float(_winsor(s).iloc[0])
-    for c in UNIFIED_VARS:
-        if c in row and c != "Catalyst":
-            row[c] = _winsor_one(row[c])
-
     ss.rows.append(row)
     st.success(f"Saved {ticker}.")
 
 # ============================== Isotonic helpers & Model Training ==============================
-# (All functions in this block are unchanged from your version, except safer fallbacks added in CatBoost)
+# (All functions in this block are unchanged)
 def _pav_isotonic(x, y):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     if x.size == 0: return [], []
@@ -362,15 +320,17 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     def _has_both_classes(arr):
         return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
-
-    # --- TUNED PARAMETERS ---
+    
+# --- TUNED PARAMETERS ---
+    # Goal: Create a more "open-minded" model that is less likely to assign 0%
+    # to outliers, at the cost of potentially more false positives.
     params = dict(
         loss_function="Logloss",
         eval_metric="Logloss",
         iterations=200,
-        learning_rate=0.05,
-        depth=2,
-        l2_leaf_reg=10,
+        learning_rate=0.05,  # Slightly increased to prevent overfitting to tiny details.
+        depth=2,             # From 3 -> 2. FORCES the model to learn simpler, more general rules. This is the biggest change.
+        l2_leaf_reg=10,      # From 6 -> 10. Increased penalty for being "too certain," pushing predictions away from 0% and 100%.
         bootstrap_type="Bayesian",
         bagging_temperature=0.5,
         auto_class_weights="Balanced",
@@ -378,7 +338,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         allow_writing_files=False,
         verbose=False,
     )
-
+    
     if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
     else:       params.update(dict(od_type="None"))
     model = CatBoostClassifier(**params)
@@ -392,7 +352,6 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
             eval_ok = False
         except Exception:
             return {}
-
     iso_bx = np.array([]); iso_by = np.array([]); platt = None
     try:
         if eval_ok:
@@ -400,18 +359,14 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
             if np.unique(p_raw).size >= 3 and _has_both_classes(yva):
                 bx, by = _pav_isotonic(p_raw, yva.astype(float))
                 if len(bx) >= 2: iso_bx, iso_by = np.array(bx), np.array(by)
-        # Fallback calibration on train if isotonic not viable
-        if iso_bx.size < 2:
-            p_tr = model.predict_proba(Xtr if eval_ok else X_all)[:, 1].astype(float)
-            y_tr = ytr if eval_ok else y_all
-            z0 = p_tr[y_tr == 0]; z1 = p_tr[y_tr == 1]
-            if z0.size and z1.size:
-                m0, m1 = float(np.mean(z0)), float(np.mean(z1))
-                s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
-                m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
-                platt = (m, k)
-    except Exception:
-        pass
+            if iso_bx.size < 2:
+                z0 = p_raw[yva==0]; z1 = p_raw[yva==1]
+                if z0.size and z1.size:
+                    m0, m1 = float(np.mean(z0)), float(np.mean(z1))
+                    s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
+                    m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
+                    platt = (m, k)
+    except Exception: pass
     return {"ok": True, "feats": feats, "gA": gA_label, "gB": gB_label, "cb": model, "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(), "platt": platt}
 
 def _cat_predict_proba_row(xrow: dict, model: dict) -> float:
@@ -443,12 +398,14 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         return {}
     gA_, gB_ = list(centers_tbl.columns)
     counts = {gA_: 0.0, gB_: 0.0}
+    
     for var in centers_tbl.index:
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
         if not np.isfinite(xv): continue
         vA = centers_tbl.at[var, gA_]
         vB = centers_tbl.at[var, gB_]
         if pd.isna(vA) or pd.isna(vB): continue
+
         if abs(xv - vA) < abs(xv - vB):
             counts[gA_] += 1.0
         elif abs(xv - vB) < abs(xv - vA):
@@ -456,6 +413,7 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         else:
             counts[gA_] += 0.5
             counts[gB_] += 0.5
+            
     total = counts[gA_] + counts[gB_]
     return {
         "A_pct": 100.0 * counts[gA_] / total if total > 0 else 0.0,
@@ -488,9 +446,6 @@ def _delete_selected():
     if tickers_to_delete:
         ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(tickers_to_delete)]
         st.session_state["align_sel_tickers"] = []
-        # Force immediate refresh so the multiselect options & charts update
-        if hasattr(st, "rerun"): st.rerun()
-        elif hasattr(st, "experimental_rerun"): st.experimental_rerun()
 
 col1, col2, col3 = st.columns([6, 1, 1])
 with col1:
@@ -514,7 +469,6 @@ if "Max_Push_Daily_%" not in base_df.columns:
     st.error("Your DB is missing column: Max_Push_Daily_% (Max Push Daily (%) as %).")
     st.stop()
 
-# Lock features to avoid threshold-by-threshold drift
 var_all = [v for v in UNIFIED_VARS if v in base_df.columns]
 if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
@@ -544,31 +498,23 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
             continue
 
-        # Extra guard to avoid pathological imbalance (stabilizes calibration)
-        pos_rate = (df_split["__Group__"] == gA).mean()
-        if pos_rate < 0.10 or pos_rate > 0.90:
-            continue
-
         nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
         cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
-
+        
         features_for_centers = [f for f in ALLOWED_LIVE_FEATURES if f in df_split.columns]
         centers_tbl = df_split.groupby("__Group__")[features_for_centers].median().T
         if gA not in centers_tbl.columns or gB not in centers_tbl.columns:
             continue
         centers_tbl = centers_tbl[[gA, gB]]
 
-        # Use the locked feature set for predictions
-        req_feats = var_all[:]
-        if added_df.empty:
-            continue
+        req_feats = sorted(set(nca_model.get("feats", []) + cat_model.get("feats", []) + features_for_centers))
+        if not req_feats: continue
 
-        # Robust reindex & mask
-        Xadd = added_df.reindex(columns=req_feats).apply(pd.to_numeric, errors="coerce")
+        if added_df.empty: continue
+        Xadd = added_df[req_feats].apply(pd.to_numeric, errors="coerce")
         mask = np.isfinite(Xadd.values).all(axis=1)
         pred_rows = added_df.loc[mask].to_dict(orient="records")
-        if len(pred_rows) == 0:
-            continue
+        if len(pred_rows) == 0: continue
 
         pN, pC, pA_centers, pB_centers = [], [], [], []
         for r in pred_rows:
@@ -595,24 +541,33 @@ with st.spinner("Calculating distributions across all cutoffs..."):
 # --- FINAL, ROBUST VERSION: Function to generate export buttons for any chart ---
 def create_export_buttons(df, chart_obj, file_prefix):
     """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
+    # Initialize with empty bytes. This is the key to preventing the crash.
     png_bytes = b""
+    
     try:
+        # --- Start of the safe block ---
+        # All complex operations for PNG generation are now inside this try...except block.
+        
+        # 1. Prepare data by pivoting
         x_axis_col = df.columns[0]
         pivot = df.pivot(index=x_axis_col, columns="Series", values="Value").sort_index()
         series_names = list(pivot.columns)
-
-        # Extract colors from chart spec when present
+        
+        # 2. Robustly extract colors from the chart's dictionary representation
         chart_dict = chart_obj.to_dict()
         unique_colors = {}
         try:
+            # This path is more stable than accessing object attributes directly
             domain = chart_dict['encoding']['color']['scale']['domain']
             range_ = chart_dict['encoding']['color']['scale']['range']
             unique_colors = dict(zip(domain, range_))
         except KeyError:
+            # Fallback if the color scale is not explicitly defined
             pass
 
         colors = [unique_colors.get(s, "#999999") for s in series_names]
-
+        
+        # 3. Create the Matplotlib figure
         x_labels = [str(label) for label in pivot.index.tolist()]
         n_groups, n_series = len(x_labels), len(series_names)
         x_pos = np.arange(n_groups)
@@ -631,26 +586,31 @@ def create_export_buttons(df, chart_obj, file_prefix):
         ax.set_ylabel("Value (%)")
         ax.legend(loc="upper left", frameon=False)
         ax.set_title(chart_obj.title)
-
+        
+        # 4. Save figure to a bytes buffer
         buf = io.BytesIO()
         fig.tight_layout()
         fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
         plt.close(fig)
         png_bytes = buf.getvalue()
 
-    except Exception:
+    except Exception as e:
+        # If ANY of the above steps fail, we silently pass.
+        # png_bytes will remain empty (b""), disabling the PNG button
+        # but allowing the script to continue and render the HTML button.
         pass
 
+    # --- This part will now always be reached ---
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
             label=f"Download PNG ({file_prefix})",
-            data=png_bytes,
+            data=png_bytes, # Will be b"" if PNG generation failed
             file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
             mime="image/png",
             use_container_width=True,
             key=f"dl_png_{file_prefix}",
-            disabled=not png_bytes
+            disabled=not png_bytes # This correctly disables the button if png_bytes is empty
         )
     with col2:
         spec = chart_obj.to_dict()
@@ -673,7 +633,7 @@ else:
     gB_label = f"Rest (Median Centers)"
     nca_label = f"NCA: P(≥...%)"
     cat_label = f"CatBoost: P(≥...%)"
-
+    
     for i, thr in enumerate(thr_labels):
         data.append({"GainCutoff_%": thr, "Series": gA_label, "Value": series_A_med[i]})
         data.append({"GainCutoff_%": thr, "Series": gB_label, "Value": series_B_med[i]})
@@ -714,29 +674,32 @@ if thr_labels:
     for s in series_list:
         x_raw = np.array(thr_labels)
         y_raw = np.array(s)
-
+        
         mask = ~np.isnan(y_raw)
         x_fit = x_raw[mask]
         y_fit = y_raw[mask]
-
+        
         y_smooth = np.full_like(x_raw, np.nan, dtype=float)
 
         if len(x_fit) > 4:
-            # Polynomial smoother (your setting)
+            # --- Polynomial Regression: The Flexible Smoother ---
             coeffs = np.polyfit(x_fit, y_fit, 4)
             poly_func = np.poly1d(coeffs)
             y_smooth = poly_func(x_raw)
             chart_title_suffix = f"(Polynomial Smoothed, Degree=4)"
+            
             smoothed_series.append(np.clip(y_smooth, 0, 100))
         else:
-            smoothed_series.append(y_raw)
+            smoothed_series.append(y_raw) # Not enough data, use raw
             chart_title_suffix = "(Raw Data - Not Enough to Smooth)"
+
 
     cond_data, cond_labels = [], [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
     for i in range(len(thr_labels) - 1):
         for j, name in enumerate(series_names):
             p_current = smoothed_series[j][i]
             p_next = smoothed_series[j][i+1]
+            
             cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100) if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6 else np.nan
             if pd.notna(cond_prob):
                 transition_label = f"{thr_labels[i]}% → {thr_labels[i+1]}%"
@@ -744,9 +707,9 @@ if thr_labels:
 
     if cond_data:
         df_cond_long = pd.DataFrame(cond_data)
-
+        
         cond_color_domain, cond_color_range = [gA_label, nca_label, cat_label], ["#3b82f6", "#10b981", "#8b5cf6"]
-
+        
         cond_chart = (
             alt.Chart(df_cond_long)
             .mark_bar()
@@ -760,9 +723,9 @@ if thr_labels:
             .properties(height=400, title=f"Conditional Probability {chart_title_suffix}")
         )
         st.altair_chart(cond_chart, use_container_width=True)
-
-        # Export buttons for the conditional probability chart
+        
+        # FIX: Added the export buttons for the conditional probability chart
         create_export_buttons(df_cond_long, cond_chart, "conditional_probability")
-
+        
     else:
         st.info("Not enough sequential data to calculate conditional probabilities.")
