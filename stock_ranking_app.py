@@ -701,3 +701,102 @@ if cond_data:
     st.altair_chart(cond_chart, use_container_width=True)
 else:
     st.info("Not enough sequential data to calculate conditional probabilities.")
+
+# --- Function to generate export buttons for any chart ---
+def create_export_buttons(df, chart_obj, file_prefix):
+    """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
+    png_bytes = None
+    try:
+        # The first column of the dataframe is assumed to be the X-axis
+        x_axis_col = df.columns[0]
+        pivot = df.pivot(index=x_axis_col, columns="Series", values="Value").sort_index()
+        series_names = list(pivot.columns)
+        
+        # Determine unique colors from the chart object's encoding
+        unique_colors = {}
+        if hasattr(chart_obj, 'encoding') and 'color' in chart_obj.encoding:
+            color_encoding = chart_obj.encoding['color']
+            if hasattr(color_encoding, 'scale') and hasattr(color_encoding.scale, 'domain'):
+                domain = color_encoding.scale.domain
+                range_ = color_encoding.scale.range
+                unique_colors = dict(zip(domain, range_))
+        
+        colors = [unique_colors.get(s, "#999999") for s in series_names]
+        
+        x_labels = [str(label) for label in pivot.index.tolist()]
+        n_groups, n_series = len(x_labels), len(series_names)
+        x_pos = np.arange(n_groups)
+        bar_width = 0.8 / max(n_series, 1)
+
+        fig, ax = plt.subplots(figsize=(max(7, n_groups * 0.6), 5))
+        for i, series_name in enumerate(series_names):
+            vals = pivot[series_name].values.astype(float)
+            # Calculate the position for each bar in the group
+            offset = i * bar_width - (n_series - 1) * bar_width / 2
+            ax.bar(x_pos + offset, vals, width=bar_width, label=series_name, color=colors[i])
+
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+        ax.set_ylim(0, 100)
+        ax.set_xlabel(x_axis_col)
+        ax.set_ylabel("Value (%)")
+        ax.legend(loc="upper left", frameon=False)
+        ax.set_title(chart_obj.title)
+        
+        # Save figure to a bytes buffer
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+        plt.close(fig)
+        png_bytes = buf.getvalue()
+
+    except Exception as e:
+        # Silently fail on PNG generation if there's an issue, but allow HTML to proceed
+        st.caption(f"Could not generate PNG for download: {e}")
+
+    # Create the download buttons in two columns
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            label=f"Download PNG ({file_prefix})",
+            data=png_bytes,
+            file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+            mime="image/png",
+            use_container_width=True,
+            key=f"dl_png_{file_prefix}",
+            disabled=(png_bytes is None)
+        )
+    with col2:
+        spec = chart_obj.to_dict()
+        html_template = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{file_prefix}</title>
+  <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+</head>
+<body>
+  <div id="vis"></div>
+  <script>
+    const spec = {json.dumps(spec)};
+    vegaEmbed("#vis", spec, {{"actions": True}});
+  </script>
+</body>
+</html>
+"""
+        st.download_button(
+            label=f"Download HTML ({file_prefix})",
+            data=html_template.encode("utf-8"),
+            file_name=f"{file_prefix}.html",
+            mime="text/html",
+            use_container_width=True,
+            key=f"dl_html_{file_prefix}"
+        )
+
+# --- This is the line you add after displaying the conditional chart ---
+# It calls the function above with the correct data and objects for the second chart.
+if 'df_cond_long' in locals() and not df_cond_long.empty:
+    create_export_buttons(df_cond_long, cond_chart, "conditional_probability")
