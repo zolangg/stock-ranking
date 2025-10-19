@@ -7,6 +7,7 @@
 # + EDIT (2025-10-19): Removed radios (FT vs Fail / Gain% vs Rest),
 #                      keep single Gain% selector and put Delete UI on same row.
 # + EDIT (perf-clean): removed unused imports, tightened DataFrame ops, de-dup helpers
+# + EDIT (fix): remove leftover `mode` refs, define gain_choices once, add safe feature lists
 
 import streamlit as st
 import pandas as pd
@@ -223,7 +224,18 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
+# Unified list for downstream code
 VAR_ALL = (ss.get("var_core", []) or []) + (ss.get("var_moderate", []) or [])
+
+# Safe feature allow/exclude lists for NCA/CatBoost (adjust these to your live features)
+try:
+    ALLOWED_LIVE_FEATURES
+except NameError:
+    ALLOWED_LIVE_FEATURES = VAR_ALL[:]  # default: allow all loaded variables
+try:
+    EXCLUDE_FOR_NCA
+except NameError:
+    EXCLUDE_FOR_NCA = []                # default: exclude nothing
 
 # ============================== Add Stock ==============================
 st.markdown("---")
@@ -344,12 +356,15 @@ def _handle_delete():
     else:
         st.session_state["__delete_msg"] = "No tickers selected."
 
+# Define choices ONCE so Distributions can reuse them
+gain_choices = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
+
 # ---- One row: Gain% (left) + Delete UI (right) ----
 left, right = st.columns([1.0, 3.0])
 
 with left:
     # --- Gain% selector with readable labels ---
-    gain_map = {v: f"{v}% from PMH" for v in [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]}
+    gain_map = {v: f"{v}% from PMH" for v in gain_choices}
     gain_label = st.selectbox(
         "",
         list(gain_map.values()),
@@ -457,6 +472,37 @@ else:
 mad_tbl = mad_tbl.reindex(index=med_tbl.index)[[gA, gB]]
 
 # ============================== NCA training (live features only) ==============================
+def _pav_isotonic(x, y):
+    # simple pooled-adjacent-violators for calibration
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    order = np.argsort(x); x = x[order]; y = y[order]
+    blocks = [[y[0], 1.0]]
+    for i in range(1, len(y)):
+        blocks.append([y[i], 1.0])
+        while len(blocks) >= 2 and blocks[-2][0] > blocks[-1][0]:
+            s1, n1 = blocks.pop()
+            s0, n0 = blocks.pop()
+            blocks.append([(s0*n0 + s1*n1)/(n0+n1), n0+n1])
+    bx = []; by = []
+    i = 0
+    for mean, n in blocks:
+        by.extend([mean]*int(n))
+        bx.extend([x[i + j] for j in range(int(n))])
+        i += int(n)
+    return bx, by
+
+def _iso_predict(bx, by, xq):
+    # piecewise-constant interpolate (right-continuous)
+    bx = np.asarray(bx, dtype=float); by = np.asarray(by, dtype=float); xq = np.asarray(xq, dtype=float)
+    if bx.size < 2: return np.full_like(xq, np.nan, dtype=float)
+    order = np.argsort(bx); bx = bx[order]; by = by[order]
+    out = np.empty_like(xq, dtype=float)
+    for i, xv in enumerate(xq):
+        k = np.searchsorted(bx, xv, side="right") - 1
+        k = np.clip(k, 0, len(bx)-1)
+        out[i] = by[k]
+    return out
+
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
 
@@ -494,7 +540,6 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=400)
         z = nca.fit_transform(Xs, y).ravel()
         used = "nca"
-        # FIX: Save the learned transformation components
         components = nca.components_
     except Exception:
         # Fisher LDA fallback
@@ -534,7 +579,7 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         "ok": True, "kind": used, "feats": feats,
         "mu": mu.tolist(), "sd": sd.tolist(),
         "w_vec": (w_vec.tolist() if w_vec is not None else None),
-        "components": (components.tolist() if components is not None else None), # FIX: Add components to model dict
+        "components": (components.tolist() if components is not None else None),
         "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(),
         "platt": (platt_params if platt_params is not None else None),
         "gA": gA_label, "gB": gB_label,
@@ -560,11 +605,10 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
         if w is None or not np.isfinite(w).all(): return np.nan
         z = float(xs @ w)
     else: # kind == "nca"
-        # FIX: Use the saved transformation components for prediction
         comp = model.get("components")
         if comp is None: return np.nan
         w = np.array(comp, dtype=float).ravel()
-        if w.size != xs.size: return np.nan # Guardrail
+        if w.size != xs.size: return np.nan
         z = float(xs @ w)
 
     if not np.isfinite(z): return np.nan
@@ -582,19 +626,12 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
 
 # ============================== CatBoost training (same live features; once per split) ==============================
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
-    """Train CatBoost on live features for this split with strong guards:
-       - numeric-only, finite, float32 features
-       - stratified split with both classes in train/val when possible
-       - safe fallback when val is degenerate
-       - probability calibration (isotonic → Platt)
-    """
     if not _CATBOOST_OK:
         if not ss.get("__catboost_warned", False):
             st.info("CatBoost is not installed. Run `pip install catboost` to enable the purple CatBoost column/series.")
             ss["__catboost_warned"] = True
         return {}
 
-    # 1) Select rows & features (applying same exclusion as NCA)
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
     feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
     if not feats:
@@ -603,36 +640,30 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
     y = (df2["__Group__"].values == gA_label).astype(int)
 
-    # 2) Drop any rows with non-finite values
     mask_finite = np.isfinite(Xdf.values).all(axis=1)
     Xdf = Xdf.loc[mask_finite]
     y = y[mask_finite]
 
-    # Need enough data and two classes
     n = len(y)
     if n < 40 or np.unique(y).size < 2:
         return {}
 
-    # Cast to float32 for CatBoost stability on numeric features
     X_all = Xdf.values.astype(np.float32, copy=False)
     y_all = y.astype(np.int32, copy=False)
 
-    # 3) Stratified split (try to ensure both classes in val)
     from sklearn.model_selection import StratifiedShuffleSplit
-    test_size = 0.2 if n >= 100 else max(0.15, min(0.25, 20 / n))  # 15–25% val; ensure some samples on small sets
+    test_size = 0.2 if n >= 100 else max(0.15, min(0.25, 20 / n))
     sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
     tr_idx, va_idx = next(sss.split(X_all, y_all))
     Xtr, Xva = X_all[tr_idx], X_all[va_idx]
     ytr, yva = y_all[tr_idx], y_all[va_idx]
 
-    # Check class coverage in train/val
     def _has_both_classes(arr):
         u = np.unique(arr)
         return (u.size == 2)
 
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
 
-    # 4) Build model (enable early stopping only if eval_set is valid)
     params = dict(
         loss_function="Logloss",
         eval_metric="Logloss",
@@ -650,39 +681,32 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     if eval_ok:
         params.update(dict(od_type="Iter", od_wait=40))
     else:
-        # No reliable eval → disable early stopping
         params.update(dict(od_type="None"))
 
     model = CatBoostClassifier(**params)
 
-    # 5) Fit with safe fallbacks
     try:
         if eval_ok:
             model.fit(Xtr, ytr, eval_set=(Xva, yva))
         else:
             model.fit(Xtr, ytr)
     except Exception:
-        # Retry: train on all data without early stopping
         try:
             model = CatBoostClassifier(**{**params, "od_type": "None"})
             model.fit(X_all, y_all)
-            # If we trained on all data, we won't have a clean val for isotonic. We'll use Platt later.
             eval_ok = False
         except Exception:
             return {}
 
-    # 6) Calibration
     iso_bx = np.array([]); iso_by = np.array([]); platt = None
     if eval_ok:
         try:
             p_raw = model.predict_proba(Xva)[:, 1].astype(float)
-            # Need variety & both classes for isotonic
             if np.unique(p_raw).size >= 3 and _has_both_classes(yva):
                 bx, by = _pav_isotonic(p_raw, yva.astype(float))
                 if len(bx) >= 2:
                     iso_bx, iso_by = np.array(bx), np.array(by)
             if iso_bx.size < 2:
-                # Platt from validation
                 z0 = p_raw[yva==0]; z1 = p_raw[yva==1]
                 if z0.size and z1.size:
                     m0, m1 = float(np.mean(z0)), float(np.mean(z1))
@@ -691,7 +715,6 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
                     k = 2.0 / (0.5*(s0+s1) + 1e-6)
                     platt = (m, k)
         except Exception:
-            # Fallback: simple Platt using train split
             try:
                 p_raw = model.predict_proba(Xtr)[:, 1].astype(float)
                 if _has_both_classes(ytr):
@@ -702,7 +725,6 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
             except Exception:
                 pass
     else:
-        # No eval set: Platt from a small internal split on train if possible
         try:
             from sklearn.model_selection import StratifiedShuffleSplit
             sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=7)
@@ -743,7 +765,7 @@ def _cat_predict_proba(row: dict, model: dict) -> float:
     try:
         cb = model.get("cb")
         if cb is None: return np.nan
-        z = float(cb.predict_proba(x)[0, 1])  # raw prob of class A
+        z = float(cb.predict_proba(x)[0, 1])
     except Exception:
         return np.nan
 
@@ -929,7 +951,7 @@ html = """
   .sig-lo{background:rgba(239,68,68,0.18)!important}
 
   /* Ensure horizontal scroll with fixed min-width so columns never hide */
-  #align { min-width: 1060px; } /* tweak if you change column widths below */
+  #align { min-width: 1060px; }
   #align-wrap { overflow:auto; width:100%; }
 </style></head><body>
   <div id="align-wrap">
@@ -1020,9 +1042,9 @@ html = """
       const table=$('#align').DataTable({
         data: data.rows||[],
         paging:false, info:false, searching:false, order:[[0,'asc']],
-        responsive:false,   // keep all columns visible
-        scrollX:true,       // enable horizontal scroll inside wrapper
-        autoWidth:false,    // we set widths manually
+        responsive:false,
+        scrollX:true,
+        autoWidth:false,
         columns:[
           {data:'Ticker', width:'140px'},
           {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int,'blue'),   width:'220px'},
@@ -1044,18 +1066,10 @@ html = """
 </body></html>
 """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
-
-# Force refresh of the HTML table when split/rows change
-cache_bust = f"{gA}|{gB}|{int(thr)}|{len(summary_rows)}"
-
-# FIX: Replaced the faulty, complex try-except block with a single, reliable call.
-# This ensures that the scrolling functionality is correctly enabled in modern Streamlit versions.
 components.html(html, height=800, scrolling=True)
-
 
 # ============================== Alignment exports (CSV full + Markdown compact) ==============================
 if summary_rows:
-    # ---------- Markdown (compact summary) ----------
     def _df_to_markdown_simple(df: pd.DataFrame, float_fmt=".0f") -> str:
         def _fmt(x):
             if x is None: return ""
@@ -1085,7 +1099,6 @@ if summary_rows:
         }
     )
 
-    # ---------- CSV (full with child rows) ----------
     full_rows = []
     sum_by_ticker = {s["Ticker"]: s for s in summary_rows}
 
@@ -1154,7 +1167,6 @@ if summary_rows:
         except Exception:
             return ""
 
-    # Columns to format
     two_dec_cols = ["Value", "A center", "B center", "Δ vs A", "Δ vs B"]
     sigma_cols   = ["σ(A)", "σ(B)"]
     pct_cols     = ["A (%) — Median centers", "B (%) — Median centers", "NCA (%)", "CatBoost (%)"]
@@ -1193,7 +1205,7 @@ if summary_rows:
             use_container_width=True,
             key="dl_align_md_summary",
         )
-                
+
 # ============================== Distributions across Gain% cutoffs ==============================
 st.markdown("---")
 st.subheader("Distributions")
@@ -1206,7 +1218,6 @@ else:
     _seen = set()
     all_tickers = [t for t in all_tickers if not (t in _seen or _seen.add(t))]
 
-    # --- init state BEFORE widgets ---
     if "dist_stock_sel" not in st.session_state:
         st.session_state["dist_stock_sel"] = all_tickers[:]  # default = all
 
@@ -1214,10 +1225,8 @@ else:
         st.session_state["dist_stock_sel"] = []
 
     csel1, csel2 = st.columns([4, 1])
-
     with csel2:
         st.button("Clear", use_container_width=True, key="dist_sel_clear", on_click=_clear_dist_sel)
-
     with csel1:
         stocks_selected = st.multiselect(
             "",
@@ -1233,20 +1242,14 @@ else:
     if not rows_for_dist:
         st.info("No stocks selected.")
     else:
-        def _make_split(df_base: pd.DataFrame, thr_val: float, mode_val: str):
+        # Single-split function (no mode)
+        def _make_split(df_base: pd.DataFrame, thr_val: float):
             df_tmp = df_base.copy()
-            if mode_val == "Gain% vs Rest":
-                df_tmp["__Group__"] = np.where(
-                    pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val,
-                    f"≥{int(thr_val)}%", "Rest"
-                )
-                gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
-            else: # "FT vs Fail (Gain% cutoff on FT=1 only)"
-                a_mask = (df_tmp["FT01"] == 1) & (pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val)
-                b_mask = (df_tmp["FT01"] == 0)
-                df_tmp = df_tmp[a_mask | b_mask].copy()
-                df_tmp["__Group__"] = np.where(df_tmp["FT01"] == 1, f"FT=1 ≥{int(thr_val)}%", "FT=0 (all)")
-                gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0 (all)"
+            df_tmp["__Group__"] = np.where(
+                pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val,
+                f"≥{int(thr_val)}%", "Rest"
+            )
+            gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
             return df_tmp, gA_, gB_
 
         def _summaries(df_in: pd.DataFrame, vars_all: list[str], grp_col: str):
@@ -1262,7 +1265,7 @@ else:
         series_A_med, series_B_med, series_N_med, series_C_med = [], [], [], []
 
         for thr_val in gain_choices:
-            df_split, gA2, gB2 = _make_split(base_df, float(thr_val), mode)
+            df_split, gA2, gB2 = _make_split(base_df, float(thr_val))
             med_tbl2, _ = _summaries(df_split, var_all, "__Group__")
             if med_tbl2.empty or med_tbl2.shape[1] < 2:
                 continue
@@ -1293,7 +1296,7 @@ else:
                 b = counts2.get("B_pct_raw", np.nan) if counts2 else np.nan
 
                 pA = _nca_predict_proba(row, nca_model2)
-                pC = _cat_predict_proba(row, cat_model2)  # ← use the per-cutoff CatBoost
+                pC = _cat_predict_proba(row, cat_model2)
 
                 Ns.append((float(pA)*100.0) if np.isfinite(pA) else np.nan)
                 Cs.append((float(pC)*100.0) if np.isfinite(pC) else np.nan)
@@ -1301,12 +1304,12 @@ else:
 
             thr_labels.append(int(thr_val))
             series_A_med.append(float(np.nanmedian(As)) if len(As) else np.nan)
-            series_B_med.append(float(np.nanmedian(Bs)) if len(Bs) else np.nan)
-            series_N_med.append(float(np.nanmedian(Ns)) if len(Ns) else np.nan)
-            series_C_med.append(float(np.nanmedian(Cs)) if len(Cs) else np.nan)
+            series_B_med.append(float(np.nanmedian(Bs)) if len(As) else np.nan)
+            series_N_med.append(float(np.nanmedian(Ns)) if len(As) else np.nan)
+            series_C_med.append(float(np.nanmedian(Cs)) if len(As) else np.nan)
 
         if not thr_labels:
-            st.info("Not enough data across cutoffs to form two groups — broaden your DB or change mode.")
+            st.info("Not enough data across cutoffs to form two groups — broaden your DB.")
         else:
             labA = f"{gA} (Median centers)"
             labB = f"{gB} (Median centers)"
@@ -1323,7 +1326,7 @@ else:
             df_long = dist_df.melt(id_vars="GainCutoff_%", var_name="Series", value_name="Value")
 
             color_domain = [labA, labB, labN, labC]
-            color_range  = ["#3b82f6", "#ef4444", "#10b981", "#8b5cf6"]  # blue, red, green, purple
+            color_range  = ["#3b82f6", "#ef4444", "#10b981", "#8b5cf6"]
 
             chart = (
                 alt.Chart(df_long)
@@ -1339,47 +1342,39 @@ else:
             )
             st.altair_chart(chart, use_container_width=True)
 
-            # ============================== Distribution chart export (PNG via Matplotlib) ==============================
+            # ---------- PNG export via Matplotlib ----------
             png_bytes = None
             try:
                 pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
                 series_names = list(pivot.columns)
-
                 color_map = {
-                    f"{gA} (Median centers)": "#3b82f6",   # blue
-                    f"{gB} (Median centers)": "#ef4444",   # red
-                    f"NCA: P({gA})": "#10b981",            # green
-                    f"CatBoost: P({gA})": "#8b5cf6",       # purple
+                    f"{gA} (Median centers)": "#3b82f6",
+                    f"{gB} (Median centers)": "#ef4444",
+                    f"NCA: P({gA})": "#10b981",
+                    f"CatBoost: P({gA})": "#8b5cf6",
                 }
                 colors = [color_map.get(s, "#999999") for s in series_names]
-
                 thresholds = pivot.index.tolist()
-                n_groups = len(thresholds)
-                n_series = len(series_names)
-                x = np.arange(n_groups)
-                width = 0.8 / max(n_series, 1)
+                n_groups = len(thresholds); n_series = len(series_names)
+                x = np.arange(n_groups); width = 0.8 / max(n_series, 1)
 
                 fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4))
                 for i, s in enumerate(series_names):
                     vals = pivot[s].values.astype(float)
                     ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
 
-                ax.set_xticks(x)
-                ax.set_xticklabels([str(t) for t in thresholds])
+                ax.set_xticks(x); ax.set_xticklabels([str(t) for t in thresholds])
                 ax.set_ylim(0, 100)
-                ax.set_xlabel("Gain% cutoff")
-                ax.set_ylabel("Median across selected stocks (%)")
+                ax.set_xlabel("Gain% cutoff"); ax.set_ylabel("Median across selected stocks (%)")
                 ax.legend(loc="upper left", frameon=False)
 
-                buf = io.BytesIO()
-                fig.tight_layout()
+                buf = io.BytesIO(); fig.tight_layout()
                 fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
                 plt.close(fig)
                 png_bytes = buf.getvalue()
             except Exception:
                 png_bytes = None
 
-            # ============================== Distribution chart export (HTML + PNG side-by-side) ==============================
             dl_c1, dl_c2 = st.columns(2)
             with dl_c1:
                 if png_bytes:
@@ -1393,7 +1388,6 @@ else:
                     )
                 else:
                     st.caption("PNG export fallback failed.")
-
             with dl_c2:
                 spec = chart.to_dict()
                 html_tpl = f"""<!doctype html>
