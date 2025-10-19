@@ -440,8 +440,6 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-st.info("Analysis compares stocks with a specific **Gain %** against all other stocks (**Rest**).")
-
 # --- NEW: Streamlined UI for stock selection and deletion in one line ---
 all_added_tickers = pd.Series([r.get("Ticker") for r in ss.rows]).dropna().unique().tolist()
 
