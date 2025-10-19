@@ -608,7 +608,7 @@ else:
         .mark_bar()
         .encode(
             x=alt.X("GainCutoff_%:O", title="Gain% cutoff (0 → 600, step 25)"),
-            y=alt.Y("Value:Q", title="Median P(A) for selected added stocks (%)", scale=alt.Scale(domain=[0, 100])),
+            y=alt.Y("Value:Q", title="Median P(A) (%)", scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="")),
             xOffset="Series:N",
             tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
