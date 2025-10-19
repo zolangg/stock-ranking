@@ -16,8 +16,8 @@ from datetime import datetime
 from catboost import CatBoostClassifier  # CatBoost is required
 
 # ============================== Page ==============================
-st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
-st.title("Premarket Stock Analysis")
+st.set_page_config(page_title="GainPredictorX", layout="wide")
+st.title("GainPredictorX")
 
 # ============================== Session ==============================
 ss = st.session_state
