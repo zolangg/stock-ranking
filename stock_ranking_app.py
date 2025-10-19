@@ -638,69 +638,6 @@ vegaEmbed("#vis", spec, {{actions: true}});
             key="dl_html",
         )
 
-# --- Conditional Probability Chart Section with a Choice of Smoothers ---
-st.markdown("---")
-
-series_list = [series_A_med, series_N_med, series_C_med]
-series_names = [gA_label, nca_label, cat_label]
-
-smoothed_series = []
-
-for s in series_list:
-    x_raw = np.array(thr_labels)
-    y_raw = np.array(s)
-    
-    mask = ~np.isnan(y_raw)
-    x_fit = x_raw[mask]
-    y_fit = y_raw[mask]
-    
-    y_smooth = np.full_like(x_raw, np.nan, dtype=float)
-
-    if len(x_fit) > 4:
-        # --- Polynomial Regression: The Flexible Smoother ---
-        coeffs = np.polyfit(x_fit, y_fit, 4)
-        poly_func = np.poly1d(coeffs)
-        y_smooth = poly_func(x_raw)
-        chart_title_suffix = f"(Polynomial Smoothed, Degree=4)"
-        
-        smoothed_series.append(np.clip(y_smooth, 0, 100))
-    else:
-        smoothed_series.append(y_raw) # Not enough data, use raw
-        chart_title_suffix = "(Raw Data - Not Enough to Smooth)"
-
-
-cond_data, cond_labels = [], [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
-for i in range(len(thr_labels) - 1):
-    for j, name in enumerate(series_names):
-        p_current = smoothed_series[j][i]
-        p_next = smoothed_series[j][i+1]
-        
-        cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100) if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6 else np.nan
-        if pd.notna(cond_prob):
-            transition_label = f"{thr_labels[i]}% → {thr_labels[i+1]}%"
-            cond_data.append({"Transition": transition_label, "Series": name, "Value": cond_prob})
-
-if cond_data:
-    df_cond_long = pd.DataFrame(cond_data)
-    
-    cond_color_domain, cond_color_range = [gA_label, nca_label, cat_label], ["#3b82f6", "#10b981", "#8b5cf6"]
-    
-    cond_chart = (
-        alt.Chart(df_cond_long)
-        .mark_bar()
-        .encode(
-            x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels),
-            y=alt.Y("Value:Q", title="Conditional Probability (%)", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("Series:N", scale=alt.Scale(domain=cond_color_domain, range=cond_color_range), legend=alt.Legend(title="Analysis Series")),
-            xOffset="Series:N",
-            tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")],
-        )
-        .properties(height=400, title=f"Conditional Probability {chart_title_suffix}")
-    )
-    st.altair_chart(cond_chart, use_container_width=True)
-else:
-    st.info("Not enough sequential data to calculate conditional probabilities.")
-
 # --- FINAL, ROBUST VERSION: Function to generate export buttons for any chart ---
 def create_export_buttons(df, chart_obj, file_prefix):
     """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
@@ -786,3 +723,66 @@ def create_export_buttons(df, chart_obj, file_prefix):
             use_container_width=True,
             key=f"dl_html_{file_prefix}"
         )
+
+# --- Conditional Probability Chart Section with a Choice of Smoothers ---
+st.markdown("---")
+
+series_list = [series_A_med, series_N_med, series_C_med]
+series_names = [gA_label, nca_label, cat_label]
+
+smoothed_series = []
+
+for s in series_list:
+    x_raw = np.array(thr_labels)
+    y_raw = np.array(s)
+    
+    mask = ~np.isnan(y_raw)
+    x_fit = x_raw[mask]
+    y_fit = y_raw[mask]
+    
+    y_smooth = np.full_like(x_raw, np.nan, dtype=float)
+
+    if len(x_fit) > 4:
+        # --- Polynomial Regression: The Flexible Smoother ---
+        coeffs = np.polyfit(x_fit, y_fit, 4)
+        poly_func = np.poly1d(coeffs)
+        y_smooth = poly_func(x_raw)
+        chart_title_suffix = f"(Polynomial Smoothed, Degree=4)"
+        
+        smoothed_series.append(np.clip(y_smooth, 0, 100))
+    else:
+        smoothed_series.append(y_raw) # Not enough data, use raw
+        chart_title_suffix = "(Raw Data - Not Enough to Smooth)"
+
+
+cond_data, cond_labels = [], [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
+for i in range(len(thr_labels) - 1):
+    for j, name in enumerate(series_names):
+        p_current = smoothed_series[j][i]
+        p_next = smoothed_series[j][i+1]
+        
+        cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100) if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6 else np.nan
+        if pd.notna(cond_prob):
+            transition_label = f"{thr_labels[i]}% → {thr_labels[i+1]}%"
+            cond_data.append({"Transition": transition_label, "Series": name, "Value": cond_prob})
+
+if cond_data:
+    df_cond_long = pd.DataFrame(cond_data)
+    
+    cond_color_domain, cond_color_range = [gA_label, nca_label, cat_label], ["#3b82f6", "#10b981", "#8b5cf6"]
+    
+    cond_chart = (
+        alt.Chart(df_cond_long)
+        .mark_bar()
+        .encode(
+            x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels),
+            y=alt.Y("Value:Q", title="Conditional Probability (%)", scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("Series:N", scale=alt.Scale(domain=cond_color_domain, range=cond_color_range), legend=alt.Legend(title="Analysis Series")),
+            xOffset="Series:N",
+            tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")],
+        )
+        .properties(height=400, title=f"Conditional Probability {chart_title_suffix}")
+    )
+    st.altair_chart(cond_chart, use_container_width=True)
+else:
+    st.info("Not enough sequential data to calculate conditional probabilities.")
