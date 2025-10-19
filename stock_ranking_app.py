@@ -1,7 +1,7 @@
 # stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
 # - Streamlined UI, High-Sensitivity CatBoost Model.
 # - Includes both Absolute and Conditional probability charts.
-# - ADDED: A checkbox to "tame" the conditional chart by applying a moving average.
+# - FINAL VERSION: Conditional chart has an adjustable smoothing slider to control noise.
 
 import streamlit as st
 import pandas as pd
@@ -31,7 +31,6 @@ ALLOWED_LIVE_FEATURES = UNIFIED_VARS[:]
 EXCLUDE_FOR_NCA = []
 
 # ============================== Helpers ==============================
-# (This section is unchanged)
 def _norm(s: str) -> str:
     v = re.sub(r"\s+", " ", str(s).strip().lower())
     v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
@@ -177,7 +176,8 @@ if submitted and ticker:
     ss.rows.append(row)
     st.success(f"Saved {ticker}.")
 
-# ============================== Isotonic helpers ==============================
+# ============================== Isotonic helpers & Model Training ==============================
+# (All functions in this block are unchanged)
 def _pav_isotonic(x, y):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     if x.size == 0: return [], []
@@ -206,7 +206,6 @@ def _iso_predict(bx, by, xq):
         out[i] = by[k]
     return out
 
-# ============================== NCA / LDA ==============================
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
@@ -298,7 +297,6 @@ def _nca_predict_proba_row(xrow: dict, model: dict) -> float:
         pA = 1.0 / (1.0 + np.exp(-k*(z - m)))
     return float(np.clip(pA, 0.0, 1.0))
 
-# ============================== CatBoost ==============================
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
@@ -323,21 +321,11 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
     
-    # High-Sensitivity "Track Car" Parameters
     params = dict(
-        loss_function="Logloss",
-        eval_metric="Logloss",
-        iterations=200,
-        learning_rate=0.08,
-        depth=4,
-        l2_leaf_reg=3,
-        min_data_in_leaf=1,
-        bootstrap_type="Bayesian",
-        bagging_temperature=0.5,
-        auto_class_weights="Balanced",
-        random_seed=42,
-        allow_writing_files=False,
-        verbose=False,
+        loss_function="Logloss", eval_metric="Logloss", iterations=200, learning_rate=0.08,
+        depth=4, l2_leaf_reg=3, min_data_in_leaf=1, bootstrap_type="Bayesian",
+        bagging_temperature=0.5, auto_class_weights="Balanced", random_seed=42,
+        allow_writing_files=False, verbose=False,
     )
     
     if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
@@ -651,8 +639,14 @@ vegaEmbed("#vis", spec, {{actions: true}});
         "and is highly sensitive to sparse data at higher gain levels."
     )
     
-    # NEW: Add a checkbox to control smoothing
-    use_smoothing = st.checkbox("Apply smoothing to 'tame' conditional chart", value=True, help="Averages data points to reduce noise and show the underlying trend more clearly.")
+    # NEW: Add a slider to control smoothing
+    smoothing_window = st.slider(
+        "Smoothing Window",
+        min_value=1,
+        max_value=5,
+        value=3,
+        help="Controls the amount of smoothing. A value of 1 means no smoothing (raw data). A higher value creates a smoother trend line by averaging more points."
+    )
 
     cond_data = []
     cond_labels = [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
@@ -660,18 +654,17 @@ vegaEmbed("#vis", spec, {{actions: true}});
     series_list = [series_A_med, series_N_med, series_C_med]
     series_names = [gA_label, nca_label, cat_label]
     
-    # --- NEW: Smoothing Logic ---
+    # NEW: Smoothing Logic with adjustable window
     def _calculate_moving_average(data, window_size=2):
+        if window_size <= 1:
+            return data
         series = pd.Series(data)
-        return series.rolling(window=window_size, min_periods=1).mean().tolist()
+        return series.rolling(window=window_size, min_periods=1, center=True).mean().tolist()
 
-    if use_smoothing:
-        smoothed_A = _calculate_moving_average(series_A_med)
-        smoothed_N = _calculate_moving_average(series_N_med)
-        smoothed_C = _calculate_moving_average(series_C_med)
-        series_to_use = [smoothed_A, smoothed_N, smoothed_C]
-    else:
-        series_to_use = series_list
+    smoothed_A = _calculate_moving_average(series_A_med, smoothing_window)
+    smoothed_N = _calculate_moving_average(series_N_med, smoothing_window)
+    smoothed_C = _calculate_moving_average(series_C_med, smoothing_window)
+    series_to_use = [smoothed_A, smoothed_N, smoothed_C]
 
     cond_series_list = [[], [], []]
 
@@ -708,7 +701,7 @@ vegaEmbed("#vis", spec, {{actions: true}});
                 xOffset="Series:N",
                 tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")],
             )
-            .properties(height=400, title="Conditional Probability of Reaching the Next Gain Cutoff")
+            .properties(height=400, title=f"Conditional Probability (Smoothed with Window={smoothing_window})")
         )
         st.altair_chart(cond_chart, use_container_width=True)
     else:
