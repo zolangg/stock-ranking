@@ -630,45 +630,86 @@ vegaEmbed("#vis", spec, {{actions: true}});
         )
 
 
-# --- Conditional Probability Chart Section ---
+# --- NEW: Conditional Probability Chart Section with Polynomial Smoothing ---
 st.markdown("---")
 st.subheader("Conditional Probability Analysis")
-st.warning("**For Research Only:** This chart is experimental. It shows the probability of reaching the *next* gain level, given the *estimated true trend* at the current level. It is highly sensitive to model parameters and sparse data.")
+st.warning(
+    "**For Trend Analysis Only:** This chart aggressively smooths the raw data by fitting a polynomial curve to find the underlying trend. "
+    "It is a powerful way to see the 'shape' of the probability distribution but should **not** be used for precise point-in-time predictions."
+)
 
-kalman_measurement_variance = st.slider("Smoothing Strength (Kalman Filter)", min_value=1.0, max_value=50.0, value=10.0, step=1.0, help="Controls how much the filter trusts the raw calculations. Higher values mean more smoothing (the filter is more skeptical of noisy data).")
-
-def _kalman_filter(data, process_variance=1e-5, measurement_variance=10.0):
-    x = data[0] if data and pd.notna(data[0]) else 0
-    p = 1.0; filtered = []
-    for z in data:
-        if pd.isna(z): filtered.append(np.nan); continue
-        p += process_variance
-        k = p / (p + measurement_variance)
-        x += k * (z - x)
-        p *= (1 - k)
-        filtered.append(x)
-    return filtered
+# NEW: Add a slider to control the degree of the polynomial curve
+poly_degree = st.slider(
+    "Smoothing Aggressiveness (Polynomial Degree)",
+    min_value=2,
+    max_value=5,
+    value=3,
+    help="Controls the complexity of the curve fitted to the data. A lower degree (2) creates a very simple, smooth arc. A higher degree (5) creates a more flexible curve that follows the data more closely."
+)
 
 series_list = [series_A_med, series_N_med, series_C_med]
 series_names = [gA_label, nca_label, cat_label]
-filtered_series = [_kalman_filter(s, measurement_variance=kalman_measurement_variance) for s in series_list]
+
+# This list will hold the new, perfectly smooth probability curves
+smoothed_series = []
+
+for s in series_list:
+    # We must remove missing values to fit a curve
+    x_raw = np.array(thr_labels)
+    y_raw = np.array(s)
+    
+    # Create a mask to filter out any NaN values
+    mask = ~np.isnan(y_raw)
+    x_fit = x_raw[mask]
+    y_fit = y_raw[mask]
+    
+    # Only try to fit a curve if we have enough data points
+    if len(x_fit) > poly_degree:
+        # 1. Find the best-fit polynomial coefficients
+        coeffs = np.polyfit(x_fit, y_fit, poly_degree)
+        
+        # 2. Create a function from those coefficients
+        poly_func = np.poly1d(coeffs)
+        
+        # 3. Generate the new, smooth Y-values using the original X-axis
+        y_smooth = poly_func(x_raw)
+        
+        # Clip the results to be within a valid probability range (0-100)
+        smoothed_series.append(np.clip(y_smooth, 0, 100))
+    else:
+        # If we don't have enough data, just pass the raw data
+        smoothed_series.append(y_raw)
 
 cond_data, cond_labels = [], [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
 for i in range(len(thr_labels) - 1):
     for j, name in enumerate(series_names):
-        p_current, p_next = filtered_series[j][i], filtered_series[j][i+1]
+        # Use the new SMOOTHED data for the calculation
+        p_current = smoothed_series[j][i]
+        p_next = smoothed_series[j][i+1]
+        
         cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100) if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6 else np.nan
-        if pd.notna(cond_prob): cond_data.append({"Transition": cond_labels[i], "Series": name, "Value": cond_prob})
+        if pd.notna(cond_prob):
+            # The transition label needs to be created inside the loop to match the data structure
+            transition_label = f"{thr_labels[i]}% → {thr_labels[i+1]}%"
+            cond_data.append({"Transition": transition_label, "Series": name, "Value": cond_prob})
 
 if cond_data:
     df_cond_long = pd.DataFrame(cond_data)
+    
     cond_color_domain, cond_color_range = [gA_label, nca_label, cat_label], ["#3b82f6", "#10b981", "#8b5cf6"]
-    cond_chart = alt.Chart(df_cond_long).mark_bar().encode(
-        x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels),
-        y=alt.Y("Value:Q", title="Conditional Probability (%)", scale=alt.Scale(domain=[0, 100])),
-        color=alt.Color("Series:N", scale=alt.Scale(domain=cond_color_domain, range=cond_color_range), legend=alt.Legend(title="Analysis Series")),
-        xOffset="Series:N", tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")]
-    ).properties(height=400, title=f"Conditional Probability (Kalman Smoothed)")
+    
+    cond_chart = (
+        alt.Chart(df_cond_long)
+        .mark_bar()
+        .encode(
+            x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels),
+            y=alt.Y("Value:Q", title="Conditional Probability (%)", scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("Series:N", scale=alt.Scale(domain=cond_color_domain, range=cond_color_range), legend=alt.Legend(title="Analysis Series")),
+            xOffset="Series:N",
+            tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")],
+        )
+        .properties(height=400, title=f"Conditional Probability (Smoothed with Polynomial Degree={poly_degree})")
+    )
     st.altair_chart(cond_chart, use_container_width=True)
 else:
     st.info("Not enough sequential data to calculate conditional probabilities.")
