@@ -630,66 +630,75 @@ vegaEmbed("#vis", spec, {{actions: true}});
         )
 
 
-# --- NEW: Conditional Probability Chart Section with Polynomial Smoothing ---
+# --- FINAL, ADVANCED: Conditional Probability Chart Section with a Choice of Smoothers ---
 st.markdown("---")
 st.subheader("Conditional Probability Analysis")
 st.warning(
-    "**For Trend Analysis Only:** This chart aggressively smooths the raw data by fitting a polynomial curve to find the underlying trend. "
-    "It is a powerful way to see the 'shape' of the probability distribution but should **not** be used for precise point-in-time predictions."
+    "**For Advanced Research:** This chart shows the probability of reaching the *next* gain level. It uses powerful smoothing techniques to find the underlying trend in the noisy absolute probability data."
 )
 
-# NEW: Add a slider to control the degree of the polynomial curve
-poly_degree = st.slider(
-    "Smoothing Aggressiveness (Polynomial Degree)",
-    min_value=2,
-    max_value=5,
-    value=3,
-    help="Controls the complexity of the curve fitted to the data. A lower degree (2) creates a very simple, smooth arc. A higher degree (5) creates a more flexible curve that follows the data more closely."
-)
+col1, col2 = st.columns(2)
+with col1:
+    # Option 1: The flexible polynomial smoother
+    poly_degree = st.slider(
+        "Smoothing Aggressiveness (Polynomial Degree)",
+        min_value=2, max_value=5, value=3,
+        help="Controls the complexity of the curve fitted to the data. Lower degrees are smoother; higher degrees follow the raw data more closely."
+    )
+with col2:
+    # Option 2: The ultimate "butcher," Isotonic Regression
+    enforce_monotonic = st.checkbox(
+        "Enforce Monotonic Trend", value=True,
+        help="Forces the probability trend to be 'downhill-only,' creating the most logically consistent (but aggressive) smoothing."
+    )
 
 series_list = [series_A_med, series_N_med, series_C_med]
 series_names = [gA_label, nca_label, cat_label]
 
-# This list will hold the new, perfectly smooth probability curves
 smoothed_series = []
 
 for s in series_list:
-    # We must remove missing values to fit a curve
     x_raw = np.array(thr_labels)
     y_raw = np.array(s)
     
-    # Create a mask to filter out any NaN values
     mask = ~np.isnan(y_raw)
     x_fit = x_raw[mask]
     y_fit = y_raw[mask]
     
-    # Only try to fit a curve if we have enough data points
+    y_smooth = np.full_like(x_raw, np.nan, dtype=float)
+
     if len(x_fit) > poly_degree:
-        # 1. Find the best-fit polynomial coefficients
-        coeffs = np.polyfit(x_fit, y_fit, poly_degree)
+        if enforce_monotonic:
+            # --- Isotonic Regression: The "Strongest Butcher" ---
+            # Isotonic regression finds the best non-decreasing fit. Since our
+            # probabilities are non-increasing, we fit the negative of our data.
+            iso_x, iso_y_neg = _pav_isotonic(x_fit, -y_fit)
+            
+            # We then interpolate from the smoothed points and flip the result back
+            y_smooth_neg = np.interp(x_raw, iso_x, iso_y_neg)
+            y_smooth = -y_smooth_neg
+            chart_title_suffix = "(Isotonic Smoothed)"
+        else:
+            # --- Polynomial Regression: The Flexible Smoother ---
+            coeffs = np.polyfit(x_fit, y_fit, poly_degree)
+            poly_func = np.poly1d(coeffs)
+            y_smooth = poly_func(x_raw)
+            chart_title_suffix = f"(Polynomial Smoothed, Degree={poly_degree})"
         
-        # 2. Create a function from those coefficients
-        poly_func = np.poly1d(coeffs)
-        
-        # 3. Generate the new, smooth Y-values using the original X-axis
-        y_smooth = poly_func(x_raw)
-        
-        # Clip the results to be within a valid probability range (0-100)
         smoothed_series.append(np.clip(y_smooth, 0, 100))
     else:
-        # If we don't have enough data, just pass the raw data
-        smoothed_series.append(y_raw)
+        smoothed_series.append(y_raw) # Not enough data, use raw
+        chart_title_suffix = "(Raw Data - Not Enough to Smooth)"
+
 
 cond_data, cond_labels = [], [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
 for i in range(len(thr_labels) - 1):
     for j, name in enumerate(series_names):
-        # Use the new SMOOTHED data for the calculation
         p_current = smoothed_series[j][i]
         p_next = smoothed_series[j][i+1]
         
         cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100) if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6 else np.nan
         if pd.notna(cond_prob):
-            # The transition label needs to be created inside the loop to match the data structure
             transition_label = f"{thr_labels[i]}% → {thr_labels[i+1]}%"
             cond_data.append({"Transition": transition_label, "Series": name, "Value": cond_prob})
 
@@ -708,7 +717,7 @@ if cond_data:
             xOffset="Series:N",
             tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")],
         )
-        .properties(height=400, title=f"Conditional Probability (Smoothed with Polynomial Degree={poly_degree})")
+        .properties(height=400, title=f"Conditional Probability {chart_title_suffix}")
     )
     st.altair_chart(cond_chart, use_container_width=True)
 else:
