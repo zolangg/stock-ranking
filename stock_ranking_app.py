@@ -633,9 +633,6 @@ vegaEmbed("#vis", spec, {{actions: true}});
 # --- FINAL, ADVANCED: Conditional Probability Chart Section with a Choice of Smoothers ---
 st.markdown("---")
 st.subheader("Conditional Probability Analysis")
-st.warning(
-    "**For Advanced Research:** This chart shows the probability of reaching the *next* gain level. It uses powerful smoothing techniques to find the underlying trend in the noisy absolute probability data."
-)
 
 series_list = [series_A_med, series_N_med, series_C_med]
 series_names = [gA_label, nca_label, cat_label]
