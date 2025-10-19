@@ -1,10 +1,8 @@
 # stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
-# - Add Stock form (no table)
-# - Alignment shows median P(A) over SELECTED added stocks across Gain% cutoffs (0..600 step 25)
-# - Models (NCA & CatBoost) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
-# - CatBoost is required; no optional branches
-# - No daily-volume prediction anywhere
-# - Simplified: one unified variables list for both models (no core/moderate split)
+# - Add Stock form and multiselect for deletion (no table)
+# - Alignment shows median P(A) over SELECTED added stocks across Gain% cutoffs
+# - Models (NCA & CatBoost) train per cutoff on the UPLOADED DB
+# - Analysis is permanently set to "Gain% vs Rest"
 
 import streamlit as st
 import pandas as pd
@@ -13,7 +11,7 @@ import re, json
 import altair as alt
 import matplotlib.pyplot as plt
 from datetime import datetime
-from catboost import CatBoostClassifier  # CatBoost is required
+from catboost import CatBoostClassifier
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
@@ -22,8 +20,7 @@ st.title("Premarket Stock Analysis")
 # ============================== Session ==============================
 ss = st.session_state
 ss.setdefault("base_df", pd.DataFrame())
-ss.setdefault("rows", [])  # user-added stocks (list of dicts)
-# --- NEW: Add state for delete functionality ---
+ss.setdefault("rows", [])
 ss.setdefault("del_selection", [])
 
 # ============================== Unified variables ==============================
@@ -88,19 +85,8 @@ if build_btn:
         try:
             file_bytes = uploaded.getvalue()
             raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
-
-            possible = [c for c in raw.columns if _norm(c) in {"ft","ft01","group","label"}]
-            col_group = possible[0] if possible else None
-            if col_group is None:
-                for c in raw.columns:
-                    vals = pd.Series(raw[c]).dropna().astype(str).str.lower()
-                    if len(vals) and vals.isin(["0","1","true","false","yes","no"]).all():
-                        col_group = c; break
-            if col_group is None:
-                st.error("Could not detect FT (0/1) column."); st.stop()
-
+            
             df = pd.DataFrame()
-            df["GroupRaw"] = raw[col_group]
 
             def add_num(dfout, name, src_candidates):
                 src = _pick(raw, src_candidates)
@@ -136,23 +122,13 @@ if build_btn:
                 if pct_col in df.columns:
                     df[pct_col] = pd.to_numeric(df[pct_col], errors="coerce") * 100.0
 
-            def _to_binary(v):
-                sv = str(v).strip().lower()
-                if sv in {"1","true","yes","y","t"}: return 1
-                if sv in {"0","false","no","n","f"}: return 0
-                try: return 1 if float(sv) >= 0.5 else 0
-                except: return np.nan
-            df["FT01"] = df["GroupRaw"].map(_to_binary)
-            df = df[df["FT01"].isin([0,1])].copy()
-            df["GroupFT"] = df["FT01"].map({1:"FT=1", 0:"FT=0"})
-
             pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
             df["Max_Push_Daily_%"] = (
                 pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce") * 100.0
                 if pmh_col is not None else np.nan
             )
-
-            keep_cols = set(UNIFIED_VARS + ["GroupRaw","FT01","GroupFT","Max_Push_Daily_%"])
+            
+            keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%"])
             df = df[[c for c in df.columns if c in keep_cols]].copy()
 
             ss.base_df = df
@@ -163,7 +139,7 @@ if build_btn:
 
 # ============================== Add Stock & Manage ==============================
 st.markdown("---")
-st.subheader("Add & Manage Stocks")
+st.subheader("Add Stock")
 
 with st.form("add_form", clear_on_submit=True):
     c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
@@ -201,17 +177,15 @@ if submitted and ticker:
     ss.rows.append(row)
     st.success(f"Saved {ticker}.")
 
-# --- NEW: Display and Delete Added Stocks ---
+# --- MODIFIED: Removed the table, leaving only the delete functionality ---
 if ss.rows:
-    st.markdown("##### Added Stocks")
-    display_df = pd.DataFrame(ss.rows)[["Ticker"] + [v for v in ALLOWED_LIVE_FEATURES if v != "Catalyst"] + ["CatalystYN"]]
-    st.dataframe(display_df, use_container_width=True)
+    st.markdown("##### Manage Added Stocks")
 
     def _handle_delete():
         sel = st.session_state.get("del_selection", [])
         if sel:
             ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(sel)]
-            st.session_state["del_selection"] = [] # Clear selection after deleting
+            st.session_state["del_selection"] = []
     
     unique_tickers = pd.Series([r.get("Ticker") for r in ss.rows]).dropna().unique().tolist()
     
@@ -232,6 +206,7 @@ if ss.rows:
         )
 
 # ============================== Isotonic helpers ==============================
+# (This section is unchanged)
 def _pav_isotonic(x, y):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     if x.size == 0: return [], []
@@ -261,7 +236,7 @@ def _iso_predict(bx, by, xq):
     return out
 
 # ============================== NCA / LDA ==============================
-# (This section remains unchanged, as it's the core model training logic)
+# (This section is unchanged)
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
@@ -354,7 +329,7 @@ def _nca_predict_proba_row(xrow: dict, model: dict) -> float:
     return float(np.clip(pA, 0.0, 1.0))
 
 # ============================== CatBoost ==============================
-# (This section remains unchanged)
+# (This section is unchanged)
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
@@ -433,7 +408,6 @@ def _cat_predict_proba_row(xrow: dict, model: dict) -> float:
         pA = z if not pl else 1.0 / (1.0 + np.exp(-pl[1]*(z - pl[0])))
     return float(np.clip(pA, 0.0, 1.0))
 
-# --- NEW: Add Median Centers Calculation Helper ---
 def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame) -> dict:
     if centers_tbl is None or centers_tbl.empty or len(centers_tbl.columns) != 2:
         return {}
@@ -451,7 +425,7 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
             counts[gA_] += 1.0
         elif abs(xv - vB) < abs(xv - vA):
             counts[gB_] += 1.0
-        else: # Tie
+        else:
             counts[gA_] += 0.5
             counts[gB_] += 0.5
             
@@ -475,19 +449,9 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- NEW: Analysis Mode Selector ---
-mode = st.radio(
-    "Analysis Mode",
-    ["Gain% vs Rest", "FT vs Fail (Gain% cutoff on FT=1 only)"],
-    horizontal=True,
-    key="analysis_mode",
-    help=(
-        "**Gain% vs Rest:** Compares high-gain stocks against all others. Good for general trends.\n\n"
-        "**FT vs Fail:** Compares high-gain `FT=1` stocks against all `FT=0` stocks. Good for finding top-tier setups."
-    )
-)
+# --- MODIFIED: Removed the analysis mode radio button ---
+st.info("Analysis compares stocks with a specific **Gain %** against all other stocks (**Rest**).")
 
-# --- choose which added stocks to include ---
 all_added_tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
 _seen = set(); all_added_tickers = [t for t in all_added_tickers if not (t in _seen or _seen.add(t))]
 if "align_sel_tickers" not in st.session_state:
@@ -519,34 +483,27 @@ if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
     st.stop()
 
-gain_cutoffs = list(range(25, 301, 25)) # Adjusted range for clarity
+gain_cutoffs = list(range(25, 301, 25))
 
-# --- MODIFIED: Split helper now uses the selected mode ---
-def _make_split(df_base: pd.DataFrame, thr_val: float, mode_val: str):
+# --- MODIFIED: Split helper is now simplified for one mode ---
+def _make_split(df_base: pd.DataFrame, thr_val: float):
     df_tmp = df_base.copy()
-    if mode_val == "Gain% vs Rest":
-        df_tmp["__Group__"] = np.where(
-            pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val,
-            f"≥{int(thr_val)}%", "Rest"
-        )
-        gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
-    else: # "FT vs Fail"
-        a_mask = (df_tmp["FT01"] == 1) & (pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val)
-        b_mask = (df_tmp["FT01"] == 0)
-        df_tmp = df_tmp[a_mask | b_mask].copy()
-        df_tmp["__Group__"] = np.where(df_tmp["FT01"] == 1, f"FT=1 ≥{int(thr_val)}%", "FT=0 (all)")
-        gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0 (all)"
+    df_tmp["__Group__"] = np.where(
+        pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val,
+        f"≥{int(thr_val)}%", "Rest"
+    )
+    gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
     return df_tmp, gA_, gB_
 
 added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
 
 thr_labels = []
-# --- NEW: Add series for Median Centers ---
 series_A_med, series_B_med, series_N_med, series_C_med = [], [], [], []
 
 with st.spinner("Calculating distributions across all cutoffs..."):
     for thr_val in gain_cutoffs:
-        df_split, gA, gB = _make_split(base_df, float(thr_val), mode)
+        # --- MODIFIED: Call to _make_split is simpler ---
+        df_split, gA, gB = _make_split(base_df, float(thr_val))
 
         vc = df_split["__Group__"].value_counts()
         if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
@@ -555,24 +512,20 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
         cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
         
-        # --- NEW: Calculate median centers for this split ---
         features_for_centers = [f for f in ALLOWED_LIVE_FEATURES if f in df_split.columns]
         centers_tbl = df_split.groupby("__Group__")[features_for_centers].median().T
         if gA not in centers_tbl.columns or gB not in centers_tbl.columns:
             continue
         centers_tbl = centers_tbl[[gA, gB]]
 
-
         req_feats = sorted(set(nca_model.get("feats", []) + cat_model.get("feats", []) + features_for_centers))
-        if not req_feats:
-            continue
+        if not req_feats: continue
 
         if added_df.empty: continue
         Xadd = added_df[req_feats].apply(pd.to_numeric, errors="coerce")
         mask = np.isfinite(Xadd.values).all(axis=1)
         pred_rows = added_df.loc[mask].to_dict(orient="records")
-        if len(pred_rows) == 0:
-            continue
+        if len(pred_rows) == 0: continue
 
         pN, pC, pA_centers, pB_centers = [], [], [], []
         for r in pred_rows:
@@ -582,7 +535,6 @@ with st.spinner("Calculating distributions across all cutoffs..."):
             if cat_model:
                 p = _cat_predict_proba_row(r, cat_model)
                 if np.isfinite(p): pC.append(p * 100.0)
-            # --- NEW: Calculate alignment for this row ---
             center_scores = _compute_alignment_median_centers(r, centers_tbl)
             if center_scores:
                 pA_centers.append(center_scores['A_pct'])
@@ -598,31 +550,25 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         series_B_med.append(float(np.nanmedian(pB_centers)) if pB_centers else np.nan)
 
 if not thr_labels:
-    st.info("Not enough data across cutoffs to train models and evaluate your selected stocks. Try a different mode or a larger database.")
+    st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
-    # --- MODIFIED: Build tidy frame with 4 series ---
     data = []
-    # Dynamically get group labels from the last successful split
-    _, gA_last, gB_last = _make_split(base_df, float(thr_labels[-1]), mode)
-    
-    series_names = {
-        "centers_A": f"{gA_last} (Median Centers)",
-        "centers_B": f"{gB_last} (Median Centers)",
-        "nca": f"NCA: P({gA_last})",
-        "catboost": f"CatBoost: P({gA_last})",
-    }
+    # --- MODIFIED: Simplified legend naming ---
+    gA_label = f"≥...% (Median Centers)"
+    gB_label = f"Rest (Median Centers)"
+    nca_label = f"NCA: P(≥...%)"
+    cat_label = f"CatBoost: P(≥...%)"
     
     for i, thr in enumerate(thr_labels):
-        data.append({"GainCutoff_%": thr, "Series": series_names["centers_A"], "Value": series_A_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": series_names["centers_B"], "Value": series_B_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": series_names["nca"],       "Value": series_N_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": series_names["catboost"],  "Value": series_C_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": gA_label, "Value": series_A_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": gB_label, "Value": series_B_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": nca_label, "Value": series_N_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": cat_label, "Value": series_C_med[i]})
 
     df_long = pd.DataFrame(data).dropna(subset=['Value'])
 
-    # --- MODIFIED: Update Chart to handle 4 series ---
-    color_domain = [series_names["centers_A"], series_names["centers_B"], series_names["nca"], series_names["catboost"]]
-    color_range  = ["#3b82f6", "#ef4444", "#10b981", "#8b5cf6"]  # blue, red, green, purple
+    color_domain = [gA_label, gB_label, nca_label, cat_label]
+    color_range  = ["#3b82f6", "#ef4444", "#10b981", "#8b5cf6"]
 
     chart = (
         alt.Chart(df_long)
@@ -638,12 +584,12 @@ else:
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # Optional PNG export via Matplotlib
+    # (PNG and HTML export sections remain unchanged)
     png_bytes = None
     try:
         pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
         series_names = list(pivot.columns)
-        color_map = {"NCA: P(A)": "#10b981", "CatBoost: P(A)": "#8b5cf6"}
+        color_map = {gA_label: "#3b82f6", gB_label: "#ef4444", nca_label: "#10b981", cat_label: "#8b5cf6"}
         colors = [color_map.get(s, "#999999") for s in series_names]
         thresholds = pivot.index.tolist()
         n_groups = len(thresholds); n_series = len(series_names)
@@ -658,7 +604,7 @@ else:
         ax.set_xticks(x); ax.set_xticklabels([str(t) for t in thresholds], rotation=0)
         ax.set_ylim(0, 100)
         ax.set_xlabel("Gain% cutoff")
-        ax.set_ylabel("Median P(A) for selected added stocks (%)")
+        ax.set_ylabel("Median Alignment / P(A) for selected stocks (%)")
         ax.legend(loc="upper left", frameon=False)
 
         buf = _io.BytesIO(); fig.tight_layout()
