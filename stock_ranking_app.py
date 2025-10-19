@@ -638,8 +638,7 @@ vegaEmbed("#vis", spec, {{actions: true}});
             key="dl_html",
         )
 
-
-# --- FINAL, ADVANCED: Conditional Probability Chart Section with a Choice of Smoothers ---
+# --- Conditional Probability Chart Section with a Choice of Smoothers ---
 st.markdown("---")
 
 series_list = [series_A_med, series_N_med, series_C_med]
