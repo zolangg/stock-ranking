@@ -422,7 +422,7 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
 
 # ============================== Alignment (Distributions for SELECTED added stocks) ==============================
 st.markdown("---")
-st.subheader("Alignment Distribution")
+st.subheader("Alignment")
 
 base_df = ss.get("base_df", pd.DataFrame())
 if base_df.empty:
@@ -432,8 +432,6 @@ if base_df.empty:
 if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
-
-st.info("This analysis shows the **absolute probability** of a stock reaching a certain gain from pre-market.")
 
 all_added_tickers = pd.Series([r.get("Ticker") for r in ss.rows]).dropna().unique().tolist()
 
@@ -643,7 +641,6 @@ vegaEmbed("#vis", spec, {{actions: true}});
 
 # --- FINAL, ADVANCED: Conditional Probability Chart Section with a Choice of Smoothers ---
 st.markdown("---")
-st.subheader("Conditional Probability Analysis")
 
 series_list = [series_A_med, series_N_med, series_C_med]
 series_names = [gA_label, nca_label, cat_label]
