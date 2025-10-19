@@ -704,4 +704,3 @@ vegaEmbed("#vis", spec, {{actions: true}});
         st.altair_chart(cond_chart, use_container_width=True)
     else:
         st.info("Not enough sequential data to calculate conditional probabilities.")
-Use Arrow Up and Arrow Down to select a turn, Enter to jump to it, and Escape to return to the chat.
