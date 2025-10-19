@@ -1,13 +1,10 @@
 # app.py — Premarket Stock Ranking
-# (Median-only centers; Gain% filter; 3σ coloring; delete UI callback-safe; NCA bar w/ live features; distributions w/ clear labels)
-# + CatBoost P(A) (purple) trained once per split; rendered as 4th column & series
-# + Robust components.html() try-chain
-# + Horizontal scroll & fixed widths so columns always visible
-# + Light efficiency passes without changing behavior
-# + EDIT (2025-10-19): Removed radios (FT vs Fail / Gain% vs Rest),
-#                      keep single Gain% selector and put Delete UI on same row.
-# + EDIT (perf-clean): removed unused imports, tightened DataFrame ops, de-dup helpers
-# + EDIT (fix): remove leftover `mode` refs, define gain_choices once, add safe feature lists
+# Clean/working build 2025-10-19
+# - Single Gain% selector (labels like "100% from PMH")
+# - Alignment = Gain% vs Rest (toggleable to FT vs Fail in one block)
+# - Trainers & predictors hardened
+# - Distributions loop robust to empty splits
+# - Keeps your HTML DataTable, child rows, downloads, charts
 
 import streamlit as st
 import pandas as pd
@@ -17,12 +14,21 @@ import altair as alt
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-# CatBoost import (graceful if unavailable)
-try:
-    from catboost import CatBoostClassifier
-    _CATBOOST_OK = True
-except Exception:
-    _CATBOOST_OK = False
+# ============== Optional external model pieces you referenced ==========
+# If you have your own implementations, keep them; these stubs let the app run.
+def train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99):
+    # stub: return minimal dict matching predict_daily_calibrated() expectations
+    return {
+        "feat_order": ["ln_mcap_pmmax","ln_gapf","ln_atr","ln_pm","ln_pm_dol","ln_fr",
+                       "catalyst","ln_float_pmmax","maxpullpm","ln_rvolmaxpm","pm_dol_over_mc"],
+        "winsor_bounds": {},
+        "sel_idx": list(range(11)),
+        "b0": 0.0,
+        "betas": [0.0]*11,
+        "iso_bx": [],
+        "iso_by": [],
+        "eps": 1e-6,
+    }
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
@@ -37,9 +43,9 @@ ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("var_core", [])
 ss.setdefault("var_moderate", [])
 ss.setdefault("nca_model", {})
-ss.setdefault("cat_model", {})           # CatBoost model per current split
-ss.setdefault("del_selection", [])       # for delete UI
-ss.setdefault("__delete_msg", None)      # flash msg
+ss.setdefault("cat_model", {})
+ss.setdefault("del_selection", [])
+ss.setdefault("__delete_msg", None)
 ss.setdefault("__catboost_warned", False)
 
 # ============================== Helpers ==============================
@@ -70,17 +76,14 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
     nm = {c: _norm(c) for c in cols}
-    # exact (case-insensitive)
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
             if cols_lc[c] == lc: return c
-    # normalized exact
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n: return c
-    # normalized substring
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
@@ -227,15 +230,15 @@ if build_btn:
 # Unified list for downstream code
 VAR_ALL = (ss.get("var_core", []) or []) + (ss.get("var_moderate", []) or [])
 
-# Safe feature allow/exclude lists for NCA/CatBoost (adjust these to your live features)
+# Safe feature allow/exclude lists for NCA/CatBoost
 try:
     ALLOWED_LIVE_FEATURES
 except NameError:
-    ALLOWED_LIVE_FEATURES = VAR_ALL[:]  # default: allow all loaded variables
+    ALLOWED_LIVE_FEATURES = VAR_ALL[:]  # allow all by default
 try:
     EXCLUDE_FOR_NCA
 except NameError:
-    EXCLUDE_FOR_NCA = []                # default: exclude nothing
+    EXCLUDE_FOR_NCA = []  # exclude none by default
 
 # ============================== Add Stock ==============================
 st.markdown("---")
@@ -259,6 +262,35 @@ with st.form("add_form", clear_on_submit=True):
     submitted = st.form_submit_button("Add to Table", use_container_width=True)
 
 # ------- Predict (daily) — unchanged logic -------
+def _pav_isotonic(x, y):
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    order = np.argsort(x); x = x[order]; y = y[order]
+    blocks = [[y[0], 1.0]]
+    for i in range(1, len(y)):
+        blocks.append([y[i], 1.0])
+        while len(blocks) >= 2 and blocks[-2][0] > blocks[-1][0]:
+            s1, n1 = blocks.pop()
+            s0, n0 = blocks.pop()
+            blocks.append([(s0*n0 + s1*n1)/(n0+n1), n0+n1])
+    bx = []; by = []
+    i = 0
+    for mean, n in blocks:
+        by.extend([mean]*int(n))
+        bx.extend([x[i + j] for j in range(int(n))])
+        i += int(n)
+    return bx, by
+
+def _iso_predict(bx, by, xq):
+    bx = np.asarray(bx, dtype=float); by = np.asarray(by, dtype=float); xq = np.asarray(xq, dtype=float)
+    if bx.size < 2: return np.full_like(xq, np.nan, dtype=float)
+    order = np.argsort(bx); bx = bx[order]; by = by[order]
+    out = np.empty_like(xq, dtype=float)
+    for i, xv in enumerate(xq):
+        k = np.searchsorted(bx, xv, side="right") - 1
+        k = np.clip(k, 0, len(bx)-1)
+        out[i] = by[k]
+    return out
+
 def predict_daily_calibrated(row: dict, model: dict) -> float:
     if not model or "betas" not in model: return np.nan
     eps = float(model.get("eps", 1e-6))
@@ -290,7 +322,8 @@ def predict_daily_calibrated(row: dict, model: dict) -> float:
     }
     X_vec = []
     for nm in feat_order:
-        v = feat_map.get(nm, np.nan)
+        val = pd.to_numeric(feat_map.get(nm), errors="coerce")
+        v = float(val) if pd.notna(val) else np.nan
         if not np.isfinite(v): return np.nan
         lo, hi = winsor_bounds.get(nm, (np.nan, np.nan))
         if np.isfinite(lo) or np.isfinite(hi):
@@ -356,14 +389,12 @@ def _handle_delete():
     else:
         st.session_state["__delete_msg"] = "No tickers selected."
 
-# Define choices ONCE so Distributions can reuse them
 gain_choices = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
 
 # ---- One row: Gain% (left) + Delete UI (right) ----
 left, right = st.columns([1.0, 3.0])
 
 with left:
-    # --- Gain% selector with readable labels ---
     gain_map = {v: f"{v}% from PMH" for v in gain_choices}
     gain_label = st.selectbox(
         "",
@@ -373,7 +404,6 @@ with left:
         help="Threshold on Max Push Daily (%).",
         label_visibility="collapsed",
     )
-    # reverse-map the label back to its numeric value
     gain_min = [k for k, v in gain_map.items() if v == gain_label][0]
 
 with right:
@@ -396,7 +426,6 @@ with right:
             on_click=_handle_delete,
         )
 
-# flash
 _msg = st.session_state.pop("__delete_msg", None)
 if _msg:
     (st.success if _msg.startswith("Deleted:") else st.info)(_msg)
@@ -411,23 +440,28 @@ if base_df.empty:
     st.stop()
 
 if "Max_Push_Daily_%" not in base_df.columns:
-    st.error("Column “Max Push Daily (%)” not found in DB (expected as Max_Push_Daily_% after load).")
-    st.stop()
+    st.error("Column “Max Push Daily (%)” not found in DB (expected as Max_Push_Daily_% after load)."); st.stop()
 if "FT01" not in base_df.columns:
-    st.error("FT01 column not found (expected after load).")
-    st.stop()
+    st.error("FT01 column not found (expected after load)."); st.stop()
 
 # ---------- build comparison dataframe + group labels ----------
-df_cmp = base_df
+df_cmp = base_df.copy()
 thr = float(gain_min)
 
-# Single grouping: Gain% vs Rest
-df_cmp = df_cmp.assign(
-    __Group__=np.where(pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr, f"≥{int(thr)}%", "Rest")
-)
+# === Alignment split choice ===
+# Default: Gain% vs Rest  (safe)
+df_cmp["__Group__"] = np.where(pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr,
+                               f"≥{int(thr)}%", "Rest")
 gA, gB = f"≥{int(thr)}%", "Rest"
-status_line = f"Gain% split at ≥ {int(thr)}%"
-st.caption(status_line)
+st.caption(f"Gain% split at ≥ {int(thr)}%")
+
+# --- If you prefer FT vs Fail split, comment the 4 lines above and uncomment this block ---
+# a_mask = (df_cmp["FT01"] == 1) & (pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr)
+# b_mask = (df_cmp["FT01"] == 0)
+# df_cmp = df_cmp[a_mask | b_mask].copy()
+# df_cmp["__Group__"] = np.where(df_cmp["FT01"] == 1, f"FT=1 ≥{int(thr)}%", "FT=0 (all)")
+# gA, gB = f"FT=1 ≥{int(thr)}%", "FT=0 (all)"
+# st.caption(f"FT vs Fail split at ≥ {int(thr)}%")
 
 # ---------- summaries (median centers + MAD→σ for 3σ highlighting) ----------
 var_core = ss.get("var_core", [])
@@ -451,12 +485,10 @@ def _summaries_median_and_mad(df_in: pd.DataFrame, var_all: list[str], group_col
     return {"med_tbl": med_tbl, "mad_tbl": mad_tbl}
 
 summ = _summaries_median_and_mad(df_cmp, var_all, "__Group__")
-med_tbl = summ["med_tbl"]; mad_tbl = summ["mad_tbl"] * 1.4826  # MAD → σ
+med_tbl = summ["med_tbl"]; mad_tbl = summ["mad_tbl"] * 1.4826
 
-# ensure exactly two groups exist
 if med_tbl.empty or med_tbl.shape[1] < 2:
-    st.info("Not enough data to form two groups with the current threshold. Adjust settings.")
-    st.stop()
+    st.info("Not enough data to form two groups with the current threshold. Adjust settings."); st.stop()
 
 cols = list(med_tbl.columns)
 if (gA in cols) and (gB in cols):
@@ -464,54 +496,24 @@ if (gA in cols) and (gB in cols):
 else:
     top2 = df_cmp["__Group__"].value_counts().index[:2].tolist()
     if len(top2) < 2:
-        st.info("One of the groups is empty. Adjust Gain% threshold.")
-        st.stop()
+        st.info("One of the groups is empty. Adjust Gain% threshold."); st.stop()
     gA, gB = top2[0], top2[1]
     med_tbl = med_tbl[[gA, gB]]
 
 mad_tbl = mad_tbl.reindex(index=med_tbl.index)[[gA, gB]]
 
-# ============================== NCA training (live features only) ==============================
-def _pav_isotonic(x, y):
-    # simple pooled-adjacent-violators for calibration
-    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
-    order = np.argsort(x); x = x[order]; y = y[order]
-    blocks = [[y[0], 1.0]]
-    for i in range(1, len(y)):
-        blocks.append([y[i], 1.0])
-        while len(blocks) >= 2 and blocks[-2][0] > blocks[-1][0]:
-            s1, n1 = blocks.pop()
-            s0, n0 = blocks.pop()
-            blocks.append([(s0*n0 + s1*n1)/(n0+n1), n0+n1])
-    bx = []; by = []
-    i = 0
-    for mean, n in blocks:
-        by.extend([mean]*int(n))
-        bx.extend([x[i + j] for j in range(int(n))])
-        i += int(n)
-    return bx, by
-
-def _iso_predict(bx, by, xq):
-    # piecewise-constant interpolate (right-continuous)
-    bx = np.asarray(bx, dtype=float); by = np.asarray(by, dtype=float); xq = np.asarray(xq, dtype=float)
-    if bx.size < 2: return np.full_like(xq, np.nan, dtype=float)
-    order = np.argsort(bx); bx = bx[order]; by = by[order]
-    out = np.empty_like(xq, dtype=float)
-    for i, xv in enumerate(xq):
-        k = np.searchsorted(bx, xv, side="right") - 1
-        k = np.clip(k, 0, len(bx)-1)
-        out[i] = by[k]
-    return out
-
+# ============================== NCA / LDA ==============================
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
+    # guard: both groups must be present
+    present = set(df_groups["__Group__"].dropna().unique().tolist())
+    if not ({gA_label, gB_label} <= present): return {}
+
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
 
     feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
-    if not feats:
-        return {}
+    if not feats: return {}
 
     Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
-    # drop degenerate columns
     good_cols = []
     for c in feats:
         col = Xdf[c].values
@@ -520,17 +522,14 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         if np.nanstd(col) < 1e-9: continue
         good_cols.append(c)
     feats = good_cols
-    if not feats:
-        return {}
+    if not feats: return {}
 
     X = df2[feats].apply(pd.to_numeric, errors="coerce").values
     y = (df2["__Group__"].values == gA_label).astype(int)
     mask = np.isfinite(X).all(axis=1)
     X = X[mask]; y = y[mask]
-    if X.shape[0] < 20 or np.unique(y).size < 2:
-        return {}
+    if X.shape[0] < 20 or np.unique(y).size < 2: return {}
 
-    # standardize
     mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0] = 1.0
     Xs = (X - mu) / sd
 
@@ -542,7 +541,6 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         used = "nca"
         components = nca.components_
     except Exception:
-        # Fisher LDA fallback
         X0 = Xs[y==0]; X1 = Xs[y==1]
         if X0.shape[0] < 2 or X1.shape[0] < 2: return {}
         m0 = X0.mean(axis=0); m1 = X1.mean(axis=0)
@@ -552,27 +550,22 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         w_vec = w_vec / (np.linalg.norm(w_vec) + 1e-12)
         z = (Xs @ w_vec)
 
-    # Orient so larger → A
     if np.nanmean(z[y==1]) < np.nanmean(z[y==0]):
         z = -z
         if w_vec is not None: w_vec = -w_vec
         if components is not None: components = -components
 
-    # Calibration: isotonic preferred; Platt fallback
     zf = z[np.isfinite(z)]; yf = y[np.isfinite(z)]
-    iso_bx, iso_by = np.array([]), np.array([])
-    platt_params = None
+    iso_bx, iso_by = np.array([]), np.array([]); platt_params = None
     if zf.size >= 8 and np.unique(zf).size >= 3:
         bx, by = _pav_isotonic(zf, yf.astype(float))
-        if len(bx) >= 2:
-            iso_bx, iso_by = np.array(bx), np.array(by)
+        if len(bx) >= 2: iso_bx, iso_by = np.array(bx), np.array(by)
     if iso_bx.size < 2:
         z0 = zf[yf==0]; z1 = zf[yf==1]
         if z0.size and z1.size:
             m0, m1 = float(np.mean(z0)), float(np.mean(z1))
             s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
-            m = 0.5*(m0+m1)
-            k = 2.0 / (0.5*(s0+s1) + 1e-6)
+            m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
             platt_params = (m, k)
 
     return {
@@ -590,21 +583,21 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
     feats = model["feats"]
     x = []
     for f in feats:
-        v = pd.to_numeric(row.get(f), errors="coerce")
+        val = pd.to_numeric(row.get(f), errors="coerce")
+        v = float(val) if pd.notna(val) else np.nan
         if not np.isfinite(v): return np.nan
-        x.append(float(v))
+        x.append(v)
     x = np.array(x, dtype=float)
 
     mu = np.array(model["mu"], dtype=float)
     sd = np.array(model["sd"], dtype=float); sd[sd==0] = 1.0
     xs = (x - mu) / sd
 
-    z = np.nan
     if model["kind"] == "lda":
         w = np.array(model.get("w_vec"), dtype=float)
         if w is None or not np.isfinite(w).all(): return np.nan
         z = float(xs @ w)
-    else: # kind == "nca"
+    else:
         comp = model.get("components")
         if comp is None: return np.nan
         w = np.array(comp, dtype=float).ravel()
@@ -624,29 +617,33 @@ def _nca_predict_proba(row: dict, model: dict) -> float:
         pA = 1.0 / (1.0 + np.exp(-k*(z - m)))
     return float(np.clip(pA, 0.0, 1.0))
 
-# ============================== CatBoost training (same live features; once per split) ==============================
+# ============================== CatBoost ==============================
+try:
+    from catboost import CatBoostClassifier
+    _CATBOOST_OK = True
+except Exception:
+    _CATBOOST_OK = False
+
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
+    present = set(df_groups["__Group__"].dropna().unique().tolist())
+    if not ({gA_label, gB_label} <= present): return {}
     if not _CATBOOST_OK:
         if not ss.get("__catboost_warned", False):
-            st.info("CatBoost is not installed. Run `pip install catboost` to enable the purple CatBoost column/series.")
+            st.info("CatBoost not installed. Run `pip install catboost` to enable the purple CatBoost column/series.")
             ss["__catboost_warned"] = True
         return {}
 
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
     feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
-    if not feats:
-        return {}
+    if not feats: return {}
 
     Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
     y = (df2["__Group__"].values == gA_label).astype(int)
 
     mask_finite = np.isfinite(Xdf.values).all(axis=1)
-    Xdf = Xdf.loc[mask_finite]
-    y = y[mask_finite]
-
+    Xdf = Xdf.loc[mask_finite]; y = y[mask_finite]
     n = len(y)
-    if n < 40 or np.unique(y).size < 2:
-        return {}
+    if n < 40 or np.unique(y).size < 2: return {}
 
     X_all = Xdf.values.astype(np.float32, copy=False)
     y_all = y.astype(np.int32, copy=False)
@@ -659,8 +656,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     ytr, yva = y_all[tr_idx], y_all[va_idx]
 
     def _has_both_classes(arr):
-        u = np.unique(arr)
-        return (u.size == 2)
+        return np.unique(arr).size == 2
 
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
 
@@ -678,18 +674,13 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         allow_writing_files=False,
         verbose=False,
     )
-    if eval_ok:
-        params.update(dict(od_type="Iter", od_wait=40))
-    else:
-        params.update(dict(od_type="None"))
+    if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
+    else:       params.update(dict(od_type="None"))
 
     model = CatBoostClassifier(**params)
-
     try:
-        if eval_ok:
-            model.fit(Xtr, ytr, eval_set=(Xva, yva))
-        else:
-            model.fit(Xtr, ytr)
+        if eval_ok: model.fit(Xtr, ytr, eval_set=(Xva, yva))
+        else:       model.fit(Xtr, ytr)
     except Exception:
         try:
             model = CatBoostClassifier(**{**params, "od_type": "None"})
@@ -704,15 +695,13 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
             p_raw = model.predict_proba(Xva)[:, 1].astype(float)
             if np.unique(p_raw).size >= 3 and _has_both_classes(yva):
                 bx, by = _pav_isotonic(p_raw, yva.astype(float))
-                if len(bx) >= 2:
-                    iso_bx, iso_by = np.array(bx), np.array(by)
+                if len(bx) >= 2: iso_bx, iso_by = np.array(bx), np.array(by)
             if iso_bx.size < 2:
                 z0 = p_raw[yva==0]; z1 = p_raw[yva==1]
                 if z0.size and z1.size:
                     m0, m1 = float(np.mean(z0)), float(np.mean(z1))
                     s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
-                    m = 0.5*(m0+m1)
-                    k = 2.0 / (0.5*(s0+s1) + 1e-6)
+                    m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
                     platt = (m, k)
         except Exception:
             try:
@@ -757,9 +746,10 @@ def _cat_predict_proba(row: dict, model: dict) -> float:
     feats = model["feats"]
     x = []
     for f in feats:
-        v = pd.to_numeric(row.get(f), errors="coerce")
+        val = pd.to_numeric(row.get(f), errors="coerce")
+        v = float(val) if pd.notna(val) else np.nan
         if not np.isfinite(v): return np.nan
-        x.append(float(v))
+        x.append(v)
     x = np.array(x, dtype=float).reshape(1, -1)
 
     try:
@@ -778,8 +768,8 @@ def _cat_predict_proba(row: dict, model: dict) -> float:
         pA = z if not pl else 1.0 / (1.0 + np.exp(-pl[1]*(z - pl[0])))
     return float(np.clip(pA, 0.0, 1.0))
 
-# Train NCA + CatBoost once for the current split
-features_for_models = VAR_ALL[:]  # filtered in trainer to live features
+# Train NCA + CatBoost once for current split
+features_for_models = VAR_ALL[:]  # filtered in trainer
 ss.nca_model = _train_nca_or_lda(df_cmp, gA, gB, features_for_models) or {}
 ss.cat_model = _train_catboost_once(df_cmp, gA, gB, features_for_models) or {}
 
@@ -852,12 +842,10 @@ for row in ss.rows:
     )
     if not counts: continue
 
-    # NCA probability (A)
     pA = _nca_predict_proba(stock, ss.get("nca_model", {}))
     nca_raw = float(pA)*100.0 if np.isfinite(pA) else np.nan
     nca_int = int(round(nca_raw)) if np.isfinite(nca_raw) else None
 
-    # CatBoost probability (A)
     pC = _cat_predict_proba(stock, ss.get("cat_model", {}))
     cat_raw = float(pC)*100.0 if np.isfinite(pC) else np.nan
     cat_int = int(round(cat_raw)) if np.isfinite(cat_raw) else None
@@ -950,7 +938,6 @@ html = """
   .sig-hi{background:rgba(250,204,21,0.18)!important}
   .sig-lo{background:rgba(239,68,68,0.18)!important}
 
-  /* Ensure horizontal scroll with fixed min-width so columns never hide */
   #align { min-width: 1060px; }
   #align-wrap { overflow:auto; width:100%; }
 </style></head><body>
@@ -993,14 +980,13 @@ html = """
         const ca=(rawDa==null)?'':(rawDa>=0?'pos':'neg');
         const cb=(rawDb==null)?'':(rawDb>=0?'pos':'neg');
 
-        // 3σ significance vs closer center
+        let sigClass = '';
         const val  = (r.Value==null || isNaN(r.Value)) ? null : Number(r.Value);
         const cA   = (r.A==null || isNaN(r.A)) ? null : Number(r.A);
         const cB   = (r.B==null || isNaN(r.B)) ? null : Number(r.B);
         const sA   = (r.sA==null || isNaN(r.sA)) ? null : Number(r.sA);
         const sB   = (r.sB==null || isNaN(r.sB)) ? null : Number(r.sB);
 
-        let sigClass = '';
         if (val!=null && cA!=null && cB!=null) {
           const dAabs = Math.abs(val - cA);
           const dBabs = Math.abs(val - cB);
@@ -1042,9 +1028,7 @@ html = """
       const table=$('#align').DataTable({
         data: data.rows||[],
         paging:false, info:false, searching:false, order:[[0,'asc']],
-        responsive:false,
-        scrollX:true,
-        autoWidth:false,
+        responsive:false, scrollX:true, autoWidth:false,
         columns:[
           {data:'Ticker', width:'140px'},
           {data:null, render:(row)=>barCellLabeled(row.A_val_raw,row.A_label,row.A_val_int,'blue'),   width:'220px'},
@@ -1068,7 +1052,7 @@ html = """
 html = html.replace("%%PAYLOAD%%", SAFE_JSON_DUMPS(payload))
 components.html(html, height=800, scrolling=True)
 
-# ============================== Alignment exports (CSV full + Markdown compact) ==============================
+# ============================== Alignment exports ==============================
 if summary_rows:
     def _df_to_markdown_simple(df: pd.DataFrame, float_fmt=".0f") -> str:
         def _fmt(x):
@@ -1109,30 +1093,18 @@ if summary_rows:
             if r.get("__group__"):
                 section = r["__group__"]
                 full_rows.append({
-                    "Ticker": tkr,
-                    "Section": section,
-                    "Variable": "",
-                    "Value": "",
-                    "A center": "",
-                    "B center": "",
-                    "Δ vs A": "",
-                    "Δ vs B": "",
-                    "σ(A)": "",
-                    "σ(B)": "",
-                    "Is core": "",
-                    "A group": s.get("A_label", ""),
-                    "B group": s.get("B_label", ""),
+                    "Ticker": tkr, "Section": section, "Variable": "",
+                    "Value": "", "A center": "", "B center": "",
+                    "Δ vs A": "", "Δ vs B": "", "σ(A)": "", "σ(B)": "", "Is core": "",
+                    "A group": s.get("A_label", ""), "B group": s.get("B_label", ""),
                     "A (%) — Median centers": s.get("A_val_int", ""),
                     "B (%) — Median centers": s.get("B_val_int", ""),
-                    "NCA (%)": s.get("NCA_int", ""),
-                    "CatBoost (%)": s.get("CAT_int", ""),
+                    "NCA (%)": s.get("NCA_int", ""), "CatBoost (%)": s.get("CAT_int", ""),
                 })
                 continue
 
             full_rows.append({
-                "Ticker": tkr,
-                "Section": section,
-                "Variable": r.get("Variable", ""),
+                "Ticker": tkr, "Section": section, "Variable": r.get("Variable", ""),
                 "Value": ("" if pd.isna(r.get("Value")) else r.get("Value")),
                 "A center": ("" if pd.isna(r.get("A")) else r.get("A")),
                 "B center": ("" if pd.isna(r.get("B")) else r.get("B")),
@@ -1141,12 +1113,10 @@ if summary_rows:
                 "σ(A)": ("" if (r.get("sA") is None or pd.isna(r.get("sA"))) else r.get("sA")),
                 "σ(B)": ("" if (r.get("sB") is None or pd.isna(r.get("sB"))) else r.get("sB")),
                 "Is core": bool(r.get("is_core", False)),
-                "A group": s.get("A_label", ""),
-                "B group": s.get("B_label", ""),
+                "A group": s.get("A_label", ""), "B group": s.get("B_label", ""),
                 "A (%) — Median centers": s.get("A_val_int", ""),
                 "B (%) — Median centers": s.get("B_val_int", ""),
-                "NCA (%)": s.get("NCA_int", ""),
-                "CatBoost (%)": s.get("CAT_int", ""),
+                "NCA (%)": s.get("NCA_int", ""), "CatBoost (%)": s.get("CAT_int", ""),
             })
 
     df_align_csv_full = pd.DataFrame(full_rows)
@@ -1242,7 +1212,6 @@ else:
     if not rows_for_dist:
         st.info("No stocks selected.")
     else:
-        # Single-split function (no mode)
         def _make_split(df_base: pd.DataFrame, thr_val: float):
             df_tmp = df_base.copy()
             df_tmp["__Group__"] = np.where(
@@ -1266,6 +1235,11 @@ else:
 
         for thr_val in gain_choices:
             df_split, gA2, gB2 = _make_split(base_df, float(thr_val))
+            # skip degenerate cutoffs
+            vc = df_split["__Group__"].value_counts()
+            if (vc.get(gA2, 0) == 0) or (vc.get(gB2, 0) == 0):
+                continue
+
             med_tbl2, _ = _summaries(df_split, var_all, "__Group__")
             if med_tbl2.empty or med_tbl2.shape[1] < 2:
                 continue
