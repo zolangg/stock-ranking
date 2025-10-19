@@ -643,8 +643,8 @@ vegaEmbed("#vis", spec, {{actions: true}});
     smoothing_window = st.slider(
         "Smoothing Window",
         min_value=1,
-        max_value=5,
-        value=3,
+        max_value=50,
+        value=21,
         help="Controls the amount of smoothing. A value of 1 means no smoothing (raw data). A higher value creates a smoother trend line by averaging more points."
     )
 
