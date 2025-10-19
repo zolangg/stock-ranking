@@ -538,106 +538,6 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         series_A_med.append(float(np.nanmedian(pA_centers)) if pA_centers else np.nan)
         series_B_med.append(float(np.nanmedian(pB_centers)) if pB_centers else np.nan)
 
-if not thr_labels:
-    st.info("Not enough data across cutoffs to train models. Try using a larger database.")
-else:
-    # --- Absolute Probability Chart (Main Chart) ---
-    data = []
-    gA_label = f"≥...% (Median Centers)"
-    gB_label = f"Rest (Median Centers)"
-    nca_label = f"NCA: P(≥...%)"
-    cat_label = f"CatBoost: P(≥...%)"
-    
-    for i, thr in enumerate(thr_labels):
-        data.append({"GainCutoff_%": thr, "Series": gA_label, "Value": series_A_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": gB_label, "Value": series_B_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": nca_label, "Value": series_N_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": cat_label, "Value": series_C_med[i]})
-
-    df_long = pd.DataFrame(data).dropna(subset=['Value'])
-
-    color_domain = [gA_label, gB_label, nca_label, cat_label]
-    color_range  = ["#3b82f6", "#ef4444", "#10b981", "#8b5cf6"]
-
-    chart = (
-        alt.Chart(df_long)
-        .mark_bar()
-        .encode(
-            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {gain_cutoffs[1]-gain_cutoffs[0]})"),
-            y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
-            xOffset="Series:N",
-            tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
-        )
-        .properties(height=400, title="Absolute Probability of Reaching Gain Cutoff")
-    )
-    st.altair_chart(chart, use_container_width=True)
-
-    # --- Chart Export Section ---
-    png_bytes = None
-    try:
-        pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
-        series_names = list(pivot.columns)
-        color_map = {gA_label: "#3b82f6", gB_label: "#ef4444", nca_label: "#10b981", cat_label: "#8b5cf6"}
-        colors = [color_map.get(s, "#999999") for s in series_names]
-        thresholds = pivot.index.tolist()
-        n_groups = len(thresholds); n_series = len(series_names)
-        x = np.arange(n_groups); width = 0.8 / max(n_series, 1)
-
-        fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4.5))
-        for i, s in enumerate(series_names):
-            vals = pivot[s].values.astype(float)
-            ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
-
-        ax.set_xticks(x); ax.set_xticklabels([str(t) for t in thresholds], rotation=0)
-        ax.set_ylim(0, 100)
-        ax.set_xlabel("Gain% cutoff")
-        ax.set_ylabel("Median Alignment / P(A) for selected stocks (%)")
-        ax.legend(loc="upper left", frameon=False)
-
-        buf = io.BytesIO(); fig.tight_layout()
-        fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-        plt.close(fig)
-        png_bytes = buf.getvalue()
-    except Exception:
-        png_bytes = None
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if png_bytes:
-            st.download_button(
-                "Download PNG (Alignment distribution)",
-                data=png_bytes,
-                file_name=f"alignment_distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                mime="image/png",
-                use_container_width=True,
-                key="dl_png",
-            )
-        else:
-            st.caption("PNG export unavailable.")
-    with col2:
-        spec = chart.to_dict()
-        html_tpl = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Alignment Distribution</title>
-<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
-</head><body>
-<div id="vis"></div>
-<script>
-const spec = {json.dumps(spec)};
-vegaEmbed("#vis", spec, {{actions: true}});
-</script>
-</body></html>"""
-        st.download_button(
-            "Download HTML (interactive Alignment chart)",
-            data=html_tpl.encode("utf-8"),
-            file_name="alignment_distribution.html",
-            mime="text/html",
-            use_container_width=True,
-            key="dl_html",
-        )
-
 # --- FINAL, ROBUST VERSION: Function to generate export buttons for any chart ---
 def create_export_buttons(df, chart_obj, file_prefix):
     """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
@@ -724,6 +624,44 @@ def create_export_buttons(df, chart_obj, file_prefix):
             key=f"dl_html_{file_prefix}"
         )
 
+if not thr_labels:
+    st.info("Not enough data across cutoffs to train models. Try using a larger database.")
+else:
+    # --- Absolute Probability Chart (Main Chart) ---
+    data = []
+    gA_label = f"≥...% (Median Centers)"
+    gB_label = f"Rest (Median Centers)"
+    nca_label = f"NCA: P(≥...%)"
+    cat_label = f"CatBoost: P(≥...%)"
+    
+    for i, thr in enumerate(thr_labels):
+        data.append({"GainCutoff_%": thr, "Series": gA_label, "Value": series_A_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": gB_label, "Value": series_B_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": nca_label, "Value": series_N_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": cat_label, "Value": series_C_med[i]})
+
+    df_long = pd.DataFrame(data).dropna(subset=['Value'])
+
+    color_domain = [gA_label, gB_label, nca_label, cat_label]
+    color_range  = ["#3b82f6", "#ef4444", "#10b981", "#8b5cf6"]
+
+    chart = (
+        alt.Chart(df_long)
+        .mark_bar()
+        .encode(
+            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {gain_cutoffs[1]-gain_cutoffs[0]})"),
+            y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
+            xOffset="Series:N",
+            tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
+        )
+        .properties(height=400, title="Absolute Probability of Reaching Gain Cutoff")
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+    # --- Chart Export Section for Absolute Probability Chart ---
+    create_export_buttons(df_long, chart, "absolute_probability")
+
 # --- Conditional Probability Chart Section with a Choice of Smoothers ---
 st.markdown("---")
 
@@ -732,57 +670,62 @@ series_names = [gA_label, nca_label, cat_label]
 
 smoothed_series = []
 
-for s in series_list:
-    x_raw = np.array(thr_labels)
-    y_raw = np.array(s)
-    
-    mask = ~np.isnan(y_raw)
-    x_fit = x_raw[mask]
-    y_fit = y_raw[mask]
-    
-    y_smooth = np.full_like(x_raw, np.nan, dtype=float)
-
-    if len(x_fit) > 4:
-        # --- Polynomial Regression: The Flexible Smoother ---
-        coeffs = np.polyfit(x_fit, y_fit, 4)
-        poly_func = np.poly1d(coeffs)
-        y_smooth = poly_func(x_raw)
-        chart_title_suffix = f"(Polynomial Smoothed, Degree=4)"
+if thr_labels:
+    for s in series_list:
+        x_raw = np.array(thr_labels)
+        y_raw = np.array(s)
         
-        smoothed_series.append(np.clip(y_smooth, 0, 100))
-    else:
-        smoothed_series.append(y_raw) # Not enough data, use raw
-        chart_title_suffix = "(Raw Data - Not Enough to Smooth)"
-
-
-cond_data, cond_labels = [], [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
-for i in range(len(thr_labels) - 1):
-    for j, name in enumerate(series_names):
-        p_current = smoothed_series[j][i]
-        p_next = smoothed_series[j][i+1]
+        mask = ~np.isnan(y_raw)
+        x_fit = x_raw[mask]
+        y_fit = y_raw[mask]
         
-        cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100) if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6 else np.nan
-        if pd.notna(cond_prob):
-            transition_label = f"{thr_labels[i]}% → {thr_labels[i+1]}%"
-            cond_data.append({"Transition": transition_label, "Series": name, "Value": cond_prob})
+        y_smooth = np.full_like(x_raw, np.nan, dtype=float)
 
-if cond_data:
-    df_cond_long = pd.DataFrame(cond_data)
-    
-    cond_color_domain, cond_color_range = [gA_label, nca_label, cat_label], ["#3b82f6", "#10b981", "#8b5cf6"]
-    
-    cond_chart = (
-        alt.Chart(df_cond_long)
-        .mark_bar()
-        .encode(
-            x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels),
-            y=alt.Y("Value:Q", title="Conditional Probability (%)", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("Series:N", scale=alt.Scale(domain=cond_color_domain, range=cond_color_range), legend=alt.Legend(title="Analysis Series")),
-            xOffset="Series:N",
-            tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")],
+        if len(x_fit) > 4:
+            # --- Polynomial Regression: The Flexible Smoother ---
+            coeffs = np.polyfit(x_fit, y_fit, 4)
+            poly_func = np.poly1d(coeffs)
+            y_smooth = poly_func(x_raw)
+            chart_title_suffix = f"(Polynomial Smoothed, Degree=4)"
+            
+            smoothed_series.append(np.clip(y_smooth, 0, 100))
+        else:
+            smoothed_series.append(y_raw) # Not enough data, use raw
+            chart_title_suffix = "(Raw Data - Not Enough to Smooth)"
+
+
+    cond_data, cond_labels = [], [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
+    for i in range(len(thr_labels) - 1):
+        for j, name in enumerate(series_names):
+            p_current = smoothed_series[j][i]
+            p_next = smoothed_series[j][i+1]
+            
+            cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100) if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6 else np.nan
+            if pd.notna(cond_prob):
+                transition_label = f"{thr_labels[i]}% → {thr_labels[i+1]}%"
+                cond_data.append({"Transition": transition_label, "Series": name, "Value": cond_prob})
+
+    if cond_data:
+        df_cond_long = pd.DataFrame(cond_data)
+        
+        cond_color_domain, cond_color_range = [gA_label, nca_label, cat_label], ["#3b82f6", "#10b981", "#8b5cf6"]
+        
+        cond_chart = (
+            alt.Chart(df_cond_long)
+            .mark_bar()
+            .encode(
+                x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels),
+                y=alt.Y("Value:Q", title="Conditional Probability (%)", scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("Series:N", scale=alt.Scale(domain=cond_color_domain, range=cond_color_range), legend=alt.Legend(title="Analysis Series")),
+                xOffset="Series:N",
+                tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")],
+            )
+            .properties(height=400, title=f"Conditional Probability {chart_title_suffix}")
         )
-        .properties(height=400, title=f"Conditional Probability {chart_title_suffix}")
-    )
-    st.altair_chart(cond_chart, use_container_width=True)
-else:
-    st.info("Not enough sequential data to calculate conditional probabilities.")
+        st.altair_chart(cond_chart, use_container_width=True)
+        
+        # FIX: Added the export buttons for the conditional probability chart
+        create_export_buttons(df_cond_long, cond_chart, "conditional_probability")
+        
+    else:
+        st.info("Not enough sequential data to calculate conditional probabilities.")
