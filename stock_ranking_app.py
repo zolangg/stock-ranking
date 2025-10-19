@@ -130,7 +130,7 @@ if build_btn:
                 df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
             mcap_basis = "MC_PM_Max_M" if "MC_PM_Max_M" in df.columns and df["MC_PM_Max_M"].notna().any() else "MarketCap_M$"
             if {"PM_$Vol_M$", mcap_basis}.issubset(df.columns):
-                df["PM$Vol/MC_%"] = (df["PM_$Vol_M$] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
+                df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
 
             for pct_col in ("Gap_%","PM_Vol_%","Max_Pull_PM_%"):
                 if pct_col in df.columns:
