@@ -1,8 +1,7 @@
 # stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
-# - Add Stock form and multiselect for deletion (no table)
-# - Alignment shows median P(A) over SELECTED added stocks across Gain% cutoffs
-# - Models (NCA & CatBoost) train per cutoff on the UPLOADED DB
-# - Analysis is permanently set to "Gain% vs Rest"
+# - Streamlined UI: Add form, and a single line for stock selection and deletion.
+# - Tuned CatBoost Model: Parameters adjusted to be more "open-minded" to outliers.
+# - Analysis is permanently set to "Gain% vs Rest".
 
 import streamlit as st
 import pandas as pd
@@ -21,7 +20,7 @@ st.title("Premarket Stock Analysis")
 ss = st.session_state
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("rows", [])
-ss.setdefault("del_selection", [])
+# --- NOTE: del_selection is no longer needed as we use the main multiselect's state ---
 
 # ============================== Unified variables ==============================
 UNIFIED_VARS = [
@@ -32,6 +31,7 @@ ALLOWED_LIVE_FEATURES = UNIFIED_VARS[:]
 EXCLUDE_FOR_NCA = []
 
 # ============================== Helpers ==============================
+# (This section is unchanged)
 def _norm(s: str) -> str:
     v = re.sub(r"\s+", " ", str(s).strip().lower())
     v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
@@ -137,7 +137,7 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# ============================== Add Stock & Manage ==============================
+# ============================== Add Stock ==============================
 st.markdown("---")
 st.subheader("Add Stock")
 
@@ -176,34 +176,6 @@ if submitted and ticker:
     }
     ss.rows.append(row)
     st.success(f"Saved {ticker}.")
-
-# --- MODIFIED: Removed the table, leaving only the delete functionality ---
-if ss.rows:
-    st.markdown("##### Manage Added Stocks")
-
-    def _handle_delete():
-        sel = st.session_state.get("del_selection", [])
-        if sel:
-            ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(sel)]
-            st.session_state["del_selection"] = []
-    
-    unique_tickers = pd.Series([r.get("Ticker") for r in ss.rows]).dropna().unique().tolist()
-    
-    cdel1, cdel2 = st.columns([4, 1])
-    with cdel1:
-        st.multiselect(
-            "Select tickers to delete",
-            options=unique_tickers,
-            key="del_selection",
-            label_visibility="collapsed"
-        )
-    with cdel2:
-        st.button(
-            "Delete Selected",
-            use_container_width=True,
-            on_click=_handle_delete,
-            disabled=not ss.get("del_selection")
-        )
 
 # ============================== Isotonic helpers ==============================
 # (This section is unchanged)
@@ -329,7 +301,6 @@ def _nca_predict_proba_row(xrow: dict, model: dict) -> float:
     return float(np.clip(pA, 0.0, 1.0))
 
 # ============================== CatBoost ==============================
-# (This section is unchanged)
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
@@ -353,7 +324,23 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     def _has_both_classes(arr):
         return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
-    params = dict(loss_function="Logloss", eval_metric="Logloss", iterations=200, learning_rate=0.04, depth=3, l2_leaf_reg=6, bootstrap_type="Bayesian", bagging_temperature=0.5, auto_class_weights="Balanced", random_seed=42, allow_writing_files=False, verbose=False)
+    
+    # --- MODIFIED: CatBoost parameters are tuned to be more "open-minded" ---
+    params = dict(
+        loss_function="Logloss",
+        eval_metric="Logloss",
+        iterations=200,
+        learning_rate=0.05,  # Slightly increased to prevent overfitting to tiny details.
+        depth=2,             # From 3 -> 2. FORCES the model to learn simpler, more general rules.
+        l2_leaf_reg=10,      # From 6 -> 10. Increased penalty for being "too certain."
+        bootstrap_type="Bayesian",
+        bagging_temperature=0.5,
+        auto_class_weights="Balanced",
+        random_seed=42,
+        allow_writing_files=False,
+        verbose=False,
+    )
+    
     if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
     else:       params.update(dict(od_type="None"))
     model = CatBoostClassifier(**params)
@@ -449,29 +436,42 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- MODIFIED: Removed the analysis mode radio button ---
 st.info("Analysis compares stocks with a specific **Gain %** against all other stocks (**Rest**).")
 
-all_added_tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-_seen = set(); all_added_tickers = [t for t in all_added_tickers if not (t in _seen or _seen.add(t))]
+# --- NEW: Streamlined UI for stock selection and deletion in one line ---
+st.markdown("##### Filter & Manage Stocks for Analysis")
+all_added_tickers = pd.Series([r.get("Ticker") for r in ss.rows]).dropna().unique().tolist()
+
 if "align_sel_tickers" not in st.session_state:
     st.session_state["align_sel_tickers"] = all_added_tickers[:]
 
-csel1, csel2 = st.columns([4, 1])
-with csel1:
+def _clear_selection():
+    st.session_state["align_sel_tickers"] = []
+
+def _delete_selected():
+    tickers_to_delete = st.session_state.get("align_sel_tickers", [])
+    if tickers_to_delete:
+        ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(tickers_to_delete)]
+        # After deleting, clear the selection to prevent accidental re-deletes
+        st.session_state["align_sel_tickers"] = []
+
+col1, col2, col3 = st.columns([6, 1, 1])
+with col1:
     selected_tickers = st.multiselect(
-        "Select stocks to include in distribution calculation",
+        "Select stocks to include in the chart below. The delete button will act on this selection.",
         options=all_added_tickers,
-        default=st.session_state["align_sel_tickers"],
+        default=st.session_state.get("align_sel_tickers", []),
         key="align_sel_tickers",
         label_visibility="collapsed",
     )
-with csel2:
-    def _clear_sel(): st.session_state["align_sel_tickers"] = []
-    st.button("Clear Selection", use_container_width=True, on_click=_clear_sel)
+with col2:
+    st.button("Clear", use_container_width=True, on_click=_clear_selection, help="Clears the current selection in the box.")
+with col3:
+    st.button("Delete", use_container_width=True, on_click=_delete_selected, help="Deletes the stocks currently selected in the box.", disabled=not selected_tickers)
+
 
 if not selected_tickers:
-    st.info("No stocks selected. Pick at least one added ticker above.")
+    st.info("No stocks selected. Pick at least one added ticker to display the chart.")
     st.stop()
 
 if "Max_Push_Daily_%" not in base_df.columns:
@@ -485,7 +485,6 @@ if not var_all:
 
 gain_cutoffs = list(range(25, 301, 25))
 
-# --- MODIFIED: Split helper is now simplified for one mode ---
 def _make_split(df_base: pd.DataFrame, thr_val: float):
     df_tmp = df_base.copy()
     df_tmp["__Group__"] = np.where(
@@ -502,7 +501,6 @@ series_A_med, series_B_med, series_N_med, series_C_med = [], [], [], []
 
 with st.spinner("Calculating distributions across all cutoffs..."):
     for thr_val in gain_cutoffs:
-        # --- MODIFIED: Call to _make_split is simpler ---
         df_split, gA, gB = _make_split(base_df, float(thr_val))
 
         vc = df_split["__Group__"].value_counts()
@@ -553,7 +551,6 @@ if not thr_labels:
     st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
     data = []
-    # --- MODIFIED: Simplified legend naming ---
     gA_label = f"≥...% (Median Centers)"
     gB_label = f"Rest (Median Centers)"
     nca_label = f"NCA: P(≥...%)"
@@ -631,9 +628,9 @@ else:
         spec = chart.to_dict()
         html_tpl = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Alignment Distribution</title>
-<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+<script src="https://cdn.jsdelivr/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr/npm/vega-embed@6"></script>
 </head><body>
 <div id="vis"></div>
 <script>
