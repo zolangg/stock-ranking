@@ -4,7 +4,9 @@
 # - Model (CatBoost) trains per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
 # - CatBoost is required; no optional branches
 # - No daily-volume prediction anywhere
-# - NCA REMOVED (per request)
+# - NCA REMOVED
+# - CatBoost features LOCKED exactly to: MC_PM_Max_M, Float_PM_Max_M, Gap_%, ATR_$, PM_Vol_M, PM_$Vol_M$, Max_Pull_PM_%,
+#                                       RVOL_Max_PM_cum, Catalyst, FR_x, PM$Vol/MC_%
 
 import streamlit as st
 import pandas as pd
@@ -16,8 +18,8 @@ from datetime import datetime
 from catboost import CatBoostClassifier  # CatBoost is required
 
 # ============================== Page ==============================
-st.set_page_config(page_title="GainPredictorX", layout="wide")
-st.title("GainPredictorX")
+st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
+st.title("Premarket Stock Analysis")
 
 # ============================== Session ==============================
 ss = st.session_state
@@ -99,7 +101,7 @@ if build_btn:
                 src = _pick(raw, src_candidates)
                 if src: dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-            # Map numeric fields (same candidates as earlier builds)
+            # Map numeric fields
             add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
             add_num(df, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
             add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
@@ -168,12 +170,22 @@ if build_btn:
             ss.var_core = [v for v in VAR_CORE if v in df.columns]
             ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
 
+            # ---- LOCK CatBoost features to your exact list (including Catalyst)
+            INTENDED_CAT_FEATURES = [
+                "MC_PM_Max_M", "Float_PM_Max_M", "Gap_%", "ATR_$",
+                "PM_Vol_M", "PM_$Vol_M$", "Max_Pull_PM_%", "RVOL_Max_PM_cum",
+                "Catalyst", "FR_x", "PM$Vol/MC_%"
+            ]
+            # Keep only those that actually exist in the DB (trainer will warn if any get dropped later)
+            INTENDED_CAT_FEATURES = [f for f in INTENDED_CAT_FEATURES if f in ss.base_df.columns]
+            ss.INTENDED_CAT_FEATURES = INTENDED_CAT_FEATURES  # store in session for trainer access
+
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
         except Exception as e:
             st.error("Loading/processing failed.")
             st.exception(e)
 
-# Unified features for models (live features only)
+# Unified features list (not used for CatBoost now; CatBoost uses locked list)
 VAR_ALL = (ss.get("var_core", []) or []) + (ss.get("var_moderate", []) or [])
 ALLOWED_LIVE_FEATURES = VAR_ALL[:] if VAR_ALL else []
 
@@ -217,7 +229,7 @@ if submitted and ticker:
     ss.rows.append(row)
     st.success(f"Saved {ticker}.")
 
-# ============================== Isotonic helpers (kept for CatBoost calibration) ==============================
+# ============================== Isotonic helpers (for CatBoost calibration) ==============================
 def _pav_isotonic(x, y):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     if x.size == 0: return [], []
@@ -252,15 +264,49 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     if not ({gA_label, gB_label} <= present): return {}
 
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
-    feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES]
-    if not feats: return {}
 
-    Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
+    # ---- Use ONLY the locked features (intersection with dataframe)
+    feats_intended = ss.get("INTENDED_CAT_FEATURES", []) or features
+    feats = [f for f in feats_intended if f in df2.columns]
+
+    # Audit: missing from DB?
+    missing = [f for f in feats_intended if f not in df2.columns]
+    if missing:
+        st.warning(f"[CatBoost] Missing features (not in DB): {', '.join(missing)}")
+
+    if not feats:
+        return {}
+
+    Xdf_all = df2[feats].apply(pd.to_numeric, errors="coerce")
+
+    # Drop degenerate columns (no finite or ~constant)
+    good_cols = []
+    for c in feats:
+        col = pd.to_numeric(Xdf_all[c], errors="coerce").values
+        col = col[np.isfinite(col)]
+        if col.size == 0:
+            st.warning(f"[CatBoost] Feature '{c}' has no finite values at this cutoff; dropping.")
+            continue
+        if np.nanstd(col) < 1e-9:
+            st.warning(f"[CatBoost] Feature '{c}' is (near) constant at this cutoff; dropping.")
+            continue
+        good_cols.append(c)
+
+    feats = good_cols
+    if not feats:
+        return {}
+
+    Xdf = Xdf_all[feats]
     y = (df2["__Group__"].values == gA_label).astype(int)
     mask_finite = np.isfinite(Xdf.values).all(axis=1)
     Xdf = Xdf.loc[mask_finite]; y = y[mask_finite]
+
+    # (visibility)
+    st.caption(f"[{gA_label} vs {gB_label}] Using {len(feats)} features: {', '.join(feats)} | rows={len(Xdf)}")
+
     n = len(y)
-    if n < 40 or np.unique(y).size < 2: return {}
+    if n < 40 or np.unique(y).size < 2:
+        return {}
 
     X_all = Xdf.values.astype(np.float32, copy=False)
     y_all = y.astype(np.int32, copy=False)
@@ -366,7 +412,7 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- choose which added stocks to include (no title/help) ---
+# choose which added stocks to include (no title/help)
 all_added_tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
 _seen = set(); all_added_tickers = [t for t in all_added_tickers if not (t in _seen or _seen.add(t))]
 if "align_sel_tickers" not in st.session_state:
@@ -394,7 +440,7 @@ if "Max_Push_Daily_%" not in base_df.columns:
     st.error("Your DB is missing column: Max_Push_Daily_% (Max Push Daily (%) as %).")
     st.stop()
 
-# Features available in DB (live)
+# Features available in DB (live) — model still uses locked list
 var_core = ss.get("var_core", [])
 var_mod  = ss.get("var_moderate", [])
 var_all  = [v for v in (var_core + var_mod) if v in base_df.columns]
