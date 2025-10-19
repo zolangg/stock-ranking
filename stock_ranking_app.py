@@ -617,6 +617,37 @@ else:
     )
     st.altair_chart(chart, use_container_width=True)
 
+# ============================== Expected Push vs P(A) calibration ==============================
+st.markdown("### Expected Max Push vs CatBoost P(A)")
+st.caption("Empirical calibration curve: what actual Max Push (%) was achieved at each predicted CatBoost P(A) level in your DB.")
+
+def predict_pa_db(cat_model, df, feats):
+    X = df[feats].apply(pd.to_numeric, errors="coerce")
+    mask = np.isfinite(X.values).all(axis=1)
+    pA = np.full(len(df), np.nan)
+    if mask.any():
+        pA[mask] = cat_model["cb"].predict_proba(X.loc[mask].values)[:, 1]
+    return pA * 100  # convert to %
+
+try:
+    df_tmp = base_df.copy()
+    if cat_model and cat_model.get("ok"):
+        df_tmp["CatBoost_P(A)%"] = predict_pa_db(cat_model, df_tmp, cat_model["feats"])
+        bins = np.arange(0, 101, 10)
+        df_tmp["pA_bin"] = pd.cut(df_tmp["CatBoost_P(A)%"], bins=bins, include_lowest=True)
+        summary = (
+            df_tmp.groupby("pA_bin")["Max_Push_Daily_%"]
+            .describe(percentiles=[0.25, 0.5, 0.75])[["25%", "50%", "75%"]]
+            .rename(columns={"50%": "Median"})
+            .reset_index()
+        )
+        st.dataframe(summary)
+    else:
+        st.info("CatBoost model not trained in this session yet.")
+except Exception as e:
+    st.warning("Could not compute calibration table.")
+    st.exception(e)
+
     # Optional PNG export via Matplotlib
     png_bytes = None
     try:
