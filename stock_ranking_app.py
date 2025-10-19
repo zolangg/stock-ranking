@@ -4,6 +4,7 @@
 # - Models (NCA & CatBoost) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
 # - CatBoost is required; no optional branches
 # - No daily-volume prediction anywhere
+# - Simplified: one unified variables list for both models (no core/moderate split)
 
 import streamlit as st
 import pandas as pd
@@ -21,9 +22,15 @@ st.title("Premarket Stock Analysis")
 # ============================== Session ==============================
 ss = st.session_state
 ss.setdefault("base_df", pd.DataFrame())
-ss.setdefault("var_core", [])
-ss.setdefault("var_moderate", [])
 ss.setdefault("rows", [])  # user-added stocks (list of dicts)
+
+# ============================== Unified variables ==============================
+UNIFIED_VARS = [
+    "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
+    "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
+]
+ALLOWED_LIVE_FEATURES = UNIFIED_VARS[:]     # what we will actually try to use
+EXCLUDE_FOR_NCA = []                        # keep hook if you want to drop any later
 
 # ============================== Helpers ==============================
 def _norm(s: str) -> str:
@@ -36,14 +43,17 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
     nm = {c: _norm(c) for c in cols}
+    # exact case-insensitive
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
             if cols_lc[c] == lc: return c
+    # normalized exact
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n: return c
+    # normalized contains
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
@@ -98,17 +108,13 @@ if build_btn:
                 src = _pick(raw, src_candidates)
                 if src: dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
-            # Map numeric fields (same candidates as earlier builds)
+            # Map numeric fields
             add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
             add_num(df, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
-            add_num(df, "MarketCap_M$",     ["marketcap m","market cap (m)","mcap m","marketcap_m$","market cap m$","market cap (m$)","marketcap","market_cap_m"])
-            add_num(df, "Float_M",          ["float m","public float (m)","float_m","float (m)","float m shares","float_m_shares"])
             add_num(df, "Gap_%",            ["gap %","gap%","premarket gap","gap","gap_percent"])
             add_num(df, "ATR_$",            ["atr $","atr$","atr (usd)","atr","daily atr","daily_atr"])
             add_num(df, "PM_Vol_M",         ["pm vol (m)","premarket vol (m)","pm volume (m)","pm shares (m)","premarket volume (m)","pm_vol_m"])
             add_num(df, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
-            add_num(df, "PM_Vol_%",         ["pm vol (%)","pm_vol_%","pm vol percent","pm volume (%)","pm_vol_percent"])
-            add_num(df, "Daily_Vol_M",      ["daily vol (m)","daily_vol_m","day volume (m)","dvol_m"])
             add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
             add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
 
@@ -154,28 +160,15 @@ if build_btn:
                 if pmh_col is not None else np.nan
             )
 
+            # Keep only columns we may use (+ necessary label columns)
+            keep_cols = set(UNIFIED_VARS + ["GroupRaw","FT01","GroupFT","Max_Push_Daily_%"])
+            df = df[[c for c in df.columns if c in keep_cols]].copy()
+
             ss.base_df = df
-
-            # Variable lists (fallback if not defined in your env)
-            try: VAR_CORE
-            except NameError:
-                VAR_CORE = ["MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum"]
-            try: VAR_MODERATE
-            except NameError:
-                VAR_MODERATE = []
-
-            ss.var_core = [v for v in VAR_CORE if v in df.columns]
-            ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
-
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
         except Exception as e:
             st.error("Loading/processing failed.")
             st.exception(e)
-
-# Unified features for models (live features only)
-VAR_ALL = (ss.get("var_core", []) or []) + (ss.get("var_moderate", []) or [])
-ALLOWED_LIVE_FEATURES = VAR_ALL[:] if VAR_ALL else []
-EXCLUDE_FOR_NCA = []  # tweak if needed
 
 # ============================== Add Stock (no table) ==============================
 st.markdown("---")
@@ -413,7 +406,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     model = CatBoostClassifier(**params)
     try:
         if eval_ok: model.fit(Xtr, ytr, eval_set=(Xva, yva))
-        else:       model.fit(Xtr, ytr)
+        else:       model.fit(X_all, y_all)
     except Exception:
         try:
             model = CatBoostClassifier(**{**params, "od_type": "None"})
@@ -482,9 +475,8 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- NEW: choose which added stocks to include ---
+# --- choose which added stocks to include ---
 all_added_tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-# de-duplicate preserving order
 _seen = set(); all_added_tickers = [t for t in all_added_tickers if not (t in _seen or _seen.add(t))]
 if "align_sel_tickers" not in st.session_state:
     st.session_state["align_sel_tickers"] = all_added_tickers[:]  # default: all
@@ -506,15 +498,13 @@ if not selected_tickers:
     st.info("No stocks selected. Pick at least one added ticker above.")
     st.stop()
 
-# Required columns on DB side
+# Required DB columns
 if "Max_Push_Daily_%" not in base_df.columns:
     st.error("Your DB is missing column: Max_Push_Daily_% (Max Push Daily (%) as %).")
     st.stop()
 
-# Features available in DB (live)
-var_core = ss.get("var_core", [])
-var_mod  = ss.get("var_moderate", [])
-var_all  = [v for v in (var_core + var_mod) if v in base_df.columns]
+# Features available in DB (live) — intersection with unified set
+var_all = [v for v in UNIFIED_VARS if v in base_df.columns]
 if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
     st.stop()
