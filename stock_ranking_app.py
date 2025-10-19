@@ -343,7 +343,7 @@ def _handle_delete():
         st.session_state["__delete_msg"] = "No tickers selected."
 
 # ---- One row: Gain% (left) + Delete UI (right) ----
-left, right = st.columns([2.0, 1.4])
+left, right = st.columns([1.4, 2.0])
 
 with left:
     gain_choices = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
@@ -357,7 +357,7 @@ with left:
     )
 
 with right:
-    cdel1, cdel2 = st.columns([3, 2])
+    cdel1, cdel2 = st.columns([4, 2])
     with cdel1:
         _ = st.multiselect(
             "",
