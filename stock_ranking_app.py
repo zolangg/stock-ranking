@@ -701,28 +701,36 @@ if cond_data:
 else:
     st.info("Not enough sequential data to calculate conditional probabilities.")
 
-# --- FINAL, CORRECTED: Function to generate export buttons for any chart ---
+# --- FINAL, ROBUST VERSION: Function to generate export buttons for any chart ---
 def create_export_buttons(df, chart_obj, file_prefix):
     """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
-    # Initialize with empty bytes, NOT None, to prevent StreamlitAPIException
+    # Initialize with empty bytes. This is the key to preventing the crash.
     png_bytes = b""
+    
     try:
-        # The first column of the dataframe is assumed to be the X-axis
+        # --- Start of the safe block ---
+        # All complex operations for PNG generation are now inside this try...except block.
+        
+        # 1. Prepare data by pivoting
         x_axis_col = df.columns[0]
         pivot = df.pivot(index=x_axis_col, columns="Series", values="Value").sort_index()
         series_names = list(pivot.columns)
         
-        # Determine unique colors from the chart object's encoding
+        # 2. Robustly extract colors from the chart's dictionary representation
+        chart_dict = chart_obj.to_dict()
         unique_colors = {}
-        if hasattr(chart_obj, 'encoding') and 'color' in chart_obj.encoding:
-            color_encoding = chart_obj.encoding['color']
-            if hasattr(color_encoding, 'scale') and hasattr(color_encoding.scale, 'domain'):
-                domain = color_encoding.scale.domain
-                range_ = color_encoding.scale.range
-                unique_colors = dict(zip(domain, range_))
-        
+        try:
+            # This path is more stable than accessing object attributes directly
+            domain = chart_dict['encoding']['color']['scale']['domain']
+            range_ = chart_dict['encoding']['color']['scale']['range']
+            unique_colors = dict(zip(domain, range_))
+        except KeyError:
+            # Fallback if the color scale is not explicitly defined
+            pass
+
         colors = [unique_colors.get(s, "#999999") for s in series_names]
         
+        # 3. Create the Matplotlib figure
         x_labels = [str(label) for label in pivot.index.tolist()]
         n_groups, n_series = len(x_labels), len(series_names)
         x_pos = np.arange(n_groups)
@@ -731,7 +739,6 @@ def create_export_buttons(df, chart_obj, file_prefix):
         fig, ax = plt.subplots(figsize=(max(7, n_groups * 0.6), 5))
         for i, series_name in enumerate(series_names):
             vals = pivot[series_name].values.astype(float)
-            # Calculate the position for each bar in the group
             offset = i * bar_width - (n_series - 1) * bar_width / 2
             ax.bar(x_pos + offset, vals, width=bar_width, label=series_name, color=colors[i])
 
@@ -743,7 +750,7 @@ def create_export_buttons(df, chart_obj, file_prefix):
         ax.legend(loc="upper left", frameon=False)
         ax.set_title(chart_obj.title)
         
-        # Save figure to a bytes buffer
+        # 4. Save figure to a bytes buffer
         buf = io.BytesIO()
         fig.tight_layout()
         fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
@@ -751,42 +758,26 @@ def create_export_buttons(df, chart_obj, file_prefix):
         png_bytes = buf.getvalue()
 
     except Exception as e:
-        # Silently fail on PNG generation if there's an issue, but allow HTML to proceed
-        st.caption(f"Could not generate PNG for download: {e}")
+        # If ANY of the above steps fail, we silently pass.
+        # png_bytes will remain empty (b""), disabling the PNG button
+        # but allowing the script to continue and render the HTML button.
+        pass
 
-    # Create the download buttons in two columns
+    # --- This part will now always be reached ---
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
             label=f"Download PNG ({file_prefix})",
-            data=png_bytes, # This will be b"" if PNG generation failed
+            data=png_bytes, # Will be b"" if PNG generation failed
             file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
             mime="image/png",
             use_container_width=True,
             key=f"dl_png_{file_prefix}",
-            disabled=not png_bytes # This evaluates to True if png_bytes is empty (b"")
+            disabled=not png_bytes # This correctly disables the button if png_bytes is empty
         )
     with col2:
         spec = chart_obj.to_dict()
-        html_template = f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>{file_prefix}</title>
-  <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-  <script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-  <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
-</head>
-<body>
-  <div id="vis"></div>
-  <script>
-    const spec = {json.dumps(spec)};
-    vegaEmbed("#vis", spec, {{"actions": True}});
-  </script>
-</body>
-</html>
-"""
+        html_template = f'<!doctype html><html><head><meta charset="utf-8"><title>{file_prefix}</title><script src="https://cdn.jsdelivr.net/npm/vega@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head><body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{"actions": True}});</script></body></html>'
         st.download_button(
             label=f"Download HTML ({file_prefix})",
             data=html_template.encode("utf-8"),
