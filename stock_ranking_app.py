@@ -1,10 +1,10 @@
 # stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
 # - Add Stock form (no table)
 # - Alignment shows median P(A) over SELECTED added stocks across Gain% cutoffs (0..600 step 25)
-# - Models (NCA & CatBoost) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
-# - CatBoost is required; no optional branches
+# - Models (NCA, CatBoost & LightGBM) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
+# - CatBoost and LightGBM are included
 # - No daily-volume prediction anywhere
-# - Simplified: one unified variables list for both models (no core/moderate split)
+# - Simplified: one unified variables list for all models
 
 import streamlit as st
 import pandas as pd
@@ -13,7 +13,8 @@ import re, json
 import altair as alt
 import matplotlib.pyplot as plt
 from datetime import datetime
-from catboost import CatBoostClassifier  # CatBoost is required
+from catboost import CatBoostClassifier
+import lightgbm as lgb  # Import LightGBM
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
@@ -462,6 +463,115 @@ def _cat_predict_proba_row(xrow: dict, model: dict) -> float:
         pA = z if not pl else 1.0 / (1.0 + np.exp(-pl[1]*(z - pl[0])))
     return float(np.clip(pA, 0.0, 1.0))
 
+# ============================== LightGBM ==============================
+def _train_lightgbm_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
+    present = set(df_groups["__Group__"].dropna().unique().tolist())
+    if not ({gA_label, gB_label} <= present): return {}
+
+    df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
+    feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES]
+    if not feats: return {}
+
+    Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
+    y = (df2["__Group__"].values == gA_label).astype(int)
+    mask_finite = np.isfinite(Xdf.values).all(axis=1)
+    Xdf = Xdf.loc[mask_finite]; y = y[mask_finite]
+    n = len(y)
+    if n < 40 or np.unique(y).size < 2: return {}
+
+    X_all = Xdf.values.astype(np.float32, copy=False)
+    y_all = y.astype(np.int32, copy=False)
+
+    from sklearn.model_selection import StratifiedShuffleSplit
+    test_size = 0.2 if n >= 100 else max(0.15, min(0.25, 20 / n))
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
+    tr_idx, va_idx = next(sss.split(X_all, y_all))
+    Xtr, Xva = X_all[tr_idx], X_all[va_idx]
+    ytr, yva = y_all[tr_idx], y_all[va_idx]
+
+    def _has_both_classes(arr):
+        return np.unique(arr).size == 2
+
+    eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
+
+    params = {
+        'objective': 'binary',
+        'metric': 'logloss',
+        'n_estimators': 200,
+        'learning_rate': 0.04,
+        'num_leaves': 8, # ~ 2^(depth=3)
+        'max_depth': 3,
+        'reg_lambda': 6,
+        'colsample_bytree': 0.7,
+        'subsample': 0.7,
+        'is_unbalance': True,
+        'random_state': 42,
+        'n_jobs': -1,
+        'verbose': -1,
+    }
+
+    model = lgb.LGBMClassifier(**params)
+    try:
+        if eval_ok:
+            model.fit(Xtr, ytr, eval_set=[(Xva, yva)], callbacks=[lgb.early_stopping(40, verbose=False)])
+        else:
+            model.fit(X_all, y_all)
+    except Exception:
+        try:
+            # Fallback without early stopping
+            model.fit(X_all, y_all)
+            eval_ok = False
+        except Exception:
+            return {}
+
+    # Calibration
+    iso_bx, iso_by, platt = np.array([]), np.array([]), None
+    try:
+        if eval_ok:
+            p_raw = model.predict_proba(Xva)[:, 1].astype(float)
+            if np.unique(p_raw).size >= 3 and _has_both_classes(yva):
+                bx, by = _pav_isotonic(p_raw, yva.astype(float))
+                if len(bx) >= 2: iso_bx, iso_by = np.array(bx), np.array(by)
+            if iso_bx.size < 2:
+                z0 = p_raw[yva == 0]; z1 = p_raw[yva == 1]
+                if z0.size and z1.size:
+                    m0, m1 = float(np.mean(z0)), float(np.mean(z1))
+                    s0, s1 = float(np.std(z0) + 1e-9), float(np.std(z1) + 1e-9)
+                    m = 0.5 * (m0 + m1); k = 2.0 / (0.5 * (s0 + s1) + 1e-6)
+                    platt = (m, k)
+    except Exception:
+        pass
+
+    return {"ok": True, "feats": feats, "gA": gA_label, "gB": gB_label,
+            "lgb": model, "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(), "platt": platt}
+
+def _lgb_predict_proba_row(xrow: dict, model: dict) -> float:
+    if not model or not model.get("ok"): return np.nan
+    feats = model["feats"]
+    vals = []
+    for f in feats:
+        v = pd.to_numeric(xrow.get(f), errors="coerce")
+        v = float(v) if pd.notna(v) else np.nan
+        if not np.isfinite(v): return np.nan
+        vals.append(v)
+    X = np.array(vals, dtype=float).reshape(1, -1)
+    try:
+        lgbm = model.get("lgb")
+        if lgbm is None: return np.nan
+        z = float(lgbm.predict_proba(X)[0, 1])
+    except Exception:
+        return np.nan
+
+    iso_bx = np.array(model.get("iso_bx", []), dtype=float)
+    iso_by = np.array(model.get("iso_by", []), dtype=float)
+    if iso_bx.size >= 2 and iso_by.size >= 2:
+        pA = float(_iso_predict(iso_bx, iso_by, np.array([z]))[0])
+    else:
+        pl = model.get("platt")
+        pA = z if not pl else 1.0 / (1.0 + np.exp(-pl[1] * (z - pl[0])))
+    return float(np.clip(pA, 0.0, 1.0))
+
+
 # ============================== Alignment (Distributions for SELECTED added stocks) ==============================
 st.markdown("---")
 st.subheader("Alignment")
@@ -526,7 +636,7 @@ def _make_split(df_base: pd.DataFrame, thr_val: float):
 added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
 
 thr_labels = []
-series_N_med, series_C_med = [], []
+series_N_med, series_C_med, series_L_med = [], [], []
 
 for thr_val in gain_cutoffs:
     df_split, gA, gB = _make_split(base_df, float(thr_val))
@@ -539,15 +649,17 @@ for thr_val in gain_cutoffs:
     # Train models on DB for this cutoff
     nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
     cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
+    lgb_model = _train_lightgbm_once(df_split, gA, gB, var_all) or {}
 
-    # If both models failed to train, skip cutoff
-    if not nca_model and not cat_model:
+    # If all models failed to train, skip cutoff
+    if not nca_model and not cat_model and not lgb_model:
         continue
 
     # Determine required features for predicting on SELECTED ADDED stocks
     req_feats = []
     if nca_model: req_feats += nca_model.get("feats", [])
     if cat_model: req_feats += cat_model.get("feats", [])
+    if lgb_model: req_feats += lgb_model.get("feats", [])
     req_feats = sorted(set(req_feats))
     if not req_feats:
         continue
@@ -562,7 +674,7 @@ for thr_val in gain_cutoffs:
         continue
 
     # Predict on SELECTED ADDED stocks
-    pN, pC = [], []
+    pN, pC, pL = [], [], []
     if nca_model:
         for r in pred_rows:
             p = _nca_predict_proba_row(r, nca_model)
@@ -571,27 +683,34 @@ for thr_val in gain_cutoffs:
         for r in pred_rows:
             p = _cat_predict_proba_row(r, cat_model)
             if np.isfinite(p): pC.append(p)
+    if lgb_model:
+        for r in pred_rows:
+            p = _lgb_predict_proba_row(r, lgb_model)
+            if np.isfinite(p): pL.append(p)
 
-    if (len(pN) == 0) and (len(pC) == 0):
+
+    if (len(pN) == 0) and (len(pC) == 0) and (len(pL) == 0):
         continue
 
     thr_labels.append(int(thr_val))
     series_N_med.append(float(np.nanmedian(pN)*100.0) if len(pN) else np.nan)
     series_C_med.append(float(np.nanmedian(pC)*100.0) if len(pC) else np.nan)
+    series_L_med.append(float(np.nanmedian(pL)*100.0) if len(pL) else np.nan)
 
 if not thr_labels:
-    st.info("Not enough data across cutoffs (or none selected) to train both classes and evaluate your selected stocks.")
+    st.info("Not enough data across cutoffs (or none selected) to train all classes and evaluate your selected stocks.")
 else:
     # Build tidy frame for Altair
     data = []
     for i, thr in enumerate(thr_labels):
         data.append({"GainCutoff_%": thr, "Series": "NCA: P(A)", "Value": series_N_med[i]})
         data.append({"GainCutoff_%": thr, "Series": "CatBoost: P(A)", "Value": series_C_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": "LightGBM: P(A)", "Value": series_L_med[i]})
     df_long = pd.DataFrame(data)
 
     # Chart (bars grouped by series at each cutoff)
-    color_domain = ["NCA: P(A)", "CatBoost: P(A)"]
-    color_range  = ["#10b981", "#8b5cf6"]  # green, purple
+    color_domain = ["NCA: P(A)", "CatBoost: P(A)", "LightGBM: P(A)"]
+    color_range  = ["#10b981", "#8b5cf6", "#f59e0b"]  # green, purple, amber
 
     chart = (
         alt.Chart(df_long)
@@ -612,14 +731,14 @@ else:
     try:
         pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
         series_names = list(pivot.columns)
-        color_map = {"NCA: P(A)": "#10b981", "CatBoost: P(A)": "#8b5cf6"}
+        color_map = {"NCA: P(A)": "#10b981", "CatBoost: P(A)": "#8b5cf6", "LightGBM: P(A)": "#f59e0b"}
         colors = [color_map.get(s, "#999999") for s in series_names]
         thresholds = pivot.index.tolist()
         n_groups = len(thresholds); n_series = len(series_names)
         x = np.arange(n_groups); width = 0.8 / max(n_series, 1)
 
         import io as _io
-        fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4.5))
+        fig, ax = plt.subplots(figsize=(max(6, n_groups*0.7), 4.5))
         for i, s in enumerate(series_names):
             vals = pivot[s].values.astype(float)
             ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
