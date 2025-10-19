@@ -2,6 +2,7 @@
 # - Streamlined UI: Add form, and a single line for stock selection and deletion.
 # - Tuned CatBoost Model: Parameters adjusted to be more "open-minded" to outliers.
 # - Analysis is permanently set to "Gain% vs Rest".
+# - ADDED: A second, conditional probability chart for research purposes.
 
 import streamlit as st
 import pandas as pd
@@ -345,7 +346,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         verbose=False,
     )
     
-    if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
+     if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
     else:       params.update(dict(od_type="None"))
     model = CatBoostClassifier(**params)
     try:
@@ -429,7 +430,7 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
 
 # ============================== Alignment (Distributions for SELECTED added stocks) ==============================
 st.markdown("---")
-st.subheader("Alignment")
+st.subheader("Alignment Distribution")
 
 base_df = ss.get("base_df", pd.DataFrame())
 if base_df.empty:
@@ -440,7 +441,9 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- NEW: Streamlined UI for stock selection and deletion in one line ---
+st.info("This analysis shows the **absolute probability** of a stock reaching a certain gain from pre-market.")
+
+# --- Streamlined UI for stock selection and deletion in one line ---
 all_added_tickers = pd.Series([r.get("Ticker") for r in ss.rows]).dropna().unique().tolist()
 
 if "align_sel_tickers" not in st.session_state:
@@ -453,7 +456,6 @@ def _delete_selected():
     tickers_to_delete = st.session_state.get("align_sel_tickers", [])
     if tickers_to_delete:
         ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(tickers_to_delete)]
-        # After deleting, clear the selection to prevent accidental re-deletes
         st.session_state["align_sel_tickers"] = []
 
 col1, col2, col3 = st.columns([6, 1, 1])
@@ -551,6 +553,7 @@ with st.spinner("Calculating distributions across all cutoffs..."):
 if not thr_labels:
     st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
+    # --- Absolute Probability Chart (Main Chart) ---
     data = []
     gA_label = f"≥...% (Median Centers)"
     gB_label = f"Rest (Median Centers)"
@@ -578,9 +581,10 @@ else:
             xOffset="Series:N",
             tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
         )
-        .properties(height=400)
+        .properties(height=400, title="Absolute Probability of Reaching Gain Cutoff")
     )
     st.altair_chart(chart, use_container_width=True)
+
 
     # (PNG and HTML export sections remain unchanged)
     png_bytes = None
@@ -647,3 +651,57 @@ vegaEmbed("#vis", spec, {{actions: true}});
             use_container_width=True,
             key="dl_html",
         )
+
+# --- NEW: Calculate and Display Conditional Probability Chart ---
+    st.markdown("---")
+    st.subheader("Conditional Probability Analysis")
+    st.warning(
+        "**For Research Only:** This chart shows the probability of a stock reaching the *next* gain level, "
+        "**given that it has already reached the current one.** This can be misleading for pre-market decisions "
+        "and is highly sensitive to sparse data at higher gain levels."
+    )
+
+    cond_data = []
+    cond_labels = [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
+    
+    series_list = [series_A_med, series_B_med, series_N_med, series_C_med]
+    series_names = [gA_label, gB_label, nca_label, cat_label]
+    cond_series_list = [[], [], [], []]
+
+    for i in range(len(thr_labels) - 1):
+        for j in range(len(series_list)):
+            p_current = series_list[j][i]
+            p_next = series_list[j][i+1]
+            
+            cond_prob = np.nan
+            if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6:
+                # Calculate conditional probability and cap it at 100%
+                cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100)
+            
+            cond_series_list[j].append(cond_prob)
+
+    for i, label in enumerate(cond_labels):
+        for j, name in enumerate(series_names):
+            value = cond_series_list[j][i]
+            if pd.notna(value):
+                cond_data.append({"Transition": label, "Series": name, "Value": value})
+
+    if cond_data:
+        df_cond_long = pd.DataFrame(cond_data)
+        
+        cond_chart = (
+            alt.Chart(df_cond_long)
+            .mark_bar()
+            .encode(
+                x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels), # Ensure correct order
+                y=alt.Y("Value:Q", title="Conditional Probability (%)", scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
+                xOffset="Series:N",
+                tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")],
+            )
+            .properties(height=400, title="Conditional Probability of Reaching the Next Gain Cutoff")
+        )
+        st.altair_chart(cond_chart, use_container_width=True)
+    else:
+        st.info("Not enough sequential data to calculate conditional probabilities.")
+Use Arrow Up and Arrow Down to select a turn, Enter to jump to it, and Escape to return to the chat.
