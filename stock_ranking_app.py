@@ -223,6 +223,8 @@ if build_btn:
             st.error("Loading/processing failed.")
             st.exception(e)
 
+VAR_ALL = (ss.get("var_core", []) or []) + (ss.get("var_moderate", []) or [])
+
 # ============================== Add Stock ==============================
 st.markdown("---")
 st.subheader("Add Stock")
