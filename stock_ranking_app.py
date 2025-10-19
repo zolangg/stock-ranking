@@ -702,10 +702,11 @@ if cond_data:
 else:
     st.info("Not enough sequential data to calculate conditional probabilities.")
 
-# --- Function to generate export buttons for any chart ---
+# --- FINAL, CORRECTED: Function to generate export buttons for any chart ---
 def create_export_buttons(df, chart_obj, file_prefix):
     """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
-    png_bytes = None
+    # Initialize with empty bytes, NOT None, to prevent StreamlitAPIException
+    png_bytes = b""
     try:
         # The first column of the dataframe is assumed to be the X-axis
         x_axis_col = df.columns[0]
@@ -759,12 +760,12 @@ def create_export_buttons(df, chart_obj, file_prefix):
     with col1:
         st.download_button(
             label=f"Download PNG ({file_prefix})",
-            data=png_bytes,
+            data=png_bytes, # This will be b"" if PNG generation failed
             file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
             mime="image/png",
             use_container_width=True,
             key=f"dl_png_{file_prefix}",
-            disabled=(png_bytes is None)
+            disabled=not png_bytes # This evaluates to True if png_bytes is empty (b"")
         )
     with col2:
         spec = chart_obj.to_dict()
@@ -795,8 +796,3 @@ def create_export_buttons(df, chart_obj, file_prefix):
             use_container_width=True,
             key=f"dl_html_{file_prefix}"
         )
-
-# --- This is the line you add after displaying the conditional chart ---
-# It calls the function above with the correct data and objects for the second chart.
-if 'df_cond_long' in locals() and not df_cond_long.empty:
-    create_export_buttons(df_cond_long, cond_chart, "conditional_probability")
