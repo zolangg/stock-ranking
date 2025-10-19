@@ -321,11 +321,22 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
     
+# --- TUNED PARAMETERS ---
+    # Goal: Create a more "open-minded" model that is less likely to assign 0%
+    # to outliers, at the cost of potentially more false positives.
     params = dict(
-        loss_function="Logloss", eval_metric="Logloss", iterations=200, learning_rate=0.08,
-        depth=4, l2_leaf_reg=3, min_data_in_leaf=1, bootstrap_type="Bayesian",
-        bagging_temperature=0.5, auto_class_weights="Balanced", random_seed=42,
-        allow_writing_files=False, verbose=False,
+        loss_function="Logloss",
+        eval_metric="Logloss",
+        iterations=200,
+        learning_rate=0.05,  # Slightly increased to prevent overfitting to tiny details.
+        depth=2,             # From 3 -> 2. FORCES the model to learn simpler, more general rules. This is the biggest change.
+        l2_leaf_reg=10,      # From 6 -> 10. Increased penalty for being "too certain," pushing predictions away from 0% and 100%.
+        bootstrap_type="Bayesian",
+        bagging_temperature=0.5,
+        auto_class_weights="Balanced",
+        random_seed=42,
+        allow_writing_files=False,
+        verbose=False,
     )
     
     if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
