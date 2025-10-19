@@ -326,13 +326,18 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
     
     # --- MODIFIED: CatBoost parameters are tuned to be more "open-minded" ---
+# --- NEW: High-Sensitivity "Track Car" Parameters ---
+    # Goal: Create a hyper-sensitive model that can detect complex, non-linear
+    # patterns and react strongly to small changes.
+    # WARNING: This model will be more volatile and produce more false alarms.
     params = dict(
         loss_function="Logloss",
         eval_metric="Logloss",
         iterations=200,
-        learning_rate=0.05,  # Slightly increased to prevent overfitting to tiny details.
-        depth=2,             # From 3 -> 2. FORCES the model to learn simpler, more general rules.
-        l2_leaf_reg=10,      # From 6 -> 10. Increased penalty for being "too certain."
+        learning_rate=0.08,    # From 0.05 -> 0.08. A higher rate makes it "fast adjusting" and more aggressive in its learning.
+        depth=4,               # From 2 -> 4. The MOST IMPORTANT CHANGE. Allows the model to learn much more complex, non-linear rules and interactions.
+        l2_leaf_reg=3,         # From 10 -> 3. A lower penalty allows the model to be more "certain" and decisive, fitting the data more tightly.
+        min_data_in_leaf=1,    # Explicitly set to 1. This allows the model to create a rule based on a single, unique stock - the definition of being sensitive to outliers.
         bootstrap_type="Bayesian",
         bagging_temperature=0.5,
         auto_class_weights="Balanced",
@@ -439,7 +444,6 @@ if not ss.rows:
 st.info("Analysis compares stocks with a specific **Gain %** against all other stocks (**Rest**).")
 
 # --- NEW: Streamlined UI for stock selection and deletion in one line ---
-st.markdown("##### Filter & Manage Stocks for Analysis")
 all_added_tickers = pd.Series([r.get("Ticker") for r in ss.rows]).dropna().unique().tolist()
 
 if "align_sel_tickers" not in st.session_state:
