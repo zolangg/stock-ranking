@@ -2,7 +2,8 @@
 # - Add Stock form (no table)
 # - Alignment shows median P(A) over SELECTED added stocks across Gain% cutoffs (0..600 step 25)
 # - Models (NCA [required] & CatBoost [required] & LightGBM [required]) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
-# - Simplified: one unified variables list for all models (no core/moderate split)
+# - Sidebar tuning controls + diagnostics table
+# - Simplified: unified variables only
 
 import streamlit as st
 import pandas as pd
@@ -21,6 +22,25 @@ from sklearn.neighbors import NeighborhoodComponentsAnalysis
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
 st.title("Premarket Stock Analysis")
 
+# ---- TUNING CONTROLS ----
+with st.sidebar:
+    st.header("Training & Cutoff Controls")
+    MIN_CLASS = st.number_input(
+        "Min samples per class",
+        min_value=2, max_value=200, value=6, step=1,
+        help="Minimum rows needed in EACH class (≥cutoff / Rest). Lower to be more permissive."
+    )
+    MIN_PRED_ROWS = st.number_input(
+        "Min added rows with all features",
+        min_value=1, max_value=1000, value=1, step=1,
+        help="Minimum number of your SELECTED added stocks that must have all features present."
+    )
+    REQUIRE_ALL_MODELS = st.checkbox(
+        "Require all 3 models per cutoff",
+        value=True,
+        help="If off, a cutoff is kept when at least one model trained & predicted."
+    )
+
 # ============================== Session ==============================
 ss = st.session_state
 ss.setdefault("base_df", pd.DataFrame())
@@ -31,8 +51,8 @@ UNIFIED_VARS = [
     "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
     "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
 ]
-ALLOWED_LIVE_FEATURES = UNIFIED_VARS[:]     # what we will actually try to use
-EXCLUDE_FOR_NCA = []                        # hook if you want to drop any later
+ALLOWED_LIVE_FEATURES = UNIFIED_VARS[:]     # actually used features
+EXCLUDE_FOR_NCA = []                        # hook to drop any for NCA if needed
 
 # ============================== Helpers ==============================
 def _norm(s: str) -> str:
@@ -45,17 +65,14 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
     nm = {c: _norm(c) for c in cols}
-    # exact case-insensitive
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
             if cols_lc[c] == lc: return c
-    # normalized exact
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n: return c
-    # normalized contains
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
@@ -278,7 +295,6 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         z = nca.fit_transform(Xs, y).ravel()
         used = "nca"; components = nca.components_
     except Exception:
-        # fallback LDA
         X0 = Xs[y==0]; X1 = Xs[y==1]
         if X0.shape[0] < 2 or X1.shape[0] < 2: return {}
         m0 = X0.mean(axis=0); m1 = X1.mean(axis=0)
@@ -288,7 +304,6 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         w_vec = w_vec / (np.linalg.norm(w_vec) + 1e-12)
         z = (Xs @ w_vec)
 
-    # Orient larger → A
     if np.nanmean(z[y==1]) < np.nanmean(z[y==0]):
         z = -z
         if w_vec is not None: w_vec = -w_vec
@@ -568,7 +583,7 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- choose which added stocks to include (final-safe pattern: sanitize BEFORE, don't assign AFTER) ---
+# --- choose which added stocks to include (safe pattern: sanitize BEFORE, don't assign AFTER) ---
 sel_key = "align_sel_tickers"
 
 # Build clean, deduped options list (UPPERCASE strings)
@@ -647,133 +662,173 @@ def _make_split(df_base: pd.DataFrame, thr_val: float):
 # Build a DataFrame of SELECTED added stocks for prediction
 added_df = pd.DataFrame([r for r in ss.rows if str(r.get("Ticker")).strip().upper() in set(selected_tickers)])
 
+# ============================== Cutoff sweep with diagnostics & relaxed rules ==============================
+diagnostics = []  # per-cutoff notes
 thr_labels = []
 series_N_med, series_C_med, series_L_med = [], [], []
 
 for thr_val in gain_cutoffs:
     df_split, gA, gB = _make_split(base_df, float(thr_val))
 
-    # need both groups reasonably present
+    # class balance check
     vc = df_split["__Group__"].value_counts()
-    if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
+    nA, nB = int(vc.get(gA, 0)), int(vc.get(gB, 0))
+    if (nA < MIN_CLASS) or (nB < MIN_CLASS):
+        diagnostics.append({"Cutoff": int(thr_val), "Kept": False, "Reason": f"Too few samples (A={nA}, B={nB})"})
         continue
 
-    # Train models on DB for this cutoff (all required)
+    # Train models on DB for this cutoff
     nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
     cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
     lgb_model = _train_lgbm_once(df_split, gA, gB, var_all) or {}
 
-    # If any required model failed to train, skip this cutoff entirely
-    if not nca_model or not cat_model or not lgb_model:
-        continue
+    trained = {"NCA": bool(nca_model), "CatBoost": bool(cat_model), "LightGBM": bool(lgb_model)}
+    if REQUIRE_ALL_MODELS:
+        if not all(trained.values()):
+            diagnostics.append({"Cutoff": int(thr_val), "Kept": False,
+                                "Reason": f"Model(s) failed: {', '.join([k for k,v in trained.items() if not v])}"})
+            continue
+    else:
+        if not any(trained.values()):
+            diagnostics.append({"Cutoff": int(thr_val), "Kept": False, "Reason": "No model trained"})
+            continue
 
     # Determine required features for predicting on SELECTED ADDED stocks
-    req_feats = sorted(set(nca_model.get("feats", []) + cat_model.get("feats", []) + lgb_model.get("feats", [])))
+    req_feats = sorted(set(
+        (nca_model.get("feats", []) if nca_model else []) +
+        (cat_model.get("feats", []) if cat_model else []) +
+        (lgb_model.get("feats", []) if lgb_model else [])
+    ))
     if not req_feats:
+        diagnostics.append({"Cutoff": int(thr_val), "Kept": False, "Reason": "No usable features after cleaning"})
         continue
 
     if added_df.empty:
+        diagnostics.append({"Cutoff": int(thr_val), "Kept": False, "Reason": "No added stocks to evaluate"})
         continue
+
     Xadd = added_df[req_feats].apply(pd.to_numeric, errors="coerce")
     mask = np.isfinite(Xadd.values).all(axis=1)
     pred_rows = added_df.loc[mask].to_dict(orient="records")
-    if len(pred_rows) == 0:
+
+    if len(pred_rows) < MIN_PRED_ROWS:
+        diagnostics.append({"Cutoff": int(thr_val), "Kept": False, "Reason": f"Too few added rows with all features (have {len(pred_rows)}, need ≥{MIN_PRED_ROWS})"})
         continue
 
     # Predict on SELECTED ADDED stocks
     pN, pC, pL = [], [], []
-    for r in pred_rows:
-        p = _nca_predict_proba_row(r, nca_model);   pN.append(p if np.isfinite(p) else np.nan)
-        p = _cat_predict_proba_row(r, cat_model);   pC.append(p if np.isfinite(p) else np.nan)
-        p = _lgbm_predict_proba_row(r, lgb_model);  pL.append(p if np.isfinite(p) else np.nan)
 
-    # Require at least one finite prediction per model (since all required)
-    if not (np.isfinite(pN).any() and np.isfinite(pC).any() and np.isfinite(pL).any()):
-        continue
+    if nca_model:
+        for r in pred_rows:
+            p = _nca_predict_proba_row(r, nca_model)
+            if np.isfinite(p): pN.append(p)
+    if cat_model:
+        for r in pred_rows:
+            p = _cat_predict_proba_row(r, cat_model)
+            if np.isfinite(p): pC.append(p)
+    if lgb_model:
+        for r in pred_rows:
+            p = _lgbm_predict_proba_row(r, lgb_model)
+            if np.isfinite(p): pL.append(p)
+
+    if REQUIRE_ALL_MODELS:
+        if not (len(pN) and len(pC) and len(pL)):
+            diagnostics.append({"Cutoff": int(thr_val), "Kept": False, "Reason": "Predictions missing for one or more models"})
+            continue
+    else:
+        if not (len(pN) or len(pC) or len(pL)):
+            diagnostics.append({"Cutoff": int(thr_val), "Kept": False, "Reason": "No predictions produced"})
+            continue
 
     thr_labels.append(int(thr_val))
-    series_N_med.append(float(np.nanmedian(pN)*100.0))
-    series_C_med.append(float(np.nanmedian(pC)*100.0))
-    series_L_med.append(float(np.nanmedian(pL)*100.0))
+    series_N_med.append(float(np.nanmedian(pN)*100.0) if len(pN) else np.nan)
+    series_C_med.append(float(np.nanmedian(pC)*100.0) if len(pC) else np.nan)
+    series_L_med.append(float(np.nanmedian(pL)*100.0) if len(pL) else np.nan)
+    diagnostics.append({"Cutoff": int(thr_val), "Kept": True, "Reason": "OK"})
 
+# ============================== Visualization & Downloads ==============================
 if not thr_labels:
-    st.info("Not enough data across cutoffs (or model(s) couldn’t train/predict) for your selected stocks.")
+    st.warning("No cutoffs made it through the filters. See diagnostics below to understand why and adjust the sidebar controls.")
 else:
-    # Build tidy frame for Altair (all three series are expected)
+    # Build tidy frame; include series depending on REQUIRE_ALL_MODELS & actual data
     data = []
     for i, thr in enumerate(thr_labels):
-        data.append({"GainCutoff_%": thr, "Series": "NCA: P(A)", "Value": series_N_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": "CatBoost: P(A)", "Value": series_C_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": "LightGBM: P(A)", "Value": series_L_med[i]})
+        if not np.isnan(series_N_med[i]): data.append({"GainCutoff_%": thr, "Series": "NCA: P(A)", "Value": series_N_med[i]})
+        if not np.isnan(series_C_med[i]): data.append({"GainCutoff_%": thr, "Series": "CatBoost: P(A)", "Value": series_C_med[i]})
+        if not np.isnan(series_L_med[i]): data.append({"GainCutoff_%": thr, "Series": "LightGBM: P(A)", "Value": series_L_med[i]})
     df_long = pd.DataFrame(data)
 
-    color_map = {
-        "NCA: P(A)": "#10b981",        # green
-        "CatBoost: P(A)": "#8b5cf6",   # purple
-        "LightGBM: P(A)": "#f59e0b",   # amber
-    }
-    color_domain = ["NCA: P(A)", "CatBoost: P(A)", "LightGBM: P(A)"]
-    color_range  = [color_map[s] for s in color_domain]
+    if df_long.empty:
+        st.warning("Models ran, but no valid predictions to plot. Check diagnostics below.")
+    else:
+        color_map = {
+            "NCA: P(A)": "#10b981",        # green
+            "CatBoost: P(A)": "#8b5cf6",   # purple
+            "LightGBM: P(A)": "#f59e0b",   # amber
+        }
+        series_in_plot = [s for s in ["NCA: P(A)", "CatBoost: P(A)", "LightGBM: P(A)"] if s in df_long["Series"].unique()]
+        color_domain = series_in_plot
+        color_range  = [color_map[s] for s in series_in_plot]
 
-    chart = (
-        alt.Chart(df_long)
-        .mark_bar()
-        .encode(
-            x=alt.X("GainCutoff_%:O", title="Gain% cutoff (0 → 600, step 25)"),
-            y=alt.Y("Value:Q", title="Median P(A) (%)", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="")),
-            xOffset="Series:N",
-            tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
-        )
-        .properties(height=360)
-    )
-    st.altair_chart(chart, use_container_width=True)
-
-    # PNG export via Matplotlib
-    png_bytes = None
-    try:
-        pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
-        series_names = list(pivot.columns)
-        thresholds = pivot.index.tolist()
-        colors = [color_map.get(s, "#999999") for s in series_names]
-        n_groups = len(thresholds); n_series = len(series_names)
-        x = np.arange(n_groups); width = 0.8 / max(n_series, 1)
-
-        import io as _io
-        fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4.5))
-        for i, s in enumerate(series_names):
-            vals = pivot[s].values.astype(float)
-            ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
-
-        ax.set_xticks(x); ax.set_xticklabels([str(t) for t in thresholds], rotation=0)
-        ax.set_ylim(0, 100)
-        ax.set_xlabel("Gain% cutoff")
-        ax.set_ylabel("Median P(A) for selected added stocks (%)")
-        ax.legend(loc="upper left", frameon=False)
-
-        buf = _io.BytesIO(); fig.tight_layout()
-        fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-        plt.close(fig)
-        png_bytes = buf.getvalue()
-    except Exception:
-        png_bytes = None
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if png_bytes:
-            st.download_button(
-                "Download PNG (Alignment distribution)",
-                data=png_bytes,
-                file_name=f"alignment_distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                mime="image/png",
-                use_container_width=True,
-                key="dl_png",
+        chart = (
+            alt.Chart(df_long)
+            .mark_bar()
+            .encode(
+                x=alt.X("GainCutoff_%:O", title="Gain% cutoff (0 → 600, step 25)"),
+                y=alt.Y("Value:Q", title="Median P(A) (%)", scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="")),
+                xOffset="Series:N",
+                tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
             )
-        else:
-            st.caption("PNG export unavailable.")
-    with col2:
-        spec = chart.to_dict()
-        html_tpl = f"""<!doctype html>
+            .properties(height=360)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+        # PNG export via Matplotlib (dynamic colors)
+        png_bytes = None
+        try:
+            pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
+            series_names = list(pivot.columns)
+            thresholds = pivot.index.tolist()
+            colors = [color_map.get(s, "#999999") for s in series_names]
+            n_groups = len(thresholds); n_series = len(series_names)
+            x = np.arange(n_groups); width = 0.8 / max(n_series, 1)
+
+            import io as _io
+            fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4.5))
+            for i, s in enumerate(series_names):
+                vals = pivot[s].values.astype(float)
+                ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
+
+            ax.set_xticks(x); ax.set_xticklabels([str(t) for t in thresholds], rotation=0)
+            ax.set_ylim(0, 100)
+            ax.set_xlabel("Gain% cutoff")
+            ax.set_ylabel("Median P(A) for selected added stocks (%)")
+            ax.legend(loc="upper left", frameon=False)
+
+            buf = _io.BytesIO(); fig.tight_layout()
+            fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+            plt.close(fig)
+            png_bytes = buf.getvalue()
+        except Exception:
+            png_bytes = None
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if png_bytes:
+                st.download_button(
+                    "Download PNG (Alignment distribution)",
+                    data=png_bytes,
+                    file_name=f"alignment_distribution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    key="dl_png",
+                )
+            else:
+                st.caption("PNG export unavailable.")
+        with col2:
+            spec = chart.to_dict()
+            html_tpl = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Alignment Distribution</title>
 <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
 <script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
@@ -785,11 +840,20 @@ const spec = {json.dumps(spec)};
 vegaEmbed("#vis", spec, {{actions: true}});
 </script>
 </body></html>"""
-        st.download_button(
-            "Download HTML (interactive Alignment chart)",
-            data=html_tpl.encode("utf-8"),
-            file_name="alignment_distribution.html",
-            mime="text/html",
-            use_container_width=True,
-            key="dl_html",
-        )
+            st.download_button(
+                "Download HTML (interactive Alignment chart)",
+                data=html_tpl.encode("utf-8"),
+                file_name="alignment_distribution.html",
+                mime="text/html",
+                use_container_width=True,
+                key="dl_html",
+            )
+
+# ============================== Diagnostics ==============================
+st.markdown("---")
+st.subheader("Diagnostics")
+if len(diagnostics):
+    diag_df = pd.DataFrame(diagnostics).sort_values(["Cutoff", "Kept"], ascending=[True, False])
+    st.dataframe(diag_df, use_container_width=True, hide_index=True)
+else:
+    st.caption("No diagnostics yet — load a DB and add stocks to evaluate.")
