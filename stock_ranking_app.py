@@ -1,9 +1,10 @@
-# stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
+# stock_ranking_app.py — Add-Stock + Alignment (Distributions of SELECTED Added Stocks Only)
 # - Add Stock form (no table)
-# - Alignment shows median P(A) over SELECTED added stocks across Gain% cutoffs (0..600 step 25)
-# - Models (NCA & CatBoost) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
+# - Alignment shows median CatBoost P(A) over SELECTED added stocks across Gain% cutoffs (0..600 step 25)
+# - Model (CatBoost) trains per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
 # - CatBoost is required; no optional branches
 # - No daily-volume prediction anywhere
+# - NCA REMOVED (per request)
 
 import streamlit as st
 import pandas as pd
@@ -175,7 +176,6 @@ if build_btn:
 # Unified features for models (live features only)
 VAR_ALL = (ss.get("var_core", []) or []) + (ss.get("var_moderate", []) or [])
 ALLOWED_LIVE_FEATURES = VAR_ALL[:] if VAR_ALL else []
-EXCLUDE_FOR_NCA = []  # tweak if needed
 
 # ============================== Add Stock (no table) ==============================
 st.markdown("---")
@@ -217,7 +217,7 @@ if submitted and ticker:
     ss.rows.append(row)
     st.success(f"Saved {ticker}.")
 
-# ============================== Isotonic helpers ==============================
+# ============================== Isotonic helpers (kept for CatBoost calibration) ==============================
 def _pav_isotonic(x, y):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     if x.size == 0: return [], []
@@ -246,129 +246,13 @@ def _iso_predict(bx, by, xq):
         out[i] = by[k]
     return out
 
-# ============================== NCA / LDA ==============================
-def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
-    present = set(df_groups["__Group__"].dropna().unique().tolist())
-    if not ({gA_label, gB_label} <= present): return {}
-    df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
-
-    feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
-    if not feats: return {}
-
-    Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
-    # drop degenerate columns
-    good_cols = []
-    for c in feats:
-        col = Xdf[c].values
-        col = col[np.isfinite(col)]
-        if col.size == 0: continue
-        if np.nanstd(col) < 1e-9: continue
-        good_cols.append(c)
-    feats = good_cols
-    if not feats: return {}
-
-    X = df2[feats].apply(pd.to_numeric, errors="coerce").values
-    y = (df2["__Group__"].values == gA_label).astype(int)
-    mask = np.isfinite(X).all(axis=1)
-    X = X[mask]; y = y[mask]
-    if X.shape[0] < 20 or np.unique(y).size < 2: return {}
-
-    # standardize
-    mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0] = 1.0
-    Xs = (X - mu) / sd
-
-    used = "lda"; w_vec = None; components = None
-    try:
-        from sklearn.neighbors import NeighborhoodComponentsAnalysis
-        nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=400)
-        z = nca.fit_transform(Xs, y).ravel()
-        used = "nca"; components = nca.components_
-    except Exception:
-        X0 = Xs[y==0]; X1 = Xs[y==1]
-        if X0.shape[0] < 2 or X1.shape[0] < 2: return {}
-        m0 = X0.mean(axis=0); m1 = X1.mean(axis=0)
-        S0 = np.cov(X0, rowvar=False); S1 = np.cov(X1, rowvar=False)
-        Sw = S0 + S1 + 1e-3*np.eye(Xs.shape[1])
-        w_vec = np.linalg.solve(Sw, (m1 - m0))
-        w_vec = w_vec / (np.linalg.norm(w_vec) + 1e-12)
-        z = (Xs @ w_vec)
-
-    # Orient larger → A
-    if np.nanmean(z[y==1]) < np.nanmean(z[y==0]):
-        z = -z
-        if w_vec is not None: w_vec = -w_vec
-        if components is not None: components = -components
-
-    # Calibration
-    zf = z[np.isfinite(z)]; yf = y[np.isfinite(z)]
-    iso_bx, iso_by = np.array([]), np.array([]); platt_params = None
-    if zf.size >= 8 and np.unique(zf).size >= 3:
-        bx, by = _pav_isotonic(zf, yf.astype(float))
-        if len(bx) >= 2: iso_bx, iso_by = np.array(bx), np.array(by)
-    if iso_bx.size < 2:
-        z0 = zf[yf==0]; z1 = zf[yf==1]
-        if z0.size and z1.size:
-            m0, m1 = float(np.mean(z0)), float(np.mean(z1))
-            s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
-            m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
-            platt_params = (m, k)
-
-    return {
-        "ok": True, "kind": used, "feats": feats,
-        "mu": mu.tolist(), "sd": sd.tolist(),
-        "w_vec": (w_vec.tolist() if w_vec is not None else None),
-        "components": (components.tolist() if components is not None else None),
-        "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(),
-        "platt": (platt_params if platt_params is not None else None),
-        "gA": gA_label, "gB": gB_label,
-    }
-
-def _nca_predict_proba_row(xrow: dict, model: dict) -> float:
-    if not model or not model.get("ok"): return np.nan
-    feats = model["feats"]
-    vals = []
-    for f in feats:
-        v = pd.to_numeric(xrow.get(f), errors="coerce")
-        v = float(v) if pd.notna(v) else np.nan
-        if not np.isfinite(v): return np.nan
-        vals.append(v)
-    x = np.array(vals, dtype=float)
-
-    mu = np.array(model["mu"], dtype=float)
-    sd = np.array(model["sd"], dtype=float); sd[sd==0] = 1.0
-    xs = (x - mu) / sd
-
-    if model["kind"] == "lda":
-        w = np.array(model.get("w_vec"), dtype=float)
-        if w is None or not np.isfinite(w).all(): return np.nan
-        z = float(xs @ w)
-    else:
-        comp = model.get("components")
-        if comp is None: return np.nan
-        w = np.array(comp, dtype=float).ravel()
-        if w.size != xs.size: return np.nan
-        z = float(xs @ w)
-
-    if not np.isfinite(z): return np.nan
-
-    iso_bx = np.array(model.get("iso_bx", []), dtype=float)
-    iso_by = np.array(model.get("iso_by", []), dtype=float)
-    if iso_bx.size >= 2 and iso_by.size >= 2:
-        pA = float(_iso_predict(iso_bx, iso_by, np.array([z]))[0])
-    else:
-        pl = model.get("platt")
-        if not pl: return np.nan
-        m, k = pl
-        pA = 1.0 / (1.0 + np.exp(-k*(z - m)))
-    return float(np.clip(pA, 0.0, 1.0))
-
 # ============================== CatBoost ==============================
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
 
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
-    feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
+    feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES]
     if not feats: return {}
 
     Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
@@ -482,9 +366,8 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- NEW: choose which added stocks to include ---
+# --- choose which added stocks to include (no title/help) ---
 all_added_tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
-# de-duplicate preserving order
 _seen = set(); all_added_tickers = [t for t in all_added_tickers if not (t in _seen or _seen.add(t))]
 if "align_sel_tickers" not in st.session_state:
     st.session_state["align_sel_tickers"] = all_added_tickers[:]  # default: all
@@ -536,7 +419,7 @@ def _make_split(df_base: pd.DataFrame, thr_val: float):
 added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
 
 thr_labels = []
-series_N_med, series_C_med = [], []
+series_C_med = []
 
 for thr_val in gain_cutoffs:
     df_split, gA, gB = _make_split(base_df, float(thr_val))
@@ -546,19 +429,13 @@ for thr_val in gain_cutoffs:
     if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
         continue
 
-    # Train models on DB for this cutoff
-    nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
+    # Train CatBoost on DB for this cutoff
     cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
-
-    # If both models failed to train, skip cutoff
-    if not nca_model and not cat_model:
+    if not cat_model:
         continue
 
     # Determine required features for predicting on SELECTED ADDED stocks
-    req_feats = []
-    if nca_model: req_feats += nca_model.get("feats", [])
-    if cat_model: req_feats += cat_model.get("feats", [])
-    req_feats = sorted(set(req_feats))
+    req_feats = cat_model.get("feats", [])
     if not req_feats:
         continue
 
@@ -572,36 +449,30 @@ for thr_val in gain_cutoffs:
         continue
 
     # Predict on SELECTED ADDED stocks
-    pN, pC = [], []
-    if nca_model:
-        for r in pred_rows:
-            p = _nca_predict_proba_row(r, nca_model)
-            if np.isfinite(p): pN.append(p)
-    if cat_model:
-        for r in pred_rows:
-            p = _cat_predict_proba_row(r, cat_model)
-            if np.isfinite(p): pC.append(p)
+    pC = []
+    for r in pred_rows:
+        p = _cat_predict_proba_row(r, cat_model)
+        if np.isfinite(p): pC.append(p)
 
-    if (len(pN) == 0) and (len(pC) == 0):
+    if len(pC) == 0:
         continue
 
     thr_labels.append(int(thr_val))
-    series_N_med.append(float(np.nanmedian(pN)*100.0) if len(pN) else np.nan)
-    series_C_med.append(float(np.nanmedian(pC)*100.0) if len(pC) else np.nan)
+    series_C_med.append(float(np.nanmedian(pC)*100.0))
 
 if not thr_labels:
     st.info("Not enough data across cutoffs (or none selected) to train both classes and evaluate your selected stocks.")
 else:
     # Build tidy frame for Altair
-    data = []
-    for i, thr in enumerate(thr_labels):
-        data.append({"GainCutoff_%": thr, "Series": "NCA: P(A)", "Value": series_N_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": "CatBoost: P(A)", "Value": series_C_med[i]})
-    df_long = pd.DataFrame(data)
+    df_long = pd.DataFrame({
+        "GainCutoff_%": thr_labels,
+        "Series": ["CatBoost: P(A)"] * len(thr_labels),
+        "Value": series_C_med,
+    })
 
-    # Chart (bars grouped by series at each cutoff)
-    color_domain = ["NCA: P(A)", "CatBoost: P(A)"]
-    color_range  = ["#10b981", "#8b5cf6"]  # green, purple
+    # Chart (single series)
+    color_domain = ["CatBoost: P(A)"]
+    color_range  = ["#8b5cf6"]  # purple
 
     chart = (
         alt.Chart(df_long)
@@ -610,7 +481,6 @@ else:
             x=alt.X("GainCutoff_%:O", title="Gain% cutoff (0 → 600, step 25)"),
             y=alt.Y("Value:Q", title="Median P(A) (%)", scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="")),
-            xOffset="Series:N",
             tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
         )
         .properties(height=360)
@@ -620,19 +490,13 @@ else:
     # Optional PNG export via Matplotlib
     png_bytes = None
     try:
-        pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
-        series_names = list(pivot.columns)
-        color_map = {"NCA: P(A)": "#10b981", "CatBoost: P(A)": "#8b5cf6"}
-        colors = [color_map.get(s, "#999999") for s in series_names]
-        thresholds = pivot.index.tolist()
-        n_groups = len(thresholds); n_series = len(series_names)
-        x = np.arange(n_groups); width = 0.8 / max(n_series, 1)
+        thresholds = thr_labels
+        vals = series_C_med
 
         import io as _io
-        fig, ax = plt.subplots(figsize=(max(6, n_groups*0.6), 4.5))
-        for i, s in enumerate(series_names):
-            vals = pivot[s].values.astype(float)
-            ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
+        fig, ax = plt.subplots(figsize=(max(6, len(thresholds)*0.6), 4.5))
+        x = np.arange(len(thresholds))
+        ax.bar(x, vals, width=0.65, label="CatBoost: P(A)", color="#8b5cf6")
 
         ax.set_xticks(x); ax.set_xticklabels([str(t) for t in thresholds], rotation=0)
         ax.set_ylim(0, 100)
