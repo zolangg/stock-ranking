@@ -1,8 +1,7 @@
 # stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
-# - Streamlined UI: Add form, and a single line for stock selection and deletion.
-# - Tuned CatBoost Model: Parameters adjusted for high sensitivity to outliers.
-# - Analysis is permanently set to "Gain% vs Rest".
+# - Streamlined UI, High-Sensitivity CatBoost Model.
 # - Includes both Absolute and Conditional probability charts.
+# - ADDED: A checkbox to "tame" the conditional chart by applying a moving average.
 
 import streamlit as st
 import pandas as pd
@@ -32,6 +31,7 @@ ALLOWED_LIVE_FEATURES = UNIFIED_VARS[:]
 EXCLUDE_FOR_NCA = []
 
 # ============================== Helpers ==============================
+# (This section is unchanged)
 def _norm(s: str) -> str:
     v = re.sub(r"\s+", " ", str(s).strip().lower())
     v = v.replace("%","").replace("$","").replace("(","").replace(")","").replace("’","").replace("'","")
@@ -650,18 +650,35 @@ vegaEmbed("#vis", spec, {{actions: true}});
         "**given that it has already reached the current one.** This can be misleading for pre-market decisions "
         "and is highly sensitive to sparse data at higher gain levels."
     )
+    
+    # NEW: Add a checkbox to control smoothing
+    use_smoothing = st.checkbox("Apply smoothing to 'tame' conditional chart", value=True, help="Averages data points to reduce noise and show the underlying trend more clearly.")
 
     cond_data = []
     cond_labels = [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
     
-    series_list = [series_A_med, series_N_med, series_C_med] # NOTE: Removed series_B_med as it's not a probability of success
+    series_list = [series_A_med, series_N_med, series_C_med]
     series_names = [gA_label, nca_label, cat_label]
+    
+    # --- NEW: Smoothing Logic ---
+    def _calculate_moving_average(data, window_size=2):
+        series = pd.Series(data)
+        return series.rolling(window=window_size, min_periods=1).mean().tolist()
+
+    if use_smoothing:
+        smoothed_A = _calculate_moving_average(series_A_med)
+        smoothed_N = _calculate_moving_average(series_N_med)
+        smoothed_C = _calculate_moving_average(series_C_med)
+        series_to_use = [smoothed_A, smoothed_N, smoothed_C]
+    else:
+        series_to_use = series_list
+
     cond_series_list = [[], [], []]
 
     for i in range(len(thr_labels) - 1):
-        for j in range(len(series_list)):
-            p_current = series_list[j][i]
-            p_next = series_list[j][i+1]
+        for j in range(len(series_to_use)):
+            p_current = series_to_use[j][i]
+            p_next = series_to_use[j][i+1]
             
             cond_prob = np.nan
             if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6:
@@ -678,7 +695,6 @@ vegaEmbed("#vis", spec, {{actions: true}});
     if cond_data:
         df_cond_long = pd.DataFrame(cond_data)
         
-        # Adjust color domain/range for conditional chart (without 'Rest')
         cond_color_domain = [gA_label, nca_label, cat_label]
         cond_color_range  = ["#3b82f6", "#10b981", "#8b5cf6"]
 
