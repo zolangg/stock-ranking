@@ -346,7 +346,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         verbose=False,
     )
     
-     if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
+    if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
     else:       params.update(dict(od_type="None"))
     model = CatBoostClassifier(**params)
     try:
