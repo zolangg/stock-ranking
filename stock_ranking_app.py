@@ -652,12 +652,12 @@ for s in series_list:
     
     y_smooth = np.full_like(x_raw, np.nan, dtype=float)
 
-    if len(x_fit) > poly_degree:
+    if len(x_fit) > 4:
         # --- Polynomial Regression: The Flexible Smoother ---
         coeffs = np.polyfit(x_fit, y_fit, 4)
         poly_func = np.poly1d(coeffs)
         y_smooth = poly_func(x_raw)
-        chart_title_suffix = f"(Polynomial Smoothed, Degree={poly_degree})"
+        chart_title_suffix = f"(Polynomial Smoothed, Degree=4)"
         
         smoothed_series.append(np.clip(y_smooth, 0, 100))
     else:
