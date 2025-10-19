@@ -8,6 +8,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import seaborn as sns
 import re, json, hashlib, io, math
 import altair as alt
 import matplotlib.pyplot as plt
@@ -1383,7 +1384,6 @@ if summary_rows:
     ]
     df_align_csv_pretty = df_align_csv_full[[c for c in col_order if c in df_align_csv_full.columns]]
 
-    st.markdown("##### Export alignment")
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
@@ -1403,7 +1403,7 @@ if summary_rows:
             use_container_width=True,
             key="dl_align_md_summary",
         )
-
+                
 # ============================== Distributions across Gain% cutoffs ==============================
 st.markdown("---")
 st.subheader("Distributions")
@@ -1590,7 +1590,6 @@ else:
                 png_bytes = None
 
             # ============================== Distribution chart export (HTML + PNG side-by-side) ==============================
-            st.markdown("##### Export distribution chart")
             dl_c1, dl_c2 = st.columns(2)
             with dl_c1:
                 if png_bytes:
