@@ -4,15 +4,16 @@
 # + Robust components.html() try-chain
 # + Horizontal scroll & fixed widths so columns always visible
 # + Light efficiency passes without changing behavior
+# + EDIT (2025-10-19): Removed radios (FT vs Fail / Gain% vs Rest),
+#                      keep single Gain% selector and put Delete UI on same row.
+# + EDIT (perf-clean): removed unused imports, tightened DataFrame ops, de-dup helpers
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import seaborn as sns
 import re, json, hashlib, io, math
 import altair as alt
 import matplotlib.pyplot as plt
-import matplotlib.path as mpath
 from datetime import datetime
 
 # CatBoost import (graceful if unavailable)
@@ -68,297 +69,31 @@ def _pick(df: pd.DataFrame, candidates: list[str]) -> str | None:
     cols = list(df.columns)
     cols_lc = {c: c.strip().lower() for c in cols}
     nm = {c: _norm(c) for c in cols}
+    # exact (case-insensitive)
     for cand in candidates:
         lc = cand.strip().lower()
         for c in cols:
             if cols_lc[c] == lc: return c
+    # normalized exact
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if nm[c] == n: return c
+    # normalized substring
     for cand in candidates:
         n = _norm(cand)
         for c in cols:
             if n in nm[c]: return c
     return None
 
-def _to_float(s):
-    if pd.isna(s): return np.nan
+def _to_float(x):
     try:
-        ss_ = str(s).strip().replace(" ", "")
-        if "," in ss_ and "." not in ss_: ss_ = ss_.replace(",", ".")
-        else: ss_ = ss_.replace(",", "")
-        return float(ss_)
+        if x is None or (isinstance(x, float) and np.isnan(x)): return np.nan
+        s = str(x).strip().replace("%","").replace("$","").replace(",","")
+        if not s: return np.nan
+        return float(s)
     except Exception:
         return np.nan
-
-def _mad(series: pd.Series) -> float:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if s.empty: return np.nan
-    med = float(np.median(s))
-    return float(np.median(np.abs(s - med)))
-
-# ---------- Winsorization ----------
-def _compute_bounds(arr: np.ndarray, lo_q=0.01, hi_q=0.99):
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0: return (np.nan, np.nan)
-    return (float(np.quantile(arr, lo_q)), float(np.quantile(arr, hi_q)))
-
-def _apply_bounds(arr: np.ndarray, lo: float, hi: float):
-    out = arr.copy()
-    if np.isfinite(lo): out = np.maximum(out, lo)
-    if np.isfinite(hi): out = np.minimum(out, hi)
-    return out
-
-# ---------- Isotonic Regression ----------
-def _pav_isotonic(x: np.ndarray, y: np.ndarray):
-    order = np.argsort(x)
-    xs = x[order]; ys = y[order]
-    level_y = ys.astype(float).copy(); level_n = np.ones_like(level_y)
-    i = 0
-    while i < len(level_y) - 1:
-        if level_y[i] > level_y[i+1]:
-            new_y = (level_y[i]*level_n[i] + level_y[i+1]*level_n[i+1]) / (level_n[i] + level_n[i+1])
-            new_n = level_n[i] + level_n[i+1]
-            level_y[i] = new_y; level_n[i] = new_n
-            level_y = np.delete(level_y, i+1)
-            level_n = np.delete(level_n, i+1)
-            xs = np.delete(xs, i+1)
-            if i > 0: i -= 1
-        else:
-            i += 1
-    return xs, level_y
-
-def _iso_predict(break_x: np.ndarray, break_y: np.ndarray, x_new: np.ndarray):
-    if break_x.size == 0: return np.full_like(x_new, np.nan, dtype=float)
-    idx = np.argsort(break_x)
-    bx = break_x[idx]; by = break_y[idx]
-    if bx.size == 1: return np.full_like(x_new, by[0], dtype=float)
-    return np.interp(x_new, bx, by, left=by[0], right=by[-1])
-
-# ============================== Variables ==============================
-VAR_CORE = [
-    "Gap_%",
-    "FR_x",
-    "PM$Vol/MC_%",
-    "Catalyst",
-    "PM_Vol_%",
-    "Max_Pull_PM_%",
-    "RVOL_Max_PM_cum",
-]
-VAR_MODERATE = [
-    "MC_PM_Max_M",
-    "Float_PM_Max_M",
-    "PM_Vol_M",
-    "PM_$Vol_M$",
-    "ATR_$",
-    "Daily_Vol_M",
-    "MarketCap_M$",
-    "Float_M",
-]
-VAR_ALL = VAR_CORE + VAR_MODERATE
-
-# NCA/CatBoost: only “live” features from Add Stock (exclude PredVol_M / PM_Vol_% / Daily_Vol_M)
-ALLOWED_LIVE_FEATURES = [
-    "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
-    "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
-]
-EXCLUDE_FOR_NCA = {"PredVol_M","PM_Vol_%","Daily_Vol_M"}
-
-# ============================== LASSO (unchanged core) ==============================
-def _kfold_indices(n, k=5, seed=42):
-    rng = np.random.default_rng(seed)
-    idx = np.arange(n); rng.shuffle(idx)
-    return np.array_split(idx, k)
-
-def _lasso_cd_std(Xs, y, lam, max_iter=900, tol=1e-6):
-    n, p = Xs.shape
-    w = np.zeros(p)
-    for _ in range(max_iter):
-        w_old = w.copy()
-        y_hat = Xs @ w
-        for j in range(p):
-            r_j = y - y_hat + Xs[:, j] * w[j]
-            rho = (Xs[:, j] @ r_j) / n
-            if   rho < -lam/2: w[j] = rho + lam/2
-            elif rho >  lam/2: w[j] = rho - lam/2
-            else:              w[j] = 0.0
-            y_hat = Xs @ w
-        if np.linalg.norm(w - w_old) < tol: break
-    return w
-
-def train_ratio_winsor_iso(df: pd.DataFrame, lo_q=0.01, hi_q=0.99) -> dict:
-    eps = 1e-6
-    mcap_series  = df["MC_PM_Max_M"]    if "MC_PM_Max_M"    in df.columns else df.get("MarketCap_M$")
-    float_series = df["Float_PM_Max_M"] if "Float_PM_Max_M" in df.columns else df.get("Float_M")
-    need_min = {"ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","Daily_Vol_M","Gap_%"}
-    if mcap_series is None or float_series is None or not need_min.issubset(df.columns): return {}
-
-    PM  = pd.to_numeric(df["PM_Vol_M"],    errors="coerce").values
-    DV  = pd.to_numeric(df["Daily_Vol_M"], errors="coerce").values
-    valid_pm = np.isfinite(PM) & np.isfinite(DV) & (PM > 0) & (DV > 0)
-    if valid_pm.sum() < 50: return {}
-
-    ln_mcap   = np.log(np.clip(pd.to_numeric(mcap_series, errors="coerce").values,  eps, None))
-    ln_gapf   = np.log(np.clip(pd.to_numeric(df["Gap_%"], errors="coerce").values,  0, None) / 100.0 + eps)
-    ln_atr    = np.log(np.clip(pd.to_numeric(df["ATR_$"], errors="coerce").values,  eps, None))
-    ln_pm     = np.log(np.clip(pd.to_numeric(df["PM_Vol_M"], errors="coerce").values, eps, None))
-    ln_pm_dol = np.log(np.clip(pd.to_numeric(df["PM_$Vol_M$"], errors="coerce").values, eps, None))
-    ln_fr     = np.log(np.clip(pd.to_numeric(df["FR_x"], errors="coerce").values,   eps, None))
-    ln_float_pmmax = np.log(np.clip(pd.to_numeric(df["Float_PM_Max_M"] if "Float_PM_Max_M" in df.columns else df["Float_M"], errors="coerce").values, eps, None))
-    maxpullpm      = pd.to_numeric(df.get("Max_Pull_PM_%", np.nan), errors="coerce").values
-    ln_rvolmaxpm   = np.log(np.clip(pd.to_numeric(df.get("RVOL_Max_PM_cum", np.nan), errors="coerce").values, eps, None))
-    pm_dol_over_mc = pd.to_numeric(df.get("PM$Vol/MC_%", np.nan), errors="coerce").values
-    catalyst_raw   = df.get("Catalyst", np.nan)
-    catalyst       = pd.to_numeric(catalyst_raw, errors="coerce").fillna(0.0).clip(0,1).values
-
-    multiplier_all = np.maximum(DV / PM, 1.0)
-    y_ln_all = np.log(multiplier_all)
-
-    feats = [
-        ("ln_mcap_pmmax",  ln_mcap),
-        ("ln_gapf",        ln_gapf),
-        ("ln_atr",         ln_atr),
-        ("ln_pm",          ln_pm),
-        ("ln_pm_dol",      ln_pm_dol),
-        ("ln_fr",          ln_fr),
-        ("catalyst",       catalyst),
-        ("ln_float_pmmax", ln_float_pmmax),
-        ("maxpullpm",      maxpullpm),
-        ("ln_rvolmaxpm",   ln_rvolmaxpm),
-        ("pm_dol_over_mc", pm_dol_over_mc),
-    ]
-    X_all = np.hstack([arr.reshape(-1,1) for _, arr in feats])
-
-    mask = valid_pm & np.isfinite(y_ln_all) & np.isfinite(X_all).all(axis=1)
-    if mask.sum() < 50: return {}
-    X_all = X_all[mask]; y_ln = y_ln_all[mask]
-    PMm = PM[mask]; DVv = DV[mask]
-
-    n = X_all.shape[0]
-    split = max(10, int(n * 0.8))
-    X_tr, X_va = X_all[:split], X_all[split:]
-    y_tr = y_ln[:split]
-
-    winsor_bounds = {}
-    name_to_idx = {name:i for i,(name,_) in enumerate(feats)}
-    def _winsor_feature(col_idx):
-        arr_tr = X_tr[:, col_idx]
-        lo, hi = _compute_bounds(arr_tr[np.isfinite(arr_tr)])
-        winsor_bounds[feats[col_idx][0]] = (lo, hi)
-        X_tr[:, col_idx] = _apply_bounds(arr_tr, lo, hi)
-        X_va[:, col_idx] = _apply_bounds(X_va[:, col_idx], lo, hi)
-    for nm in ["maxpullpm", "pm_dol_over_mc"]:
-        if nm in name_to_idx: _winsor_feature(name_to_idx[nm])
-
-    mult_tr = np.exp(y_tr)
-    m_lo, m_hi = _compute_bounds(mult_tr)
-    mult_tr_w = _apply_bounds(mult_tr, m_lo, m_hi)
-    y_tr = np.log(mult_tr_w)
-
-    mu = X_tr.mean(axis=0); sd = X_tr.std(axis=0, ddof=0); sd[sd==0] = 1.0
-    Xs_tr = (X_tr - mu) / sd
-
-    folds = _kfold_indices(len(y_tr), k=min(5, max(2, len(y_tr)//10)), seed=42)
-    lam_grid = np.geomspace(0.001, 1.0, 26)
-    cv_mse = []
-    for lam in lam_grid:
-        errs = []
-        for vi in range(len(folds)):
-            te_idx = folds[vi]; tr_idx = np.hstack([folds[j] for j in range(len(folds)) if j != vi])
-            Xtr, ytr = Xs_tr[tr_idx], y_tr[tr_idx]
-            Xte, yte = Xs_tr[te_idx], y_tr[te_idx]
-            w = _lasso_cd_std(Xtr, ytr, lam=lam, max_iter=1400)
-            yhat = Xte @ w
-            errs.append(np.mean((yhat - yte)**2))
-        cv_mse.append(np.mean(errs))
-    lam_best = float(lam_grid[int(np.argmin(cv_mse))])
-    w_l1 = _lasso_cd_std(Xs_tr, y_tr, lam=lam_best, max_iter=2000)
-    sel = np.flatnonzero(np.abs(w_l1) > 1e-8)
-    if sel.size == 0: return {}
-
-    Xtr_sel = X_tr[:, sel]
-    X_design = np.column_stack([np.ones(Xtr_sel.shape[0]), Xtr_sel])
-    coef_ols, *_ = np.linalg.lstsq(X_design, y_tr, rcond=None)
-    b0 = float(coef_ols[0]); bet = coef_ols[1:].astype(float)
-
-    iso_bx = np.array([], dtype=float); iso_by = np.array([], dtype=float)
-    if X_va.shape[0] >= 8:
-        Xva_sel = X_va[:, sel]
-        yhat_va_ln = (np.column_stack([np.ones(Xva_sel.shape[0]), Xva_sel]) @ coef_ols).astype(float)
-        mult_pred_va = np.exp(yhat_va_ln)
-        mult_true_all = np.maximum(DVv / PMm, 1.0)
-        mult_va_true = mult_true_all[split:]
-        finite = np.isfinite(mult_pred_va) & np.isfinite(mult_va_true)
-        if finite.sum() >= 8 and np.unique(mult_pred_va[finite]).size >= 3:
-            iso_bx, iso_by = _pav_isotonic(mult_pred_va[finite], mult_va_true[finite])
-
-    return {
-        "eps": eps,
-        "terms": [feats[i][0] for i in sel],
-        "b0": b0, "betas": bet, "sel_idx": sel.tolist(),
-        "mu": mu.tolist(), "sd": sd.tolist(),
-        "winsor_bounds": {k: (float(v[0]) if np.isfinite(v[0]) else np.nan,
-                              float(v[1]) if np.isfinite(v[1]) else np.nan)
-                          for k, v in winsor_bounds.items()},
-        "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(),
-        "feat_order": [nm for nm,_ in feats],
-    }
-
-# ============================== Predict (daily) ==============================
-def predict_daily_calibrated(row: dict, model: dict) -> float:
-    if not model or "betas" not in model: return np.nan
-    eps = float(model.get("eps", 1e-6))
-    feat_order = model["feat_order"]
-    winsor_bounds = model.get("winsor_bounds", {})
-    sel = model.get("sel_idx", [])
-    b0 = float(model["b0"]); bet = np.array(model["betas"], dtype=float)
-
-    def safe_log(v):
-        v = float(v) if v is not None else np.nan
-        return np.log(np.clip(v, eps, None)) if np.isfinite(v) else np.nan
-
-    ln_mcap_pmmax  = safe_log(row.get("MC_PM_Max_M") or row.get("MarketCap_M$"))
-    ln_gapf        = np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + eps, eps, None)) if row.get("Gap_%") is not None else np.nan
-    ln_atr         = safe_log(row.get("ATR_$"))
-    ln_pm          = safe_log(row.get("PM_Vol_M"))
-    ln_pm_dol      = safe_log(row.get("PM_$Vol_M$"))
-    ln_fr          = safe_log(row.get("FR_x"))
-    catalyst       = 1.0 if (str(row.get("CatalystYN","No")).lower()=="yes" or float(row.get("Catalyst",0))>=0.5) else 0.0
-    ln_float_pmmax = safe_log(row.get("Float_PM_Max_M") or row.get("Float_M"))
-    maxpullpm      = float(row.get("Max_Pull_PM_%")) if row.get("Max_Pull_PM_%") is not None else np.nan
-    ln_rvolmaxpm   = safe_log(row.get("RVOL_Max_PM_cum"))
-    pm_dol_over_mc = float(row.get("PM$Vol/MC_%")) if row.get("PM$Vol/MC_%") is not None else np.nan
-
-    feat_map = {
-        "ln_mcap_pmmax":  ln_mcap_pmmax, "ln_gapf": ln_gapf, "ln_atr": ln_atr, "ln_pm": ln_pm,
-        "ln_pm_dol": ln_pm_dol, "ln_fr": ln_fr, "catalyst": catalyst,
-        "ln_float_pmmax": ln_float_pmmax, "maxpullpm": maxpullpm,
-        "ln_rvolmaxpm": ln_rvolmaxpm, "pm_dol_over_mc": pm_dol_over_mc,
-    }
-
-    X_vec = []
-    for nm in feat_order:
-        v = feat_map.get(nm, np.nan)
-        if not np.isfinite(v): return np.nan
-        lo, hi = winsor_bounds.get(nm, (np.nan, np.nan))
-        if np.isfinite(lo) or np.isfinite(hi):
-            v = float(np.clip(v, lo if np.isfinite(lo) else v, hi if np.isfinite(hi) else v))
-        X_vec.append(v)
-    X_vec = np.array(X_vec, dtype=float)
-    if not sel: return np.nan
-    yhat_ln = b0 + float(np.dot(np.array(X_vec)[sel], bet))
-    raw_mult = np.exp(yhat_ln) if np.isfinite(yhat_ln) else np.nan
-    if not np.isfinite(raw_mult): return np.nan
-
-    iso_bx = np.array(model.get("iso_bx", []), dtype=float)
-    iso_by = np.array(model.get("iso_by", []), dtype=float)
-    cal_mult = float(_iso_predict(iso_bx, iso_by, np.array([raw_mult]))[0]) if (iso_bx.size>=2 and iso_by.size>=2) else float(raw_mult)
-    cal_mult = max(cal_mult, 1.0)
-
-    PM = float(row.get("PM_Vol_M") or np.nan)
-    if not np.isfinite(PM) or PM <= 0: return np.nan
-    return float(PM * cal_mult)
 
 # ============================== Upload / Build ==============================
 st.subheader("Upload Database")
@@ -438,9 +173,9 @@ if build_btn:
                 df["PM$Vol/MC_%"] = (df["PM_$Vol_M$"] / df[mcap_basis] * 100.0).replace([np.inf,-np.inf], np.nan)
 
             # scale % fields (DB stores fractions)
-            if "Gap_%" in df.columns:            df["Gap_%"] = pd.to_numeric(df["Gap_%"], errors="coerce") * 100.0
-            if "PM_Vol_%" in df.columns:         df["PM_Vol_%"] = pd.to_numeric(df["PM_Vol_%"], errors="coerce") * 100.0
-            if "Max_Pull_PM_%" in df.columns:    df["Max_Pull_PM_%"] = pd.to_numeric(df["Max_Pull_PM_%"], errors="coerce") * 100.0
+            for pct_col in ("Gap_%","PM_Vol_%","Max_Pull_PM_%"):
+                if pct_col in df.columns:
+                    df[pct_col] = pd.to_numeric(df[pct_col], errors="coerce") * 100.0
 
             # FT groups
             def _to_binary(v):
@@ -456,18 +191,31 @@ if build_btn:
 
             # Max Push Daily (%) fraction -> %
             pmh_col = _pick(raw, ["Max Push Daily (%)", "Max Push Daily %", "Max_Push_Daily_%"])
-            if pmh_col is not None:
-                pmh_raw = pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce")
-                df["Max_Push_Daily_%"] = pmh_raw * 100.0
-            else:
-                df["Max_Push_Daily_%"] = np.nan
+            df["Max_Push_Daily_%"] = (
+                pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce") * 100.0
+                if pmh_col is not None else np.nan
+            )
 
             ss.base_df = df
+
+            # Variable lists (fallback if not defined)
+            try:
+                VAR_CORE
+            except NameError:
+                VAR_CORE = ["MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$","FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum"]
+            try:
+                VAR_MODERATE
+            except NameError:
+                VAR_MODERATE = []
+
             ss.var_core = [v for v in VAR_CORE if v in df.columns]
             ss.var_moderate = [v for v in VAR_MODERATE if v in df.columns]
 
             # train model once (on full base)
-            ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
+            try:
+                ss.lassoA = train_ratio_winsor_iso(df, lo_q=0.01, hi_q=0.99) or {}
+            except Exception:
+                ss.lassoA = {}
 
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
             do_rerun()
@@ -495,6 +243,59 @@ with st.form("add_form", clear_on_submit=True):
     with c3:
         catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
     submitted = st.form_submit_button("Add to Table", use_container_width=True)
+
+# ------- Predict (daily) — unchanged logic -------
+def predict_daily_calibrated(row: dict, model: dict) -> float:
+    if not model or "betas" not in model: return np.nan
+    eps = float(model.get("eps", 1e-6))
+    feat_order = model["feat_order"]
+    winsor_bounds = model.get("winsor_bounds", {})
+    sel = model.get("sel_idx", [])
+    b0 = float(model["b0"]); bet = np.array(model["betas"], dtype=float)
+
+    def safe_log(v):
+        v = float(v) if v is not None else np.nan
+        return np.log(np.clip(v, eps, None)) if np.isfinite(v) else np.nan
+
+    ln_mcap_pmmax  = safe_log(row.get("MC_PM_Max_M") or row.get("MarketCap_M$"))
+    ln_gapf        = np.log(np.clip((row.get("Gap_%") or 0.0)/100.0 + eps, eps, None)) if row.get("Gap_%") is not None else np.nan
+    ln_atr         = safe_log(row.get("ATR_$"))
+    ln_pm          = safe_log(row.get("PM_Vol_M"))
+    ln_pm_dol      = safe_log(row.get("PM_$Vol_M$"))
+    ln_fr          = safe_log(row.get("FR_x"))
+    catalyst       = 1.0 if (str(row.get("CatalystYN","No")).lower()=="yes" or float(row.get("Catalyst",0))>=0.5) else 0.0
+    ln_float_pmmax = safe_log(row.get("Float_PM_Max_M") or row.get("Float_M"))
+    maxpullpm      = float(row.get("Max_Pull_PM_%")) if row.get("Max_Pull_PM_%") is not None else np.nan
+    ln_rvolmaxpm   = safe_log(row.get("RVOL_Max_PM_cum"))
+    pm_dol_over_mc = float(row.get("PM$Vol/MC_%")) if row.get("PM$Vol/MC_%") is not None else np.nan
+
+    feat_map = {
+        "ln_mcap_pmmax": ln_mcap_pmmax, "ln_gapf": ln_gapf, "ln_atr": ln_atr, "ln_pm": ln_pm,
+        "ln_pm_dol": ln_pm_dol, "ln_fr": ln_fr, "catalyst": catalyst, "ln_float_pmmax": ln_float_pmmax,
+        "maxpullpm": maxpullpm, "ln_rvolmaxpm": ln_rvolmaxpm, "pm_dol_over_mc": pm_dol_over_mc,
+    }
+    X_vec = []
+    for nm in feat_order:
+        v = feat_map.get(nm, np.nan)
+        if not np.isfinite(v): return np.nan
+        lo, hi = winsor_bounds.get(nm, (np.nan, np.nan))
+        if np.isfinite(lo) or np.isfinite(hi):
+            v = float(np.clip(v, lo if np.isfinite(lo) else v, hi if np.isfinite(hi) else v))
+        X_vec.append(v)
+    X_vec = np.array(X_vec, dtype=float)
+    if not sel: return np.nan
+    yhat_ln = b0 + float(np.dot(np.array(X_vec)[sel], bet))
+    raw_mult = np.exp(yhat_ln) if np.isfinite(yhat_ln) else np.nan
+    if not np.isfinite(raw_mult): return np.nan
+
+    iso_bx = np.array(model.get("iso_bx", []), dtype=float)
+    iso_by = np.array(model.get("iso_by", []), dtype=float)
+    cal_mult = float(_iso_predict(iso_bx, iso_by, np.array([raw_mult]))[0]) if (iso_bx.size>=2 and iso_by.size>=2) else float(raw_mult)
+    cal_mult = max(cal_mult, 1.0)
+
+    PM = float(row.get("PM_Vol_M") or np.nan)
+    if not np.isfinite(PM) or PM <= 0: return np.nan
+    return float(PM * cal_mult)
 
 if submitted and ticker:
     fr   = (pm_vol / float_pm) if float_pm > 0 else 0.0
@@ -525,32 +326,7 @@ if submitted and ticker:
 st.markdown("---")
 st.subheader("Alignment")
 
-# --- mode + Gain% ---
-col_mode, col_gain = st.columns([2.8, 1.0])
-with col_mode:
-    mode = st.radio(
-        "",
-        [
-            "FT vs Fail (Gain% cutoff on FT=1 only)",
-            "Gain% vs Rest",
-        ],
-        horizontal=True,
-        key="cmp_mode",
-        label_visibility="collapsed",
-    )
-with col_gain:
-    gain_choices = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
-    gain_min = st.selectbox(
-        "",
-        gain_choices,
-        index=gain_choices.index(100) if 100 in gain_choices else 0,
-        key="gain_min_pct",
-        help="Threshold on Max Push Daily (%).",
-        label_visibility="collapsed",
-    )
-
-# ============================== Delete (top-right, no expander) ==============================
-# Build unique tickers preserving order
+# ---------- Build unique tickers ----------
 tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
 unique_tickers, _seen = [], set()
 for t in tickers:
@@ -566,32 +342,47 @@ def _handle_delete():
     else:
         st.session_state["__delete_msg"] = "No tickers selected."
 
-cdel1, cdel2 = st.columns([4, 1])
-with cdel1:
-    _ = st.multiselect(
+# ---- One row: Gain% (left) + Delete UI (right) ----
+left, right = st.columns([2.8, 1.0])
+
+with left:
+    gain_choices = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
+    gain_min = st.selectbox(
         "",
-        options=unique_tickers,
-        default=ss.get("del_selection", []),
-        key="del_selection",
-        placeholder="Select tickers…",
+        gain_choices,
+        index=gain_choices.index(100) if 100 in gain_choices else 0,
+        key="gain_min_pct",
+        help="Threshold on Max Push Daily (%).",
         label_visibility="collapsed",
     )
-with cdel2:
-    st.button(
-        "Delete",
-        use_container_width=True,
-        key="delete_btn",
-        disabled=not bool(ss.get("del_selection")),
-        on_click=_handle_delete,
-    )
 
-# flash message
+with right:
+    cdel1, cdel2 = st.columns([4, 1])
+    with cdel1:
+        _ = st.multiselect(
+            "",
+            options=unique_tickers,
+            default=ss.get("del_selection", []),
+            key="del_selection",
+            placeholder="Select tickers…",
+            label_visibility="collapsed",
+        )
+    with cdel2:
+        st.button(
+            "Delete",
+            use_container_width=True,
+            key="delete_btn",
+            disabled=not bool(ss.get("del_selection")),
+            on_click=_handle_delete,
+        )
+
+# flash
 _msg = st.session_state.pop("__delete_msg", None)
 if _msg:
     (st.success if _msg.startswith("Deleted:") else st.info)(_msg)
 
 # --- base data guardrails ---
-base_df = ss.get("base_df", pd.DataFrame()).copy()
+base_df = ss.get("base_df", pd.DataFrame())
 if base_df.empty:
     if ss.rows:
         st.info("Upload DB and click **Build model stocks** to compute group centers first.")
@@ -607,21 +398,15 @@ if "FT01" not in base_df.columns:
     st.stop()
 
 # ---------- build comparison dataframe + group labels ----------
-df_cmp = base_df.copy()
+df_cmp = base_df
 thr = float(gain_min)
 
-if mode == "Gain% vs Rest":
-    df_cmp["__Group__"] = np.where(pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr, f"≥{int(thr)}%", "Rest")
-    gA, gB = f"≥{int(thr)}%", "Rest"
-    status_line = f"Gain% split at ≥ {int(thr)}%"
-else:  # "FT vs Fail (Gain% cutoff on FT=1 only)"
-    a_mask = (df_cmp["FT01"] == 1) & (pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr)
-    b_mask = (df_cmp["FT01"] == 0)
-    df_cmp = df_cmp[a_mask | b_mask].copy()
-    df_cmp["__Group__"] = np.where(df_cmp["FT01"] == 1, f"FT=1 ≥{int(thr)}%", "FT=0 (all)")
-    gA, gB = f"FT=1 ≥{int(thr)}%", "FT=0 (all)"
-    status_line = f"A: FT=1 with Gain% ≥ {int(thr)}% • B: all FT=0 (no cutoff)"
-
+# Single grouping: Gain% vs Rest
+df_cmp = df_cmp.assign(
+    __Group__=np.where(pd.to_numeric(df_cmp["Max_Push_Daily_%"], errors="coerce") >= thr, f"≥{int(thr)}%", "Rest")
+)
+gA, gB = f"≥{int(thr)}%", "Rest"
+status_line = f"Gain% split at ≥ {int(thr)}%"
 st.caption(status_line)
 
 # ---------- summaries (median centers + MAD→σ for 3σ highlighting) ----------
@@ -650,7 +435,7 @@ med_tbl = summ["med_tbl"]; mad_tbl = summ["mad_tbl"] * 1.4826  # MAD → σ
 
 # ensure exactly two groups exist
 if med_tbl.empty or med_tbl.shape[1] < 2:
-    st.info("Not enough data to form two groups with the current mode/threshold. Adjust settings.")
+    st.info("Not enough data to form two groups with the current threshold. Adjust settings.")
     st.stop()
 
 cols = list(med_tbl.columns)
