@@ -14,7 +14,7 @@ import altair as alt
 import matplotlib.pyplot as plt
 from datetime import datetime
 from catboost import CatBoostClassifier
-import lightgbm as lgb  # Import LightGBM
+import lightgbm as lgb
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
@@ -75,7 +75,7 @@ st.subheader("Upload Database")
 uploaded = st.file_uploader("Upload .xlsx with your DB", type=["xlsx"], key="db_upl")
 build_btn = st.button("Build model stocks", use_container_width=True, key="db_build_btn")
 
-@st.cache_data(show_spinner=True)
+@st.cache_data(show_spinner="Loading and processing Excel file...")
 def _load_sheet(file_bytes: bytes):
     xls = pd.ExcelFile(file_bytes)
     sheet_candidates = [s for s in xls.sheet_names if _norm(s) not in {"legend","readme"}]
@@ -589,26 +589,27 @@ if not ss.rows:
 all_added_tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
 _seen = set(); all_added_tickers = [t for t in all_added_tickers if not (t in _seen or _seen.add(t))]
 if "align_sel_tickers" not in st.session_state:
-    st.session_state["align_sel_tickers"] = all_added_tickers[:]  # default: all
+    st.session_state["align_sel_tickers"] = all_added_tickers[:]
 
 csel1, csel2 = st.columns([4, 1])
 with csel1:
     selected_tickers = st.multiselect(
-        "",
+        "Select added stocks to analyze:",
         options=all_added_tickers,
         default=st.session_state["align_sel_tickers"],
         key="align_sel_tickers",
-        label_visibility="collapsed",
     )
 with csel2:
+    st.write("") # for vertical alignment
+    st.write("")
     def _clear_sel(): st.session_state["align_sel_tickers"] = []
-    st.button("Clear", use_container_width=True, on_click=_clear_sel)
+    st.button("Clear Selection", use_container_width=True, on_click=_clear_sel)
 
 if not selected_tickers:
-    st.info("No stocks selected. Pick at least one added ticker above.")
+    st.info("No stocks selected. Pick at least one added ticker above to analyze.")
     st.stop()
 
-# Required DB columns
+# Required DB columns check
 if "Max_Push_Daily_%" not in base_df.columns:
     st.error("Your DB is missing column: Max_Push_Daily_% (Max Push Daily (%) as %).")
     st.stop()
@@ -619,95 +620,95 @@ if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
     st.stop()
 
-# Gain% cutoffs 0 → 600 step 25
-gain_cutoffs = list(range(0, 601, 25))
-
-# Split helper: Gain% ≥ cutoff vs Rest
-def _make_split(df_base: pd.DataFrame, thr_val: float):
-    df_tmp = df_base.copy()
-    df_tmp["__Group__"] = np.where(
-        pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val,
-        f"≥{int(thr_val)}%", "Rest"
-    )
-    gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
-    return df_tmp, gA_, gB_
-
 # Build a DataFrame of SELECTED added stocks for prediction
-added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
-
-thr_labels = []
-series_N_med, series_C_med, series_L_med = [], [], []
-
-for thr_val in gain_cutoffs:
-    df_split, gA, gB = _make_split(base_df, float(thr_val))
-
-    # need both groups reasonably present
-    vc = df_split["__Group__"].value_counts()
-    if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
-        continue
-
-    # Train models on DB for this cutoff
-    nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
-    cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
-    lgb_model = _train_lightgbm_once(df_split, gA, gB, var_all) or {}
-
-    # If all models failed to train, skip cutoff
-    if not nca_model and not cat_model and not lgb_model:
-        continue
-
-    # Determine required features for predicting on SELECTED ADDED stocks
-    req_feats = []
-    if nca_model: req_feats += nca_model.get("feats", [])
-    if cat_model: req_feats += cat_model.get("feats", [])
-    if lgb_model: req_feats += lgb_model.get("feats", [])
-    req_feats = sorted(set(req_feats))
-    if not req_feats:
-        continue
-
-    # Filter SELECTED ADDED rows to those with finite values for required feats
-    if added_df.empty:
-        continue
-    Xadd = added_df[req_feats].apply(pd.to_numeric, errors="coerce")
-    mask = np.isfinite(Xadd.values).all(axis=1)
-    pred_rows = added_df.loc[mask].to_dict(orient="records")
-    if len(pred_rows) == 0:
-        continue
-
-    # Predict on SELECTED ADDED stocks
-    pN, pC, pL = [], [], []
-    if nca_model:
-        for r in pred_rows:
-            p = _nca_predict_proba_row(r, nca_model)
-            if np.isfinite(p): pN.append(p)
-    if cat_model:
-        for r in pred_rows:
-            p = _cat_predict_proba_row(r, cat_model)
-            if np.isfinite(p): pC.append(p)
-    if lgb_model:
-        for r in pred_rows:
-            p = _lgb_predict_proba_row(r, lgb_model)
-            if np.isfinite(p): pL.append(p)
+added_df_selected = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
 
 
-    if (len(pN) == 0) and (len(pC) == 0) and (len(pL) == 0):
-        continue
+# --------- The new cached computation function ----------
+@st.cache_data(show_spinner="Training models and computing alignment. Please wait...")
+def compute_alignment_data(_base_df, _added_df):
+    """
+    This function contains the expensive computations (model training and prediction).
+    Streamlit's caching will prevent it from re-running if the inputs don't change.
+    """
+    gain_cutoffs = list(range(0, 601, 25))
 
-    thr_labels.append(int(thr_val))
-    series_N_med.append(float(np.nanmedian(pN)*100.0) if len(pN) else np.nan)
-    series_C_med.append(float(np.nanmedian(pC)*100.0) if len(pC) else np.nan)
-    series_L_med.append(float(np.nanmedian(pL)*100.0) if len(pL) else np.nan)
+    def _make_split(df_base: pd.DataFrame, thr_val: float):
+        df_tmp = df_base.copy()
+        df_tmp["__Group__"] = np.where(
+            pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val,
+            f"≥{int(thr_val)}%", "Rest"
+        )
+        gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
+        return df_tmp, gA_, gB_
 
-if not thr_labels:
-    st.info("Not enough data across cutoffs (or none selected) to train all classes and evaluate your selected stocks.")
-else:
-    # Build tidy frame for Altair
+    thr_labels = []
+    series_N_med, series_C_med, series_L_med = [], [], []
+
+    for thr_val in gain_cutoffs:
+        df_split, gA, gB = _make_split(_base_df, float(thr_val))
+        vc = df_split["__Group__"].value_counts()
+        if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10): continue
+
+        nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
+        cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
+        lgb_model = _train_lightgbm_once(df_split, gA, gB, var_all) or {}
+
+        if not nca_model and not cat_model and not lgb_model: continue
+
+        req_feats = sorted(set(nca_model.get("feats", []) + cat_model.get("feats", []) + lgb_model.get("feats", [])))
+        if not req_feats: continue
+        if _added_df.empty: continue
+
+        Xadd = _added_df[req_feats].apply(pd.to_numeric, errors="coerce")
+        mask = np.isfinite(Xadd.values).all(axis=1)
+        pred_rows = _added_df.loc[mask].to_dict(orient="records")
+        if not pred_rows: continue
+
+        pN, pC, pL = [], [], []
+        if nca_model:
+            for r in pred_rows:
+                p = _nca_predict_proba_row(r, nca_model)
+                if np.isfinite(p): pN.append(p)
+        if cat_model:
+            for r in pred_rows:
+                p = _cat_predict_proba_row(r, cat_model)
+                if np.isfinite(p): pC.append(p)
+        if lgb_model:
+            for r in pred_rows:
+                p = _lgb_predict_proba_row(r, lgb_model)
+                if np.isfinite(p): pL.append(p)
+
+        if not pN and not pC and not pL: continue
+
+        thr_labels.append(int(thr_val))
+        series_N_med.append(float(np.nanmedian(pN) * 100.0) if pN else np.nan)
+        series_C_med.append(float(np.nanmedian(pC) * 100.0) if pC else np.nan)
+        series_L_med.append(float(np.nanmedian(pL) * 100.0) if pL else np.nan)
+
+    if not thr_labels:
+        return pd.DataFrame()
+
     data = []
     for i, thr in enumerate(thr_labels):
         data.append({"GainCutoff_%": thr, "Series": "NCA: P(A)", "Value": series_N_med[i]})
         data.append({"GainCutoff_%": thr, "Series": "CatBoost: P(A)", "Value": series_C_med[i]})
         data.append({"GainCutoff_%": thr, "Series": "LightGBM: P(A)", "Value": series_L_med[i]})
-    df_long = pd.DataFrame(data)
+    return pd.DataFrame(data)
 
+# ---- The new UI section with the "Compute" button ----
+compute_btn = st.button("Compute & Display Alignment Chart", use_container_width=True, type="primary")
+
+if compute_btn:
+    # Call the cached function when the button is pressed
+    df_long = compute_alignment_data(base_df, added_df_selected)
+    ss.alignment_df = df_long # Store result in session state to persist it
+else:
+    # On subsequent re-runs, get the data from session state without re-computing
+    df_long = ss.get("alignment_df")
+
+# --- Display the chart and download buttons only if we have data ---
+if df_long is not None and not df_long.empty:
     # Chart (bars grouped by series at each cutoff)
     color_domain = ["NCA: P(A)", "CatBoost: P(A)", "LightGBM: P(A)"]
     color_range  = ["#10b981", "#8b5cf6", "#f59e0b"]  # green, purple, amber
@@ -727,7 +728,6 @@ else:
     st.altair_chart(chart, use_container_width=True)
 
     # Optional PNG export via Matplotlib
-    png_bytes = None
     try:
         pivot = df_long.pivot(index="GainCutoff_%", columns="Series", values="Value").sort_index()
         series_names = list(pivot.columns)
@@ -741,7 +741,7 @@ else:
         fig, ax = plt.subplots(figsize=(max(6, n_groups*0.7), 4.5))
         for i, s in enumerate(series_names):
             vals = pivot[s].values.astype(float)
-            ax.bar(x + i*width - (n_series-1)*width/2, vals, width=width, label=s, color=colors[i])
+            ax.bar(x + i*width - (n_series-1)*width/2, vals, width, label=s, color=colors[i])
 
         ax.set_xticks(x); ax.set_xticklabels([str(t) for t in thresholds], rotation=0)
         ax.set_ylim(0, 100)
@@ -767,8 +767,6 @@ else:
                 use_container_width=True,
                 key="dl_png",
             )
-        else:
-            st.caption("PNG export unavailable.")
     with col2:
         spec = chart.to_dict()
         html_tpl = f"""<!doctype html>
@@ -776,12 +774,8 @@ else:
 <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
 <script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
 <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
-</head><body>
-<div id="vis"></div>
-<script>
-const spec = {json.dumps(spec)};
-vegaEmbed("#vis", spec, {{actions: true}});
-</script>
+</head><body><div id="vis"></div>
+<script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions: true}});</script>
 </body></html>"""
         st.download_button(
             "Download HTML (interactive Alignment chart)",
@@ -791,3 +785,5 @@ vegaEmbed("#vis", spec, {{actions: true}});
             use_container_width=True,
             key="dl_html",
         )
+elif df_long is not None and df_long.empty:
+     st.warning("Could not generate an alignment chart. There may not have been enough data across the gain cutoffs to train the models and make predictions for the selected stocks.")
