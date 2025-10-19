@@ -334,10 +334,9 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         loss_function="Logloss",
         eval_metric="Logloss",
         iterations=200,
-        learning_rate=0.08,    # From 0.05 -> 0.08. A higher rate makes it "fast adjusting" and more aggressive in its learning.
-        depth=4,               # From 2 -> 4. The MOST IMPORTANT CHANGE. Allows the model to learn much more complex, non-linear rules and interactions.
-        l2_leaf_reg=3,         # From 10 -> 3. A lower penalty allows the model to be more "certain" and decisive, fitting the data more tightly.
-        min_data_in_leaf=1,    # Explicitly set to 1. This allows the model to create a rule based on a single, unique stock - the definition of being sensitive to outliers.
+        learning_rate=0.05,  # Slightly increased to prevent overfitting to tiny details.
+        depth=2,             # From 3 -> 2. FORCES the model to learn simpler, more general rules.
+        l2_leaf_reg=10,      # From 6 -> 10. Increased penalty for being "too certain."
         bootstrap_type="Bayesian",
         bagging_temperature=0.5,
         auto_class_weights="Balanced",
