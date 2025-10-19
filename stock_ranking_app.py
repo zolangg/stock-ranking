@@ -34,6 +34,15 @@ ss = st.session_state
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("rows", {})  # dict keyed by Ticker (de-duplicated)
 
+# --- Backward-compat: migrate old list-based rows to dict ---
+if isinstance(ss.rows, list):
+    # Old format was a list of row dicts; convert to {Ticker: row}
+    migrated = {}
+    for r in ss.rows:
+        t = (r or {}).get("Ticker")
+        if t: migrated[str(t).upper()] = r
+    ss.rows = migrated
+    
 # ============================== Unified variables ==============================
 UNIFIED_VARS = [
     "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
