@@ -1,6 +1,6 @@
 # stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
 # - Add Stock form (no table)
-# - Alignment shows median P(A) over ADDED stocks across Gain% cutoffs (0..600 step 25)
+# - Alignment shows median P(A) over SELECTED added stocks across Gain% cutoffs (0..600 step 25)
 # - Models (NCA & CatBoost) train per cutoff on the UPLOADED DB; predictions are for ADDED stocks only
 # - CatBoost is required; no optional branches
 # - No daily-volume prediction anywhere
@@ -17,7 +17,7 @@ from catboost import CatBoostClassifier  # CatBoost is required
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
 st.title("Premarket Stock Analysis")
-st.caption("Flow: 1) Upload Excel → Build • 2) Add stocks • 3) Alignment shows NCA/CatBoost median P(A) over your added stocks across Gain% cutoffs (0→600).")
+st.caption("Flow: 1) Upload Excel → Build • 2) Add stocks • 3) Alignment shows NCA/CatBoost median P(A) over your selected added stocks across Gain% cutoffs (0→600).")
 
 # ============================== Session ==============================
 ss = st.session_state
@@ -470,7 +470,7 @@ def _cat_predict_proba_row(xrow: dict, model: dict) -> float:
         pA = z if not pl else 1.0 / (1.0 + np.exp(-pl[1]*(z - pl[0])))
     return float(np.clip(pA, 0.0, 1.0))
 
-# ============================== Alignment (Distributions for ADDED stocks) ==============================
+# ============================== Alignment (Distributions for SELECTED added stocks) ==============================
 st.markdown("---")
 st.subheader("Alignment")
 
@@ -481,6 +481,30 @@ if base_df.empty:
 
 if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
+    st.stop()
+
+# --- NEW: choose which added stocks to include ---
+all_added_tickers = [r.get("Ticker") for r in ss.rows if r.get("Ticker")]
+# de-duplicate preserving order
+_seen = set(); all_added_tickers = [t for t in all_added_tickers if not (t in _seen or _seen.add(t))]
+if "align_sel_tickers" not in st.session_state:
+    st.session_state["align_sel_tickers"] = all_added_tickers[:]  # default: all
+
+csel1, csel2 = st.columns([4, 1])
+with csel1:
+    selected_tickers = st.multiselect(
+        "Select added stocks to include",
+        options=all_added_tickers,
+        default=st.session_state["align_sel_tickers"],
+        key="align_sel_tickers",
+        help="Median P(A) will be computed over just these tickers.",
+    )
+with csel2:
+    def _clear_sel(): st.session_state["align_sel_tickers"] = []
+    st.button("Clear", use_container_width=True, on_click=_clear_sel)
+
+if not selected_tickers:
+    st.info("No stocks selected. Pick at least one added ticker above.")
     st.stop()
 
 # Required columns on DB side
@@ -509,8 +533,8 @@ def _make_split(df_base: pd.DataFrame, thr_val: float):
     gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
     return df_tmp, gA_, gB_
 
-# Build a DataFrame of added stocks for prediction (we'll use the model feature set per cutoff)
-added_df = pd.DataFrame(ss.rows)
+# Build a DataFrame of SELECTED added stocks for prediction
+added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
 
 thr_labels = []
 series_N_med, series_C_med = [], []
@@ -531,7 +555,7 @@ for thr_val in gain_cutoffs:
     if not nca_model and not cat_model:
         continue
 
-    # Determine required features for predicting on ADDED stocks
+    # Determine required features for predicting on SELECTED ADDED stocks
     req_feats = []
     if nca_model: req_feats += nca_model.get("feats", [])
     if cat_model: req_feats += cat_model.get("feats", [])
@@ -539,7 +563,7 @@ for thr_val in gain_cutoffs:
     if not req_feats:
         continue
 
-    # Filter ADDED rows to those with finite values for required feats
+    # Filter SELECTED ADDED rows to those with finite values for required feats
     if added_df.empty:
         continue
     Xadd = added_df[req_feats].apply(pd.to_numeric, errors="coerce")
@@ -548,7 +572,7 @@ for thr_val in gain_cutoffs:
     if len(pred_rows) == 0:
         continue
 
-    # Predict on ADDED stocks
+    # Predict on SELECTED ADDED stocks
     pN, pC = [], []
     if nca_model:
         for r in pred_rows:
@@ -567,7 +591,7 @@ for thr_val in gain_cutoffs:
     series_C_med.append(float(np.nanmedian(pC)*100.0) if len(pC) else np.nan)
 
 if not thr_labels:
-    st.info("Not enough data across cutoffs to train both classes and evaluate your added stocks. Add more stocks or broaden the DB.")
+    st.info("Not enough data across cutoffs (or none selected) to train both classes and evaluate your selected stocks.")
 else:
     # Build tidy frame for Altair
     data = []
@@ -585,7 +609,7 @@ else:
         .mark_bar()
         .encode(
             x=alt.X("GainCutoff_%:O", title="Gain% cutoff (0 → 600, step 25)"),
-            y=alt.Y("Value:Q", title="Median P(A) for your added stocks (%)", scale=alt.Scale(domain=[0, 100])),
+            y=alt.Y("Value:Q", title="Median P(A) for selected added stocks (%)", scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="")),
             xOffset="Series:N",
             tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
@@ -614,7 +638,7 @@ else:
         ax.set_xticks(x); ax.set_xticklabels([str(t) for t in thresholds], rotation=0)
         ax.set_ylim(0, 100)
         ax.set_xlabel("Gain% cutoff")
-        ax.set_ylabel("Median P(A) for your added stocks (%)")
+        ax.set_ylabel("Median P(A) for selected added stocks (%)")
         ax.legend(loc="upper left", frameon=False)
 
         buf = _io.BytesIO(); fig.tight_layout()
