@@ -346,15 +346,18 @@ def _handle_delete():
 left, right = st.columns([1.0, 3.0])
 
 with left:
-    gain_choices = [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]
-    gain_min = st.selectbox(
+    # --- Gain% selector with readable labels ---
+    gain_map = {v: f"{v}% from PMH" for v in [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300]}
+    gain_label = st.selectbox(
         "",
-        gain_choices,
-        index=gain_choices.index(100) if 100 in gain_choices else 0,
-        key="gain_min_pct",
+        list(gain_map.values()),
+        index=list(gain_map.keys()).index(100),
+        key="gain_min_label",
         help="Threshold on Max Push Daily (%).",
         label_visibility="collapsed",
     )
+    # reverse-map the label back to its numeric value
+    gain_min = [k for k, v in gain_map.items() if v == gain_label][0]
 
 with right:
     cdel1, cdel2 = st.columns([5, 2])
