@@ -630,79 +630,46 @@ vegaEmbed("#vis", spec, {{actions: true}});
         )
 
 
-    # --- Conditional Probability Chart Section ---
-    st.markdown("---")
-    st.subheader("Conditional Probability Analysis")
-    st.warning(
-        "**For Research Only:** This chart shows the probability of a stock reaching the *next* gain level, "
-        "**given that it has already reached the current one.** This can be misleading for pre-market decisions "
-        "and is highly sensitive to sparse data at higher gain levels."
-    )
-    
-    # NEW: Add a slider to control smoothing
-    smoothing_window = st.slider(
-        "Smoothing Window",
-        min_value=1,
-        max_value=50,
-        value=21,
-        help="Controls the amount of smoothing. A value of 1 means no smoothing (raw data). A higher value creates a smoother trend line by averaging more points."
-    )
+# --- Conditional Probability Chart Section ---
+st.markdown("---")
+st.subheader("Conditional Probability Analysis")
+st.warning("**For Research Only:** This chart is experimental. It shows the probability of reaching the *next* gain level, given the *estimated true trend* at the current level. It is highly sensitive to model parameters and sparse data.")
 
-    cond_data = []
-    cond_labels = [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
-    
-    series_list = [series_A_med, series_N_med, series_C_med]
-    series_names = [gA_label, nca_label, cat_label]
-    
-    # NEW: Smoothing Logic with adjustable window
-    def _calculate_moving_average(data, window_size=2):
-        if window_size <= 1:
-            return data
-        series = pd.Series(data)
-        return series.rolling(window=window_size, min_periods=1, center=True).mean().tolist()
+kalman_measurement_variance = st.slider("Smoothing Strength (Kalman Filter)", min_value=1.0, max_value=50.0, value=10.0, step=1.0, help="Controls how much the filter trusts the raw calculations. Higher values mean more smoothing (the filter is more skeptical of noisy data).")
 
-    smoothed_A = _calculate_moving_average(series_A_med, smoothing_window)
-    smoothed_N = _calculate_moving_average(series_N_med, smoothing_window)
-    smoothed_C = _calculate_moving_average(series_C_med, smoothing_window)
-    series_to_use = [smoothed_A, smoothed_N, smoothed_C]
+def _kalman_filter(data, process_variance=1e-5, measurement_variance=10.0):
+    x = data[0] if data and pd.notna(data[0]) else 0
+    p = 1.0; filtered = []
+    for z in data:
+        if pd.isna(z): filtered.append(np.nan); continue
+        p += process_variance
+        k = p / (p + measurement_variance)
+        x += k * (z - x)
+        p *= (1 - k)
+        filtered.append(x)
+    return filtered
 
-    cond_series_list = [[], [], []]
+series_list = [series_A_med, series_N_med, series_C_med]
+series_names = [gA_label, nca_label, cat_label]
+filtered_series = [_kalman_filter(s, measurement_variance=kalman_measurement_variance) for s in series_list]
 
-    for i in range(len(thr_labels) - 1):
-        for j in range(len(series_to_use)):
-            p_current = series_to_use[j][i]
-            p_next = series_to_use[j][i+1]
-            
-            cond_prob = np.nan
-            if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6:
-                cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100)
-            
-            cond_series_list[j].append(cond_prob)
+cond_data, cond_labels = [], [f"{thr_labels[i]}% → {thr_labels[i+1]}%" for i in range(len(thr_labels) - 1)]
+for i in range(len(thr_labels) - 1):
+    for j, name in enumerate(series_names):
+        p_current, p_next = filtered_series[j][i], filtered_series[j][i+1]
+        cond_prob = np.clip((p_next / p_current) * 100.0, 0, 100) if pd.notna(p_current) and pd.notna(p_next) and p_current > 1e-6 else np.nan
+        if pd.notna(cond_prob): cond_data.append({"Transition": cond_labels[i], "Series": name, "Value": cond_prob})
 
-    for i, label in enumerate(cond_labels):
-        for j, name in enumerate(series_names):
-            value = cond_series_list[j][i]
-            if pd.notna(value):
-                cond_data.append({"Transition": label, "Series": name, "Value": value})
-
-    if cond_data:
-        df_cond_long = pd.DataFrame(cond_data)
-        
-        cond_color_domain = [gA_label, nca_label, cat_label]
-        cond_color_range  = ["#3b82f6", "#10b981", "#8b5cf6"]
-
-        cond_chart = (
-            alt.Chart(df_cond_long)
-            .mark_bar()
-            .encode(
-                x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels),
-                y=alt.Y("Value:Q", title="Conditional Probability (%)", scale=alt.Scale(domain=[0, 100])),
-                color=alt.Color("Series:N", scale=alt.Scale(domain=cond_color_domain, range=cond_color_range), legend=alt.Legend(title="Analysis Series")),
-                xOffset="Series:N",
-                tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")],
-            )
-            .properties(height=400, title=f"Conditional Probability (Smoothed with Window={smoothing_window})")
-        )
-        st.altair_chart(cond_chart, use_container_width=True)
-    else:
-        st.info("Not enough sequential data to calculate conditional probabilities.")
+if cond_data:
+    df_cond_long = pd.DataFrame(cond_data)
+    cond_color_domain, cond_color_range = [gA_label, nca_label, cat_label], ["#3b82f6", "#10b981", "#8b5cf6"]
+    cond_chart = alt.Chart(df_cond_long).mark_bar().encode(
+        x=alt.X("Transition:O", title="Gain% Transition", sort=cond_labels),
+        y=alt.Y("Value:Q", title="Conditional Probability (%)", scale=alt.Scale(domain=[0, 100])),
+        color=alt.Color("Series:N", scale=alt.Scale(domain=cond_color_domain, range=cond_color_range), legend=alt.Legend(title="Analysis Series")),
+        xOffset="Series:N", tooltip=["Transition:O", "Series:N", alt.Tooltip("Value:Q", format=".1f")]
+    ).properties(height=400, title=f"Conditional Probability (Kalman Smoothed)")
+    st.altair_chart(cond_chart, use_container_width=True)
+else:
+    st.info("Not enough sequential data to calculate conditional probabilities.")
+Use Arrow Up and Arrow Down to select a turn, Enter to jump to it, and Escape to return to the chat.
