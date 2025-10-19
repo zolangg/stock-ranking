@@ -429,7 +429,7 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
 
 # ============================== Alignment (Distributions for SELECTED added stocks) ==============================
 st.markdown("---")
-st.subheader("Alignment Distribution")
+st.subheader("Alignment")
 
 base_df = ss.get("base_df", pd.DataFrame())
 if base_df.empty:
