@@ -637,21 +637,6 @@ st.warning(
     "**For Advanced Research:** This chart shows the probability of reaching the *next* gain level. It uses powerful smoothing techniques to find the underlying trend in the noisy absolute probability data."
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    # Option 1: The flexible polynomial smoother
-    poly_degree = st.slider(
-        "Smoothing Aggressiveness (Polynomial Degree)",
-        min_value=2, max_value=5, value=3,
-        help="Controls the complexity of the curve fitted to the data. Lower degrees are smoother; higher degrees follow the raw data more closely."
-    )
-with col2:
-    # Option 2: The ultimate "butcher," Isotonic Regression
-    enforce_monotonic = st.checkbox(
-        "Enforce Monotonic Trend", value=True,
-        help="Forces the probability trend to be 'downhill-only,' creating the most logically consistent (but aggressive) smoothing."
-    )
-
 series_list = [series_A_med, series_N_med, series_C_med]
 series_names = [gA_label, nca_label, cat_label]
 
@@ -668,22 +653,11 @@ for s in series_list:
     y_smooth = np.full_like(x_raw, np.nan, dtype=float)
 
     if len(x_fit) > poly_degree:
-        if enforce_monotonic:
-            # --- Isotonic Regression: The "Strongest Butcher" ---
-            # Isotonic regression finds the best non-decreasing fit. Since our
-            # probabilities are non-increasing, we fit the negative of our data.
-            iso_x, iso_y_neg = _pav_isotonic(x_fit, -y_fit)
-            
-            # We then interpolate from the smoothed points and flip the result back
-            y_smooth_neg = np.interp(x_raw, iso_x, iso_y_neg)
-            y_smooth = -y_smooth_neg
-            chart_title_suffix = "(Isotonic Smoothed)"
-        else:
-            # --- Polynomial Regression: The Flexible Smoother ---
-            coeffs = np.polyfit(x_fit, y_fit, poly_degree)
-            poly_func = np.poly1d(coeffs)
-            y_smooth = poly_func(x_raw)
-            chart_title_suffix = f"(Polynomial Smoothed, Degree={poly_degree})"
+        # --- Polynomial Regression: The Flexible Smoother ---
+        coeffs = np.polyfit(x_fit, y_fit, 4)
+        poly_func = np.poly1d(coeffs)
+        y_smooth = poly_func(x_raw)
+        chart_title_suffix = f"(Polynomial Smoothed, Degree={poly_degree})"
         
         smoothed_series.append(np.clip(y_smooth, 0, 100))
     else:
