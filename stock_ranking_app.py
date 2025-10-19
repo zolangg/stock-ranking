@@ -617,9 +617,9 @@ else:
     )
     st.altair_chart(chart, use_container_width=True)
 
-# ============================== Expected Push vs P(A) calibration ==============================
+# ============================== Expected Push vs CatBoost P(A) calibration ==============================
 st.markdown("### Expected Max Push vs CatBoost P(A)")
-st.caption("Empirical calibration curve: what actual Max Push (%) was achieved at each predicted CatBoost P(A) level in your DB.")
+st.caption("Empirical calibration: median realized Max Push (%) at each predicted CatBoost P(A) level.")
 
 def predict_pa_db(cat_model, df, feats):
     X = df[feats].apply(pd.to_numeric, errors="coerce")
@@ -630,22 +630,36 @@ def predict_pa_db(cat_model, df, feats):
     return pA * 100  # convert to %
 
 try:
-    df_tmp = base_df.copy()
     if cat_model and cat_model.get("ok"):
+        df_tmp = base_df.copy()
         df_tmp["CatBoost_P(A)%"] = predict_pa_db(cat_model, df_tmp, cat_model["feats"])
         bins = np.arange(0, 101, 10)
         df_tmp["pA_bin"] = pd.cut(df_tmp["CatBoost_P(A)%"], bins=bins, include_lowest=True)
-        summary = (
+
+        # Aggregate median and IQR of realized Max Push per P(A) bin
+        grouped = (
             df_tmp.groupby("pA_bin")["Max_Push_Daily_%"]
             .describe(percentiles=[0.25, 0.5, 0.75])[["25%", "50%", "75%"]]
             .rename(columns={"50%": "Median"})
             .reset_index()
         )
-        st.dataframe(summary)
+        grouped["pA_mid"] = grouped["pA_bin"].apply(lambda b: b.mid)
+
+        # Altair line + IQR band
+        base = alt.Chart(grouped).encode(x=alt.X("pA_mid:Q", title="Predicted CatBoost P(A) (%)"))
+        band = base.mark_area(opacity=0.25, color="#8b5cf6").encode(
+            y="25%:Q", y2="75%:Q"
+        )
+        line = base.mark_line(color="#8b5cf6", size=2).encode(
+            y=alt.Y("Median:Q", title="Realized Median Max Push (%)")
+        )
+        points = base.mark_point(color="#8b5cf6").encode(y="Median:Q")
+
+        st.altair_chart((band + line + points).properties(height=350), use_container_width=True)
     else:
         st.info("CatBoost model not trained in this session yet.")
 except Exception as e:
-    st.warning("Could not compute calibration table.")
+    st.warning("Could not compute or plot calibration curve.")
     st.exception(e)
 
     # Optional PNG export via Matplotlib
