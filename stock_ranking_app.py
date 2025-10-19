@@ -568,10 +568,10 @@ if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
 
-# --- choose which added stocks to include (hardened against options/value mismatch) ---
+# --- choose which added stocks to include (final, robust, no value=) ---
 sel_key = "align_sel_tickers"
 
-# Build clean, deduped options list
+# Build clean, deduped options list (UPPERCASE strings)
 all_added_tickers = [
     str(r.get("Ticker")).strip().upper()
     for r in ss.rows
@@ -579,32 +579,28 @@ all_added_tickers = [
 ]
 _seen = set()
 all_added_tickers = [t for t in all_added_tickers if t not in _seen and not _seen.add(t)]
-
-# Sanitize session value BEFORE rendering
-raw_state = st.session_state.get(sel_key, [])
-if not isinstance(raw_state, list):
-    raw_state = []
-
-# Normalize and filter to valid options only
 valid_set = set(all_added_tickers)
-sanitized = [
+
+# Sanitize session state BEFORE rendering the widget
+cur = st.session_state.get(sel_key, [])
+if not isinstance(cur, list):
+    cur = []
+cur = [
     str(t).strip().upper()
-    for t in raw_state
+    for t in cur
     if t is not None and str(t).strip().upper() in valid_set
 ]
-
 # If nothing selected (first run or options changed), default to ALL (or [] if no options)
-if not sanitized:
-    sanitized = all_added_tickers[:] if all_added_tickers else []
-
-st.session_state[sel_key] = sanitized
+if not cur:
+    cur = all_added_tickers[:] if all_added_tickers else []
+st.session_state[sel_key] = cur  # write back sanitized state
 
 csel1, csel2 = st.columns([4, 1])
 with csel1:
+    # IMPORTANT: no 'value=' here; the widget binds to st.session_state[sel_key]
     selected_tickers = st.multiselect(
         label="",
         options=all_added_tickers,
-        value=st.session_state[sel_key],
         key=sel_key,
         label_visibility="collapsed",
         placeholder="Select added tickers…",
@@ -615,7 +611,9 @@ with csel2:
     st.button("Clear", use_container_width=True, on_click=_clear_sel)
 
 # Final guardrail after user interaction
-selected_tickers = [t for t in st.session_state[sel_key] if t in valid_set]
+selected_tickers = [
+    str(t).strip().upper() for t in st.session_state[sel_key] if str(t).strip().upper() in valid_set
+]
 st.session_state[sel_key] = selected_tickers
 
 if not selected_tickers:
