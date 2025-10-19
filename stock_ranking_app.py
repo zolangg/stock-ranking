@@ -176,9 +176,8 @@ if build_btn:
                 "PM_Vol_M", "PM_$Vol_M$", "Max_Pull_PM_%", "RVOL_Max_PM_cum",
                 "Catalyst", "FR_x", "PM$Vol/MC_%"
             ]
-            # Keep only those that actually exist in the DB (trainer will warn if any get dropped later)
             INTENDED_CAT_FEATURES = [f for f in INTENDED_CAT_FEATURES if f in ss.base_df.columns]
-            ss.INTENDED_CAT_FEATURES = INTENDED_CAT_FEATURES  # store in session for trainer access
+            ss.INTENDED_CAT_FEATURES = INTENDED_CAT_FEATURES  # store for trainer access
 
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
         except Exception as e:
@@ -268,12 +267,6 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     # ---- Use ONLY the locked features (intersection with dataframe)
     feats_intended = ss.get("INTENDED_CAT_FEATURES", []) or features
     feats = [f for f in feats_intended if f in df2.columns]
-
-    # Audit: missing from DB?
-    missing = [f for f in feats_intended if f not in df2.columns]
-    if missing:
-        st.warning(f"[CatBoost] Missing features (not in DB): {', '.join(missing)}")
-
     if not feats:
         return {}
 
@@ -284,11 +277,9 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     for c in feats:
         col = pd.to_numeric(Xdf_all[c], errors="coerce").values
         col = col[np.isfinite(col)]
-        if col.size == 0:
-            st.warning(f"[CatBoost] Feature '{c}' has no finite values at this cutoff; dropping.")
+        if col.size == 0:  # no finite values
             continue
-        if np.nanstd(col) < 1e-9:
-            st.warning(f"[CatBoost] Feature '{c}' is (near) constant at this cutoff; dropping.")
+        if np.nanstd(col) < 1e-9:  # near-constant
             continue
         good_cols.append(c)
 
@@ -300,9 +291,6 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     y = (df2["__Group__"].values == gA_label).astype(int)
     mask_finite = np.isfinite(Xdf.values).all(axis=1)
     Xdf = Xdf.loc[mask_finite]; y = y[mask_finite]
-
-    # (visibility)
-    st.caption(f"[{gA_label} vs {gB_label}] Using {len(feats)} features: {', '.join(feats)} | rows={len(Xdf)}")
 
     n = len(y)
     if n < 40 or np.unique(y).size < 2:
