@@ -638,7 +638,7 @@ else:
     df_long = pd.DataFrame(data).dropna(subset=['Value'])
 
     color_domain = [gA_label, gB_label, nca_label, cat_label]
-    color_range  = ["#3b82f6", "#ef4444", "#10b981", "#8b5cf6"]
+    color_range  = ["#015e06", "#b30100", "#faa1a4", "#ff2501"]
 
     chart = (
         alt.Chart(df_long)
