@@ -599,7 +599,7 @@ def create_export_buttons(df, chart_obj, file_prefix):
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
-            label=f"Download PNG ({file_prefix})",
+            label=f"Download PNG",
             data=png_bytes, # Will be b"" if PNG generation failed
             file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
             mime="image/png",
@@ -611,7 +611,7 @@ def create_export_buttons(df, chart_obj, file_prefix):
         spec = chart_obj.to_dict()
         html_template = f'<!doctype html><html><head><meta charset="utf-8"><title>{file_prefix}</title><script src="https://cdn.jsdelivr.net/npm/vega@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head><body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{"actions": True}});</script></body></html>'
         st.download_button(
-            label=f"Download HTML ({file_prefix})",
+            label=f"Download HTML",
             data=html_template.encode("utf-8"),
             file_name=f"{file_prefix}.html",
             mime="text/html",
