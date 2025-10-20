@@ -9,8 +9,8 @@ from catboost import CatBoostClassifier
 import io
 
 # ============================== Page ==============================
-st.set_page_config(page_title="Premarket Stock Analysis", layout="wide")
-st.title("Premarket Stock Analysis")
+st.set_page_config(page_title="Premarket Stock Alignment", layout="wide")
+st.title("Premarket Stock Alignment")
 
 # ============================== Session ==============================
 ss = st.session_state
