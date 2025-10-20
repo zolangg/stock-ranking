@@ -661,6 +661,3 @@ else:
 
     # --- Chart Export Section for Absolute Probability Chart ---
     create_export_buttons(df_long, chart, "absolute_probability")
-        
-    else:
-        st.info("Not enough sequential data to calculate conditional probabilities.")
