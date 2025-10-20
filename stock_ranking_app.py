@@ -1,10 +1,3 @@
-# stock_ranking_app.py — Add-Stock + Alignment (Distributions of Added Stocks Only)
-# - Streamlined UI, High-Sensitivity CatBoost Model.
-# - Includes both Absolute and Conditional probability charts.
-# - FINAL VERSION: Conditional chart has an adjustable smoothing slider to control noise.
-# - Additions: Trust surfacing (nA/nB/ratio), Trust-weighted Final series, optional monotone check,
-#              trust table, and audit CSV export. Existing behavior preserved.
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -323,14 +316,16 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
     
-    # --- TUNED PARAMETERS ---
+# --- TUNED PARAMETERS ---
+    # Goal: Create a more "open-minded" model that is less likely to assign 0%
+    # to outliers, at the cost of potentially more false positives.
     params = dict(
         loss_function="Logloss",
         eval_metric="Logloss",
         iterations=200,
-        learning_rate=0.05,
-        depth=2,
-        l2_leaf_reg=10,
+        learning_rate=0.05,  # Slightly increased to prevent overfitting to tiny details.
+        depth=2,             # From 3 -> 2. FORCES the model to learn simpler, more general rules. This is the biggest change.
+        l2_leaf_reg=10,      # From 6 -> 10. Increased penalty for being "too certain," pushing predictions away from 0% and 100%.
         bootstrap_type="Bayesian",
         bagging_temperature=0.5,
         auto_class_weights="Balanced",
@@ -338,6 +333,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         allow_writing_files=False,
         verbose=False,
     )
+    
     if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
     else:       params.update(dict(od_type="None"))
     model = CatBoostClassifier(**params)
@@ -397,12 +393,14 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         return {}
     gA_, gB_ = list(centers_tbl.columns)
     counts = {gA_: 0.0, gB_: 0.0}
+    
     for var in centers_tbl.index:
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
         if not np.isfinite(xv): continue
         vA = centers_tbl.at[var, gA_]
         vB = centers_tbl.at[var, gB_]
         if pd.isna(vA) or pd.isna(vB): continue
+
         if abs(xv - vA) < abs(xv - vB):
             counts[gA_] += 1.0
         elif abs(xv - vB) < abs(xv - vA):
@@ -410,6 +408,7 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         else:
             counts[gA_] += 0.5
             counts[gB_] += 0.5
+            
     total = counts[gA_] + counts[gB_]
     return {
         "A_pct": 100.0 * counts[gA_] / total if total > 0 else 0.0,
@@ -442,21 +441,6 @@ def _delete_selected():
     if tickers_to_delete:
         ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(tickers_to_delete)]
         st.session_state["align_sel_tickers"] = []
-
-# --- (NEW) Trust mode small UI (non-invasive) ---
-cA, cB, cC = st.columns([1, 1, 2])
-with cA:
-    trust_mode = st.radio("Trust mode", ["Auto","Balanced","Manual"], horizontal=True, key="trust_mode")
-with cB:
-    mono_check = st.checkbox("Enforce monotonicity across cutoffs", value=True, key="mono_check")
-with cC:
-    manual_w = {}
-    if trust_mode == "Manual":
-        wm = st.slider("Median weight", 0.0, 1.0, 0.4, 0.05, key="wm")
-        wn = st.slider("NCA weight",    0.0, 1.0, 0.3, 0.05, key="wn")
-        wc = st.slider("CatBoost weight",0.0, 1.0, 0.3, 0.05, key="wc")
-        s = max(1e-9, wm+wn+wc)
-        manual_w = dict(med=wm/s, nca=wn/s, cat=wc/s)
 
 col1, col2, col3 = st.columns([6, 1, 1])
 with col1:
@@ -501,45 +485,13 @@ added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_t
 thr_labels = []
 series_A_med, series_B_med, series_N_med, series_C_med = [], [], [], []
 
-# --- (NEW) trust tracking arrays ---
-nA_list, nB_list, cls_ratio_list, trust_list = [], [], [], []
-series_FINAL_med = []
-
-# --- (NEW) trust helpers (non-invasive defaults) ---
-def _trust_weights(nA, nB, mode="Auto"):
-    tot = int(nA) + int(nB)
-    if mode == "Balanced":
-        # Cap extreme imbalance; push toward mid weights
-        if   tot >= 60: return dict(med=0.45, nca=0.35, cat=0.20), 0.95
-        elif tot >= 25: return dict(med=0.35, nca=0.35, cat=0.30), 0.80
-        else:           return dict(med=0.25, nca=0.25, cat=0.50), 0.60
-    if mode == "Manual":
-        return manual_w or dict(med=0.4, nca=0.3, cat=0.3), min(0.9, np.log1p(tot)/4.0)
-    # Auto
-    if   tot >= 60: return dict(med=0.50, nca=0.30, cat=0.20), 0.95
-    elif tot >= 25: return dict(med=0.35, nca=0.35, cat=0.30), 0.80
-    else:           return dict(med=0.20, nca=0.20, cat=0.60), 0.55
-
-def _enforce_monotone_nonincreasing(vals):
-    out = vals[:]
-    for i in range(1, len(out)):
-        if np.isfinite(out[i]) and np.isfinite(out[i-1]):
-            out[i] = min(out[i], out[i-1])
-    return out
-
 with st.spinner("Calculating distributions across all cutoffs..."):
     for thr_val in gain_cutoffs:
         df_split, gA, gB = _make_split(base_df, float(thr_val))
 
         vc = df_split["__Group__"].value_counts()
-        nA, nB = int(vc.get(gA, 0)), int(vc.get(gB, 0))
-        if (nA < 10) or (nB < 10):
+        if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
             continue
-
-        nA_list.append(nA); nB_list.append(nB)
-        tot = nA + nB
-        cls_ratio = (nA / tot) if tot else np.nan
-        cls_ratio_list.append(float(cls_ratio))
 
         nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
         cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
@@ -547,26 +499,17 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         features_for_centers = [f for f in ALLOWED_LIVE_FEATURES if f in df_split.columns]
         centers_tbl = df_split.groupby("__Group__")[features_for_centers].median().T
         if gA not in centers_tbl.columns or gB not in centers_tbl.columns:
-            # keep trust arrays aligned if we skip
-            nA_list.pop(); nB_list.pop(); cls_ratio_list.pop()
             continue
         centers_tbl = centers_tbl[[gA, gB]]
 
         req_feats = sorted(set(nca_model.get("feats", []) + cat_model.get("feats", []) + features_for_centers))
-        if not req_feats:
-            nA_list.pop(); nB_list.pop(); cls_ratio_list.pop()
-            continue
+        if not req_feats: continue
 
-        if added_df.empty:
-            nA_list.pop(); nB_list.pop(); cls_ratio_list.pop()
-            continue
-
+        if added_df.empty: continue
         Xadd = added_df[req_feats].apply(pd.to_numeric, errors="coerce")
         mask = np.isfinite(Xadd.values).all(axis=1)
         pred_rows = added_df.loc[mask].to_dict(orient="records")
-        if len(pred_rows) == 0:
-            nA_list.pop(); nB_list.pop(); cls_ratio_list.pop()
-            continue
+        if len(pred_rows) == 0: continue
 
         pN, pC, pA_centers, pB_centers = [], [], [], []
         for r in pred_rows:
@@ -582,7 +525,6 @@ with st.spinner("Calculating distributions across all cutoffs..."):
                 pB_centers.append(center_scores['B_pct'])
 
         if not any([pN, pC, pA_centers]):
-            nA_list.pop(); nB_list.pop(); cls_ratio_list.pop()
             continue
 
         thr_labels.append(int(thr_val))
@@ -591,51 +533,47 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         series_A_med.append(float(np.nanmedian(pA_centers)) if pA_centers else np.nan)
         series_B_med.append(float(np.nanmedian(pB_centers)) if pB_centers else np.nan)
 
-        # --- (NEW) compute trust & Final (trust-weighted) per threshold
-        wts, trust_score = _trust_weights(nA, nB, mode=trust_mode)
-        trust_list.append(float(trust_score))
-
-        med_val = series_A_med[-1] if series_A_med else np.nan   # median alignment A%
-        nca_val = series_N_med[-1] if series_N_med else np.nan
-        cat_val = series_C_med[-1] if series_C_med else np.nan
-
-        # If data is extremely thin, skip Final to avoid false precision
-        if tot < 15:
-            series_FINAL_med.append(np.nan)
-        else:
-            final_med = (
-                (0.0 if np.isnan(med_val) else wts["med"] * med_val) +
-                (0.0 if np.isnan(nca_val) else wts["nca"] * nca_val) +
-                (0.0 if np.isnan(cat_val) else wts["cat"] * cat_val)
-            )
-            series_FINAL_med.append(float(final_med))
-
 # --- FINAL, ROBUST VERSION: Function to generate export buttons for any chart ---
 def create_export_buttons(df, chart_obj, file_prefix):
     """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
+    # Initialize with empty bytes. This is the key to preventing the crash.
     png_bytes = b""
+    
     try:
+        # --- Start of the safe block ---
+        # All complex operations for PNG generation are now inside this try...except block.
+        
+        # 1. Prepare data by pivoting
         x_axis_col = df.columns[0]
         pivot = df.pivot(index=x_axis_col, columns="Series", values="Value").sort_index()
         series_names = list(pivot.columns)
+        
+        # 2. Robustly extract colors from the chart's dictionary representation
         chart_dict = chart_obj.to_dict()
         unique_colors = {}
         try:
+            # This path is more stable than accessing object attributes directly
             domain = chart_dict['encoding']['color']['scale']['domain']
             range_ = chart_dict['encoding']['color']['scale']['range']
             unique_colors = dict(zip(domain, range_))
         except KeyError:
+            # Fallback if the color scale is not explicitly defined
             pass
+
         colors = [unique_colors.get(s, "#999999") for s in series_names]
+        
+        # 3. Create the Matplotlib figure
         x_labels = [str(label) for label in pivot.index.tolist()]
         n_groups, n_series = len(x_labels), len(series_names)
         x_pos = np.arange(n_groups)
         bar_width = 0.8 / max(n_series, 1)
+
         fig, ax = plt.subplots(figsize=(max(7, n_groups * 0.6), 5))
         for i, series_name in enumerate(series_names):
             vals = pivot[series_name].values.astype(float)
             offset = i * bar_width - (n_series - 1) * bar_width / 2
             ax.bar(x_pos + offset, vals, width=bar_width, label=series_name, color=colors[i])
+
         ax.set_xticks(x_pos)
         ax.set_xticklabels(x_labels, rotation=45, ha="right")
         ax.set_ylim(0, 100)
@@ -643,24 +581,31 @@ def create_export_buttons(df, chart_obj, file_prefix):
         ax.set_ylabel("Value (%)")
         ax.legend(loc="upper left", frameon=False)
         ax.set_title(chart_obj.title)
+        
+        # 4. Save figure to a bytes buffer
         buf = io.BytesIO()
         fig.tight_layout()
         fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
         plt.close(fig)
         png_bytes = buf.getvalue()
-    except Exception:
+
+    except Exception as e:
+        # If ANY of the above steps fail, we silently pass.
+        # png_bytes will remain empty (b""), disabling the PNG button
+        # but allowing the script to continue and render the HTML button.
         pass
 
+    # --- This part will now always be reached ---
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
             label=f"Download PNG",
-            data=png_bytes,
+            data=png_bytes, # Will be b"" if PNG generation failed
             file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
             mime="image/png",
             use_container_width=True,
             key=f"dl_png_{file_prefix}",
-            disabled=not png_bytes
+            disabled=not png_bytes # This correctly disables the button if png_bytes is empty
         )
     with col2:
         spec = chart_obj.to_dict()
@@ -677,85 +622,37 @@ def create_export_buttons(df, chart_obj, file_prefix):
 if not thr_labels:
     st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
-    # --- Optional monotonic sanity on final (non-invasive) ---
-    if mono_check and series_FINAL_med:
-        series_FINAL_med = _enforce_monotone_nonincreasing(series_FINAL_med)
-
     # --- Absolute Probability Chart (Main Chart) ---
     data = []
     gA_label = f"≥...% (Median Centers)"
     gB_label = f"Rest (Median Centers)"
     nca_label = f"NCA: P(≥...%)"
     cat_label = f"CatBoost: P(≥...%)"
-    final_label = "Final (Trust-Weighted)"
-
-    # build base series rows
+    
     for i, thr in enumerate(thr_labels):
         data.append({"GainCutoff_%": thr, "Series": gA_label, "Value": series_A_med[i]})
         data.append({"GainCutoff_%": thr, "Series": gB_label, "Value": series_B_med[i]})
         data.append({"GainCutoff_%": thr, "Series": nca_label, "Value": series_N_med[i]})
         data.append({"GainCutoff_%": thr, "Series": cat_label, "Value": series_C_med[i]})
-        # add final if finite
-        if i < len(series_FINAL_med) and np.isfinite(series_FINAL_med[i]):
-            data.append({"GainCutoff_%": thr, "Series": final_label, "Value": series_FINAL_med[i]})
 
     df_long = pd.DataFrame(data).dropna(subset=['Value'])
 
-    # --- (NEW) trust diagnostics table above chart ---
-    trust_tbl = pd.DataFrame({
-        "Cutoff_%": thr_labels,
-        "nA (≥cutoff)": nA_list[:len(thr_labels)],
-        "nB (Rest)": nB_list[:len(thr_labels)],
-        "Class ratio": [round(x, 3) if np.isfinite(x) else np.nan for x in cls_ratio_list[:len(thr_labels)]],
-        "Trust (0–1)": [round(x, 3) if np.isfinite(x) else np.nan for x in trust_list[:len(thr_labels)]],
-        final_label: [series_FINAL_med[i] if i < len(series_FINAL_med) else np.nan for i in range(len(thr_labels))]
-    })
-    st.dataframe(trust_tbl, use_container_width=True, hide_index=True)
-
-    # color & encoding
     color_domain = [gA_label, gB_label, nca_label, cat_label]
     color_range  = ["#3b82f6", "#ef4444", "#10b981", "#8b5cf6"]
 
-    bars = (
-        alt.Chart(df_long[df_long["Series"].isin([gA_label, gB_label, nca_label, cat_label])])
+    chart = (
+        alt.Chart(df_long)
         .mark_bar()
         .encode(
-            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {25})"),
+            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {gain_cutoffs[1]-gain_cutoffs[0]})"),
             y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
             xOffset="Series:N",
-            tooltip=[
-                "GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")
-            ],
+            tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
         )
         .properties(height=400, title="Absolute Probability of Reaching Gain Cutoff")
     )
-
-    # --- (NEW) overlay Final (trust-weighted) as a line with points
-    final_df = df_long[df_long["Series"]==final_label]
-    final_layer = alt.Chart(final_df).mark_line(point=True).encode(
-        x="GainCutoff_%:O",
-        y=alt.Y("Value:Q", title=""),
-        tooltip=[
-            "GainCutoff_%:O",
-            alt.Tooltip("Value:Q", format=".1f", title=final_label)
-        ]
-    )
-
-    chart = (bars + final_layer)
     st.altair_chart(chart, use_container_width=True)
 
     # --- Chart Export Section for Absolute Probability Chart ---
     create_export_buttons(df_long, chart, "absolute_probability")
-
-    # --- (NEW) Audit CSV export (series + trust, for offline review) ---
-    # Merge trust into long DF by cutoff
-    trust_for_merge = trust_tbl.rename(columns={"Cutoff_%":"GainCutoff_%"})
-    audit_df = df_long.merge(trust_for_merge, on="GainCutoff_%", how="left")
-    st.download_button(
-        "Download trust audit CSV",
-        audit_df.to_csv(index=False).encode("utf-8"),
-        file_name="alignment_trust_audit.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
