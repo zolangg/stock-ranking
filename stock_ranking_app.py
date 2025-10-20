@@ -650,7 +650,6 @@ else:
             xOffset="Series:N",
             tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
         )
-        .properties(height=400, title="Absolute Probability of Reaching Gain Cutoff")
     )
     st.altair_chart(chart, use_container_width=True)
 
