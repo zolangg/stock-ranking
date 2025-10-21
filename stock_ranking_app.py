@@ -450,7 +450,7 @@ col1, col2, col3, col4 = st.columns([2, 5, 1.2, 1.2])
 with col1:
     split_mode = st.selectbox(
         "",
-        options=["Gain% vs Rest", "FT=1 (Gain% cutoff) vs FT=0"],
+        options=["Gain%", "FT Gain%"],
         index=0,
         label_visibility="collapsed",
     )
