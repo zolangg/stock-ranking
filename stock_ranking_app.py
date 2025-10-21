@@ -461,10 +461,10 @@ with col3:
     st.button("Delete", use_container_width=True, on_click=_delete_selected, help="Deletes the stocks currently selected in the box.", disabled=not selected_tickers)
 with col4:
     split_mode = st.selectbox(
-        "Split mode",
+        "",
         options=["Gain% vs Rest", "FT=1 (Gain% cutoff) vs FT=0"],
         index=0,
-        help="Choose how to define the two groups for alignment across Gain% cutoffs."
+        label_visibility="collapsed",
     )
 
 if not selected_tickers:
