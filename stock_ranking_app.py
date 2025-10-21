@@ -95,15 +95,18 @@ if build_btn:
             add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
             add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
 
-            cand_catalyst = _pick(raw, ["catalyst","catalyst?","has catalyst","news catalyst","catalyst_yn","cat"])
-            def _to_binary_local(v):
-                sv = str(v).strip().lower()
-                if sv in {"1","true","yes","y","t"}: return 1.0
-                if sv in {"0","false","no","n","f"}: return 0.0
-                try:
-                    fv = float(sv); return 1.0 if fv >= 0.5 else 0.0
-                except: return np.nan
-            if cand_catalyst: df["Catalyst"] = raw[cand_catalyst].map(_to_binary_local)
+            # --- NEW: load FT (Follow Through flag) if present ---
+            cand_ft = _pick(raw, ["FT","Follow Through","FT_flag","FT=1","FollowThrough","ft"])
+            if cand_ft:
+                def _to_ft_flag(v):
+                    sv = str(v).strip().lower()
+                    if sv in {"1","true","yes","y","t"}: return 1
+                    if sv in {"0","false","no","n","f"}: return 0
+                    try:
+                        return 1 if float(sv) >= 0.5 else 0
+                    except:
+                        return np.nan
+                df["FT"] = raw[cand_ft].map(_to_ft_flag)
 
             float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
             if {"PM_Vol_M", float_basis}.issubset(df.columns):
@@ -122,7 +125,7 @@ if build_btn:
                 if pmh_col is not None else np.nan
             )
             
-            keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%"])
+            keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT"])  # include FT if present
             df = df[[c for c in df.columns if c in keep_cols]].copy()
 
             ss.base_df = df
@@ -324,8 +327,8 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         eval_metric="Logloss",
         iterations=200,
         learning_rate=0.05,  # Slightly increased to prevent overfitting to tiny details.
-        depth=2,             # From 3 -> 2. FORCES the model to learn simpler, more general rules. This is the biggest change.
-        l2_leaf_reg=10,      # From 6 -> 10. Increased penalty for being "too certain," pushing predictions away from 0% and 100%.
+        depth=2,             # From 3 -> 2. Simpler rules.
+        l2_leaf_reg=10,      # More regularization.
         bootstrap_type="Bayesian",
         bagging_temperature=0.5,
         auto_class_weights="Balanced",
@@ -442,7 +445,8 @@ def _delete_selected():
         ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(tickers_to_delete)]
         st.session_state["align_sel_tickers"] = []
 
-col1, col2, col3 = st.columns([6, 1, 1])
+# --- Controls row: multiselect, Clear, Delete, and NEW split-mode dropdown on the same line ---
+col1, col2, col3, col4 = st.columns([5, 1.2, 1.2, 2])
 with col1:
     selected_tickers = st.multiselect(
         "Select stocks to include in the charts below. The delete button will act on this selection.",
@@ -455,6 +459,13 @@ with col2:
     st.button("Clear", use_container_width=True, on_click=_clear_selection, help="Clears the current selection in the box.")
 with col3:
     st.button("Delete", use_container_width=True, on_click=_delete_selected, help="Deletes the stocks currently selected in the box.", disabled=not selected_tickers)
+with col4:
+    split_mode = st.selectbox(
+        "Split mode",
+        options=["Gain% vs Rest", "FT=1 (Gain% cutoff) vs FT=0"],
+        index=0,
+        help="Choose how to define the two groups for alignment across Gain% cutoffs."
+    )
 
 if not selected_tickers:
     st.info("No stocks selected. Pick at least one added ticker to display the chart.")
@@ -471,13 +482,22 @@ if not var_all:
 
 gain_cutoffs = list(range(25, 301, 25))
 
-def _make_split(df_base: pd.DataFrame, thr_val: float):
+def _make_split(df_base: pd.DataFrame, thr_val: float, mode: str):
     df_tmp = df_base.copy()
-    df_tmp["__Group__"] = np.where(
-        pd.to_numeric(df_tmp["Max_Push_Daily_%"], errors="coerce") >= thr_val,
-        f"≥{int(thr_val)}%", "Rest"
-    )
-    gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
+
+    if mode == "FT=1 (Gain% cutoff) vs FT=0" and "FT" in df_tmp.columns:
+        # Group A: FT=1 with Max_Push_Daily_% >= thr
+        # Group B: FT=0 (all FT=0 names, any Gain%)
+        gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0"
+        m_ft = pd.to_numeric(df_tmp.get("FT"), errors="coerce")
+        m_gain = pd.to_numeric(df_tmp.get("Max_Push_Daily_%"), errors="coerce")
+        df_tmp["__Group__"] = np.where((m_ft == 1) & (m_gain >= thr_val), gA_, "FT=0")
+    else:
+        # Default: Gain% vs Rest (entire universe)
+        gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
+        m_gain = pd.to_numeric(df_tmp.get("Max_Push_Daily_%"), errors="coerce")
+        df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, "Rest")
+
     return df_tmp, gA_, gB_
 
 added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
@@ -487,7 +507,7 @@ series_A_med, series_B_med, series_N_med, series_C_med = [], [], [], []
 
 with st.spinner("Calculating distributions across all cutoffs..."):
     for thr_val in gain_cutoffs:
-        df_split, gA, gB = _make_split(base_df, float(thr_val))
+        df_split, gA, gB = _make_split(base_df, float(thr_val), split_mode)
 
         vc = df_split["__Group__"].value_counts()
         if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
@@ -541,8 +561,6 @@ def create_export_buttons(df, chart_obj, file_prefix):
     
     try:
         # --- Start of the safe block ---
-        # All complex operations for PNG generation are now inside this try...except block.
-        
         # 1. Prepare data by pivoting
         x_axis_col = df.columns[0]
         pivot = df.pivot(index=x_axis_col, columns="Series", values="Value").sort_index()
@@ -552,12 +570,10 @@ def create_export_buttons(df, chart_obj, file_prefix):
         chart_dict = chart_obj.to_dict()
         unique_colors = {}
         try:
-            # This path is more stable than accessing object attributes directly
             domain = chart_dict['encoding']['color']['scale']['domain']
             range_ = chart_dict['encoding']['color']['scale']['range']
             unique_colors = dict(zip(domain, range_))
         except KeyError:
-            # Fallback if the color scale is not explicitly defined
             pass
 
         colors = [unique_colors.get(s, "#999999") for s in series_names]
@@ -589,23 +605,19 @@ def create_export_buttons(df, chart_obj, file_prefix):
         plt.close(fig)
         png_bytes = buf.getvalue()
 
-    except Exception as e:
-        # If ANY of the above steps fail, we silently pass.
-        # png_bytes will remain empty (b""), disabling the PNG button
-        # but allowing the script to continue and render the HTML button.
+    except Exception:
         pass
 
-    # --- This part will now always be reached ---
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
             label=f"Download PNG",
-            data=png_bytes, # Will be b"" if PNG generation failed
+            data=png_bytes,
             file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
             mime="image/png",
             use_container_width=True,
             key=f"dl_png_{file_prefix}",
-            disabled=not png_bytes # This correctly disables the button if png_bytes is empty
+            disabled=not png_bytes
         )
     with col2:
         spec = chart_obj.to_dict()
@@ -624,10 +636,17 @@ if not thr_labels:
 else:
     # --- Absolute Probability Chart (Main Chart) ---
     data = []
-    gA_label = f"≥...% (Median Centers)"
-    gB_label = f"Rest (Median Centers)"
-    nca_label = f"NCA: P(≥...%)"
-    cat_label = f"CatBoost: P(≥...%)"
+
+    if 'split_mode' in locals() and split_mode == "FT=1 (Gain% cutoff) vs FT=0":
+        gA_label = "FT=1 ≥...% (Median Centers)"
+        gB_label = "FT=0 (Median Centers)"
+        nca_label = "NCA: P(FT=1 ≥...%)"
+        cat_label = "CatBoost: P(FT=1 ≥...%)"
+    else:
+        gA_label = "≥...% (Median Centers)"
+        gB_label = "Rest (Median Centers)"
+        nca_label = "NCA: P(≥...%)"
+        cat_label = "CatBoost: P(≥...%)"
     
     for i, thr in enumerate(thr_labels):
         data.append({"GainCutoff_%": thr, "Series": gA_label, "Value": series_A_med[i]})
@@ -644,7 +663,7 @@ else:
         alt.Chart(df_long)
         .mark_bar()
         .encode(
-            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {gain_cutoffs[1]-gain_cutoffs[0]})"),
+            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {25})"),
             y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
             xOffset="Series:N",
