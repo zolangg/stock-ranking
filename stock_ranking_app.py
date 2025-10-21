@@ -446,8 +446,15 @@ def _delete_selected():
         st.session_state["align_sel_tickers"] = []
 
 # --- Controls row: multiselect, Clear, Delete, and NEW split-mode dropdown on the same line ---
-col1, col2, col3, col4 = st.columns([5, 1.2, 1.2, 2])
+col1, col2, col3, col4 = st.columns([2, 5, 1.2, 1.2])
 with col1:
+    split_mode = st.selectbox(
+        "",
+        options=["Gain% vs Rest", "FT=1 (Gain% cutoff) vs FT=0"],
+        index=0,
+        label_visibility="collapsed",
+    )
+with col2:
     selected_tickers = st.multiselect(
         "Select stocks to include in the charts below. The delete button will act on this selection.",
         options=all_added_tickers,
@@ -455,17 +462,10 @@ with col1:
         key="align_sel_tickers",
         label_visibility="collapsed",
     )
-with col2:
-    st.button("Clear", use_container_width=True, on_click=_clear_selection, help="Clears the current selection in the box.")
 with col3:
-    st.button("Delete", use_container_width=True, on_click=_delete_selected, help="Deletes the stocks currently selected in the box.", disabled=not selected_tickers)
+    st.button("Clear", use_container_width=True, on_click=_clear_selection, help="Clears the current selection in the box.")
 with col4:
-    split_mode = st.selectbox(
-        "",
-        options=["Gain% vs Rest", "FT=1 (Gain% cutoff) vs FT=0"],
-        index=0,
-        label_visibility="collapsed",
-    )
+    st.button("Delete", use_container_width=True, on_click=_delete_selected, help="Deletes the stocks currently selected in the box.", disabled=not selected_tickers)
 
 if not selected_tickers:
     st.info("No stocks selected. Pick at least one added ticker to display the chart.")
