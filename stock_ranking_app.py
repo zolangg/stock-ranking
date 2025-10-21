@@ -485,7 +485,7 @@ gain_cutoffs = list(range(25, 301, 25))
 def _make_split(df_base: pd.DataFrame, thr_val: float, mode: str):
     df_tmp = df_base.copy()
 
-    if mode == "FT=1 (Gain% cutoff) vs FT=0" and "FT" in df_tmp.columns:
+    if mode == "FT Gain%" and "FT" in df_tmp.columns:
         # Group A: FT=1 with Max_Push_Daily_% >= thr
         # Group B: FT=0 (all FT=0 names, any Gain%)
         gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0"
@@ -637,7 +637,7 @@ else:
     # --- Absolute Probability Chart (Main Chart) ---
     data = []
 
-    if 'split_mode' in locals() and split_mode == "FT=1 (Gain% cutoff) vs FT=0":
+    if 'split_mode' in locals() and split_mode == "FT Gain%":
         gA_label = "FT=1 ≥...% (Median Centers)"
         gB_label = "FT=0 (Median Centers)"
         nca_label = "NCA: P(FT=1 ≥...%)"
