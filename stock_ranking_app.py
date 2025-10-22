@@ -94,9 +94,7 @@ if build_btn:
             add_num(df, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
             add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
             add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
-            add_num(df, "Eta_%_per_min",    ["η (%/min)","eta (%/min)","eta %/min","eta_per_min_%","eta_per_min (fractioned)","eta_per_min","efficiency η (%/min)","efficiency (%/min)"])
-            add_num(df, "Decay_Ratio",      ["decay ratio","decay_ratio","decayratio","decay r","decay r."])
-            
+
             # --- NEW: load FT (Follow Through flag) if present ---
             cand_ft = _pick(raw, ["FT","Follow Through","FT_flag","FT=1","FollowThrough","ft"])
             if cand_ft:
@@ -127,7 +125,7 @@ if build_btn:
                 if pmh_col is not None else np.nan
             )
             
-            keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT", "Eta_%_per_min", "Decay_Ratio"])  # include FT if present
+            keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT"])  # include FT if present
             df = df[[c for c in df.columns if c in keep_cols]].copy()
 
             ss.base_df = df
@@ -177,6 +175,7 @@ if submitted and ticker:
     st.success(f"Saved {ticker}.")
 
 # ============================== Isotonic helpers & Model Training ==============================
+# (All functions in this block are unchanged)
 def _pav_isotonic(x, y):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     if x.size == 0: return [], []
@@ -315,20 +314,21 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
     tr_idx, va_idx = next(sss.split(X_all, y_all))
     Xtr, Xva = X_all[tr_idx], X_all[va_idx]
-    ytr, yva = y_all[tr_idx], y_all[va_idx]  # <-- FIXED unpack (no ValueError)
-
+    ytr, yva = y_all[tr_idx], y_all[va_idx]
     def _has_both_classes(arr):
         return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
     
-    # --- TUNED PARAMETERS ---
+# --- TUNED PARAMETERS ---
+    # Goal: Create a more "open-minded" model that is less likely to assign 0%
+    # to outliers, at the cost of potentially more false positives.
     params = dict(
         loss_function="Logloss",
         eval_metric="Logloss",
         iterations=200,
-        learning_rate=0.05,
-        depth=2,
-        l2_leaf_reg=10,
+        learning_rate=0.05,  # Slightly increased to prevent overfitting to tiny details.
+        depth=2,             # From 3 -> 2. Simpler rules.
+        l2_leaf_reg=10,      # More regularization.
         bootstrap_type="Bayesian",
         bagging_temperature=0.5,
         auto_class_weights="Balanced",
@@ -364,8 +364,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
                     s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
                     m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
                     platt = (m, k)
-    except Exception:
-        pass
+    except Exception: pass
     return {"ok": True, "feats": feats, "gA": gA_label, "gB": gB_label, "cb": model, "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(), "platt": platt}
 
 def _cat_predict_proba_row(xrow: dict, model: dict) -> float:
@@ -382,8 +381,7 @@ def _cat_predict_proba_row(xrow: dict, model: dict) -> float:
         cb = model.get("cb")
         if cb is None: return np.nan
         z = float(cb.predict_proba(X)[0, 1])
-    except Exception:
-        return np.nan
+    except Exception: return np.nan
     iso_bx = np.array(model.get("iso_bx", []), dtype=float)
     iso_by = np.array(model.get("iso_by", []), dtype=float)
     if iso_bx.size >= 2 and iso_by.size >= 2:
@@ -398,12 +396,14 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         return {}
     gA_, gB_ = list(centers_tbl.columns)
     counts = {gA_: 0.0, gB_: 0.0}
+    
     for var in centers_tbl.index:
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
         if not np.isfinite(xv): continue
         vA = centers_tbl.at[var, gA_]
         vB = centers_tbl.at[var, gB_]
         if pd.isna(vA) or pd.isna(vB): continue
+
         if abs(xv - vA) < abs(xv - vB):
             counts[gA_] += 1.0
         elif abs(xv - vB) < abs(xv - vA):
@@ -411,6 +411,7 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         else:
             counts[gA_] += 0.5
             counts[gB_] += 0.5
+            
     total = counts[gA_] + counts[gB_]
     return {
         "A_pct": 100.0 * counts[gA_] / total if total > 0 else 0.0,
@@ -444,17 +445,12 @@ def _delete_selected():
         ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(tickers_to_delete)]
         st.session_state["align_sel_tickers"] = []
 
-# --- Controls row: multiselect, Clear, Delete, and split-mode dropdown ---
+# --- Controls row: multiselect, Clear, Delete, and NEW split-mode dropdown on the same line ---
 col1, col2, col3, col4 = st.columns([2, 5, 1.2, 1.2])
 with col1:
     split_mode = st.selectbox(
         "",
-        options=[
-            "Gain%",        # Group A: Max_Push_Daily_% ≥ thr
-            "FT Gain%",     # Group A: FT=1 ∧ Max_Push_Daily_% ≥ thr
-            "Efficiency η", # A: η ≥ 1 vs η < 1 within Gain% ≥ thr
-            "Decay Ratio",  # A: Decay > 1 vs Decay ≤ 1 within Gain% ≥ thr
-        ],
+        options=["Gain%", "FT Gain%"],
         index=0,
         label_visibility="collapsed",
     )
@@ -484,55 +480,24 @@ if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
     st.stop()
 
-# Cutoff ladder (Gain% only for x-axis)
-gain_cutoffs = list(range(25, 301, 25))  # % (already scaled 0–100)
+gain_cutoffs = list(range(25, 301, 25))
 
 def _make_split(df_base: pd.DataFrame, thr_val: float, mode: str):
     df_tmp = df_base.copy()
 
-    col_gain = "Max_Push_Daily_%"
-    col_eta  = "Eta_%_per_min"
-    col_dec  = "Decay_Ratio"
-    col_ft   = "FT" if "FT" in df_tmp.columns else None
-
-    m_gain = pd.to_numeric(df_tmp.get(col_gain), errors="coerce") if col_gain in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
-    m_eta  = pd.to_numeric(df_tmp.get(col_eta),  errors="coerce") if col_eta  in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
-    m_dec  = pd.to_numeric(df_tmp.get(col_dec),  errors="coerce") if col_dec  in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
-    m_ft   = pd.to_numeric(df_tmp.get(col_ft),   errors="coerce") if col_ft   else pd.Series(np.nan, index=df_tmp.index)
-
-    if mode == "Gain%":
+    if mode == "FT Gain%" and "FT" in df_tmp.columns:
+        # Group A: FT=1 with Max_Push_Daily_% >= thr
+        # Group B: FT=0 (all FT=0 names, any Gain%)
+        gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0"
+        m_ft = pd.to_numeric(df_tmp.get("FT"), errors="coerce")
+        m_gain = pd.to_numeric(df_tmp.get("Max_Push_Daily_%"), errors="coerce")
+        df_tmp["__Group__"] = np.where((m_ft == 1) & (m_gain >= thr_val), gA_, "FT=0")
+    else:
+        # Default: Gain% vs Rest (entire universe)
         gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
-        df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
-        return df_tmp, gA_, gB_
+        m_gain = pd.to_numeric(df_tmp.get("Max_Push_Daily_%"), errors="coerce")
+        df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, "Rest")
 
-    if mode == "FT Gain%":
-        if col_ft is None:
-            gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
-            df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
-        else:
-            gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0"
-            df_tmp["__Group__"] = np.where((m_ft == 1) & (m_gain >= thr_val), gA_, "FT=0")
-        return df_tmp, gA_, gB_
-        
-    if mode == "Efficiency η":
-        # Filter by Gain% cutoff, then split by η >= 1 vs η < 1
-        df_tmp = df_tmp[m_gain >= float(thr_val)].copy()
-        m_eta  = pd.to_numeric(df_tmp.get(col_eta), errors="coerce") if col_eta in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
-        gA_, gB_ = "η ≥ 1 (%/min)", "η < 1 (%/min)"
-        df_tmp["__Group__"] = np.where(m_eta >= 1.0, gA_, gB_)
-        return df_tmp, gA_, gB_
-
-    if mode == "Decay Ratio":
-        # Filter by Gain% cutoff, then split by Decay > 1 vs ≤ 1
-        df_tmp = df_tmp[m_gain >= float(thr_val)].copy()
-        m_dec  = pd.to_numeric(df_tmp.get(col_dec), errors="coerce") if col_dec in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
-        gA_, gB_ = "Decay > 1", "Decay ≤ 1"
-        df_tmp["__Group__"] = np.where(m_dec > 1.0, gA_, gB_)
-        return df_tmp, gA_, gB_
-
-    # Fallback (original Gain%)
-    gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
-    df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
     return df_tmp, gA_, gB_
 
 added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
@@ -545,7 +510,7 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         df_split, gA, gB = _make_split(base_df, float(thr_val), split_mode)
 
         vc = df_split["__Group__"].value_counts()
-        if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
+        if (vc.get(gA, 0) < 6) or (vc.get(gB, 0) < 6):
             continue
 
         nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
@@ -582,7 +547,7 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         if not any([pN, pC, pA_centers]):
             continue
 
-        thr_labels.append(float(thr_val))
+        thr_labels.append(int(thr_val))
         series_N_med.append(float(np.nanmedian(pN)) if pN else np.nan)
         series_C_med.append(float(np.nanmedian(pC)) if pC else np.nan)
         series_A_med.append(float(np.nanmedian(pA_centers)) if pA_centers else np.nan)
@@ -591,27 +556,29 @@ with st.spinner("Calculating distributions across all cutoffs..."):
 # --- FINAL, ROBUST VERSION: Function to generate export buttons for any chart ---
 def create_export_buttons(df, chart_obj, file_prefix):
     """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
+    # Initialize with empty bytes. This is the key to preventing the crash.
     png_bytes = b""
+    
     try:
-        # Ensure numeric order for export
-        if "ThresholdNum" in df.columns:
-            df = df.sort_values("ThresholdNum")
-        x_axis_col = "Threshold"
-        pivot = df.pivot(index=x_axis_col, columns="Series", values="Value")
+        # --- Start of the safe block ---
+        # 1. Prepare data by pivoting
+        x_axis_col = df.columns[0]
+        pivot = df.pivot(index=x_axis_col, columns="Series", values="Value").sort_index()
         series_names = list(pivot.columns)
-
-        # Extract colors from Altair chart if present
+        
+        # 2. Robustly extract colors from the chart's dictionary representation
         chart_dict = chart_obj.to_dict()
         unique_colors = {}
         try:
             domain = chart_dict['encoding']['color']['scale']['domain']
             range_ = chart_dict['encoding']['color']['scale']['range']
             unique_colors = dict(zip(domain, range_))
-        except Exception:
+        except KeyError:
             pass
+
         colors = [unique_colors.get(s, "#999999") for s in series_names]
         
-        # Matplotlib figure
+        # 3. Create the Matplotlib figure
         x_labels = [str(label) for label in pivot.index.tolist()]
         n_groups, n_series = len(x_labels), len(series_names)
         x_pos = np.arange(n_groups)
@@ -629,20 +596,22 @@ def create_export_buttons(df, chart_obj, file_prefix):
         ax.set_xlabel(x_axis_col)
         ax.set_ylabel("Value (%)")
         ax.legend(loc="upper left", frameon=False)
-        ax.set_title(chart_dict.get("title", ""))
-
+        ax.set_title(chart_obj.title)
+        
+        # 4. Save figure to a bytes buffer
         buf = io.BytesIO()
         fig.tight_layout()
         fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
         plt.close(fig)
         png_bytes = buf.getvalue()
+
     except Exception:
         pass
 
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
-            label="Download PNG",
+            label=f"Download PNG",
             data=png_bytes,
             file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
             mime="image/png",
@@ -652,9 +621,9 @@ def create_export_buttons(df, chart_obj, file_prefix):
         )
     with col2:
         spec = chart_obj.to_dict()
-        html_template = f'<!doctype html><html><head><meta charset="utf-8"><title>{file_prefix}</title><script src="https://cdn.jsdelivr.net/npm/vega@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head><body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{"actions": true}});</script></body></html>'
+        html_template = f'<!doctype html><html><head><meta charset="utf-8"><title>{file_prefix}</title><script src="https://cdn.jsdelivr.net/npm/vega@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head><body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{"actions": True}});</script></body></html>'
         st.download_button(
-            label="Download HTML",
+            label=f"Download HTML",
             data=html_template.encode("utf-8"),
             file_name=f"{file_prefix}.html",
             mime="text/html",
@@ -665,47 +634,25 @@ def create_export_buttons(df, chart_obj, file_prefix):
 if not thr_labels:
     st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
-    # --- Safe defaults for x-axis values (avoid NameError) ---
-    x_key   = "Threshold"
-    x_title = "Gain% cutoff"
-    x_vals  = list(thr_labels)  # numeric thresholds collected above
-    thr_fmt = lambda v: f"{int(v)}" if float(v).is_integer() else f"{v:g}"
-
-    # --- Adaptive labels per mode (x stays Gain% for all modes here) ---
-    if split_mode == "FT Gain%":
-        gA_label = "FT=1 ≥ thr (Median Centers)"
-        gB_label = "FT=0 (Median Centers)"
-        nca_label = "NCA: P(FT=1 ≥ thr)"
-        cat_label = "CatBoost: P(FT=1 ≥ thr)"
-        x_title  = "Gain% cutoff"
-    elif split_mode == "Gain%":
-        gA_label = "≥ thr (Median Centers)"
-        gB_label = "Rest (Median Centers)"
-        nca_label = "NCA: P(≥ thr)"
-        cat_label = "CatBoost: P(≥ thr)"
-        x_title  = "Gain% cutoff"
-    elif split_mode == "Efficiency η":
-        gA_label = "η ≥ 1 (Median Centers)"
-        gB_label = "η < 1 (Median Centers)"
-        nca_label = "NCA: P(η ≥ 1)"
-        cat_label = "CatBoost: P(η ≥ 1)"
-        x_title  = "Gain% cutoff (filter)"
-    else:  # "Decay Ratio"
-        gA_label = "Decay > 1 (Median Centers)"
-        gB_label = "Decay ≤ 1 (Median Centers)"
-        nca_label = "NCA: P(Decay > 1)"
-        cat_label = "CatBoost: P(Decay > 1)"
-        x_title  = "Gain% cutoff (filter)"
-    
-    # --- Build long data with numeric sort key ---
+    # --- Absolute Probability Chart (Main Chart) ---
     data = []
-    for i, thr in enumerate(x_vals):
-        label_val = thr_fmt(thr)
-        sort_val  = float(thr)
-        data.append({x_key: label_val, "ThresholdNum": sort_val, "Series": gA_label,  "Value": series_A_med[i]})
-        data.append({x_key: label_val, "ThresholdNum": sort_val, "Series": gB_label,  "Value": series_B_med[i]})
-        data.append({x_key: label_val, "ThresholdNum": sort_val, "Series": nca_label, "Value": series_N_med[i]})
-        data.append({x_key: label_val, "ThresholdNum": sort_val, "Series": cat_label, "Value": series_C_med[i]})
+
+    if 'split_mode' in locals() and split_mode == "FT Gain%":
+        gA_label = "FT=1 ≥...% (Median Centers)"
+        gB_label = "FT=0 (Median Centers)"
+        nca_label = "NCA: P(FT=1 ≥...%)"
+        cat_label = "CatBoost: P(FT=1 ≥...%)"
+    else:
+        gA_label = "≥...% (Median Centers)"
+        gB_label = "Rest (Median Centers)"
+        nca_label = "NCA: P(≥...%)"
+        cat_label = "CatBoost: P(≥...%)"
+    
+    for i, thr in enumerate(thr_labels):
+        data.append({"GainCutoff_%": thr, "Series": gA_label, "Value": series_A_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": gB_label, "Value": series_B_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": nca_label, "Value": series_N_med[i]})
+        data.append({"GainCutoff_%": thr, "Series": cat_label, "Value": series_C_med[i]})
 
     df_long = pd.DataFrame(data).dropna(subset=['Value'])
 
@@ -716,17 +663,11 @@ else:
         alt.Chart(df_long)
         .mark_bar()
         .encode(
-            x=alt.X(
-                f"{x_key}:O",
-                title=x_title,
-                sort=alt.SortField(field="ThresholdNum", order="ascending")
-            ),
+            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {25})"),
             y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("Series:N",
-                            scale=alt.Scale(domain=color_domain, range=color_range),
-                            legend=alt.Legend(title="Analysis Series")),
+            color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
             xOffset="Series:N",
-            tooltip=[alt.Tooltip(f"{x_key}:O", title="Threshold"), "Series:N", alt.Tooltip("Value:Q", format=".1f")],
+            tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
         )
     )
     st.altair_chart(chart, use_container_width=True)
