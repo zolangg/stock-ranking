@@ -697,7 +697,7 @@ else:
         gB_label = "Rest (Median Centers)"
         nca_label = "NCA: P(≥...%)"
         cat_label = "CatBoost: P(≥...%)"
-    elif split_mode == "η groups @ Gain%":
+    elif split_mode == "Efficiency η":
         gA_label = "η ≥ 1 (Median Centers)"
         gB_label = "η < 1 (Median Centers)"
         nca_label = "NCA: P(η ≥ 1)"
