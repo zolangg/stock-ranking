@@ -94,7 +94,9 @@ if build_btn:
             add_num(df, "PM_$Vol_M$",       ["pm $vol (m)","pm dollar vol (m)","pm $ volume (m)","pm $vol","pm dollar volume (m)","pm_dollarvol_m","pm $vol"])
             add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
             add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
-
+            add_num(df, "Eta_%_per_min",    ["η (%/min)","eta (%/min)","eta %/min","eta_per_min_%","eta_per_min (fractioned)","eta_per_min", "efficiency η (%/min)","efficiency (%/min)"])
+            add_num(df, "Decay_Ratio",      ["decay ratio","decay_ratio","decayratio","decay r","decay r."])
+            
             # --- NEW: load FT (Follow Through flag) if present ---
             cand_ft = _pick(raw, ["FT","Follow Through","FT_flag","FT=1","FollowThrough","ft"])
             if cand_ft:
@@ -125,7 +127,7 @@ if build_btn:
                 if pmh_col is not None else np.nan
             )
             
-            keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT"])  # include FT if present
+            keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT", "Eta_%_per_min", "Decay_Ratio"])  # include FT if present
             df = df[[c for c in df.columns if c in keep_cols]].copy()
 
             ss.base_df = df
@@ -448,9 +450,16 @@ def _delete_selected():
 # --- Controls row: multiselect, Clear, Delete, and NEW split-mode dropdown on the same line ---
 col1, col2, col3, col4 = st.columns([2, 5, 1.2, 1.2])
 with col1:
-    split_mode = st.selectbox(
+        split_mode = st.selectbox(
         "",
-        options=["Gain%", "FT Gain%"],
+        options=[
+            "Gain%",        # Group A: Max_Push_Daily_% ≥ thr
+            "FT Gain%",     # Group A: FT=1 ∧ Max_Push_Daily_% ≥ thr
+            "η (%/min)",    # Group A: Eta_%_per_min ≥ thr
+            "FT η (%/min)", # Group A: FT=1 ∧ Eta_%_per_min ≥ thr
+            "Decay Ratio",  # Group A: Decay_Ratio ≤ thr  (lower decay is better)
+            "FT Decay"      # Group A: FT=1 ∧ Decay_Ratio ≤ thr
+        ],
         index=0,
         label_visibility="collapsed",
     )
@@ -480,23 +489,79 @@ if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
     st.stop()
 
-gain_cutoffs = list(range(25, 301, 25))
+# Cutoff ladders per split mode
+gain_cutoffs = list(range(25, 301, 25))  # % (already scaled 0–100)
+eta_cutoffs  = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]   # %/min
+decay_cuts   = [0.20, 0.35, 0.50, 0.75, 1.00, 1.25]   # dimensionless
 
 def _make_split(df_base: pd.DataFrame, thr_val: float, mode: str):
+    """
+    Returns (df_tmp, gA_label, gB_label) where df_tmp has a __Group__ column.
+    Conventions:
+    - Gain% / η: Group A if variable ≥ threshold.
+    - Decay Ratio: Group A if variable ≤ threshold (lower decay = better).
+    - FT* modes intersect Group A with FT=1 and use all FT=0 as Group B (for FT Gain%),
+      or intersect both sides with FT present for η/Decay FT variants.
+    """
     df_tmp = df_base.copy()
 
-    if mode == "FT Gain%" and "FT" in df_tmp.columns:
-        # Group A: FT=1 with Max_Push_Daily_% >= thr
-        # Group B: FT=0 (all FT=0 names, any Gain%)
-        gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0"
-        m_ft = pd.to_numeric(df_tmp.get("FT"), errors="coerce")
-        m_gain = pd.to_numeric(df_tmp.get("Max_Push_Daily_%"), errors="coerce")
-        df_tmp["__Group__"] = np.where((m_ft == 1) & (m_gain >= thr_val), gA_, "FT=0")
-    else:
-        # Default: Gain% vs Rest (entire universe)
+    # Identify columns
+    col_gain = "Max_Push_Daily_%"
+    col_eta  = "Eta_%_per_min"
+    col_dec  = "Decay_Ratio"
+    col_ft   = "FT" if "FT" in df_tmp.columns else None
+
+    # Build masks
+    m_gain = pd.to_numeric(df_tmp.get(col_gain), errors="coerce") if col_gain in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
+    m_eta  = pd.to_numeric(df_tmp.get(col_eta),  errors="coerce") if col_eta  in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
+    m_dec  = pd.to_numeric(df_tmp.get(col_dec),  errors="coerce") if col_dec  in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
+    m_ft   = pd.to_numeric(df_tmp.get(col_ft),   errors="coerce") if col_ft   else pd.Series(np.nan, index=df_tmp.index)
+
+    # Default labels
+    gA_, gB_ = "A", "B"
+
+    if mode == "Gain%":
         gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
-        m_gain = pd.to_numeric(df_tmp.get("Max_Push_Daily_%"), errors="coerce")
-        df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, "Rest")
+        df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
+
+    elif mode == "FT Gain%":
+        gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0"
+        if col_ft is None:
+            # Fallback to non-FT if FT column missing
+            gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
+            df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
+        else:
+            df_tmp["__Group__"] = np.where((m_ft == 1) & (m_gain >= thr_val), gA_, "FT=0")
+
+    elif mode == "η (%/min)":
+        gA_, gB_ = f"η ≥ {thr_val:g} %/min", "Rest"
+        df_tmp["__Group__"] = np.where(m_eta >= thr_val, gA_, gB_)
+
+    elif mode == "FT η (%/min)":
+        gA_, gB_ = f"FT=1 ∧ η ≥ {thr_val:g}", "FT=0"
+        if col_ft is None:
+            gA_, gB_ = f"η ≥ {thr_val:g} %/min", "Rest"
+            df_tmp["__Group__"] = np.where(m_eta >= thr_val, gA_, gB_)
+        else:
+            # All FT=0 go to B; FT=1 are split by η threshold
+            df_tmp["__Group__"] = np.where((m_ft == 1) & (m_eta >= thr_val), gA_, "FT=0")
+
+    elif mode == "Decay Ratio":
+        gA_, gB_ = f"Decay ≤ {thr_val:g}", "Rest"
+        df_tmp["__Group__"] = np.where(m_dec <= thr_val, gA_, gB_)
+
+    elif mode == "FT Decay":
+        gA_, gB_ = f"FT=1 ∧ Decay ≤ {thr_val:g}", "FT=0"
+        if col_ft is None:
+            gA_, gB_ = f"Decay ≤ {thr_val:g}", "Rest"
+            df_tmp["__Group__"] = np.where(m_dec <= thr_val, gA_, gB_)
+        else:
+            df_tmp["__Group__"] = np.where((m_ft == 1) & (m_dec <= thr_val), gA_, "FT=0")
+
+    else:
+        # Fallback = Gain%
+        gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
+        df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
 
     return df_tmp, gA_, gB_
 
@@ -505,8 +570,18 @@ added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_t
 thr_labels = []
 series_A_med, series_B_med, series_N_med, series_C_med = [], [], [], []
 
+# Select which ladder we use for thresholds
+if split_mode in ("Gain%", "FT Gain%"):
+    cutoff_list = gain_cutoffs
+elif split_mode in ("η (%/min)", "FT η (%/min)"):
+    cutoff_list = eta_cutoffs
+elif split_mode in ("Decay Ratio", "FT Decay"):
+    cutoff_list = decay_cuts
+else:
+    cutoff_list = gain_cutoffs
+
 with st.spinner("Calculating distributions across all cutoffs..."):
-    for thr_val in gain_cutoffs:
+    for thr_val in cutoff_list:
         df_split, gA, gB = _make_split(base_df, float(thr_val), split_mode)
 
         vc = df_split["__Group__"].value_counts()
@@ -637,22 +712,60 @@ else:
     # --- Absolute Probability Chart (Main Chart) ---
     data = []
 
-    if 'split_mode' in locals() and split_mode == "FT Gain%":
-        gA_label = "FT=1 ≥...% (Median Centers)"
+        # Adaptive labels per mode
+    if split_mode == "FT Gain%":
+        gA_label = "FT=1 ≥ thr (Median Centers)"
         gB_label = "FT=0 (Median Centers)"
-        nca_label = "NCA: P(FT=1 ≥...%)"
-        cat_label = "CatBoost: P(FT=1 ≥...%)"
+        nca_label = "NCA: P(FT=1 ≥ thr)"
+        cat_label = "CatBoost: P(FT=1 ≥ thr)"
+        x_title  = f"Gain% cutoff"
+        x_vals   = thr_labels
+        thr_fmt  = lambda v: f"{int(v)}"
+    elif split_mode in ("η (%/min)", "FT η (%/min)"):
+        if split_mode.startswith("FT"):
+            gA_label = "FT=1 ∧ η ≥ thr (Median Centers)"
+            nca_label = "NCA: P(FT=1 ∧ η ≥ thr)"
+            cat_label = "CatBoost: P(FT=1 ∧ η ≥ thr)"
+            gB_label = "FT=0 (Median Centers)"
+        else:
+            gA_label = "η ≥ thr (Median Centers)"
+            gB_label = "Rest (Median Centers)"
+            nca_label = "NCA: P(η ≥ thr)"
+            cat_label = "CatBoost: P(η ≥ thr)"
+        x_title  = "η threshold (%/min)"
+        x_vals   = thr_labels
+        thr_fmt  = lambda v: f"{v:g}"
+    elif split_mode in ("Decay Ratio", "FT Decay"):
+        if split_mode.startswith("FT"):
+            gA_label = "FT=1 ∧ Decay ≤ thr (Median Centers)"
+            nca_label = "NCA: P(FT=1 ∧ Decay ≤ thr)"
+            cat_label = "CatBoost: P(FT=1 ∧ Decay ≤ thr)"
+            gB_label = "FT=0 (Median Centers)"
+        else:
+            gA_label = "Decay ≤ thr (Median Centers)"
+            gB_label = "Rest (Median Centers)"
+            nca_label = "NCA: P(Decay ≤ thr)"
+            cat_label = "CatBoost: P(Decay ≤ thr)"
+        x_title  = "Decay threshold"
+        x_vals   = thr_labels
+        thr_fmt  = lambda v: f"{v:g}"
     else:
-        gA_label = "≥...% (Median Centers)"
+        gA_label = "≥ thr (Median Centers)"
         gB_label = "Rest (Median Centers)"
-        nca_label = "NCA: P(≥...%)"
-        cat_label = "CatBoost: P(≥...%)"
+        nca_label = "NCA: P(≥ thr)"
+        cat_label = "CatBoost: P(≥ thr)"
+        x_title  = f"Gain% cutoff"
+        x_vals   = thr_labels
+        thr_fmt  = lambda v: f"{int(v)}"
     
-    for i, thr in enumerate(thr_labels):
-        data.append({"GainCutoff_%": thr, "Series": gA_label, "Value": series_A_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": gB_label, "Value": series_B_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": nca_label, "Value": series_N_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": cat_label, "Value": series_C_med[i]})
+        # Build long data with a generic x field
+    x_key = "Threshold"
+    for i, thr in enumerate(x_vals):
+        label_val = thr_fmt(thr)
+        data.append({x_key: label_val, "Series": gA_label, "Value": series_A_med[i]})
+        data.append({x_key: label_val, "Series": gB_label, "Value": series_B_med[i]})
+        data.append({x_key: label_val, "Series": nca_label, "Value": series_N_med[i]})
+        data.append({x_key: label_val, "Series": cat_label, "Value": series_C_med[i]})
 
     df_long = pd.DataFrame(data).dropna(subset=['Value'])
 
@@ -663,11 +776,11 @@ else:
         alt.Chart(df_long)
         .mark_bar()
         .encode(
-            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {25})"),
+            x=alt.X(f"{x_key}:O", title=x_title),
             y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
             xOffset="Series:N",
-            tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
+            tooltip=[alt.Tooltip(f"{x_key}:O", title="Threshold"), "Series:N", alt.Tooltip("Value:Q", format=".1f")],
         )
     )
     st.altair_chart(chart, use_container_width=True)
