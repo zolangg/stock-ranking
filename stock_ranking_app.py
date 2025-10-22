@@ -683,6 +683,12 @@ def create_export_buttons(df, chart_obj, file_prefix):
 if not thr_labels:
     st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
+    # --- Safe defaults for x-axis values (avoid NameError) ---
+    x_key   = "Threshold"
+    x_title = "Gain% cutoff"
+    x_vals  = list(thr_labels)  # default: use the thresholds we collected
+    thr_fmt = lambda v: f"{int(v)}" if isinstance(v, (int, float)) and float(v).is_integer() else f"{v}"
+    
     # --- Absolute Probability Chart (Main Chart) ---
     data = []
 
