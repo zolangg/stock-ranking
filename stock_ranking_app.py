@@ -692,7 +692,8 @@ else:
         gB_label = "FT=0 (Median Centers)"
         nca_label = "NCA: P(FT=1 ≥...%)"
         cat_label = "CatBoost: P(FT=1 ≥...%)"
-    elif gA_label = "≥...% (Median Centers)"
+    elif split_mode == "Gain%":
+        gA_label = "≥...% (Median Centers)"
         gB_label = "Rest (Median Centers)"
         nca_label = "NCA: P(≥...%)"
         cat_label = "CatBoost: P(≥...%)"
@@ -703,7 +704,6 @@ else:
         cat_label = "CatBoost: P(η ≥ 1)"
         x_title  = "Gain% cutoff (filter)"
     else: 
-        split_mode == "Decay groups @ Gain%":
         gA_label = "Decay > 1 (Median Centers)"
         gB_label = "Decay ≤ 1 (Median Centers)"  # or "< 1" if you make it strict
         nca_label = "NCA: P(Decay > 1)"
