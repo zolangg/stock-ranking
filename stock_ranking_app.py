@@ -455,10 +455,8 @@ with col1:
         options=[
             "Gain%",        # Group A: Max_Push_Daily_% ≥ thr
             "FT Gain%",     # Group A: FT=1 ∧ Max_Push_Daily_% ≥ thr
-            "η (%/min)",    # Group A: Eta_%_per_min ≥ thr
-            "FT η (%/min)", # Group A: FT=1 ∧ Eta_%_per_min ≥ thr
-            "Decay Ratio",  # Group A: Decay_Ratio ≤ thr  (lower decay is better)
-            "FT Decay"      # Group A: FT=1 ∧ Decay_Ratio ≤ thr
+            "Efficiency η",     # A: η ≥ 1   vs   B: η < 1  (within Gain% ≥ cutoff)
+            "Decay Ratio", # A: Decay > 1   vs   B: Decay ≤ 1 (within Gain% ≥ cutoff)
         ],
         index=0,
         label_visibility="collapsed",
@@ -495,74 +493,50 @@ eta_cutoffs  = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]   # %/min
 decay_cuts   = [0.20, 0.35, 0.50, 0.75, 1.00, 1.25]   # dimensionless
 
 def _make_split(df_base: pd.DataFrame, thr_val: float, mode: str):
-    """
-    Returns (df_tmp, gA_label, gB_label) where df_tmp has a __Group__ column.
-    Conventions:
-    - Gain% / η: Group A if variable ≥ threshold.
-    - Decay Ratio: Group A if variable ≤ threshold (lower decay = better).
-    - FT* modes intersect Group A with FT=1 and use all FT=0 as Group B (for FT Gain%),
-      or intersect both sides with FT present for η/Decay FT variants.
-    """
     df_tmp = df_base.copy()
 
-    # Identify columns
     col_gain = "Max_Push_Daily_%"
     col_eta  = "Eta_%_per_min"
     col_dec  = "Decay_Ratio"
     col_ft   = "FT" if "FT" in df_tmp.columns else None
 
-    # Build masks
     m_gain = pd.to_numeric(df_tmp.get(col_gain), errors="coerce") if col_gain in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
     m_eta  = pd.to_numeric(df_tmp.get(col_eta),  errors="coerce") if col_eta  in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
     m_dec  = pd.to_numeric(df_tmp.get(col_dec),  errors="coerce") if col_dec  in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
     m_ft   = pd.to_numeric(df_tmp.get(col_ft),   errors="coerce") if col_ft   else pd.Series(np.nan, index=df_tmp.index)
 
-    # Default labels
-    gA_, gB_ = "A", "B"
-
     if mode == "Gain%":
         gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
         df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
+        return df_tmp, gA_, gB_
 
-    elif mode == "FT Gain%":
-        gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0"
+    if mode == "FT Gain%":
         if col_ft is None:
-            # Fallback to non-FT if FT column missing
             gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
             df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
         else:
+            gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0"
             df_tmp["__Group__"] = np.where((m_ft == 1) & (m_gain >= thr_val), gA_, "FT=0")
+        return df_tmp, gA_, gB_
+        
+    if mode == "Efficiency η":
+        # 1) filter by Gain% cutoff for the x-position
+        df_tmp = df_tmp[m_gain >= float(thr_val)].copy()
+        m_eta  = pd.to_numeric(df_tmp.get(col_eta), errors="coerce") if col_eta in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
+        gA_, gB_ = "η ≥ 1 (%/min)", "η < 1 (%/min)"
+        df_tmp["__Group__"] = np.where(m_eta >= 1.0, gA_, gB_)
+        return df_tmp, gA_, gB_
 
-    elif mode == "η (%/min)":
-        gA_, gB_ = f"η ≥ {thr_val:g} %/min", "Rest"
-        df_tmp["__Group__"] = np.where(m_eta >= thr_val, gA_, gB_)
+    if mode == "Decay Ratio":
+        df_tmp = df_tmp[m_gain >= float(thr_val)].copy()
+        m_dec  = pd.to_numeric(df_tmp.get(col_dec), errors="coerce") if col_dec in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
+        gA_, gB_ = "Decay > 1", "Decay ≤ 1"  # ← if you truly want "<1" (strict), change to: "Decay > 1", "Decay < 1"
+        df_tmp["__Group__"] = np.where(m_dec > 1.0, gA_, gB_)
+        return df_tmp, gA_, gB_
 
-    elif mode == "FT η (%/min)":
-        gA_, gB_ = f"FT=1 ∧ η ≥ {thr_val:g}", "FT=0"
-        if col_ft is None:
-            gA_, gB_ = f"η ≥ {thr_val:g} %/min", "Rest"
-            df_tmp["__Group__"] = np.where(m_eta >= thr_val, gA_, gB_)
-        else:
-            # All FT=0 go to B; FT=1 are split by η threshold
-            df_tmp["__Group__"] = np.where((m_ft == 1) & (m_eta >= thr_val), gA_, "FT=0")
-
-    elif mode == "Decay Ratio":
-        gA_, gB_ = f"Decay ≤ {thr_val:g}", "Rest"
-        df_tmp["__Group__"] = np.where(m_dec <= thr_val, gA_, gB_)
-
-    elif mode == "FT Decay":
-        gA_, gB_ = f"FT=1 ∧ Decay ≤ {thr_val:g}", "FT=0"
-        if col_ft is None:
-            gA_, gB_ = f"Decay ≤ {thr_val:g}", "Rest"
-            df_tmp["__Group__"] = np.where(m_dec <= thr_val, gA_, gB_)
-        else:
-            df_tmp["__Group__"] = np.where((m_ft == 1) & (m_dec <= thr_val), gA_, "FT=0")
-
-    else:
-        # Fallback = Gain%
-        gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
-        df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
-
+    # Fallback (original Gain%)
+    gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
+    df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
     return df_tmp, gA_, gB_
 
 added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
@@ -714,49 +688,27 @@ else:
 
         # Adaptive labels per mode
     if split_mode == "FT Gain%":
-        gA_label = "FT=1 ≥ thr (Median Centers)"
+        gA_label = "FT=1 ≥...% (Median Centers)"
         gB_label = "FT=0 (Median Centers)"
-        nca_label = "NCA: P(FT=1 ≥ thr)"
-        cat_label = "CatBoost: P(FT=1 ≥ thr)"
-        x_title  = f"Gain% cutoff"
-        x_vals   = thr_labels
-        thr_fmt  = lambda v: f"{int(v)}"
-    elif split_mode in ("η (%/min)", "FT η (%/min)"):
-        if split_mode.startswith("FT"):
-            gA_label = "FT=1 ∧ η ≥ thr (Median Centers)"
-            nca_label = "NCA: P(FT=1 ∧ η ≥ thr)"
-            cat_label = "CatBoost: P(FT=1 ∧ η ≥ thr)"
-            gB_label = "FT=0 (Median Centers)"
-        else:
-            gA_label = "η ≥ thr (Median Centers)"
-            gB_label = "Rest (Median Centers)"
-            nca_label = "NCA: P(η ≥ thr)"
-            cat_label = "CatBoost: P(η ≥ thr)"
-        x_title  = "η threshold (%/min)"
-        x_vals   = thr_labels
-        thr_fmt  = lambda v: f"{v:g}"
-    elif split_mode in ("Decay Ratio", "FT Decay"):
-        if split_mode.startswith("FT"):
-            gA_label = "FT=1 ∧ Decay ≤ thr (Median Centers)"
-            nca_label = "NCA: P(FT=1 ∧ Decay ≤ thr)"
-            cat_label = "CatBoost: P(FT=1 ∧ Decay ≤ thr)"
-            gB_label = "FT=0 (Median Centers)"
-        else:
-            gA_label = "Decay ≤ thr (Median Centers)"
-            gB_label = "Rest (Median Centers)"
-            nca_label = "NCA: P(Decay ≤ thr)"
-            cat_label = "CatBoost: P(Decay ≤ thr)"
-        x_title  = "Decay threshold"
-        x_vals   = thr_labels
-        thr_fmt  = lambda v: f"{v:g}"
-    else:
-        gA_label = "≥ thr (Median Centers)"
+        nca_label = "NCA: P(FT=1 ≥...%)"
+        cat_label = "CatBoost: P(FT=1 ≥...%)"
+    elif:
+        gA_label = "≥...% (Median Centers)"
         gB_label = "Rest (Median Centers)"
-        nca_label = "NCA: P(≥ thr)"
-        cat_label = "CatBoost: P(≥ thr)"
-        x_title  = f"Gain% cutoff"
-        x_vals   = thr_labels
-        thr_fmt  = lambda v: f"{int(v)}"
+        nca_label = "NCA: P(≥...%)"
+        cat_label = "CatBoost: P(≥...%)"
+    elif split_mode == "η groups @ Gain%":
+        gA_label = "η ≥ 1 (Median Centers)"
+        gB_label = "η < 1 (Median Centers)"
+        nca_label = "NCA: P(η ≥ 1)"
+        cat_label = "CatBoost: P(η ≥ 1)"
+        x_title  = "Gain% cutoff (filter)"
+    else split_mode == "Decay groups @ Gain%":
+        gA_label = "Decay > 1 (Median Centers)"
+        gB_label = "Decay ≤ 1 (Median Centers)"  # or "< 1" if you make it strict
+        nca_label = "NCA: P(Decay > 1)"
+        cat_label = "CatBoost: P(Decay > 1)"
+        x_title  = "Gain% cutoff (filter)"
     
         # Build long data with a generic x field
     x_key = "Threshold"
