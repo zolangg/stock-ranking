@@ -97,7 +97,7 @@ if build_btn:
             add_num(df, "Eta_%_per_min",    ["η (%/min)","eta (%/min)","eta %/min","eta_per_min_%","eta_per_min (fractioned)","eta_per_min","efficiency η (%/min)","efficiency (%/min)"])
             add_num(df, "Decay_Ratio",      ["decay ratio","decay_ratio","decayratio","decay r","decay r."])
             
-            # --- NEW: load FT (Follow Through flag) if present ---
+            # --- FT flag if present ---
             cand_ft = _pick(raw, ["FT","Follow Through","FT_flag","FT=1","FollowThrough","ft"])
             if cand_ft:
                 def _to_ft_flag(v):
@@ -315,7 +315,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
     tr_idx, va_idx = next(sss.split(X_all, y_all))
     Xtr, Xva = X_all[tr_idx], X_all[va_idx]
-    ytr, yva = y_all[tr_idx], y_all[va_idx]
+    ytr, yva = y_all[tr_idx]
     def _has_both_classes(arr):
         return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
@@ -353,7 +353,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     try:
         if eval_ok:
             p_raw = model.predict_proba(Xva)[:, 1].astype(float)
-            if np.unique(p_raw).size >= 3 and (np.unique(yva).size == 2):
+            if np.unique(p_raw).size >= 3 and (_has_both_classes(yva)):
                 bx, by = _pav_isotonic(p_raw, yva.astype(float))
                 if len(bx) >= 2: iso_bx, iso_by = np.array(bx), np.array(by)
             if iso_bx.size < 2:
@@ -395,14 +395,12 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         return {}
     gA_, gB_ = list(centers_tbl.columns)
     counts = {gA_: 0.0, gB_: 0.0}
-    
     for var in centers_tbl.index:
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
         if not np.isfinite(xv): continue
         vA = centers_tbl.at[var, gA_]
         vB = centers_tbl.at[var, gB_]
         if pd.isna(vA) or pd.isna(vB): continue
-
         if abs(xv - vA) < abs(xv - vB):
             counts[gA_] += 1.0
         elif abs(xv - vB) < abs(xv - vA):
@@ -410,14 +408,13 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         else:
             counts[gA_] += 0.5
             counts[gB_] += 0.5
-            
     total = counts[gA_] + counts[gB_]
     return {
         "A_pct": 100.0 * counts[gA_] / total if total > 0 else 0.0,
         "B_pct": 100.0 * counts[gB_] / total if total > 0 else 0.0,
     }
 
-# ============================== Alignment (Distributions for SELECTED added stocks) ==============================
+# ============================== Alignment ==============================
 st.markdown("---")
 st.subheader("Alignment")
 
@@ -450,10 +447,10 @@ with col1:
     split_mode = st.selectbox(
         "",
         options=[
-            "Gain%",        # Group A: Max_Push_Daily_% ≥ thr
-            "FT Gain%",     # Group A: FT=1 ∧ Max_Push_Daily_% ≥ thr
-            "Efficiency η", # A: η ≥ 1 vs η < 1 (within Gain% ≥ cutoff)
-            "Decay Ratio",  # A: Decay > 1 vs Decay ≤ 1 (within Gain% ≥ cutoff)
+            "Gain%",
+            "FT Gain%",
+            "Efficiency η",
+            "Decay Ratio",
         ],
         index=0,
         label_visibility="collapsed",
@@ -484,8 +481,8 @@ if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
     st.stop()
 
-# Cutoff ladder (Gain% only for x-axis)
-gain_cutoffs = list(range(25, 301, 25))  # % (already scaled 0–100)
+# Gain% ladder for x-axis
+gain_cutoffs = list(range(25, 301, 25))
 
 def _make_split(df_base: pd.DataFrame, thr_val: float, mode: str):
     df_tmp = df_base.copy()
@@ -515,7 +512,6 @@ def _make_split(df_base: pd.DataFrame, thr_val: float, mode: str):
         return df_tmp, gA_, gB_
         
     if mode == "Efficiency η":
-        # Filter by Gain% cutoff, then split by η >= 1 vs η < 1
         df_tmp = df_tmp[m_gain >= float(thr_val)].copy()
         m_eta  = pd.to_numeric(df_tmp.get(col_eta), errors="coerce") if col_eta in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
         gA_, gB_ = "η ≥ 1 (%/min)", "η < 1 (%/min)"
@@ -523,14 +519,12 @@ def _make_split(df_base: pd.DataFrame, thr_val: float, mode: str):
         return df_tmp, gA_, gB_
 
     if mode == "Decay Ratio":
-        # Filter by Gain% cutoff, then split by Decay > 1 vs ≤ 1
         df_tmp = df_tmp[m_gain >= float(thr_val)].copy()
         m_dec  = pd.to_numeric(df_tmp.get(col_dec), errors="coerce") if col_dec in df_tmp.columns else pd.Series(np.nan, index=df_tmp.index)
         gA_, gB_ = "Decay > 1", "Decay ≤ 1"
         df_tmp["__Group__"] = np.where(m_dec > 1.0, gA_, gB_)
         return df_tmp, gA_, gB_
 
-    # Fallback (original Gain%)
     gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
     df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, gB_)
     return df_tmp, gA_, gB_
@@ -540,11 +534,8 @@ added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_t
 thr_labels = []
 series_A_med, series_B_med, series_N_med, series_C_med = [], [], [], []
 
-# Always sweep Gain% on x-axis (even for η/Decay modes)
-cutoff_list = gain_cutoffs
-
 with st.spinner("Calculating distributions across all cutoffs..."):
-    for thr_val in cutoff_list:
+    for thr_val in gain_cutoffs:
         df_split, gA, gB = _make_split(base_df, float(thr_val), split_mode)
 
         vc = df_split["__Group__"].value_counts()
@@ -585,25 +576,22 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         if not any([pN, pC, pA_centers]):
             continue
 
-        thr_labels.append(float(thr_val))  # numeric for proper ordering
+        thr_labels.append(float(thr_val))
         series_N_med.append(float(np.nanmedian(pN)) if pN else np.nan)
         series_C_med.append(float(np.nanmedian(pC)) if pC else np.nan)
         series_A_med.append(float(np.nanmedian(pA_centers)) if pA_centers else np.nan)
         series_B_med.append(float(np.nanmedian(pB_centers)) if pB_centers else np.nan)
 
-# --- FINAL, ROBUST VERSION: Function to generate export buttons for any chart ---
+# --- Export helpers (PNG/HTML) ---
 def create_export_buttons(df, chart_obj, file_prefix):
-    """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
     png_bytes = b""
     try:
-        # Ensure numeric order for export
         if "ThresholdNum" in df.columns:
             df = df.sort_values("ThresholdNum")
         x_axis_col = "Threshold"
         pivot = df.pivot(index=x_axis_col, columns="Series", values="Value")
         series_names = list(pivot.columns)
 
-        # Extract colors from Altair chart if present
         chart_dict = chart_obj.to_dict()
         unique_colors = {}
         try:
@@ -614,7 +602,6 @@ def create_export_buttons(df, chart_obj, file_prefix):
             pass
         colors = [unique_colors.get(s, "#999999") for s in series_names]
         
-        # Matplotlib figure
         x_labels = [str(label) for label in pivot.index.tolist()]
         n_groups, n_series = len(x_labels), len(series_names)
         x_pos = np.arange(n_groups)
@@ -668,13 +655,13 @@ def create_export_buttons(df, chart_obj, file_prefix):
 if not thr_labels:
     st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
-    # --- Safe defaults for x-axis values (avoid NameError) ---
+    # x-axis defaults
     x_key   = "Threshold"
     x_title = "Gain% cutoff"
-    x_vals  = list(thr_labels)  # numeric thresholds collected above
+    x_vals  = list(thr_labels)
     thr_fmt = lambda v: f"{int(v)}" if float(v).is_integer() else f"{v:g}"
 
-    # --- Adaptive labels per mode (x stays Gain% for all modes here) ---
+    # Labels per mode (x always Gain%)
     if split_mode == "FT Gain%":
         gA_label = "FT=1 ≥ thr (Median Centers)"
         gB_label = "FT=0 (Median Centers)"
@@ -700,7 +687,7 @@ else:
         cat_label = "CatBoost: P(Decay > 1)"
         x_title  = "Gain% cutoff (filter)"
     
-    # --- Build long data with numeric sort key ---
+    # Build long data + numeric sort key
     data = []
     for i, thr in enumerate(x_vals):
         label_val = thr_fmt(thr)
@@ -722,7 +709,7 @@ else:
             x=alt.X(
                 f"{x_key}:O",
                 title=x_title,
-                sort=alt.SortField(field="ThresholdNum", order="ascending")  # enforce numeric order
+                sort=alt.SortField(field="ThresholdNum", order="ascending")
             ),
             y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("Series:N",
@@ -731,9 +718,8 @@ else:
             xOffset="Series:N",
             tooltip=[alt.Tooltip(f"{x_key}:O", title="Threshold"), "Series:N", alt.Tooltip("Value:Q", format=".1f")],
         )
-        .properties(title=None)
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # --- Chart Export Section for Absolute Probability Chart ---
+    # Exports (PNG/HTML)
     create_export_buttons(df_long, chart, "absolute_probability")
