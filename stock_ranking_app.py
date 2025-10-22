@@ -315,7 +315,7 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
     tr_idx, va_idx = next(sss.split(X_all, y_all))
     Xtr, Xva = X_all[tr_idx], X_all[va_idx]
-    ytr, yva = y_all[tr_idx]
+    ytr, yva = y_all[tr_idx], y_all[va_idx]
     def _has_both_classes(arr):
         return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
