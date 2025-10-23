@@ -1,7 +1,7 @@
-# Premarket Stock Alignment — Confidence opacity only (no Regime; no Confidence legend)
-# - Encodes Confidence per Gain% cutoff as bar opacity (legend hidden).
-# - Keeps hover diagnostics (Confidence, Coverage, nA, nB, ECE_NCA, ECE_Cat).
-# - Leaves everything else unchanged.
+# Premarket Stock Alignment — SATURATED BARS (no opacity mapping)
+# - Bars are fully saturated (no Confidence->opacity encoding).
+# - Confidence, Coverage, nA/nB, ECEs remain in hover tooltips.
+# - No regime logic. Everything else unchanged.
 
 import streamlit as st
 import pandas as pd
@@ -11,7 +11,7 @@ import altair as alt
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-# CatBoost import (unchanged)
+# CatBoost import (graceful)
 try:
     from catboost import CatBoostClassifier
     _CATBOOST_OK = True
@@ -88,13 +88,14 @@ if build_btn:
     else:
         try:
             file_bytes = uploaded.getvalue()
-            raw, sel_sheet, all_sheets = _load_sheet(file_bytes)
-            
+            raw, sel_sheet, _all = _load_sheet(file_bytes)
+
             df = pd.DataFrame()
 
             def add_num(dfout, name, src_candidates):
                 src = _pick(raw, src_candidates)
-                if src: dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
+                if src:
+                    dfout[name] = pd.to_numeric(raw[src].map(_to_float), errors="coerce")
 
             add_num(df, "MC_PM_Max_M",      ["mc pm max (m)","premarket market cap (m)","mc_pm_max_m","mc pm max (m$)","market cap pm max (m)","market cap pm max m","premarket market cap (m$)"])
             add_num(df, "Float_PM_Max_M",   ["float pm max (m)","premarket float (m)","float_pm_max_m","float pm max (m shares)"])
@@ -105,7 +106,7 @@ if build_btn:
             add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
             add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
 
-            # --- Load FT (Follow Through flag) if present ---
+            # Load FT if present
             cand_ft = _pick(raw, ["FT","Follow Through","FT_flag","FT=1","FollowThrough","ft"])
             if cand_ft:
                 def _to_ft_flag(v):
@@ -135,7 +136,7 @@ if build_btn:
                 pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce") * 100.0
                 if pmh_col is not None else np.nan
             )
-            
+
             keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT"])
             df = df[[c for c in df.columns if c in keep_cols]].copy()
 
@@ -460,7 +461,7 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         "B_pct": 100.0 * counts[gB_] / total if total > 0 else 0.0,
     }
 
-# ============================== Alignment (Distributions for SELECTED added stocks) ==============================
+# ============================== Alignment (Distributions) ==============================
 st.markdown("---")
 st.subheader("Alignment")
 
@@ -486,15 +487,9 @@ def _delete_selected():
         ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(tickers_to_delete)]
         st.session_state["align_sel_tickers"] = []
 
-# Controls row
 col1, col2, col3, col4 = st.columns([2, 5, 1.2, 1.2])
 with col1:
-    split_mode = st.selectbox(
-        "",
-        options=["Gain%", "FT Gain%"],
-        index=0,
-        label_visibility="collapsed",
-    )
+    split_mode = st.selectbox("", options=["Gain%", "FT Gain%"], index=0, label_visibility="collapsed")
 with col2:
     selected_tickers = st.multiselect(
         "Select stocks to include in the charts below. The delete button will act on this selection.",
@@ -504,9 +499,9 @@ with col2:
         label_visibility="collapsed",
     )
 with col3:
-    st.button("Clear", use_container_width=True, on_click=_clear_selection, help="Clears the current selection in the box.")
+    st.button("Clear", use_container_width=True, on_click=_clear_selection)
 with col4:
-    st.button("Delete", use_container_width=True, on_click=_delete_selected, help="Deletes the stocks currently selected in the box.", disabled=not selected_tickers)
+    st.button("Delete", use_container_width=True, on_click=_delete_selected, disabled=not selected_tickers)
 
 if not selected_tickers:
     st.info("No stocks selected. Pick at least one added ticker to display the chart.")
@@ -551,11 +546,9 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         if (nA < 10) or (nB < 10):
             continue
 
-        # Models
         nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
         cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
 
-        # Centers
         features_for_centers = [f for f in ALLOWED_LIVE_FEATURES if f in df_split.columns]
         centers_tbl = df_split.groupby("__Group__")[features_for_centers].median().T
         if gA not in centers_tbl.columns or gB not in centers_tbl.columns:
@@ -587,7 +580,7 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         if not any([pN, pC, pA_centers]):
             continue
 
-        # --- Confidence (coverage × calibration) ---
+        # Confidence (for tooltip only)
         if nA == 0 or nB == 0:
             coverage = 0.0
         else:
@@ -602,7 +595,6 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         calib_score = float(np.mean(cal_scores)) if cal_scores else 0.6
         confidence = max(0.25, min(1.0, math.sqrt(coverage) * calib_score))
 
-        # --- Store medians + diagnostics ---
         thr_labels.append(int(thr_val))
         series_N_med.append(float(np.nanmedian(pN)) if pN else np.nan)
         series_C_med.append(float(np.nanmedian(pC)) if pC else np.nan)
@@ -615,7 +607,6 @@ with st.spinner("Calculating distributions across all cutoffs..."):
 
 # --- Export buttons (unchanged) ---
 def create_export_buttons(df, chart_obj, file_prefix):
-    """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
     png_bytes = b""
     try:
         x_axis_col = df.columns[0]
@@ -680,72 +671,63 @@ def create_export_buttons(df, chart_obj, file_prefix):
 if not thr_labels:
     st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
-# --- Absolute Probability / Alignment Chart (boosted opacity; no opacity legend) ---
-data = []
+    # --- SATURATED BARS: no opacity channel, hover still shows diagnostics ---
+    data = []
 
-if 'split_mode' in locals() and split_mode == "FT Gain%":
-    gA_label = "FT=1 ≥...% (Median Centers)"
-    gB_label = "FT=0 (Median Centers)"
-    nca_label = "NCA: P(FT=1 ≥...%)"
-    cat_label = "CatBoost: P(FT=1 ≥...%)"
-else:
-    gA_label = "≥...% (Median Centers)"
-    gB_label = "Rest (Median Centers)"
-    nca_label = "NCA: P(≥...%)"
-    cat_label = "CatBoost: P(≥...%)"
+    if 'split_mode' in locals() and split_mode == "FT Gain%":
+        gA_label = "FT=1 ≥...% (Median Centers)"
+        gB_label = "FT=0 (Median Centers)"
+        nca_label = "NCA: P(FT=1 ≥...%)"
+        cat_label = "CatBoost: P(FT=1 ≥...%)"
+    else:
+        gA_label = "≥...% (Median Centers)"
+        gB_label = "Rest (Median Centers)"
+        nca_label = "NCA: P(≥...%)"
+        cat_label = "CatBoost: P(≥...%)"
 
-for i, thr in enumerate(thr_labels):
-    common = {
-        "GainCutoff_%": thr,
-        "Confidence": float(diag_conf[i]),
-        "Coverage": float(diag_cov[i]),
-        "nA": int(diag_nA[i]),
-        "nB": int(diag_nB[i]),
-        "ECE_NCA": float(diag_ece_nca[i]) if np.isfinite(diag_ece_nca[i]) else np.nan,
-        "ECE_Cat": float(diag_ece_cat[i]) if np.isfinite(diag_ece_cat[i]) else np.nan,
-    }
-    data.append({**common, "Series": gA_label, "Value": series_A_med[i]})
-    data.append({**common, "Series": gB_label, "Value": series_B_med[i]})
-    data.append({**common, "Series": nca_label, "Value": series_N_med[i]})
-    data.append({**common, "Series": cat_label, "Value": series_C_med[i]})
+    for i, thr in enumerate(thr_labels):
+        common = {
+            "GainCutoff_%": thr,
+            "Confidence": float(diag_conf[i]),
+            "Coverage": float(diag_cov[i]),
+            "nA": int(diag_nA[i]),
+            "nB": int(diag_nB[i]),
+            "ECE_NCA": float(diag_ece_nca[i]) if np.isfinite(diag_ece_nca[i]) else np.nan,
+            "ECE_Cat": float(diag_ece_cat[i]) if np.isfinite(diag_ece_cat[i]) else np.nan,
+        }
+        data.append({**common, "Series": gA_label, "Value": series_A_med[i]})
+        data.append({**common, "Series": gB_label, "Value": series_B_med[i]})
+        data.append({**common, "Series": nca_label, "Value": series_N_med[i]})
+        data.append({**common, "Series": cat_label, "Value": series_C_med[i]})
 
-df_long = pd.DataFrame(data).dropna(subset=['Value'])
+    df_long = pd.DataFrame(data).dropna(subset=['Value'])
 
-color_domain = [gA_label, gB_label, nca_label, cat_label]
-color_range  = ["#015e06", "#b30100", "#faa1a4", "#ff2501"]
+    color_domain = [gA_label, gB_label, nca_label, cat_label]
+    color_range  = ["#015e06", "#b30100", "#faa1a4", "#ff2501"]
 
-tooltip_cols = [
-    "GainCutoff_%:O","Series:N",
-    alt.Tooltip("Value:Q", format=".1f"),
-    alt.Tooltip("Confidence:Q", format=".2f"),
-    alt.Tooltip("Coverage:Q", format=".2f"),
-    alt.Tooltip("nA:Q", title="n(A)"),
-    alt.Tooltip("nB:Q", title="n(B)"),
-    alt.Tooltip("ECE_NCA:Q", format=".3f"),
-    alt.Tooltip("ECE_Cat:Q", format=".3f"),
-]
+    tooltip_cols = [
+        "GainCutoff_%:O","Series:N",
+        alt.Tooltip("Value:Q", format=".1f"),
+        alt.Tooltip("Confidence:Q", format=".2f"),
+        alt.Tooltip("Coverage:Q", format=".2f"),
+        alt.Tooltip("nA:Q", title="n(A)"),
+        alt.Tooltip("nB:Q", title="n(B)"),
+        alt.Tooltip("ECE_NCA:Q", format=".3f"),
+        alt.Tooltip("ECE_Cat:Q", format=".3f"),
+    ]
 
-chart = (
-    alt.Chart(df_long)
-    .mark_bar()
-    .encode(
-        x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {25})"),
-        y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)",
-                scale=alt.Scale(domain=[0, 100])),
-        color=alt.Color("Series:N",
-                        scale=alt.Scale(domain=color_domain, range=color_range),
-                        legend=alt.Legend(title="Analysis Series")),
-        xOffset="Series:N",
-        # brighter bars while still reflecting Confidence
-        opacity=alt.Opacity(
-            "Confidence:Q",
-            scale=alt.Scale(domain=[0.25, 1.0], range=[0.75, 1.0], clamp=True),
-            legend=None
-        ),
-        tooltip=tooltip_cols,
+    chart = (
+        alt.Chart(df_long)
+        .mark_bar()
+        .encode(
+            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {25})"),
+            y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range),
+                            legend=alt.Legend(title="Analysis Series")),
+            xOffset="Series:N",
+            tooltip=tooltip_cols,
+        )
     )
-)
-st.altair_chart(chart, use_container_width=True)
 
-# downloads unchanged
-create_export_buttons(df_long, chart, "absolute_probability")
+    st.altair_chart(chart, use_container_width=True)
+    create_export_buttons(df_long, chart, "absolute_probability")
