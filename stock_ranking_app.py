@@ -745,8 +745,8 @@ else:
                 y="Value:Q",
                 xOffset="Series:N",
                 opacity=alt.Opacity("Fade:Q", scale=alt.Scale(domain=[0, 0.75], range=[0, 0.6], clamp=True), legend=None),
-            ),
-            chart = alt.layer(base, fade)
+            )
+        chart = alt.layer(base, fade)
         )
     )
     st.altair_chart(chart, use_container_width=True)
