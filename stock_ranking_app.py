@@ -680,76 +680,72 @@ def create_export_buttons(df, chart_obj, file_prefix):
 if not thr_labels:
     st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
-    # --- Absolute Probability / Alignment Chart (with Confidence opacity; legend hidden) ---
-    data = []
+# --- Absolute Probability / Alignment Chart (boosted opacity; no opacity legend) ---
+data = []
 
-    if 'split_mode' in locals() and split_mode == "FT Gain%":
-        gA_label = "FT=1 ≥...% (Median Centers)"
-        gB_label = "FT=0 (Median Centers)"
-        nca_label = "NCA: P(FT=1 ≥...%)"
-        cat_label = "CatBoost: P(FT=1 ≥...%)"
-    else:
-        gA_label = "≥...% (Median Centers)"
-        gB_label = "Rest (Median Centers)"
-        nca_label = "NCA: P(≥...%)"
-        cat_label = "CatBoost: P(≥...%)"
-    
-    for i, thr in enumerate(thr_labels):
-        common = {
-            "GainCutoff_%": thr,
-            "Confidence": float(diag_conf[i]),
-            "Coverage": float(diag_cov[i]),
-            "nA": int(diag_nA[i]),
-            "nB": int(diag_nB[i]),
-            "ECE_NCA": float(diag_ece_nca[i]) if np.isfinite(diag_ece_nca[i]) else np.nan,
-            "ECE_Cat": float(diag_ece_cat[i]) if np.isfinite(diag_ece_cat[i]) else np.nan,
-        }
-        data.append({**common, "Series": gA_label, "Value": series_A_med[i]})
-        data.append({**common, "Series": gB_label, "Value": series_B_med[i]})
-        data.append({**common, "Series": nca_label, "Value": series_N_med[i]})
-        data.append({**common, "Series": cat_label, "Value": series_C_med[i]})
+if 'split_mode' in locals() and split_mode == "FT Gain%":
+    gA_label = "FT=1 ≥...% (Median Centers)"
+    gB_label = "FT=0 (Median Centers)"
+    nca_label = "NCA: P(FT=1 ≥...%)"
+    cat_label = "CatBoost: P(FT=1 ≥...%)"
+else:
+    gA_label = "≥...% (Median Centers)"
+    gB_label = "Rest (Median Centers)"
+    nca_label = "NCA: P(≥...%)"
+    cat_label = "CatBoost: P(≥...%)"
 
-    df_long = pd.DataFrame(data).dropna(subset=['Value'])
+for i, thr in enumerate(thr_labels):
+    common = {
+        "GainCutoff_%": thr,
+        "Confidence": float(diag_conf[i]),
+        "Coverage": float(diag_cov[i]),
+        "nA": int(diag_nA[i]),
+        "nB": int(diag_nB[i]),
+        "ECE_NCA": float(diag_ece_nca[i]) if np.isfinite(diag_ece_nca[i]) else np.nan,
+        "ECE_Cat": float(diag_ece_cat[i]) if np.isfinite(diag_ece_cat[i]) else np.nan,
+    }
+    data.append({**common, "Series": gA_label, "Value": series_A_med[i]})
+    data.append({**common, "Series": gB_label, "Value": series_B_med[i]})
+    data.append({**common, "Series": nca_label, "Value": series_N_med[i]})
+    data.append({**common, "Series": cat_label, "Value": series_C_med[i]})
 
-    color_domain = [gA_label, gB_label, nca_label, cat_label]
-    color_range  = ["#015e06", "#b30100", "#faa1a4", "#ff2501"]
+df_long = pd.DataFrame(data).dropna(subset=['Value'])
 
-    chart = (
-        alt.Chart(df_long)
-        .mark_bar()
-        .encode(
-            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {25})"),
-            y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range),
-                            legend=alt.Legend(title="Analysis Series")),
-            xOffset="Series:N",
-            base = alt.Chart(df_long).mark_bar().encode(
-                x="GainCutoff_%:O",
-                y=alt.Y("Value:Q", scale=alt.Scale(domain=[0,100])),
-                color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
-                xOffset="Series:N",
-            tooltip=[
-                "GainCutoff_%:O","Series:N",
-                alt.Tooltip("Value:Q", format=".1f"),
-                alt.Tooltip("Confidence:Q", format=".2f"),
-                alt.Tooltip("Coverage:Q", format=".2f"),
-                alt.Tooltip("nA:Q", title="n(A)"),
-                alt.Tooltip("nB:Q", title="n(B)"),
-                alt.Tooltip("ECE_NCA:Q", format=".3f"),
-                alt.Tooltip("ECE_Cat:Q", format=".3f"),
-            ],
-            )
-            
-            fade = alt.Chart(df_long).transform_calculate(Fade="1 - datum.Confidence").mark_bar(color="white").encode(
-                x="GainCutoff_%:O",
-                y="Value:Q",
-                xOffset="Series:N",
-                opacity=alt.Opacity("Fade:Q", scale=alt.Scale(domain=[0, 0.75], range=[0, 0.6], clamp=True), legend=None),
-            )
-        chart = alt.layer(base, fade)
-        )
+color_domain = [gA_label, gB_label, nca_label, cat_label]
+color_range  = ["#015e06", "#b30100", "#faa1a4", "#ff2501"]
+
+tooltip_cols = [
+    "GainCutoff_%:O","Series:N",
+    alt.Tooltip("Value:Q", format=".1f"),
+    alt.Tooltip("Confidence:Q", format=".2f"),
+    alt.Tooltip("Coverage:Q", format=".2f"),
+    alt.Tooltip("nA:Q", title="n(A)"),
+    alt.Tooltip("nB:Q", title="n(B)"),
+    alt.Tooltip("ECE_NCA:Q", format=".3f"),
+    alt.Tooltip("ECE_Cat:Q", format=".3f"),
+]
+
+chart = (
+    alt.Chart(df_long)
+    .mark_bar()
+    .encode(
+        x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {25})"),
+        y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)",
+                scale=alt.Scale(domain=[0, 100])),
+        color=alt.Color("Series:N",
+                        scale=alt.Scale(domain=color_domain, range=color_range),
+                        legend=alt.Legend(title="Analysis Series")),
+        xOffset="Series:N",
+        # brighter bars while still reflecting Confidence
+        opacity=alt.Opacity(
+            "Confidence:Q",
+            scale=alt.Scale(domain=[0.25, 1.0], range=[0.75, 1.0], clamp=True),
+            legend=None
+        ),
+        tooltip=tooltip_cols,
     )
-    st.altair_chart(chart, use_container_width=True)
+)
+st.altair_chart(chart, use_container_width=True)
 
-    # --- Chart Export Section (unchanged) ---
-    create_export_buttons(df_long, chart, "absolute_probability")
+# downloads unchanged
+create_export_buttons(df_long, chart, "absolute_probability")
