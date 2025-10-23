@@ -1,8 +1,7 @@
-# Premarket Stock Alignment — with Confidence & Regime (minimal, surgical changes only)
-# - Adds Confidence per Gain% cutoff (coverage × calibration) and encodes it as bar opacity.
-# - Adds Regime tagging (High / Neutral / Low) from FR_x, PM$Vol/MC_%, RVOL_Max_PM_cum
-#   with a UI filter (All / High / Neutral / Low / Current(auto)).
-# - Leaves your existing behavior and visuals otherwise unchanged.
+# Premarket Stock Alignment — Confidence opacity only (no Regime; no Confidence legend)
+# - Encodes Confidence per Gain% cutoff as bar opacity (legend hidden).
+# - Keeps hover diagnostics (Confidence, Coverage, nA, nB, ECE_NCA, ECE_Cat).
+# - Leaves everything else unchanged.
 
 import streamlit as st
 import pandas as pd
@@ -27,7 +26,6 @@ st.title("Premarket Stock Alignment")
 ss = st.session_state
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("rows", [])
-ss.setdefault("regime_mu_sd", {})   # will hold mu/sd for regime z-scores
 
 # ============================== Unified variables ==============================
 UNIFIED_VARS = [
@@ -120,6 +118,7 @@ if build_btn:
                         return np.nan
                 df["FT"] = raw[cand_ft].map(_to_ft_flag)
 
+            # Deriveds
             float_basis = "Float_PM_Max_M" if "Float_PM_Max_M" in df.columns and df["Float_PM_Max_M"].notna().any() else "Float_M"
             if {"PM_Vol_M", float_basis}.issubset(df.columns):
                 df["FR_x"] = (df["PM_Vol_M"] / df[float_basis]).replace([np.inf,-np.inf], np.nan)
@@ -137,39 +136,8 @@ if build_btn:
                 if pmh_col is not None else np.nan
             )
             
-            keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT"])  # include FT if present
+            keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT"])
             df = df[[c for c in df.columns if c in keep_cols]].copy()
-
-            # ------- Regime tagging (NEW) -------
-            def _fit_mu_sd_for_regime(df_):
-                feats = ["FR_x","PM$Vol/MC_%","RVOL_Max_PM_cum"]
-                mu, sd = {}, {}
-                for f in feats:
-                    s = pd.to_numeric(df_.get(f), errors="coerce")
-                    mu[f] = float(np.nanmean(s)) if s.notna().any() else 0.0
-                    sd_val = float(np.nanstd(s, ddof=0)) if s.notna().any() else 1.0
-                    sd[f] = sd_val if sd_val > 0 else 1.0
-                return {"mu": mu, "sd": sd}
-
-            def _label_regime_rows(df_, mu_sd):
-                feats = ["FR_x","PM$Vol/MC_%","RVOL_Max_PM_cum"]
-                if not set(feats).issubset(df_.columns):
-                    df_["Regime"] = "All"
-                    return df_
-                mu, sd = mu_sd["mu"], mu_sd["sd"]
-                Zs = []
-                for f in feats:
-                    Zs.append((pd.to_numeric(df_[f], errors="coerce") - mu[f]) / sd[f])
-                L = sum(Zs) / 3.0
-                reg = np.where(L >= 0.5, "High", np.where(L <= -0.5, "Low", "Neutral"))
-                df_ = df_.copy()
-                df_["Regime"] = pd.Series(reg, index=df_.index)
-                return df_
-
-            mu_sd = _fit_mu_sd_for_regime(df)
-            ss.regime_mu_sd = mu_sd
-            df = _label_regime_rows(df, mu_sd)
-            # -----------------------------------
 
             ss.base_df = df
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
@@ -214,20 +182,6 @@ if submitted and ticker:
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
         "CatalystYN": catalyst_yn,
     }
-    # --- auto regime for the added row (for 'Current(auto)' UI) ---
-    mu_sd = ss.get("regime_mu_sd", {"mu": {"FR_x":0,"PM$Vol/MC_%":0,"RVOL_Max_PM_cum":0}, "sd": {"FR_x":1,"PM$Vol/MC_%":1,"RVOL_Max_PM_cum":1}})
-    def _regime_of_row(r, mu_sd):
-        feats = ["FR_x","PM$Vol/MC_%","RVOL_Max_PM_cum"]
-        try:
-            Zs = []
-            for f in feats:
-                mu, sd = mu_sd["mu"][f], mu_sd["sd"][f] if mu_sd["sd"][f] != 0 else 1.0
-                Zs.append(((float(r.get(f, np.nan)) - mu) / sd) if np.isfinite(r.get(f, np.nan)) else 0.0)
-            L = sum(Zs) / 3.0
-            return "High" if L >= 0.5 else ("Low" if L <= -0.5 else "Neutral")
-        except Exception:
-            return "Neutral"
-    row["RegimeAuto"] = _regime_of_row(row, mu_sd)
     ss.rows.append(row)
     st.success(f"Saved {ticker}.")
 
@@ -316,13 +270,11 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
         ztr = (Xtr_s @ w_vec)
         zva = (Xva_s @ w_vec)
 
-    # Align direction
     if np.nanmean(ztr[ytr==1]) < np.nanmean(ztr[ytr==0]):
         ztr = -ztr; zva = -zva
         if w_vec is not None: w_vec = -w_vec
         if components is not None: components = -components
 
-    # Calibrate on TRAIN only
     iso_bx, iso_by = np.array([]), np.array([])
     platt_params = None
     ece = np.nan
@@ -534,7 +486,7 @@ def _delete_selected():
         ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(tickers_to_delete)]
         st.session_state["align_sel_tickers"] = []
 
-# --- Controls row (existing) ---
+# Controls row
 col1, col2, col3, col4 = st.columns([2, 5, 1.2, 1.2])
 with col1:
     split_mode = st.selectbox(
@@ -556,13 +508,6 @@ with col3:
 with col4:
     st.button("Delete", use_container_width=True, on_click=_delete_selected, help="Deletes the stocks currently selected in the box.", disabled=not selected_tickers)
 
-# --- NEW: Regime filter row (surgical) ---
-reg_col1, reg_col2 = st.columns([2, 6])
-with reg_col1:
-    regime_choice = st.selectbox("Regime", ["All", "High", "Neutral", "Low", "Current (auto)"], index=0)
-with reg_col2:
-    st.caption("Confidence = f(coverage, calibration). Bars fade when evidence is weak. Regime filters train/evaluate within similar tape.")
-
 if not selected_tickers:
     st.info("No stocks selected. Pick at least one added ticker to display the chart.")
     st.stop()
@@ -575,25 +520,6 @@ var_all = [v for v in UNIFIED_VARS if v in base_df.columns]
 if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
     st.stop()
-
-# Determine regime filter
-def _resolve_regime_used():
-    if regime_choice != "Current (auto)":
-        return regime_choice
-    # Infer from added tickers' 'RegimeAuto' field (majority vote), fallback Neutral
-    rows = [r for r in ss.rows if r.get("Ticker") in set(selected_tickers)]
-    if not rows: return "All"
-    regs = pd.Series([r.get("RegimeAuto","Neutral") for r in rows]).dropna()
-    if regs.empty: return "Neutral"
-    return regs.mode().iloc[0]
-
-regime_used = _resolve_regime_used()
-
-# Prepare df filtered by regime
-if regime_used in {"High","Neutral","Low"} and "Regime" in base_df.columns:
-    df_base_for_models = base_df[base_df["Regime"] == regime_used].copy()
-else:
-    df_base_for_models = base_df.copy()
 
 gain_cutoffs = list(range(25, 301, 25))
 
@@ -614,12 +540,11 @@ added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_t
 
 thr_labels = []
 series_A_med, series_B_med, series_N_med, series_C_med = [], [], [], []
-# NEW: store diagnostics per cutoff
 diag_conf, diag_nA, diag_nB, diag_cov, diag_ece_nca, diag_ece_cat = [], [], [], [], [], []
 
 with st.spinner("Calculating distributions across all cutoffs..."):
     for thr_val in gain_cutoffs:
-        df_split, gA, gB = _make_split(df_base_for_models, float(thr_val), split_mode)
+        df_split, gA, gB = _make_split(base_df, float(thr_val), split_mode)
 
         vc = df_split["__Group__"].value_counts()
         nA, nB = int(vc.get(gA, 0)), int(vc.get(gB, 0))
@@ -663,20 +588,18 @@ with st.spinner("Calculating distributions across all cutoffs..."):
             continue
 
         # --- Confidence (coverage × calibration) ---
-        # coverage via harmonic mean vs reference 200
         if nA == 0 or nB == 0:
             coverage = 0.0
         else:
             n_eff = 2.0 / (1.0/nA + 1.0/nB)
             coverage = min(1.0, n_eff / 200.0)
-        # calibration score from ECEs
         ece_nca = nca_model.get("ece", np.nan) if nca_model else np.nan
         ece_cat = cat_model.get("ece", np.nan) if cat_model else np.nan
         cal_scores = []
         for e in [ece_nca, ece_cat]:
             if np.isfinite(e):
-                cal_scores.append(max(0.0, min(1.0, 1.0 - (e / 0.2))))  # 0.2 = "bad" reference
-        calib_score = float(np.mean(cal_scores)) if cal_scores else 0.6  # conservative default
+                cal_scores.append(max(0.0, min(1.0, 1.0 - (e / 0.2))))
+        calib_score = float(np.mean(cal_scores)) if cal_scores else 0.6
         confidence = max(0.25, min(1.0, math.sqrt(coverage) * calib_score))
 
         # --- Store medians + diagnostics ---
@@ -690,7 +613,7 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         diag_ece_nca.append(float(ece_nca) if np.isfinite(ece_nca) else np.nan)
         diag_ece_cat.append(float(ece_cat) if np.isfinite(ece_cat) else np.nan)
 
-# --- FINAL, ROBUST VERSION: Function to generate export buttons for any chart (unchanged behavior) ---
+# --- Export buttons (unchanged) ---
 def create_export_buttons(df, chart_obj, file_prefix):
     """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
     png_bytes = b""
@@ -755,9 +678,9 @@ def create_export_buttons(df, chart_obj, file_prefix):
         )
 
 if not thr_labels:
-    st.info("Not enough data across cutoffs to train models. Try using a larger database or relax the regime filter.")
+    st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
-    # --- Absolute Probability / Alignment Chart (with Confidence opacity) ---
+    # --- Absolute Probability / Alignment Chart (with Confidence opacity; legend hidden) ---
     data = []
 
     if 'split_mode' in locals() and split_mode == "FT Gain%":
@@ -771,7 +694,6 @@ else:
         nca_label = "NCA: P(≥...%)"
         cat_label = "CatBoost: P(≥...%)"
     
-    # Build rows with diagnostics / confidence per cutoff
     for i, thr in enumerate(thr_labels):
         common = {
             "GainCutoff_%": thr,
@@ -781,7 +703,6 @@ else:
             "nB": int(diag_nB[i]),
             "ECE_NCA": float(diag_ece_nca[i]) if np.isfinite(diag_ece_nca[i]) else np.nan,
             "ECE_Cat": float(diag_ece_cat[i]) if np.isfinite(diag_ece_cat[i]) else np.nan,
-            "Regime": regime_used
         }
         data.append({**common, "Series": gA_label, "Value": series_A_med[i]})
         data.append({**common, "Series": gB_label, "Value": series_B_med[i]})
@@ -799,9 +720,10 @@ else:
         .encode(
             x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {25})"),
             y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
+            color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range),
+                            legend=alt.Legend(title="Analysis Series")),
             xOffset="Series:N",
-            opacity=alt.Opacity("Confidence:Q", scale=alt.Scale(domain=[0.25, 1.0], clamp=True)),
+            opacity=alt.Opacity("Confidence:Q", scale=alt.Scale(domain=[0.25, 1.0], clamp=True), legend=None),
             tooltip=[
                 "GainCutoff_%:O","Series:N",
                 alt.Tooltip("Value:Q", format=".1f"),
@@ -811,7 +733,6 @@ else:
                 alt.Tooltip("nB:Q", title="n(B)"),
                 alt.Tooltip("ECE_NCA:Q", format=".3f"),
                 alt.Tooltip("ECE_Cat:Q", format=".3f"),
-                "Regime:N"
             ],
         )
     )
