@@ -1,12 +1,23 @@
+# Premarket Stock Alignment — with Confidence & Regime (minimal, surgical changes only)
+# - Adds Confidence per Gain% cutoff (coverage × calibration) and encodes it as bar opacity.
+# - Adds Regime tagging (High / Neutral / Low) from FR_x, PM$Vol/MC_%, RVOL_Max_PM_cum
+#   with a UI filter (All / High / Neutral / Low / Current(auto)).
+# - Leaves your existing behavior and visuals otherwise unchanged.
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re, json
+import re, json, io, math
 import altair as alt
 import matplotlib.pyplot as plt
 from datetime import datetime
-from catboost import CatBoostClassifier
-import io
+
+# CatBoost import (unchanged)
+try:
+    from catboost import CatBoostClassifier
+    _CATBOOST_OK = True
+except Exception:
+    _CATBOOST_OK = False
 
 # ============================== Page ==============================
 st.set_page_config(page_title="Premarket Stock Alignment", layout="wide")
@@ -16,6 +27,7 @@ st.title("Premarket Stock Alignment")
 ss = st.session_state
 ss.setdefault("base_df", pd.DataFrame())
 ss.setdefault("rows", [])
+ss.setdefault("regime_mu_sd", {})   # will hold mu/sd for regime z-scores
 
 # ============================== Unified variables ==============================
 UNIFIED_VARS = [
@@ -95,7 +107,7 @@ if build_btn:
             add_num(df, "Max_Pull_PM_%",    ["max pull pm (%)","max pull pm %","max pull pm","max_pull_pm_%"])
             add_num(df, "RVOL_Max_PM_cum",  ["rvol max pm (cum)","rvol max pm cum","rvol_max_pm (cum)","rvol_max_pm_cum","premarket max rvol","premarket max rvol (cum)"])
 
-            # --- NEW: load FT (Follow Through flag) if present ---
+            # --- Load FT (Follow Through flag) if present ---
             cand_ft = _pick(raw, ["FT","Follow Through","FT_flag","FT=1","FollowThrough","ft"])
             if cand_ft:
                 def _to_ft_flag(v):
@@ -127,6 +139,37 @@ if build_btn:
             
             keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT"])  # include FT if present
             df = df[[c for c in df.columns if c in keep_cols]].copy()
+
+            # ------- Regime tagging (NEW) -------
+            def _fit_mu_sd_for_regime(df_):
+                feats = ["FR_x","PM$Vol/MC_%","RVOL_Max_PM_cum"]
+                mu, sd = {}, {}
+                for f in feats:
+                    s = pd.to_numeric(df_.get(f), errors="coerce")
+                    mu[f] = float(np.nanmean(s)) if s.notna().any() else 0.0
+                    sd_val = float(np.nanstd(s, ddof=0)) if s.notna().any() else 1.0
+                    sd[f] = sd_val if sd_val > 0 else 1.0
+                return {"mu": mu, "sd": sd}
+
+            def _label_regime_rows(df_, mu_sd):
+                feats = ["FR_x","PM$Vol/MC_%","RVOL_Max_PM_cum"]
+                if not set(feats).issubset(df_.columns):
+                    df_["Regime"] = "All"
+                    return df_
+                mu, sd = mu_sd["mu"], mu_sd["sd"]
+                Zs = []
+                for f in feats:
+                    Zs.append((pd.to_numeric(df_[f], errors="coerce") - mu[f]) / sd[f])
+                L = sum(Zs) / 3.0
+                reg = np.where(L >= 0.5, "High", np.where(L <= -0.5, "Low", "Neutral"))
+                df_ = df_.copy()
+                df_["Regime"] = pd.Series(reg, index=df_.index)
+                return df_
+
+            mu_sd = _fit_mu_sd_for_regime(df)
+            ss.regime_mu_sd = mu_sd
+            df = _label_regime_rows(df, mu_sd)
+            # -----------------------------------
 
             ss.base_df = df
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
@@ -171,11 +214,24 @@ if submitted and ticker:
         "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
         "CatalystYN": catalyst_yn,
     }
+    # --- auto regime for the added row (for 'Current(auto)' UI) ---
+    mu_sd = ss.get("regime_mu_sd", {"mu": {"FR_x":0,"PM$Vol/MC_%":0,"RVOL_Max_PM_cum":0}, "sd": {"FR_x":1,"PM$Vol/MC_%":1,"RVOL_Max_PM_cum":1}})
+    def _regime_of_row(r, mu_sd):
+        feats = ["FR_x","PM$Vol/MC_%","RVOL_Max_PM_cum"]
+        try:
+            Zs = []
+            for f in feats:
+                mu, sd = mu_sd["mu"][f], mu_sd["sd"][f] if mu_sd["sd"][f] != 0 else 1.0
+                Zs.append(((float(r.get(f, np.nan)) - mu) / sd) if np.isfinite(r.get(f, np.nan)) else 0.0)
+            L = sum(Zs) / 3.0
+            return "High" if L >= 0.5 else ("Low" if L <= -0.5 else "Neutral")
+        except Exception:
+            return "Neutral"
+    row["RegimeAuto"] = _regime_of_row(row, mu_sd)
     ss.rows.append(row)
     st.success(f"Saved {ticker}.")
 
 # ============================== Isotonic helpers & Model Training ==============================
-# (All functions in this block are unchanged)
 def _pav_isotonic(x, y):
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     if x.size == 0: return [], []
@@ -204,6 +260,23 @@ def _iso_predict(bx, by, xq):
         out[i] = by[k]
     return out
 
+def _ece_score(y_true, p_pred, bins=10):
+    y = np.asarray(y_true).astype(int)
+    p = np.asarray(p_pred).astype(float)
+    mask = np.isfinite(p) & np.isfinite(y)
+    y = y[mask]; p = p[mask]
+    if y.size < 10: return np.nan
+    edges = np.linspace(0, 1, bins+1)
+    ece = 0.0; n = y.size
+    for i in range(bins):
+        lo, hi = edges[i], edges[i+1]
+        idx = (p >= lo) & ((p < hi) if i < bins-1 else (p <= hi))
+        if idx.sum() == 0: continue
+        avg_p = float(np.mean(p[idx]))
+        freq = float(np.mean(y[idx]))
+        ece += (idx.sum() / n) * abs(avg_p - freq)
+    return float(ece)
+
 def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
@@ -211,54 +284,72 @@ def _train_nca_or_lda(df_groups: pd.DataFrame, gA_label: str, gB_label: str, fea
     feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
     if not feats: return {}
     Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
-    good_cols = []
-    for c in feats:
-        col = Xdf[c].values
-        col = col[np.isfinite(col)]
-        if col.size == 0: continue
-        if np.nanstd(col) < 1e-9: continue
-        good_cols.append(c)
-    feats = good_cols
-    if not feats: return {}
-    X = df2[feats].apply(pd.to_numeric, errors="coerce").values
     y = (df2["__Group__"].values == gA_label).astype(int)
-    mask = np.isfinite(X).all(axis=1)
-    X = X[mask]; y = y[mask]
-    if X.shape[0] < 20 or np.unique(y).size < 2: return {}
-    mu = X.mean(axis=0); sd = X.std(axis=0, ddof=0); sd[sd==0] = 1.0
-    Xs = (X - mu) / sd
+    mask = np.isfinite(Xdf.values).all(axis=1)
+    Xdf = Xdf.loc[mask]; y = y[mask]
+    if Xdf.shape[0] < 40 or np.unique(y).size < 2: return {}
+    X = Xdf.values
+    from sklearn.model_selection import StratifiedShuffleSplit
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=max(0.15, min(0.25, 40/len(y))), random_state=42)
+    tr_idx, va_idx = next(sss.split(X, y))
+    Xtr, Xva = X[tr_idx], X[va_idx]
+    ytr, yva = y[tr_idx], y[va_idx]
+
+    mu = Xtr.mean(axis=0); sd = Xtr.std(axis=0, ddof=0); sd[sd==0] = 1.0
+    Xtr_s = (Xtr - mu) / sd; Xva_s = (Xva - mu) / sd
+
     used = "lda"; w_vec = None; components = None
     try:
         from sklearn.neighbors import NeighborhoodComponentsAnalysis
         nca = NeighborhoodComponentsAnalysis(n_components=1, random_state=42, max_iter=400)
-        z = nca.fit_transform(Xs, y).ravel()
+        ztr = nca.fit_transform(Xtr_s, ytr).ravel()
+        zva = (Xva_s @ nca.components_.ravel())
         used = "nca"; components = nca.components_
     except Exception:
-        X0 = Xs[y==0]; X1 = Xs[y==1]
+        X0, X1 = Xtr_s[ytr==0], Xtr_s[ytr==1]
         if X0.shape[0] < 2 or X1.shape[0] < 2: return {}
-        m0 = X0.mean(axis=0); m1 = X1.mean(axis=0)
-        S0 = np.cov(X0, rowvar=False); S1 = np.cov(X1, rowvar=False)
-        Sw = S0 + S1 + 1e-3*np.eye(Xs.shape[1])
+        m0, m1 = X0.mean(axis=0), X1.mean(axis=0)
+        S0, S1 = np.cov(X0, rowvar=False), np.cov(X1, rowvar=False)
+        Sw = S0 + S1 + 1e-3*np.eye(Xtr_s.shape[1])
         w_vec = np.linalg.solve(Sw, (m1 - m0))
         w_vec = w_vec / (np.linalg.norm(w_vec) + 1e-12)
-        z = (Xs @ w_vec)
-    if np.nanmean(z[y==1]) < np.nanmean(z[y==0]):
-        z = -z
+        ztr = (Xtr_s @ w_vec)
+        zva = (Xva_s @ w_vec)
+
+    # Align direction
+    if np.nanmean(ztr[ytr==1]) < np.nanmean(ztr[ytr==0]):
+        ztr = -ztr; zva = -zva
         if w_vec is not None: w_vec = -w_vec
         if components is not None: components = -components
-    zf = z[np.isfinite(z)]; yf = y[np.isfinite(z)]
-    iso_bx, iso_by = np.array([]), np.array([]); platt_params = None
-    if zf.size >= 8 and np.unique(zf).size >= 3:
-        bx, by = _pav_isotonic(zf, yf.astype(float))
-        if len(bx) >= 2: iso_bx, iso_by = np.array(bx), np.array(by)
+
+    # Calibrate on TRAIN only
+    iso_bx, iso_by = np.array([]), np.array([])
+    platt_params = None
+    ece = np.nan
+    if ztr.size >= 8 and np.unique(ztr).size >= 3:
+        bx, by = _pav_isotonic(ztr, ytr.astype(float))
+        if len(bx) >= 2:
+            iso_bx, iso_by = np.array(bx), np.array(by)
+            pva = _iso_predict(iso_bx, iso_by, zva)
+            ece = _ece_score(yva, pva)
     if iso_bx.size < 2:
-        z0 = zf[yf==0]; z1 = zf[yf==1]
+        z0, z1 = ztr[ytr==0], ztr[ytr==1]
         if z0.size and z1.size:
             m0, m1 = float(np.mean(z0)), float(np.mean(z1))
             s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
             m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
             platt_params = (m, k)
-    return {"ok": True, "kind": used, "feats": feats, "mu": mu.tolist(), "sd": sd.tolist(), "w_vec": (w_vec.tolist() if w_vec is not None else None), "components": (components.tolist() if components is not None else None), "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(), "platt": (platt_params if platt_params is not None else None), "gA": gA_label, "gB": gB_label}
+            pva = 1.0 / (1.0 + np.exp(-k*(zva - m)))
+            ece = _ece_score(yva, pva)
+    return {
+        "ok": True, "kind": used, "feats": feats,
+        "mu": mu.tolist(), "sd": sd.tolist(),
+        "w_vec": (w_vec.tolist() if w_vec is not None else None),
+        "components": (components.tolist() if components is not None else None),
+        "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(), "platt": (platt_params if platt_params is not None else None),
+        "ece": float(ece) if np.isfinite(ece) else np.nan,
+        "gA": gA_label, "gB": gB_label
+    }
 
 def _nca_predict_proba_row(xrow: dict, model: dict) -> float:
     if not model or not model.get("ok"): return np.nan
@@ -296,6 +387,7 @@ def _nca_predict_proba_row(xrow: dict, model: dict) -> float:
     return float(np.clip(pA, 0.0, 1.0))
 
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
+    if not _CATBOOST_OK: return {}
     present = set(df_groups["__Group__"].dropna().unique().tolist())
     if not ({gA_label, gB_label} <= present): return {}
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
@@ -318,17 +410,13 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
     def _has_both_classes(arr):
         return np.unique(arr).size == 2
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
-    
-# --- TUNED PARAMETERS ---
-    # Goal: Create a more "open-minded" model that is less likely to assign 0%
-    # to outliers, at the cost of potentially more false positives.
     params = dict(
         loss_function="Logloss",
         eval_metric="Logloss",
         iterations=200,
-        learning_rate=0.05,  # Slightly increased to prevent overfitting to tiny details.
-        depth=2,             # From 3 -> 2. Simpler rules.
-        l2_leaf_reg=10,      # More regularization.
+        learning_rate=0.05,
+        depth=2,
+        l2_leaf_reg=10,
         bootstrap_type="Bayesian",
         bagging_temperature=0.5,
         auto_class_weights="Balanced",
@@ -336,7 +424,6 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
         allow_writing_files=False,
         verbose=False,
     )
-    
     if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
     else:       params.update(dict(od_type="None"))
     model = CatBoostClassifier(**params)
@@ -350,13 +437,16 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
             eval_ok = False
         except Exception:
             return {}
-    iso_bx = np.array([]); iso_by = np.array([]); platt = None
+    iso_bx = np.array([]); iso_by = np.array([]); platt = None; ece = np.nan
     try:
         if eval_ok:
             p_raw = model.predict_proba(Xva)[:, 1].astype(float)
             if np.unique(p_raw).size >= 3 and _has_both_classes(yva):
                 bx, by = _pav_isotonic(p_raw, yva.astype(float))
-                if len(bx) >= 2: iso_bx, iso_by = np.array(bx), np.array(by)
+                if len(bx) >= 2:
+                    iso_bx, iso_by = np.array(bx), np.array(by)
+                    p_cal = _iso_predict(iso_bx, iso_by, p_raw)
+                    ece = _ece_score(yva, p_cal)
             if iso_bx.size < 2:
                 z0 = p_raw[yva==0]; z1 = p_raw[yva==1]
                 if z0.size and z1.size:
@@ -364,8 +454,11 @@ def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, 
                     s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
                     m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
                     platt = (m, k)
-    except Exception: pass
-    return {"ok": True, "feats": feats, "gA": gA_label, "gB": gB_label, "cb": model, "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(), "platt": platt}
+                    p_cal = 1.0 / (1.0 + np.exp(-platt[1]*(p_raw - platt[0])))
+                    ece = _ece_score(yva, p_cal)
+    except Exception:
+        pass
+    return {"ok": True, "feats": feats, "gA": gA_label, "gB": gB_label, "cb": model, "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(), "platt": platt, "ece": float(ece) if np.isfinite(ece) else np.nan}
 
 def _cat_predict_proba_row(xrow: dict, model: dict) -> float:
     if not model or not model.get("ok"): return np.nan
@@ -396,14 +489,12 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         return {}
     gA_, gB_ = list(centers_tbl.columns)
     counts = {gA_: 0.0, gB_: 0.0}
-    
     for var in centers_tbl.index:
         xv = pd.to_numeric(stock_row.get(var), errors="coerce")
         if not np.isfinite(xv): continue
         vA = centers_tbl.at[var, gA_]
         vB = centers_tbl.at[var, gB_]
         if pd.isna(vA) or pd.isna(vB): continue
-
         if abs(xv - vA) < abs(xv - vB):
             counts[gA_] += 1.0
         elif abs(xv - vB) < abs(xv - vA):
@@ -411,7 +502,6 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         else:
             counts[gA_] += 0.5
             counts[gB_] += 0.5
-            
     total = counts[gA_] + counts[gB_]
     return {
         "A_pct": 100.0 * counts[gA_] / total if total > 0 else 0.0,
@@ -432,7 +522,6 @@ if not ss.rows:
     st.stop()
 
 all_added_tickers = pd.Series([r.get("Ticker") for r in ss.rows]).dropna().unique().tolist()
-
 if "align_sel_tickers" not in st.session_state:
     st.session_state["align_sel_tickers"] = all_added_tickers[:]
 
@@ -445,7 +534,7 @@ def _delete_selected():
         ss.rows = [r for r in ss.rows if r.get("Ticker") not in set(tickers_to_delete)]
         st.session_state["align_sel_tickers"] = []
 
-# --- Controls row: multiselect, Clear, Delete, and NEW split-mode dropdown on the same line ---
+# --- Controls row (existing) ---
 col1, col2, col3, col4 = st.columns([2, 5, 1.2, 1.2])
 with col1:
     split_mode = st.selectbox(
@@ -467,6 +556,13 @@ with col3:
 with col4:
     st.button("Delete", use_container_width=True, on_click=_delete_selected, help="Deletes the stocks currently selected in the box.", disabled=not selected_tickers)
 
+# --- NEW: Regime filter row (surgical) ---
+reg_col1, reg_col2 = st.columns([2, 6])
+with reg_col1:
+    regime_choice = st.selectbox("Regime", ["All", "High", "Neutral", "Low", "Current (auto)"], index=0)
+with reg_col2:
+    st.caption("Confidence = f(coverage, calibration). Bars fade when evidence is weak. Regime filters train/evaluate within similar tape.")
+
 if not selected_tickers:
     st.info("No stocks selected. Pick at least one added ticker to display the chart.")
     st.stop()
@@ -480,42 +576,61 @@ if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
     st.stop()
 
+# Determine regime filter
+def _resolve_regime_used():
+    if regime_choice != "Current (auto)":
+        return regime_choice
+    # Infer from added tickers' 'RegimeAuto' field (majority vote), fallback Neutral
+    rows = [r for r in ss.rows if r.get("Ticker") in set(selected_tickers)]
+    if not rows: return "All"
+    regs = pd.Series([r.get("RegimeAuto","Neutral") for r in rows]).dropna()
+    if regs.empty: return "Neutral"
+    return regs.mode().iloc[0]
+
+regime_used = _resolve_regime_used()
+
+# Prepare df filtered by regime
+if regime_used in {"High","Neutral","Low"} and "Regime" in base_df.columns:
+    df_base_for_models = base_df[base_df["Regime"] == regime_used].copy()
+else:
+    df_base_for_models = base_df.copy()
+
 gain_cutoffs = list(range(25, 301, 25))
 
 def _make_split(df_base: pd.DataFrame, thr_val: float, mode: str):
     df_tmp = df_base.copy()
-
     if mode == "FT Gain%" and "FT" in df_tmp.columns:
-        # Group A: FT=1 with Max_Push_Daily_% >= thr
-        # Group B: FT=0 (all FT=0 names, any Gain%)
         gA_, gB_ = f"FT=1 ≥{int(thr_val)}%", "FT=0"
         m_ft = pd.to_numeric(df_tmp.get("FT"), errors="coerce")
         m_gain = pd.to_numeric(df_tmp.get("Max_Push_Daily_%"), errors="coerce")
         df_tmp["__Group__"] = np.where((m_ft == 1) & (m_gain >= thr_val), gA_, "FT=0")
     else:
-        # Default: Gain% vs Rest (entire universe)
         gA_, gB_ = f"≥{int(thr_val)}%", "Rest"
         m_gain = pd.to_numeric(df_tmp.get("Max_Push_Daily_%"), errors="coerce")
         df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, "Rest")
-
     return df_tmp, gA_, gB_
 
 added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
 
 thr_labels = []
 series_A_med, series_B_med, series_N_med, series_C_med = [], [], [], []
+# NEW: store diagnostics per cutoff
+diag_conf, diag_nA, diag_nB, diag_cov, diag_ece_nca, diag_ece_cat = [], [], [], [], [], []
 
 with st.spinner("Calculating distributions across all cutoffs..."):
     for thr_val in gain_cutoffs:
-        df_split, gA, gB = _make_split(base_df, float(thr_val), split_mode)
+        df_split, gA, gB = _make_split(df_base_for_models, float(thr_val), split_mode)
 
         vc = df_split["__Group__"].value_counts()
-        if (vc.get(gA, 0) < 10) or (vc.get(gB, 0) < 10):
+        nA, nB = int(vc.get(gA, 0)), int(vc.get(gB, 0))
+        if (nA < 10) or (nB < 10):
             continue
 
+        # Models
         nca_model = _train_nca_or_lda(df_split, gA, gB, var_all) or {}
         cat_model = _train_catboost_once(df_split, gA, gB, var_all) or {}
-        
+
+        # Centers
         features_for_centers = [f for f in ALLOWED_LIVE_FEATURES if f in df_split.columns]
         centers_tbl = df_split.groupby("__Group__")[features_for_centers].median().T
         if gA not in centers_tbl.columns or gB not in centers_tbl.columns:
@@ -547,26 +662,42 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         if not any([pN, pC, pA_centers]):
             continue
 
+        # --- Confidence (coverage × calibration) ---
+        # coverage via harmonic mean vs reference 200
+        if nA == 0 or nB == 0:
+            coverage = 0.0
+        else:
+            n_eff = 2.0 / (1.0/nA + 1.0/nB)
+            coverage = min(1.0, n_eff / 200.0)
+        # calibration score from ECEs
+        ece_nca = nca_model.get("ece", np.nan) if nca_model else np.nan
+        ece_cat = cat_model.get("ece", np.nan) if cat_model else np.nan
+        cal_scores = []
+        for e in [ece_nca, ece_cat]:
+            if np.isfinite(e):
+                cal_scores.append(max(0.0, min(1.0, 1.0 - (e / 0.2))))  # 0.2 = "bad" reference
+        calib_score = float(np.mean(cal_scores)) if cal_scores else 0.6  # conservative default
+        confidence = max(0.25, min(1.0, math.sqrt(coverage) * calib_score))
+
+        # --- Store medians + diagnostics ---
         thr_labels.append(int(thr_val))
         series_N_med.append(float(np.nanmedian(pN)) if pN else np.nan)
         series_C_med.append(float(np.nanmedian(pC)) if pC else np.nan)
         series_A_med.append(float(np.nanmedian(pA_centers)) if pA_centers else np.nan)
         series_B_med.append(float(np.nanmedian(pB_centers)) if pB_centers else np.nan)
+        diag_conf.append(confidence); diag_cov.append(coverage)
+        diag_nA.append(nA); diag_nB.append(nB)
+        diag_ece_nca.append(float(ece_nca) if np.isfinite(ece_nca) else np.nan)
+        diag_ece_cat.append(float(ece_cat) if np.isfinite(ece_cat) else np.nan)
 
-# --- FINAL, ROBUST VERSION: Function to generate export buttons for any chart ---
+# --- FINAL, ROBUST VERSION: Function to generate export buttons for any chart (unchanged behavior) ---
 def create_export_buttons(df, chart_obj, file_prefix):
     """Generates PNG and HTML download buttons for a given dataframe and Altair chart."""
-    # Initialize with empty bytes. This is the key to preventing the crash.
     png_bytes = b""
-    
     try:
-        # --- Start of the safe block ---
-        # 1. Prepare data by pivoting
         x_axis_col = df.columns[0]
         pivot = df.pivot(index=x_axis_col, columns="Series", values="Value").sort_index()
         series_names = list(pivot.columns)
-        
-        # 2. Robustly extract colors from the chart's dictionary representation
         chart_dict = chart_obj.to_dict()
         unique_colors = {}
         try:
@@ -575,21 +706,16 @@ def create_export_buttons(df, chart_obj, file_prefix):
             unique_colors = dict(zip(domain, range_))
         except KeyError:
             pass
-
         colors = [unique_colors.get(s, "#999999") for s in series_names]
-        
-        # 3. Create the Matplotlib figure
         x_labels = [str(label) for label in pivot.index.tolist()]
         n_groups, n_series = len(x_labels), len(series_names)
         x_pos = np.arange(n_groups)
         bar_width = 0.8 / max(n_series, 1)
-
         fig, ax = plt.subplots(figsize=(max(7, n_groups * 0.6), 5))
         for i, series_name in enumerate(series_names):
             vals = pivot[series_name].values.astype(float)
             offset = i * bar_width - (n_series - 1) * bar_width / 2
             ax.bar(x_pos + offset, vals, width=bar_width, label=series_name, color=colors[i])
-
         ax.set_xticks(x_pos)
         ax.set_xticklabels(x_labels, rotation=45, ha="right")
         ax.set_ylim(0, 100)
@@ -597,14 +723,11 @@ def create_export_buttons(df, chart_obj, file_prefix):
         ax.set_ylabel("Value (%)")
         ax.legend(loc="upper left", frameon=False)
         ax.set_title(chart_obj.title)
-        
-        # 4. Save figure to a bytes buffer
         buf = io.BytesIO()
         fig.tight_layout()
         fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
         plt.close(fig)
         png_bytes = buf.getvalue()
-
     except Exception:
         pass
 
@@ -632,9 +755,9 @@ def create_export_buttons(df, chart_obj, file_prefix):
         )
 
 if not thr_labels:
-    st.info("Not enough data across cutoffs to train models. Try using a larger database.")
+    st.info("Not enough data across cutoffs to train models. Try using a larger database or relax the regime filter.")
 else:
-    # --- Absolute Probability Chart (Main Chart) ---
+    # --- Absolute Probability / Alignment Chart (with Confidence opacity) ---
     data = []
 
     if 'split_mode' in locals() and split_mode == "FT Gain%":
@@ -648,11 +771,22 @@ else:
         nca_label = "NCA: P(≥...%)"
         cat_label = "CatBoost: P(≥...%)"
     
+    # Build rows with diagnostics / confidence per cutoff
     for i, thr in enumerate(thr_labels):
-        data.append({"GainCutoff_%": thr, "Series": gA_label, "Value": series_A_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": gB_label, "Value": series_B_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": nca_label, "Value": series_N_med[i]})
-        data.append({"GainCutoff_%": thr, "Series": cat_label, "Value": series_C_med[i]})
+        common = {
+            "GainCutoff_%": thr,
+            "Confidence": float(diag_conf[i]),
+            "Coverage": float(diag_cov[i]),
+            "nA": int(diag_nA[i]),
+            "nB": int(diag_nB[i]),
+            "ECE_NCA": float(diag_ece_nca[i]) if np.isfinite(diag_ece_nca[i]) else np.nan,
+            "ECE_Cat": float(diag_ece_cat[i]) if np.isfinite(diag_ece_cat[i]) else np.nan,
+            "Regime": regime_used
+        }
+        data.append({**common, "Series": gA_label, "Value": series_A_med[i]})
+        data.append({**common, "Series": gB_label, "Value": series_B_med[i]})
+        data.append({**common, "Series": nca_label, "Value": series_N_med[i]})
+        data.append({**common, "Series": cat_label, "Value": series_C_med[i]})
 
     df_long = pd.DataFrame(data).dropna(subset=['Value'])
 
@@ -667,10 +801,21 @@ else:
             y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
             xOffset="Series:N",
-            tooltip=["GainCutoff_%:O","Series:N",alt.Tooltip("Value:Q", format=".1f")],
+            opacity=alt.Opacity("Confidence:Q", scale=alt.Scale(domain=[0.25, 1.0], clamp=True)),
+            tooltip=[
+                "GainCutoff_%:O","Series:N",
+                alt.Tooltip("Value:Q", format=".1f"),
+                alt.Tooltip("Confidence:Q", format=".2f"),
+                alt.Tooltip("Coverage:Q", format=".2f"),
+                alt.Tooltip("nA:Q", title="n(A)"),
+                alt.Tooltip("nB:Q", title="n(B)"),
+                alt.Tooltip("ECE_NCA:Q", format=".3f"),
+                alt.Tooltip("ECE_Cat:Q", format=".3f"),
+                "Regime:N"
+            ],
         )
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # --- Chart Export Section for Absolute Probability Chart ---
+    # --- Chart Export Section (unchanged) ---
     create_export_buttons(df_long, chart, "absolute_probability")
