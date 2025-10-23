@@ -723,7 +723,21 @@ else:
             color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range),
                             legend=alt.Legend(title="Analysis Series")),
             xOffset="Series:N",
-            opacity=alt.Opacity("Confidence:Q", scale=alt.Scale(domain=[0.25, 1.0], clamp=True), legend=None),
+            base = alt.Chart(df_long).mark_bar().encode(
+                x="GainCutoff_%:O",
+                y=alt.Y("Value:Q", scale=alt.Scale(domain=[0,100])),
+                color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=alt.Legend(title="Analysis Series")),
+                xOffset="Series:N",
+                tooltip=[ ... same as before ... ],
+            )
+            
+            fade = alt.Chart(df_long).transform_calculate(Fade="1 - datum.Confidence").mark_bar(color="white").encode(
+                x="GainCutoff_%:O",
+                y="Value:Q",
+                xOffset="Series:N",
+                opacity=alt.Opacity("Fade:Q", scale=alt.Scale(domain=[0, 0.75], range=[0, 0.6], clamp=True), legend=None),
+            )
+            chart = alt.layer(base, fade)
             tooltip=[
                 "GainCutoff_%:O","Series:N",
                 alt.Tooltip("Value:Q", format=".1f"),
