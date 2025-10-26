@@ -779,16 +779,17 @@ else:
         if not np.isfinite(p) or not np.isfinite(rr_val):
             continue
         ev_r = (p * rr_val) - ((1.0 - p) * 1.0)        # EV in R
-        ev_$ = ev_r * risk_cash                        # EV in dollars
+        ev_dollars = ev_r * risk_cash                  # EV in dollars
         ev_rows.append({
             "GainCutoff_%": int(thr),
             "p_win": round(p, 4),
             "R:R": round(rr_val, 3),
             "EV_R": round(ev_r, 3),
-            "EV_$": round(ev_$, 2),
+            "EV_$": round(ev_dollars, 2),
             "Position_Size": round(pos_size, 0) if np.isfinite(pos_size) else np.nan,
             "Risk_$": round(risk_cash, 2)
         })
+
 
     if not ev_rows:
         st.warning("Enter valid Entry/Stop/Target to compute EV.")
