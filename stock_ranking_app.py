@@ -733,24 +733,19 @@ else:
     st.altair_chart(chart, use_container_width=True)
     create_export_buttons(df_long, chart, "absolute_probability")
 
-# ============================== EV Evaluation (No Context, No Shrinkage; Always Liquidity + Catalyst Tilts) ==============================
+# ============================== EV Evaluation (Single Chart: Liquidity + Catalyst Adjusted) ==============================
 st.markdown("---")
-st.subheader("EV Evaluation")
+st.subheader("EV (Adjusted: Liquidity + Catalyst)")
 
 if not thr_labels:
     st.info("EV needs the computed probability series. Upload DB → Build model → Add stocks.")
 else:
-    # --- Controls (persisted via keys) ---
+    # ---- Controls (keep only what you need) ----
     c1, c2 = st.columns([1.2, 1.0])
     with c1:
         prob_source = st.selectbox(
             "Probability source",
-            [
-                "NCA & CatBoost Avg",
-                "NCA",
-                "CatBoost",
-                "Median Centers"
-            ],
+            ["NCA & CatBoost Avg", "NCA", "CatBoost", "Median Centers"],
             index=0,
             key="prob_source"
         )
@@ -760,11 +755,11 @@ else:
             key="rr_assumed"
         )
 
-    # --- Helper: convert % series to probabilities in [0,1] ---
+    # ---- Helper: convert % to [0,1] ----
     def _to_prob_list(series_pct):
         return [(s/100.0) if (s is not None and not np.isnan(s)) else np.nan for s in series_pct]
 
-    # --- Build probability list from selection ---
+    # ---- Build probability list from selection ----
     if prob_source.startswith("NCA & CatBoost Avg"):
         p_n = _to_prob_list(series_N_med)
         p_c = _to_prob_list(series_C_med)
@@ -781,107 +776,10 @@ else:
     else:
         p_list = _to_prob_list(series_A_med)  # Median Centers as fallback
 
-    # ================= Base EV (uses your R:R) =================
-    ev_rows = []
-    rr_for_base = float(st.session_state.get("rr_assumed", rr_assumed))
-    for i, thr in enumerate(thr_labels):
-        p = p_list[i] if i < len(p_list) else np.nan
-        if not np.isfinite(p): 
-            continue
-        ev_r = p * rr_for_base - (1.0 - p)
-        ev_rows.append({
-            "GainCutoff_%": int(thr),
-            "p_win": round(p, 4),
-            "R:R": round(rr_for_base, 3),
-            "EV_R": round(ev_r, 3),
-        })
+    # ---- Always-on tilts (no UI) ----
+    lam_liq = 0.10  # liquidity tilt strength on probability
+    gam_cat = 0.05  # catalyst tilt strength on probability
 
-    if not ev_rows:
-        st.warning("No valid probabilities available to compute EV.")
-        st.stop()
-
-    ev_df = pd.DataFrame(ev_rows).sort_values("GainCutoff_%")
-
-    # EV chart (green/red by sign)
-    ev_chart = (
-        alt.Chart(ev_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("GainCutoff_%:O", title="Gain% cutoff"),
-            y=alt.Y("EV_R:Q", title="EV (R)"),
-            color=alt.condition(
-                alt.datum["EV_R"] >= 0,
-                alt.value("#015e06"),
-                alt.value("#b30100")
-            ),
-            tooltip=[
-                alt.Tooltip("GainCutoff_%:O", title="Cutoff (%)"),
-                alt.Tooltip("p_win:Q", format=".2f"),
-                alt.Tooltip(field="R:R", type="quantitative", title="R:R", format=".2f"),
-                alt.Tooltip("EV_R:Q", format=".3f"),
-            ],
-        )
-    )
-    st.altair_chart(ev_chart, use_container_width=True)
-
-    # ---------------- Downloads (PNG + HTML) for Base EV ----------------
-    def _dl_base_ev_png_html(ev_df: pd.DataFrame, chart_obj: alt.Chart, file_prefix: str):
-        png_bytes = b""
-        try:
-            x_labels = [str(v) for v in ev_df["GainCutoff_%"].tolist()]
-            heights  = ev_df["EV_R"].astype(float).tolist()
-            colors   = ["#015e06" if v >= 0 else "#b30100" for v in heights]
-            x_pos = np.arange(len(x_labels))
-            fig, ax = plt.subplots(figsize=(max(7, len(x_labels) * 0.6), 5))
-            ax.bar(x_pos, heights, color=colors)
-            ax.set_xticks(x_pos); ax.set_xticklabels(x_labels, rotation=45, ha="right")
-            ax.set_xlabel("Gain% cutoff"); ax.set_ylabel("EV (R)")
-            ax.set_title(chart_obj.title)
-            fig.tight_layout()
-            buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=160, bbox_inches="tight"); plt.close(fig)
-            png_bytes = buf.getvalue()
-        except Exception:
-            pass
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                label="Download PNG",
-                data=png_bytes,
-                file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                mime="image/png",
-                use_container_width=True,
-                disabled=not png_bytes
-            )
-        with col2:
-            spec = chart_obj.to_dict()
-            html_template = f'''<!doctype html>
-<html><head><meta charset="utf-8"><title>{file_prefix}</title>
-<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head>
-<body><div id="vis"></div>
-<script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions: true}});</script>
-</body></html>'''
-            st.download_button(
-                label="Download HTML",
-                data=html_template.encode("utf-8"),
-                file_name=f"{file_prefix}.html",
-                mime="text/html",
-                use_container_width=True,
-            )
-
-    _dl_base_ev_png_html(ev_df, ev_chart, "ev_by_cutoff")
-
-    # ================= Adjusted EV (Liquidity + Catalyst tilts on probability ONLY) =================
-    st.markdown("---")
-    st.subheader("EV — Adjusted (Liquidity + Catalyst tilts)")
-
-    # ---- Fixed strengths (no UI) ----
-    lam_liq = 0.10  # liquidity tilt strength applied to probability
-    gam_cat = 0.05  # catalyst tilt strength applied to probability
-
-    # ---- Helpers for robust z ----
     def _robust_z(x, arr):
         arr = pd.to_numeric(pd.Series(arr), errors="coerce")
         med = np.nanmedian(arr)
@@ -890,7 +788,7 @@ else:
         scale = (1.4826 * mad) if (mad and mad > 0) else (std if std > 0 else 1.0)
         return (x - med)/scale if np.isfinite(x) else 0.0
 
-    # ---- Compute cross-sectional tilts from selected tickers (median across them) ----
+    # Median features across selected tickers; neutral if none selected
     selected_set = set(selected_tickers) if "selected_tickers" in st.session_state else set()
     added_df_full = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in selected_set]) if selected_set else pd.DataFrame()
 
@@ -902,91 +800,89 @@ else:
         pm_mc_med = float(np.nanmedian(pd.to_numeric(added_df_full.get("PM$Vol/MC_%"), errors="coerce")))
         frx_med   = float(np.nanmedian(pd.to_numeric(added_df_full.get("FR_x"), errors="coerce")))
         rvol_med  = float(np.nanmedian(pd.to_numeric(added_df_full.get("RVOL_Max_PM_cum"), errors="coerce")))
-        # Liquidity factor based on robust z-sum (bounded)
+
         zsum = 0.0
         if np.isfinite(pm_mc_med): zsum += _robust_z(pm_mc_med, arr_pm_mc)
         if np.isfinite(frx_med):   zsum += _robust_z(frx_med,   arr_fr)
         if np.isfinite(rvol_med):  zsum += _robust_z(rvol_med,  arr_rvol)
         L_prob = 1.0 + lam_liq * np.tanh(zsum)
-        L_prob = float(np.clip(L_prob, 0.8, 1.2))  # modest bounds
-        # Catalyst factor from share of catalysts among selected
+        L_prob = float(np.clip(L_prob, 0.8, 1.2))
+
         has_cat = (pd.to_numeric(added_df_full.get("Catalyst"), errors="coerce") >= 0.5).sum()
         share_cat = has_cat / max(1, len(added_df_full))
         K_prob = 1.0 + gam_cat * (2*share_cat - 1.0)
         K_prob = float(np.clip(K_prob, 0.9, 1.1))
     else:
-        # No selected tickers → neutral tilts
         L_prob = 1.0
         K_prob = 1.0
 
-    # ---- Apply tilts to probability and compute EV ----
-    rr_for_adj = float(st.session_state.get("rr_assumed", rr_assumed))
-    rows_adj = []
+    # ---- Apply tilts, compute single EV series ----
+    rr = float(st.session_state.get("rr_assumed", rr_assumed))
+    rows = []
     for i, g in enumerate(thr_labels):
         p = p_list[i] if i < len(p_list) else np.nan
         if not np.isfinite(p):
             continue
         p_adj = float(np.clip(p * L_prob * K_prob, 0.0, 1.0))
-        ev = p_adj * rr_for_adj - (1.0 - p_adj)
-        ev = float(np.clip(ev, -3.0, 8.0))
-        rows_adj.append({
+        ev_r  = float(np.clip(p_adj * rr - (1.0 - p_adj), -3.0, 8.0))
+        rows.append({
             "GainCutoff_%": int(g),
-            "EV_adj_R": ev,
+            "EV_R": ev_r,
             "P_model": float(p),
             "P_adj": float(p_adj),
-            "RR": rr_for_adj,
+            "RR": rr,
             "LiqTilt": float(L_prob),
             "CatTilt": float(K_prob),
         })
 
-    df_adj = pd.DataFrame(rows_adj)
+    df_ev = pd.DataFrame(rows)
 
-    if df_adj.empty:
-        st.warning("No adjusted EV values to display (insufficient probabilities).")
+    if df_ev.empty:
+        st.warning("No EV values to display (insufficient probabilities).")
     else:
-        ev_adj_chart = (
-            alt.Chart(df_adj)
+        ev_chart = (
+            alt.Chart(df_ev)
             .mark_bar()
             .encode(
                 x=alt.X("GainCutoff_%:O", title="Gain% cutoff"),
-                y=alt.Y("EV_adj_R:Q", title="EV (R) — adjusted"),
-                color=alt.condition(alt.datum["EV_adj_R"] >= 0, alt.value("#015e06"), alt.value("#b30100")),
+                y=alt.Y("EV_R:Q", title="EV (R)"),
+                color=alt.condition(alt.datum["EV_R"] >= 0, alt.value("#015e06"), alt.value("#b30100")),
                 tooltip=[
                     alt.Tooltip("GainCutoff_%:O", title="Cutoff (%)"),
-                    alt.Tooltip("EV_adj_R:Q", title="EV (R)", format=".3f"),
+                    alt.Tooltip("EV_R:Q", title="EV (R)", format=".3f"),
                     alt.Tooltip("P_model:Q", title="P(model)", format=".2f"),
                     alt.Tooltip("P_adj:Q",   title="P(adjusted)", format=".2f"),
-                    alt.Tooltip("RR:Q", title="R:R", format=".2f"),
+                    alt.Tooltip("RR:Q",      title="R:R", format=".2f"),
                     alt.Tooltip("LiqTilt:Q", title="Liquidity ×", format=".2f"),
                     alt.Tooltip("CatTilt:Q", title="Catalyst ×",  format=".2f"),
                 ],
             )
         )
-        st.altair_chart(ev_adj_chart, use_container_width=True)
+        st.altair_chart(ev_chart, use_container_width=True)
 
-        # ---------------- Downloads (PNG + HTML) for Adjusted EV ----------------
-        def _dl_adj_png_html(df_adj: pd.DataFrame, chart_obj: alt.Chart, file_prefix: str):
+        # ---- Downloads (PNG + HTML) for the single EV chart ----
+        def _dl_ev_png_html(df_ev: pd.DataFrame, chart_obj: alt.Chart, file_prefix: str):
             png_bytes = b""
             try:
-                labs = [str(v) for v in df_adj["GainCutoff_%"].tolist()]
-                vals = df_adj["EV_adj_R"].astype(float).tolist()
+                labs = [str(v) for v in df_ev["GainCutoff_%"].tolist()]
+                vals = df_ev["EV_R"].astype(float).tolist()
                 cols = ["#015e06" if v >= 0 else "#b30100" for v in vals]
                 x = np.arange(len(labs))
                 fig, ax = plt.subplots(figsize=(max(7, len(labs) * 0.6), 5))
                 ax.bar(x, vals, color=cols)
                 ax.set_xticks(x); ax.set_xticklabels(labs, rotation=45, ha="right")
-                ax.set_xlabel("Gain% cutoff"); ax.set_ylabel("EV (R) — adjusted")
+                ax.set_xlabel("Gain% cutoff"); ax.set_ylabel("EV (R)")
                 fig.tight_layout()
                 buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=160, bbox_inches="tight"); plt.close(fig)
                 png_bytes = buf.getvalue()
             except Exception:
                 pass
-            c1, c2 = st.columns(2)
-            with c1:
+            col1, col2 = st.columns(2)
+            with col1:
                 st.download_button("Download PNG", png_bytes,
                                    file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
                                    mime="image/png", use_container_width=True, disabled=not png_bytes)
-            with c2:
+            with col2:
                 spec = chart_obj.to_dict()
                 html = f'''<!doctype html><html><head><meta charset="utf-8"><title>{file_prefix}</title>
 <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
@@ -994,6 +890,6 @@ else:
 <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head>
 <body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions:true}});</script></body></html>'''
                 st.download_button("Download HTML", html.encode("utf-8"),
-                                   file_name=f"{prefix}.html", mime="text/html", use_container_width=True)
+                                   file_name=f"{file_prefix}.html", mime="text/html", use_container_width=True)
 
-        _dl_adj_png_html(df_adj, ev_adj_chart, "ev_adjusted_liq_cat")
+        _dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
