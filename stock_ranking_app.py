@@ -728,14 +728,12 @@ else:
             tooltip=tooltip_cols,
         )
     )
-
-
     st.altair_chart(chart, use_container_width=True)
     create_export_buttons(df_long, chart, "absolute_probability")
 
 # ============================== EV Evaluation (Single Chart: Liquidity + Catalyst Adjusted) ==============================
 st.markdown("---")
-st.subheader("EV (Adjusted: Liquidity + Catalyst)")
+st.subheader("EV Evaluation")
 
 if not thr_labels:
     st.info("EV needs the computed probability series. Upload DB → Build model → Add stocks.")
@@ -891,5 +889,16 @@ else:
 <body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions:true}});</script></body></html>'''
                 st.download_button("Download HTML", html.encode("utf-8"),
                                    file_name=f"{file_prefix}.html", mime="text/html", use_container_width=True)
+
+        st.caption(
+    f"Liq inputs — pm_mc_med={pm_mc_med}, frx_med={frx_med}, rvol_med={rvol_med} | "
+    f"zsum={zsum if 'zsum' in locals() else '—'} → L={L_prob:.4f}"
+)
+st.caption(
+    f"Cat inputs — selected={len(added_df_full)} | share_cat="
+    f"{(has_cat / max(1, len(added_df_full))):.3f}" if not added_df_full.empty else "Cat inputs — none selected"
+    + f" → K={K_prob:.4f}"
+)
+
 
         _dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
