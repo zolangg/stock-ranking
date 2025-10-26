@@ -733,11 +733,37 @@ else:
     st.altair_chart(chart, use_container_width=True)
     create_export_buttons(df_long, chart, "absolute_probability")
 
-# ============================== Market Context (computed from DB) ==============================
+# ===== Patch A — persist EV controls in your existing "EV Evaluation" section =====
+# --- Inline controls (no expander) ---
+c1, c2 = st.columns([1.2, 1.0])
+with c1:
+    prob_source = st.selectbox(
+        "Probability source",
+        [
+            "NCA & CatBoost Avg",
+            "NCA",
+            "CatBoost",
+            "Median Centers"
+        ],
+        index=0,
+        key="prob_source"  # persist in session
+    )
+with c2:
+    rr_assumed = st.number_input(
+        "Assumed R:R", min_value=0.1, value=1.80, step=0.10, format="%.2f",
+        key="rr_assumed"   # persist in session
+    )
+ss["prob_source"] = st.session_state["prob_source"]
+ss["rr_assumed"]  = float(st.session_state["rr_assumed"])
+
+# (rest of your original EV chart + downloads remain unchanged above this line)
+
+
+
+# ===== Patch B — Market Context (computed from your DB) =====
 st.markdown("---")
 st.subheader("Market Context (auto)")
 
-# Controls
 ctx_c1, ctx_c2, ctx_c3 = st.columns([1.0, 1.0, 1.0])
 with ctx_c1:
     gap_thr = st.slider("Gap threshold % (gapper)", 5.0, 50.0, 20.0, 1.0)
@@ -751,7 +777,6 @@ with st.expander("Context weights", expanded=False):
     w_push = st.slider("Weight: Median Max Push", 0.0, 1.0, 0.33, 0.01)
     w_vol  = st.slider("Weight: PM $Vol", 0.0, 1.0, 0.34, 0.01)
 
-# Find a Date column if present
 date_col = _pick(base_df, ["Date","Session Date","Trade Date","date","session_date","DATE"])
 have_date = date_col is not None and date_col in base_df.columns
 
@@ -764,7 +789,6 @@ def _to_date_series(s):
         return pd.Series([pd.NaT] * len(s))
 
 def _daily_agg(df_day):
-    # returns (ft_rate, median_push, total_pm_dollar_vol)
     ft_rate = np.nan
     if "FT" in df_day.columns:
         ft_rate = pd.to_numeric(df_day["FT"], errors="coerce").mean()
@@ -776,12 +800,10 @@ def _daily_agg(df_day):
     return pd.Series(dict(ft_rate=ft_rate, med_push=med_push, tot_vol=tot_vol))
 
 def _bounded_diff(a, b, k=2.0):
-    # For rates in [0,1] — push difference into [-1,1]
     if not (np.isfinite(a) and np.isfinite(b)): return 0.0
     return float(np.tanh(k * (a - b)))
 
 def _bounded_log_ratio(a, b, k=0.7):
-    # For positive magnitudes — log ratio then tanh → [-1,1]
     eps = 1e-9
     if not (np.isfinite(a) and np.isfinite(b)) or a <= 0 or b <= 0: return 0.0
     return float(np.tanh(k * np.log((a + eps) / (b + eps))))
@@ -826,9 +848,9 @@ if have_date:
             )
             ctx_ok = True
 
-# UI — meter + sub-metrics
+# UI meter + sub-metrics
 if ctx_ok:
-    pos = int((ctx_score + 1.0) * 50)  # 0..100
+    pos = int((ctx_score + 1.0) * 50)
     label = "bullish" if ctx_score > 0.1 else ("bearish" if ctx_score < -0.1 else "neutral")
     html = f'''
     <div style="height:14px; background: linear-gradient(90deg, #b30100, #015e06); position: relative; border-radius:8px;">
@@ -860,18 +882,19 @@ if ctx_ok:
 else:
     st.info("Context needs a Date column and a few sessions of gappers. Fallback = 0 (neutral).")
 
-# Persist context score for later blocks
 ss["ctx_score"] = float(ctx_score)
-ss["ctx_ok"] = bool(ctx_ok)
+ss["ctx_ok"]    = bool(ctx_ok)
 
-# ============================== EV — Adjusted Probabilities (keeps your R:R; uses computed Context) ==============================
+
+
+# ===== Patch C — EV — Adjusted Probabilities (keeps your R:R; uses computed Context) =====
 st.markdown("---")
 st.subheader("EV — Adjusted Probabilities (Context-calibrated)")
 
 if not thr_labels:
     st.info("Needs the probability series above.")
 else:
-    # --- Controls (minimal) ---
+    # Controls
     c1, c2, c3, c4 = st.columns([1.2, 1.0, 1.0, 1.0])
     with c1:
         beta_ctx = st.number_input("Context strength β", 0.00, 0.50, 0.20, 0.05, format="%.2f")
@@ -882,11 +905,15 @@ else:
     with c4:
         use_cat = st.checkbox("Catalyst tilt", value=False)
 
-    # Show which Context we use
+    # Read persisted EV inputs
+    prob_source = st.session_state.get("prob_source", "NCA & CatBoost Avg")
+    rr_assumed  = float(st.session_state.get("rr_assumed", 1.80))
+
+    # Show computed context
     context_tilt = float(ss.get("ctx_score", 0.0))
     st.caption(f"Using computed Context C = {context_tilt:+.2f} (bear↔︎bull)")
 
-    # probability source (reuse your selection)
+    # Get probability list based on your source
     def _to_prob_list(series_pct):
         return [(s/100.0) if (s is not None and not np.isnan(s)) else np.nan for s in series_pct]
 
@@ -903,25 +930,22 @@ else:
     elif prob_source == "CatBoost":
         p_list = _to_prob_list(series_C_med)
     else:
-        p_list = _to_prob_list(series_A_med)  # Median centers as fallback
+        p_list = _to_prob_list(series_A_med)  # Median Centers as fallback
 
-    # ---- Context adjustment ----
+    # Context adjustment
     p0 = float(np.nanmean([p for p in p_list if np.isfinite(p)])) if any(np.isfinite(p_list)) else 0.5
     p_ctx = [float(np.clip(p * (1.0 + beta_ctx * context_tilt), 0.0, 1.0)) if np.isfinite(p) else np.nan for p in p_list]
 
-    # ---- Optional tilts (apply to probability, not to R) ----
-    # Build selection of added rows to compute a single per-stock tilt; use medians across selected rows.
-    selected_set = set(selected_tickers)
-    added_df_full = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in selected_set])
-
-    # Liquidity tilt λ: map robust z of [PM$Vol/MC_%, FR_x, RVOL_Max_PM_cum] to a small multiplicative uplift on p.
-    lam_liq = 0.10  # strength of liquidity tilt on probability
+    # Optional probability tilts (small, bounded)
     def _robust_z(x, arr):
         arr = pd.to_numeric(pd.Series(arr), errors="coerce")
         med = np.nanmedian(arr); mad = np.nanmedian(np.abs(arr - med))
-        scale = (1.4826 * mad) if (mad and mad > 0) else (float(np.nanstd(arr)) if np.isfinite(np.nanstd(arr)) else 1.0)
-        if not np.isfinite(scale) or scale == 0: scale = 1.0
+        std = float(np.nanstd(arr)) if np.isfinite(np.nanstd(arr)) else 1.0
+        scale = (1.4826 * mad) if (mad and mad > 0) else (std if std > 0 else 1.0)
         return (x - med)/scale if np.isfinite(x) else 0.0
+
+    selected_set = set(selected_tickers)
+    added_df_full = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in selected_set])
 
     arr_pm_mc = pd.to_numeric(base_df.get("PM$Vol/MC_%", pd.Series(dtype=float)), errors="coerce").values
     arr_fr    = pd.to_numeric(base_df.get("FR_x", pd.Series(dtype=float)), errors="coerce").values
@@ -934,27 +958,27 @@ else:
     else:
         pm_mc_med = frx_med = rvol_med = np.nan
 
+    lam_liq = 0.10  # probability tilt strength
     zsum = 0.0
     if use_liq:
         if np.isfinite(pm_mc_med): zsum += _robust_z(pm_mc_med, arr_pm_mc)
         if np.isfinite(frx_med):   zsum += _robust_z(frx_med,   arr_fr)
         if np.isfinite(rvol_med):  zsum += _robust_z(rvol_med,  arr_rvol)
     L_prob = (1.0 + lam_liq * np.tanh(zsum)) if use_liq else 1.0
-    L_prob = float(np.clip(L_prob, 0.8, 1.2))  # keep it modest
+    L_prob = float(np.clip(L_prob, 0.8, 1.2))
 
-    # Catalyst probability tilt γ (very small), based on Yes/No in added rows
-    gam_cat = 0.05
+    gam_cat = 0.05  # tiny catalyst tilt
     if use_cat and not added_df_full.empty:
         has_cat = (pd.to_numeric(added_df_full.get("Catalyst"), errors="coerce") >= 0.5).sum()
         share_cat = has_cat / max(1, len(added_df_full))
-        K_prob = 1.0 + gam_cat * (2*share_cat - 1.0)  # more Yes → slight uplift; more No → slight penalty
+        K_prob = 1.0 + gam_cat * (2*share_cat - 1.0)
         K_prob = float(np.clip(K_prob, 0.9, 1.1))
     else:
         K_prob = 1.0
 
     p_tilt = [float(np.clip(p * L_prob * K_prob, 0.0, 1.0)) if np.isfinite(p) else np.nan for p in p_ctx]
 
-    # ---- Sample shrinkage toward baseline P0 ----
+    # Sample shrinkage toward baseline P0
     alpha_list = []
     for i in range(len(thr_labels)):
         if i < len(diag_nA) and i < len(diag_nB):
@@ -971,14 +995,15 @@ else:
               if (i < len(p_tilt) and np.isfinite(p_tilt[i])) else np.nan
               for i in range(len(thr_labels)) ]
 
-    # ---- Final EV uses YOUR rr_assumed (unchanged) ----
-    rr_for_adj = float(rr_assumed) if 'rr_assumed' in locals() else 1.80
+    # Final EV (uses your rr_assumed)
+    rr_for_adj = float(rr_assumed)
     ev_adj = [ (p * rr_for_adj - (1.0 - p)) if np.isfinite(p) else np.nan for p in p_shr ]
     ev_adj = [ float(np.clip(v, -3.0, 8.0)) if np.isfinite(v) else np.nan for v in ev_adj ]
 
+    # Build dataframe (NOTE: quoted keys to avoid SyntaxError)
     rows = []
     for i, g in enumerate(thr_labels):
-        if not np.isfinite(ev_adj[i]):
+        if not np.isfinite(ev_adj[i]): 
             continue
         rows.append({
             "GainCutoff_%": int(g),
@@ -1021,7 +1046,7 @@ else:
     )
     st.altair_chart(ev_adj_chart, use_container_width=True)
 
-    # ---- Downloads (PNG + HTML), same style as your other charts ----
+    # Downloads (PNG + HTML)
     def _dl_adj_png_html(df_adj: pd.DataFrame, chart_obj: alt.Chart, prefix: str):
         png_bytes = b""
         try:
@@ -1054,3 +1079,4 @@ else:
                                file_name=f"{prefix}.html", mime="text/html", use_container_width=True)
 
     _dl_adj_png_html(df_adj, ev_adj_chart, "ev_prob_adjusted_only_ctx")
+
