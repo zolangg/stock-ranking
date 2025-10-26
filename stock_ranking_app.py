@@ -680,38 +680,18 @@ if not thr_labels:
 else:
     # ---- Controls you keep ----
     c1, c2 = st.columns([1.2, 1.0])
-# --- Inline controls (no expander) ---
-c1, c2 = st.columns([1.2, 1.0])
-with c1:
-    prob_source = st.selectbox(
-        "Probability source",
-        [
-            "NCA & CatBoost Avg",
-            "NCA",
-            "CatBoost",
-            "Median Centers"
-        ],
-        index=0,
-        key="prob_source"
-    )
-
-with c2:
-    rr_assumed = st.number_input(
-        "Assumed R:R",
-        min_value=0.1,
-        value=1.80,
-        step=0.10,
-        format="%.2f",
-        help=(
-            "Interpretation:\n"
-            "• EV ≈ 1 → C trade (baseline)\n"
-            "• EV ≥ 1.5 → B trade (solid)\n"
-            "• EV ≥ 2.5 → A trade (strong)\n"
-            "• EV ≥ 4 → A+ trade (exceptional runner)"
-        ),
-        key="rr_assumed"
-    )
-
+    with c1:
+        prob_source = st.selectbox(
+            "Probability source",
+            ["NCA & CatBoost Avg", "NCA", "CatBoost", "Median Centers"],
+            index=0,
+            key="prob_source"
+        )
+    with c2:
+        rr_assumed = st.number_input(
+            "Assumed R:R", min_value=0.1, value=1.80, step=0.10, format="%.2f",
+            key="rr_assumed"
+        )
 
     # ---- Helper: convert % to [0,1] ----
     def _to_prob_list(series_pct):
