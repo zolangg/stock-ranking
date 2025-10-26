@@ -865,6 +865,7 @@ else:
             )
         )
         st.altair_chart(ev_chart, use_container_width=True)
+         _dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
 
         # ---- Downloads (PNG + HTML) for the single EV chart ----
         def _dl_ev_png_html(df_ev: pd.DataFrame, chart_obj: alt.Chart, file_prefix: str):
@@ -897,5 +898,3 @@ else:
 <body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions:true}});</script></body></html>'''
                 st.download_button("Download HTML", html.encode("utf-8"),
                                    file_name=f"{file_prefix}.html", mime="text/html", use_container_width=True)
-
-        _dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
