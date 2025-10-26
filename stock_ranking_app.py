@@ -733,9 +733,9 @@ else:
     st.altair_chart(chart, use_container_width=True)
     create_export_buttons(df_long, chart, "absolute_probability")
 
-# ============================== EV Evaluation (models only) ==============================
+# ============================== EV Evaluation (Models Only — No Position Sizing) ==============================
 st.markdown("---")
-st.subheader("EV Evaluation (Models Only — No Position Sizing)")
+st.subheader("EV Evaluation")
 
 if not thr_labels:
     st.info("EV needs the computed probability series. Upload DB → Build model → Add stocks.")
@@ -779,7 +779,7 @@ else:
     else:
         p_list = _to_prob_list(series_A_med)  # Median Centers as P(win)
 
-    # Build EV table in memory (no display)
+    # Build EV table in memory (no dataframe shown)
     ev_rows = []
     for i, thr in enumerate(thr_labels):
         p = p_list[i] if i < len(p_list) else np.nan
@@ -798,7 +798,7 @@ else:
     else:
         ev_df = pd.DataFrame(ev_rows).sort_values("GainCutoff_%")
 
-        # EV chart (green/red by sign). Use dict form for colon fields if needed elsewhere.
+        # EV chart (green/red by sign)
         ev_chart = (
             alt.Chart(ev_df)
             .mark_bar()
@@ -819,6 +819,62 @@ else:
             )
             .properties(title=f"EV (R) by cutoff — source: {prob_source}")
         )
-
         st.altair_chart(ev_chart, use_container_width=True)
 
+        # ---------------- Download buttons (PNG + HTML), tailored for EV chart ----------------
+        def create_ev_export_buttons(ev_df: pd.DataFrame, chart_obj: alt.Chart, file_prefix: str):
+            # PNG via matplotlib
+            png_bytes = b""
+            try:
+                x_labels = [str(v) for v in ev_df["GainCutoff_%"].tolist()]
+                heights  = ev_df["EV_R"].astype(float).tolist()
+                colors   = ["#015e06" if v >= 0 else "#b30100" for v in heights]
+
+                x_pos = np.arange(len(x_labels))
+                fig, ax = plt.subplots(figsize=(max(7, len(x_labels) * 0.6), 5))
+                ax.bar(x_pos, heights, color=colors)
+                ax.set_xticks(x_pos)
+                ax.set_xticklabels(x_labels, rotation=45, ha="right")
+                ax.set_xlabel("Gain% cutoff")
+                ax.set_ylabel("EV (R)")
+                ax.set_title(chart_obj.title)
+                fig.tight_layout()
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+                plt.close(fig)
+                png_bytes = buf.getvalue()
+            except Exception:
+                pass
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    label="Download PNG",
+                    data=png_bytes,
+                    file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    key=f"dl_png_{file_prefix}",
+                    disabled=not png_bytes
+                )
+            with col2:
+                # HTML via vega-embed
+                spec = chart_obj.to_dict()
+                html_template = f'''<!doctype html>
+<html><head><meta charset="utf-8"><title>{file_prefix}</title>
+<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head>
+<body><div id="vis"></div>
+<script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions: true}});</script>
+</body></html>'''
+                st.download_button(
+                    label="Download HTML",
+                    data=html_template.encode("utf-8"),
+                    file_name=f"{file_prefix}.html",
+                    mime="text/html",
+                    use_container_width=True,
+                    key=f"dl_html_{file_prefix}"
+                )
+
+        create_ev_export_buttons(ev_df, ev_chart, "ev_by_cutoff")
