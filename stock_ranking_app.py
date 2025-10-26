@@ -605,69 +605,6 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         diag_ece_nca.append(float(ece_nca) if np.isfinite(ece_nca) else np.nan)
         diag_ece_cat.append(float(ece_cat) if np.isfinite(ece_cat) else np.nan)
 
-# --- Export buttons (unchanged) ---
-def create_export_buttons(df, chart_obj, file_prefix):
-    png_bytes = b""
-    try:
-        x_axis_col = df.columns[0]
-        pivot = df.pivot(index=x_axis_col, columns="Series", values="Value").sort_index()
-        series_names = list(pivot.columns)
-        chart_dict = chart_obj.to_dict()
-        unique_colors = {}
-        try:
-            domain = chart_dict['encoding']['color']['scale']['domain']
-            range_ = chart_dict['encoding']['color']['scale']['range']
-            unique_colors = dict(zip(domain, range_))
-        except KeyError:
-            pass
-        colors = [unique_colors.get(s, "#999999") for s in series_names]
-        x_labels = [str(label) for label in pivot.index.tolist()]
-        n_groups, n_series = len(x_labels), len(series_names)
-        x_pos = np.arange(n_groups)
-        bar_width = 0.8 / max(n_series, 1)
-        fig, ax = plt.subplots(figsize=(max(7, n_groups * 0.6), 5))
-        for i, series_name in enumerate(series_names):
-            vals = pivot[series_name].values.astype(float)
-            offset = i * bar_width - (n_series - 1) * bar_width / 2
-            ax.bar(x_pos + offset, vals, width=bar_width, label=series_name, color=colors[i])
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels(x_labels, rotation=45, ha="right")
-        ax.set_ylim(0, 100)
-        ax.set_xlabel(x_axis_col)
-        ax.set_ylabel("Value (%)")
-        ax.legend(loc="upper left", frameon=False)
-        ax.set_title(chart_obj.title)
-        buf = io.BytesIO()
-        fig.tight_layout()
-        fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-        plt.close(fig)
-        png_bytes = buf.getvalue()
-    except Exception:
-        pass
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            label=f"Download PNG",
-            data=png_bytes,
-            file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-            mime="image/png",
-            use_container_width=True,
-            key=f"dl_png_{file_prefix}",
-            disabled=not png_bytes
-        )
-    with col2:
-        spec = chart_obj.to_dict()
-        html_template = f'<!doctype html><html><head><meta charset="utf-8"><title>{file_prefix}</title><script src="https://cdn.jsdelivr.net/npm/vega@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script><script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head><body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{"actions": True}});</script></body></html>'
-        st.download_button(
-            label=f"Download HTML",
-            data=html_template.encode("utf-8"),
-            file_name=f"{file_prefix}.html",
-            mime="text/html",
-            use_container_width=True,
-            key=f"dl_html_{file_prefix}"
-        )
-
 if not thr_labels:
     st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
@@ -865,37 +802,3 @@ else:
             )
         )
         st.altair_chart(ev_chart, use_container_width=True)
-
-        # ---- Downloads (PNG + HTML) for the single EV chart ----
-        def _dl_ev_png_html(df_ev: pd.DataFrame, chart_obj: alt.Chart, file_prefix: str):
-            png_bytes = b""
-            try:
-                labs = [str(v) for v in df_ev["GainCutoff_%"].tolist()]
-                vals = df_ev["EV_R"].astype(float).tolist()
-                cols = ["#015e06" if v >= 0 else "#b30100" for v in vals]
-                x = np.arange(len(labs))
-                fig, ax = plt.subplots(figsize=(max(7, len(labs) * 0.6), 5))
-                ax.bar(x, vals, color=cols)
-                ax.set_xticks(x); ax.set_xticklabels(labs, rotation=45, ha="right")
-                ax.set_xlabel("Gain% cutoff"); ax.set_ylabel("EV (R)")
-                fig.tight_layout()
-                buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=160, bbox_inches="tight"); plt.close(fig)
-                png_bytes = buf.getvalue()
-            except Exception:
-                pass
-            col1, col2 = st.columns(2)
-            with col1:
-                st.download_button("Download PNG", png_bytes,
-                                   file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                                   mime="image/png", use_container_width=True, disabled=not png_bytes)
-            with col2:
-                spec = chart_obj.to_dict()
-                html = f'''<!doctype html><html><head><meta charset="utf-8"><title>{file_prefix}</title>
-<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script></head>
-<body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions:true}});</script></body></html>'''
-                st.download_button("Download HTML", html.encode("utf-8"),
-                                   file_name=f"{file_prefix}.html", mime="text/html", use_container_width=True)
-
-        _dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
