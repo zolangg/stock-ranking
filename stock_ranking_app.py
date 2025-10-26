@@ -731,14 +731,14 @@ else:
     st.altair_chart(chart, use_container_width=True)
     create_export_buttons(df_long, chart, "absolute_probability")
 
-# ============================== EV Evaluation (Single Chart: Liquidity + Catalyst Adjusted) ==============================
+# ============================== EV (Single Chart: Liquidity + Catalyst Adjusted) ==============================
 st.markdown("---")
-st.subheader("EV Evaluation")
+st.subheader("EV (Adjusted: Liquidity + Catalyst)")
 
 if not thr_labels:
     st.info("EV needs the computed probability series. Upload DB → Build model → Add stocks.")
 else:
-    # ---- Controls (keep only what you need) ----
+    # ---- Controls you keep ----
     c1, c2 = st.columns([1.2, 1.0])
     with c1:
         prob_source = st.selectbox(
@@ -774,47 +774,55 @@ else:
     else:
         p_list = _to_prob_list(series_A_med)  # Median Centers as fallback
 
-    # ---- Always-on tilts (no UI) ----
+    # ---- Always-on tilts (robust; percentile-based) ----
     lam_liq = 0.10  # liquidity tilt strength on probability
     gam_cat = 0.05  # catalyst tilt strength on probability
 
-    def _robust_z(x, arr):
-        arr = pd.to_numeric(pd.Series(arr), errors="coerce")
-        med = np.nanmedian(arr)
-        mad = np.nanmedian(np.abs(arr - med))
-        std = float(np.nanstd(arr)) if np.isfinite(np.nanstd(arr)) else 1.0
-        scale = (1.4826 * mad) if (mad and mad > 0) else (std if std > 0 else 1.0)
-        return (x - med)/scale if np.isfinite(x) else 0.0
+    def _valid_arr(series):
+        arr = pd.to_numeric(series, errors="coerce").astype(float).values if series is not None else np.array([])
+        return arr[np.isfinite(arr)]
 
-    # Median features across selected tickers; neutral if none selected
-    selected_set = set(selected_tickers) if "selected_tickers" in st.session_state else set()
+    def _pct_rank(x, arr: np.ndarray) -> float:
+        """Percentile rank in [0,1]; 0.5 if x or arr invalid."""
+        if not np.isfinite(x) or arr.size == 0:
+            return 0.5
+        less = np.sum(arr < x)
+        equal = np.sum(arr == x)
+        return float((less + 0.5 * equal) / len(arr))
+
+    # Historical distributions (from your DB)
+    arr_pm_mc = _valid_arr(base_df.get("PM$Vol/MC_%", pd.Series(dtype=float)))
+    arr_fr    = _valid_arr(base_df.get("FR_x", pd.Series(dtype=float)))
+    arr_rvol  = _valid_arr(base_df.get("RVOL_Max_PM_cum", pd.Series(dtype=float)))
+
+    # Selected tickers → median cross-sectional values
+    selected_names = st.session_state.get("align_sel_tickers", [])  # fallback to alignment selection
+    selected_set = set(selected_names) if isinstance(selected_names, list) else set()
     added_df_full = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in selected_set]) if selected_set else pd.DataFrame()
 
-    arr_pm_mc = pd.to_numeric(base_df.get("PM$Vol/MC_%", pd.Series(dtype=float)), errors="coerce").values
-    arr_fr    = pd.to_numeric(base_df.get("FR_x", pd.Series(dtype=float)), errors="coerce").values
-    arr_rvol  = pd.to_numeric(base_df.get("RVOL_Max_PM_cum", pd.Series(dtype=float)), errors="coerce").values
+    pm_mc_val = float(np.nanmedian(pd.to_numeric(added_df_full.get("PM$Vol/MC_%"), errors="coerce"))) if not added_df_full.empty else np.nan
+    frx_val   = float(np.nanmedian(pd.to_numeric(added_df_full.get("FR_x"), errors="coerce")))       if not added_df_full.empty else np.nan
+    rvol_val  = float(np.nanmedian(pd.to_numeric(added_df_full.get("RVOL_Max_PM_cum"), errors="coerce"))) if not added_df_full.empty else np.nan
 
-    if not added_df_full.empty:
-        pm_mc_med = float(np.nanmedian(pd.to_numeric(added_df_full.get("PM$Vol/MC_%"), errors="coerce")))
-        frx_med   = float(np.nanmedian(pd.to_numeric(added_df_full.get("FR_x"), errors="coerce")))
-        rvol_med  = float(np.nanmedian(pd.to_numeric(added_df_full.get("RVOL_Max_PM_cum"), errors="coerce")))
+    # Percentile ranks (0..1) → center to [-0.5, 0.5] → gentle tanh mapping
+    pr1 = _pct_rank(pm_mc_val, arr_pm_mc)  # PM$Vol/MC_%
+    pr2 = _pct_rank(frx_val,   arr_fr)     # FR_x
+    pr3 = _pct_rank(rvol_val,  arr_rvol)   # RVOL_Max_PM_cum
+    score = float(np.nanmean([pr1, pr2, pr3]) - 0.5)  # [-0.5, 0.5]
+    L_prob = 1.0 + lam_liq * float(np.tanh(score * 3.0))
+    L_prob = float(np.clip(L_prob, 0.85, 1.20))  # modest bounds
 
-        zsum = 0.0
-        if np.isfinite(pm_mc_med): zsum += _robust_z(pm_mc_med, arr_pm_mc)
-        if np.isfinite(frx_med):   zsum += _robust_z(frx_med,   arr_fr)
-        if np.isfinite(rvol_med):  zsum += _robust_z(rvol_med,  arr_rvol)
-        L_prob = 1.0 + lam_liq * np.tanh(zsum)
-        L_prob = float(np.clip(L_prob, 0.8, 1.2))
-
-        has_cat = (pd.to_numeric(added_df_full.get("Catalyst"), errors="coerce") >= 0.5).sum()
-        share_cat = has_cat / max(1, len(added_df_full))
-        K_prob = 1.0 + gam_cat * (2*share_cat - 1.0)
-        K_prob = float(np.clip(K_prob, 0.9, 1.1))
+    # Catalyst factor (share of 'Yes' among selected tickers)
+    if not added_df_full.empty and "Catalyst" in added_df_full.columns:
+        share_cat = float(np.nanmean(pd.to_numeric(added_df_full["Catalyst"], errors="coerce") >= 0.5))
     else:
-        L_prob = 1.0
-        K_prob = 1.0
+        share_cat = np.nan
+    if not np.isfinite(share_cat):  # neutral if unknown
+        share_cat = 0.5
+    K_prob = 1.0 + gam_cat * (2.0 * share_cat - 1.0)
+    K_prob = float(np.clip(K_prob, 0.90, 1.10))  # modest bounds
 
-    # ---- Apply tilts, compute single EV series ----
+    # ---- Apply tilts, compute EV series ----
     rr = float(st.session_state.get("rr_assumed", rr_assumed))
     rows = []
     for i, g in enumerate(thr_labels):
@@ -851,8 +859,8 @@ else:
                     alt.Tooltip("P_model:Q", title="P(model)", format=".2f"),
                     alt.Tooltip("P_adj:Q",   title="P(adjusted)", format=".2f"),
                     alt.Tooltip("RR:Q",      title="R:R", format=".2f"),
-                    alt.Tooltip("LiqTilt:Q", title="Liquidity ×", format=".2f"),
-                    alt.Tooltip("CatTilt:Q", title="Catalyst ×",  format=".2f"),
+                    alt.Tooltip("LiqTilt:Q", title="Liquidity ×", format=".3f"),
+                    alt.Tooltip("CatTilt:Q", title="Catalyst ×",  format=".3f"),
                 ],
             )
         )
@@ -880,7 +888,7 @@ else:
                 st.download_button("Download PNG", png_bytes,
                                    file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
                                    mime="image/png", use_container_width=True, disabled=not png_bytes)
-            with col2:
+            with c2:
                 spec = chart_obj.to_dict()
                 html = f'''<!doctype html><html><head><meta charset="utf-8"><title>{file_prefix}</title>
 <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
@@ -889,16 +897,5 @@ else:
 <body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions:true}});</script></body></html>'''
                 st.download_button("Download HTML", html.encode("utf-8"),
                                    file_name=f"{file_prefix}.html", mime="text/html", use_container_width=True)
-
-        st.caption(
-            f"Liq inputs — pm_mc_med={pm_mc_med}, frx_med={frx_med}, rvol_med={rvol_med} | "
-            f"zsum={zsum if 'zsum' in locals() else '—'} → L={L_prob:.4f}"
-        )
-        st.caption(
-            f"Cat inputs — selected={len(added_df_full)} | share_cat="
-            f"{(has_cat / max(1, len(added_df_full))):.3f}" if not added_df_full.empty else "Cat inputs — none selected"
-            + f" → K={K_prob:.4f}"
-        )
-
 
         _dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
