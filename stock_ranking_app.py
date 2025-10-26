@@ -978,21 +978,24 @@ else:
 
     rows = []
     for i, g in enumerate(thr_labels):
-        if not np.isfinite(ev_adj[i]): continue
-        rows.append(dict(
-            GainCutoff_%=int(g),
-            EV_adj_R=float(ev_adj[i]),
-            P_model=float(p_list[i]) if i < len(p_list) and np.isfinite(p_list[i]) else np.nan,
-            P_ctx=float(p_ctx[i]) if i < len(p_ctx) and np.isfinite(p_ctx[i]) else np.nan,
-            P_tilt=float(p_tilt[i]) if i < len(p_tilt) and np.isfinite(p_tilt[i]) else np.nan,
-            P_shr=float(p_shr[i]) if i < len(p_shr) and np.isfinite(p_shr[i]) else np.nan,
-            alpha=float(alpha_list[i]),
-            nA=int(diag_nA[i]) if i < len(diag_nA) else 0,
-            nB=int(diag_nB[i]) if i < len(diag_nB) else 0,
-            RR=float(rr_for_adj),
-            Ctx=float(context_tilt), Beta=float(beta_ctx),
-            LiqTilt=float(L_prob), CatTilt=float(K_prob),
-        ))
+        if not np.isfinite(ev_adj[i]):
+            continue
+        rows.append({
+            "GainCutoff_%": int(g),
+            "EV_adj_R": float(ev_adj[i]),
+            "P_model": float(p_list[i]) if i < len(p_list) and np.isfinite(p_list[i]) else np.nan,
+            "P_ctx": float(p_ctx[i]) if i < len(p_ctx) and np.isfinite(p_ctx[i]) else np.nan,
+            "P_tilt": float(p_tilt[i]) if i < len(p_tilt) and np.isfinite(p_tilt[i]) else np.nan,
+            "P_shr": float(p_shr[i]) if i < len(p_shr) and np.isfinite(p_shr[i]) else np.nan,
+            "alpha": float(alpha_list[i]),
+            "nA": int(diag_nA[i]) if i < len(diag_nA) else 0,
+            "nB": int(diag_nB[i]) if i < len(diag_nB) else 0,
+            "RR": float(rr_for_adj),
+            "Ctx": float(context_tilt),
+            "Beta": float(beta_ctx),
+            "LiqTilt": float(L_prob),
+            "CatTilt": float(K_prob),
+        })
     df_adj = pd.DataFrame(rows)
 
     # Chart (saturated bars)
