@@ -888,7 +888,7 @@ else:
                 st.download_button("Download PNG", png_bytes,
                                    file_name=f"{file_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
                                    mime="image/png", use_container_width=True, disabled=not png_bytes)
-            with c2:
+            with col2:
                 spec = chart_obj.to_dict()
                 html = f'''<!doctype html><html><head><meta charset="utf-8"><title>{file_prefix}</title>
 <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
@@ -897,4 +897,5 @@ else:
 <body><div id="vis"></div><script>const spec = {json.dumps(spec)}; vegaEmbed("#vis", spec, {{actions:true}});</script></body></html>'''
                 st.download_button("Download HTML", html.encode("utf-8"),
                                    file_name=f"{file_prefix}.html", mime="text/html", use_container_width=True)
-_dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
+
+        _dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
