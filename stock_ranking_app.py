@@ -747,9 +747,9 @@ else:
             "Probability source",
             [
                 "NCA & CatBoost avg",
-                nca_label,
-                cat_label,
-                f"{gA_label}"
+                "NCA",
+                "CatBoost",
+                "Median Centers"
             ],
             index=0
         )
@@ -763,7 +763,7 @@ else:
         return [(s/100.0) if (s is not None and not np.isnan(s)) else np.nan for s in series_pct]
 
     # Choose probability list
-    if prob_source.startswith("Ensemble"):
+    if prob_source.startswith("NCA & CatBoost avg"):
         p_n = _to_prob_list(series_N_med)
         p_c = _to_prob_list(series_C_med)
         p_list = []
@@ -772,9 +772,9 @@ else:
             if i < len(p_n) and np.isfinite(p_n[i]): vals.append(p_n[i])
             if i < len(p_c) and np.isfinite(p_c[i]): vals.append(p_c[i])
             p_list.append(float(np.mean(vals)) if vals else np.nan)
-    elif prob_source == nca_label:
+    elif prob_source == "NCA":
         p_list = _to_prob_list(series_N_med)
-    elif prob_source == cat_label:
+    elif prob_source == "CatBoost":
         p_list = _to_prob_list(series_C_med)
     else:
         p_list = _to_prob_list(series_A_med)  # Median Centers as P(win)
