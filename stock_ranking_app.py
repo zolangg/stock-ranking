@@ -692,15 +692,6 @@ with c1:
             "Median Centers"
         ],
         index=0,
-        help=(
-            "Choose which probability estimate drives Expected Value (EV).\n\n"
-            "• **NCA & CatBoost Avg** — blended model probability\n"
-            "• **NCA** — metric-learning model only\n"
-            "• **CatBoost** — gradient boosting model only\n"
-            "• **Median Centers** — alignment-based (no ML)\n\n"
-            "EV grades (SMB style):\n"
-            "C = 1 | B = 1.5 | A = 2.5 | A+ = 4+"
-        ),
         key="prob_source"
     )
 
@@ -712,9 +703,7 @@ with c2:
         step=0.10,
         format="%.2f",
         help=(
-            "Expected Value (EV) = P(win) × R:R − (1 − P(win))\n\n"
             "Interpretation:\n"
-            "• EV < 0 → negative expectancy\n"
             "• EV ≈ 1 → C trade (baseline)\n"
             "• EV ≥ 1.5 → B trade (solid)\n"
             "• EV ≥ 2.5 → A trade (strong)\n"
