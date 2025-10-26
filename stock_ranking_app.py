@@ -891,14 +891,14 @@ else:
                                    file_name=f"{file_prefix}.html", mime="text/html", use_container_width=True)
 
         st.caption(
-    f"Liq inputs — pm_mc_med={pm_mc_med}, frx_med={frx_med}, rvol_med={rvol_med} | "
-    f"zsum={zsum if 'zsum' in locals() else '—'} → L={L_prob:.4f}"
-)
-st.caption(
-    f"Cat inputs — selected={len(added_df_full)} | share_cat="
-    f"{(has_cat / max(1, len(added_df_full))):.3f}" if not added_df_full.empty else "Cat inputs — none selected"
-    + f" → K={K_prob:.4f}"
-)
+            f"Liq inputs — pm_mc_med={pm_mc_med}, frx_med={frx_med}, rvol_med={rvol_med} | "
+            f"zsum={zsum if 'zsum' in locals() else '—'} → L={L_prob:.4f}"
+        )
+        st.caption(
+            f"Cat inputs — selected={len(added_df_full)} | share_cat="
+            f"{(has_cat / max(1, len(added_df_full))):.3f}" if not added_df_full.empty else "Cat inputs — none selected"
+            + f" → K={K_prob:.4f}"
+        )
 
 
         _dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
