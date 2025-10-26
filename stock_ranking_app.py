@@ -675,16 +675,24 @@ else:
 st.markdown("---")
 st.subheader("Expected Value")
 st.markdown("""
-### EV (R) Chart&nbsp;&nbsp;
-<span title="
-**Expected Value (EV)** = P(win) × R:R − (1 − P(win))
-- D/F: EV < 0 → negative expectancy  
-- C: 0–1 → small edge  
-- B: 1–1.5 → solid edge  
-- A: 1.5–2.5 → strong  
-- A+: >2.5 → exceptional  
-">❓</span>
+### EV Evaluation
+<small style="color:gray">
+Expected Value (EV) represents the average R you can expect to make per 1R risked.<br>
+Hover the <b>❓</b> icon for grading.
+</small>
 """, unsafe_allow_html=True)
+
+st.tooltip("""
+**EV Interpretation (SMB-style grading)**  
+- **D / F:** EV < 0 → Negative expectancy, skip.  
+- **C Trade:** 0–1 → Thin edge; okay for data gathering.  
+- **B Trade:** 1–1.5 → Solid, consistent setup.  
+- **A Trade:** 1.5–2.5 → Strong edge; good confidence.  
+- **A+ Trade:** >2.5 → Exceptional asymmetry; top-tier setup.
+
+💡 Formula: EV = P(win) × R:R – (1 – P(win))
+Example: 50% win rate, 3R target → EV = 1.0 (C trade).
+""")
 
 if not thr_labels:
     st.info("EV needs the computed probability series. Upload DB → Build model → Add stocks.")
