@@ -729,5 +729,106 @@ else:
         )
     )
 
+    # ============================== EV Evaluation (EV in R only) ==============================
+st.markdown("---")
+st.subheader("EV Evaluation (Models Only — No Position Sizing)")
+
+if not thr_labels:
+    st.info("EV needs the computed probability series. Upload DB → Build model → Add stocks.")
+else:
+    # Controls: choose probability source and assumed R:R
+    with st.expander("EV settings", expanded=True):
+        c1, c2 = st.columns([1.2, 1.0])
+        with c1:
+            prob_source = st.selectbox(
+                "Probability source",
+                [  # these labels already exist above in your code
+                    "Ensemble (NCA & CatBoost avg)",
+                    nca_label,
+                    cat_label,
+                    f"{gA_label} (Median Centers)"
+                ],
+                index=0
+            )
+        with c2:
+            rr_assumed = st.number_input("Assumed R:R (no sizing)", min_value=0.1, value=1.80, step=0.10, format="%.2f")
+
+    # Choose/compute the probability list (in 0..1)
+    # series_* are in percent. Convert to 0..1 while guarding NaNs.
+    def _to_prob_list(series_pct):
+        return [(s/100.0) if (s is not None and not np.isnan(s)) else np.nan for s in series_pct]
+
+    p_list = None
+    if prob_source.startswith("Ensemble"):
+        # simple mean of NCA & Cat if both present; otherwise whichever exists
+        p_n = _to_prob_list(series_N_med)
+        p_c = _to_prob_list(series_C_med)
+        p_list = []
+        for i in range(len(thr_labels)):
+            vals = [v for v in [p_n[i] if i < len(p_n) else np.nan,
+                                p_c[i] if i < len(p_c) else np.nan] if np.isfinite(v)]
+            p_list.append(float(np.mean(vals)) if vals else np.nan)
+    elif prob_source == nca_label:
+        p_list = _to_prob_list(series_N_med)
+    elif prob_source == cat_label:
+        p_list = _to_prob_list(series_C_med)
+    else:
+        # Median Centers A as P(win)
+        p_list = _to_prob_list(series_A_med)
+
+    # Build EV table: EV_R per cutoff
+    ev_rows = []
+    for i, thr in enumerate(thr_labels):
+        p = p_list[i] if i < len(p_list) else np.nan
+        if not np.isfinite(p):
+            continue
+        ev_r = (p * rr_assumed) - ((1.0 - p) * 1.0)  # EV in R
+        ev_rows.append({
+            "GainCutoff_%": int(thr),
+            "p_win": round(p, 4),
+            "R:R": round(rr_assumed, 3),
+            "EV_R": round(ev_r, 3),
+        })
+
+    if not ev_rows:
+        st.warning("No valid probabilities available to compute EV.")
+    else:
+        ev_df = pd.DataFrame(ev_rows).sort_values("GainCutoff_%")
+
+        # Summary tiles
+        best_idx = ev_df["EV_R"].idxmax()
+        worst_idx = ev_df["EV_R"].idxmin()
+        best_row = ev_df.loc[best_idx]; worst_row = ev_df.loc[worst_idx]
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Best EV (R)", f"{best_row['EV_R']:.3f}", help=f"Cutoff {int(best_row['GainCutoff_%'])}% | p_win={best_row['p_win']:.2f} | R:R={best_row['R:R']:.2f}")
+        k2.metric("Worst EV (R)", f"{worst_row['EV_R']:.3f}", help=f"Cutoff {int(worst_row['GainCutoff_%'])}% | p_win={worst_row['p_win']:.2f}")
+        k3.metric("EV source", prob_source)
+
+        # EV chart (bars green/red by sign)
+        ev_chart = (
+            alt.Chart(ev_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("GainCutoff_%:O", title="Gain% cutoff"),
+                y=alt.Y("EV_R:Q", title="EV (R)"),
+                color=alt.condition(
+                    alt.datum["EV_R"] >= 0,
+                    alt.value("#015e06"),
+                    alt.value("#b30100")
+                ),
+                tooltip=[
+                    alt.Tooltip("GainCutoff_%:O", title="Cutoff (%)"),
+                    alt.Tooltip("p_win:Q", format=".2f"),
+                    alt.Tooltip("R:R:Q",  format=".2f"),
+                    alt.Tooltip("EV_R:Q", format=".3f"),
+                ],
+            )
+            .properties(title=f"EV (R) by cutoff — source: {prob_source}")
+        )
+        st.altair_chart(ev_chart, use_container_width=True)
+        st.dataframe(ev_df, use_container_width=True)
+
+
     st.altair_chart(chart, use_container_width=True)
     create_export_buttons(df_long, chart, "absolute_probability")
