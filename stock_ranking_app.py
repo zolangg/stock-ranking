@@ -729,6 +729,10 @@ else:
         )
     )
 
+
+    st.altair_chart(chart, use_container_width=True)
+    create_export_buttons(df_long, chart, "absolute_probability")
+
     # ============================== EV Evaluation (EV in R only) ==============================
 st.markdown("---")
 st.subheader("EV Evaluation (Models Only — No Position Sizing)")
@@ -828,7 +832,3 @@ else:
         )
         st.altair_chart(ev_chart, use_container_width=True)
         st.dataframe(ev_df, use_container_width=True)
-
-
-    st.altair_chart(chart, use_container_width=True)
-    create_export_buttons(df_long, chart, "absolute_probability")
