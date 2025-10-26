@@ -674,6 +674,17 @@ else:
 # ============================== EV (Single Chart: Liquidity + Catalyst Adjusted) ==============================
 st.markdown("---")
 st.subheader("Expected Value")
+st.markdown("""
+### EV (R) Chart&nbsp;&nbsp;
+<span title="
+**Expected Value (EV)** = P(win) × R:R − (1 − P(win))
+- D/F: EV < 0 → negative expectancy  
+- C: 0–1 → small edge  
+- B: 1–1.5 → solid edge  
+- A: 1.5–2.5 → strong  
+- A+: >2.5 → exceptional  
+">❓</span>
+""", unsafe_allow_html=True)
 
 if not thr_labels:
     st.info("EV needs the computed probability series. Upload DB → Build model → Add stocks.")
