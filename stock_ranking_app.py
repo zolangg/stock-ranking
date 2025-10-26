@@ -865,7 +865,7 @@ else:
             )
         )
         st.altair_chart(ev_chart, use_container_width=True)
-         _dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
+        _dl_ev_png_html(df_ev, ev_chart, "ev_adjusted_single")
 
         # ---- Downloads (PNG + HTML) for the single EV chart ----
         def _dl_ev_png_html(df_ev: pd.DataFrame, chart_obj: alt.Chart, file_prefix: str):
