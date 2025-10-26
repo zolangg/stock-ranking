@@ -729,5 +729,108 @@ else:
         )
     )
 
+   # ============================== EV Evaluation (drop-in) ==============================
+st.markdown("---")
+st.subheader("EV Evaluation")
+
+# Guard: need computed series
+if not thr_labels:
+    st.info("EV requires the computed probability series. Add stocks and Build model first.")
+else:
+    # --- Trade parameters (kept simple & consistent with your Pine calc) ---
+    with st.expander("Trade parameters", expanded=True):
+        c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 1.1])
+        with c1:
+            equity = st.number_input("Account Equity ($)", min_value=0.0, value=30000.0, step=100.0, format="%.2f")
+        with c2:
+            risk_pct_str = st.selectbox("Risk % of Equity", ["0.25","0.50","0.75","1.0","1.5","2.0","2.5","4.0"], index=3)
+            risk_pct = float(risk_pct_str)
+        with c3:
+            entry_ev  = st.number_input("Entry Price",  min_value=0.0, value=0.0, step=0.01, format="%.4f")
+            stop_ev   = st.number_input("Stop Price",   min_value=0.0, value=0.0, step=0.01, format="%.4f")
+        with c4:
+            target_ev = st.number_input("Target Price", min_value=0.0, value=0.0, step=0.01, format="%.4f")
+            prob_source = st.selectbox(
+                "Probability source",
+                [nca_label, cat_label, f"{gA_label} (Median Centers)"],
+                index=1 if cat_label in [nca_label, cat_label] else 0
+            )
+
+    # Compute R:R, position size, risk$
+    loss_sz   = abs(entry_ev - stop_ev)
+    profit_sz = abs(target_ev - entry_ev)
+    rr_val    = (profit_sz / loss_sz) if loss_sz > 0 else np.nan
+    risk_cash = equity * (risk_pct * 0.01)
+    pos_size  = (risk_cash / loss_sz) if loss_sz > 0 else np.nan
+
+    # Pick probability series (already in %); convert to 0..1
+    if prob_source == nca_label:
+        p_list = series_N_med
+    elif prob_source == cat_label:
+        p_list = series_C_med
+    else:
+        # Use A (centers) as proxy for P(win). You can change to an ensemble if desired.
+        p_list = series_A_med
+
+    # Build EV table
+    ev_rows = []
+    for i, thr in enumerate(thr_labels):
+        p = p_list[i] / 100.0 if i < len(p_list) and p_list[i] is not None and not np.isnan(p_list[i]) else np.nan
+        if not np.isfinite(p) or not np.isfinite(rr_val):
+            continue
+        ev_r = (p * rr_val) - ((1.0 - p) * 1.0)        # EV in R
+        ev_$ = ev_r * risk_cash                        # EV in dollars
+        ev_rows.append({
+            "GainCutoff_%": int(thr),
+            "p_win": round(p, 4),
+            "R:R": round(rr_val, 3),
+            "EV_R": round(ev_r, 3),
+            "EV_$": round(ev_$, 2),
+            "Position_Size": round(pos_size, 0) if np.isfinite(pos_size) else np.nan,
+            "Risk_$": round(risk_cash, 2)
+        })
+
+    if not ev_rows:
+        st.warning("Enter valid Entry/Stop/Target to compute EV.")
+    else:
+        ev_df = pd.DataFrame(ev_rows).sort_values("GainCutoff_%")
+        # Summary tiles
+        best_idx = ev_df["EV_$"].idxmax()
+        worst_idx = ev_df["EV_$"].idxmin()
+        best_row = ev_df.loc[best_idx]; worst_row = ev_df.loc[worst_idx]
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Position Size (shares)", f"{int(best_row['Position_Size']) if np.isfinite(best_row['Position_Size']) else 0}")
+        k2.metric("Risk $ / trade", f"${best_row['Risk_$']:.2f}")
+        k3.metric("Best EV $", f"${best_row['EV_$']:.2f}", help=f"Cutoff {int(best_row['GainCutoff_%'])}%, p_win={best_row['p_win']:.2f}, R:R={best_row['R:R']:.2f}")
+        k4.metric("Worst EV $", f"${worst_row['EV_$']:.2f}", help=f"Cutoff {int(worst_row['GainCutoff_%'])}%, p_win={worst_row['p_win']:.2f}")
+
+        # EV bar chart
+        ev_chart = (
+            alt.Chart(ev_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("GainCutoff_%:O", title="Gain% cutoff"),
+                y=alt.Y("EV_$:Q", title="EV ($ per trade)"),
+                color=alt.condition(
+                    alt.datum.EV_$ >= 0,
+                    alt.value("#015e06"),
+                    alt.value("#b30100")
+                ),
+                tooltip=[
+                    alt.Tooltip("GainCutoff_%:O", title="Cutoff (%)"),
+                    alt.Tooltip("p_win:Q", format=".2f"),
+                    alt.Tooltip("R:R:Q",  format=".2f"),
+                    alt.Tooltip("EV_R:Q", format=".3f"),
+                    alt.Tooltip("EV_$:Q", format=",.2f"),
+                    alt.Tooltip("Position_Size:Q", title="Shares", format=",.0f"),
+                    alt.Tooltip("Risk_$:Q", format=",.2f"),
+                ],
+            )
+            .properties(title=f"EV by cutoff — source: {prob_source}")
+        )
+        st.altair_chart(ev_chart, use_container_width=True)
+        st.dataframe(ev_df, use_container_width=True)
+
     st.altair_chart(chart, use_container_width=True)
     create_export_buttons(df_long, chart, "absolute_probability")
