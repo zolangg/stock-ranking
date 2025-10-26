@@ -674,43 +674,55 @@ else:
 # ============================== EV (Single Chart: Liquidity + Catalyst Adjusted) ==============================
 st.markdown("---")
 st.subheader("Expected Value")
-st.markdown("""
-### EV Evaluation
-<small style="color:gray">
-Expected Value (EV) represents the average R you can expect to make per 1R risked.<br>
-Hover the <b>❓</b> icon for grading.
-</small>
-""", unsafe_allow_html=True)
-
-st.tooltip("""
-**EV Interpretation (SMB-style grading)**  
-- **D / F:** EV < 0 → Negative expectancy, skip.  
-- **C Trade:** 0–1 → Thin edge; okay for data gathering.  
-- **B Trade:** 1–1.5 → Solid, consistent setup.  
-- **A Trade:** 1.5–2.5 → Strong edge; good confidence.  
-- **A+ Trade:** >2.5 → Exceptional asymmetry; top-tier setup.
-
-💡 Formula: EV = P(win) × R:R – (1 – P(win))
-Example: 50% win rate, 3R target → EV = 1.0 (C trade).
-""")
 
 if not thr_labels:
     st.info("EV needs the computed probability series. Upload DB → Build model → Add stocks.")
 else:
     # ---- Controls you keep ----
     c1, c2 = st.columns([1.2, 1.0])
-    with c1:
-        prob_source = st.selectbox(
-            "Probability source",
-            ["NCA & CatBoost Avg", "NCA", "CatBoost", "Median Centers"],
-            index=0,
-            key="prob_source"
-        )
-    with c2:
-        rr_assumed = st.number_input(
-            "Assumed R:R", min_value=0.1, value=1.80, step=0.10, format="%.2f",
-            key="rr_assumed"
-        )
+# --- Inline controls (no expander) ---
+c1, c2 = st.columns([1.2, 1.0])
+with c1:
+    prob_source = st.selectbox(
+        "Probability source",
+        [
+            "NCA & CatBoost Avg",
+            "NCA",
+            "CatBoost",
+            "Median Centers"
+        ],
+        index=0,
+        help=(
+            "Choose which probability estimate drives Expected Value (EV).\n\n"
+            "• **NCA & CatBoost Avg** — blended model probability\n"
+            "• **NCA** — metric-learning model only\n"
+            "• **CatBoost** — gradient boosting model only\n"
+            "• **Median Centers** — alignment-based (no ML)\n\n"
+            "EV grades (SMB style):\n"
+            "C = 1 | B = 1.5 | A = 2.5 | A+ = 4+"
+        ),
+        key="prob_source"
+    )
+
+with c2:
+    rr_assumed = st.number_input(
+        "Assumed R:R",
+        min_value=0.1,
+        value=1.80,
+        step=0.10,
+        format="%.2f",
+        help=(
+            "Expected Value (EV) = P(win) × R:R − (1 − P(win))\n\n"
+            "Interpretation:\n"
+            "• EV < 0 → negative expectancy\n"
+            "• EV ≈ 1 → C trade (baseline)\n"
+            "• EV ≥ 1.5 → B trade (solid)\n"
+            "• EV ≥ 2.5 → A trade (strong)\n"
+            "• EV ≥ 4 → A+ trade (exceptional runner)"
+        ),
+        key="rr_assumed"
+    )
+
 
     # ---- Helper: convert % to [0,1] ----
     def _to_prob_list(series_pct):
