@@ -660,7 +660,7 @@ else:
         alt.Chart(df_long)
         .mark_bar()
         .encode(
-            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff (step {25})"),
+            x=alt.X("GainCutoff_%:O", title=f"Gain% cutoff"),
             y=alt.Y("Value:Q", title="Median Alignment / P(A) (%)", scale=alt.Scale(domain=[0, 100])),
             color=alt.Color("Series:N", scale=alt.Scale(domain=color_domain, range=color_range),
                             legend=alt.Legend(title="Analysis Series")),
