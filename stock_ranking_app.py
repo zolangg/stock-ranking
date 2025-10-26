@@ -746,7 +746,7 @@ else:
         prob_source = st.selectbox(
             "Probability source",
             [
-                "NCA & CatBoost avg",
+                "NCA & CatBoost Avg",
                 "NCA",
                 "CatBoost",
                 "Median Centers"
