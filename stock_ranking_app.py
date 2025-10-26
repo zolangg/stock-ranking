@@ -824,9 +824,11 @@ else:
                 tooltip=[
                     alt.Tooltip("GainCutoff_%:O", title="Cutoff (%)"),
                     alt.Tooltip("p_win:Q", format=".2f"),
-                    alt.Tooltip("R:R:Q",  format=".2f"),
+                    # ⬇️ use dict form for the colon-containing field
+                    alt.Tooltip(field="R:R", type="quantitative", title="R:R", format=".2f"),
                     alt.Tooltip("EV_R:Q", format=".3f"),
                 ],
+
             )
             .properties(title=f"EV (R) by cutoff — source: {prob_source}")
         )
