@@ -806,3 +806,4 @@ else:
         )
         vspace(24)
         st.altair_chart(ev_chart, use_container_width=True)
+        st.markdown("---")
