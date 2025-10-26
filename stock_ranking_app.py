@@ -465,6 +465,9 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
 st.markdown("---")
 st.subheader("Alignment")
 
+def vspace(px: int = 16):
+    st.markdown(f"<div style='height:{px}px'></div>", unsafe_allow_html=True)
+
 base_df = ss.get("base_df", pd.DataFrame())
 if base_df.empty:
     st.warning("Upload your Excel and click **Build model stocks**. Alignment distributions are disabled until then.")
@@ -665,6 +668,7 @@ else:
             tooltip=tooltip_cols,
         )
     )
+    vspace(24)
     st.altair_chart(chart, use_container_width=True)
 
 # ============================== EV (Single Chart: Liquidity + Catalyst Adjusted) ==============================
@@ -800,4 +804,5 @@ else:
                 ],
             )
         )
+        vspace(24)
         st.altair_chart(ev_chart, use_container_width=True)
