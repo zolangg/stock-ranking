@@ -817,7 +817,6 @@ else:
                     alt.Tooltip("EV_R:Q", format=".3f"),
                 ],
             )
-            .properties(title=f"EV (R) by cutoff — source: {prob_source}")
         )
         st.altair_chart(ev_chart, use_container_width=True)
 
