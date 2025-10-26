@@ -666,7 +666,6 @@ else:
         )
     )
     st.altair_chart(chart, use_container_width=True)
-    create_export_buttons(df_long, chart, "absolute_probability")
 
 # ============================== EV (Single Chart: Liquidity + Catalyst Adjusted) ==============================
 st.markdown("---")
