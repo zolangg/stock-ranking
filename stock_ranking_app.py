@@ -763,7 +763,7 @@ else:
         return [(s/100.0) if (s is not None and not np.isnan(s)) else np.nan for s in series_pct]
 
     # Choose probability list
-    if prob_source.startswith("NCA & CatBoost avg"):
+    if prob_source.startswith("NCA & CatBoost Avg"):
         p_n = _to_prob_list(series_N_med)
         p_c = _to_prob_list(series_C_med)
         p_list = []
