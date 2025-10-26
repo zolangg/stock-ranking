@@ -746,10 +746,10 @@ else:
         prob_source = st.selectbox(
             "Probability source",
             [
-                "Ensemble (NCA & CatBoost avg)",
+                "NCA & CatBoost avg",
                 nca_label,
                 cat_label,
-                f"{gA_label} (Median Centers)"
+                f"{gA_label}"
             ],
             index=0
         )
