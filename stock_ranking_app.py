@@ -753,8 +753,6 @@ with c2:
         "Assumed R:R", min_value=0.1, value=1.80, step=0.10, format="%.2f",
         key="rr_assumed"   # persist in session
     )
-ss["prob_source"] = st.session_state["prob_source"]
-ss["rr_assumed"]  = float(st.session_state["rr_assumed"])
 
 # (rest of your original EV chart + downloads remain unchanged above this line)
 
@@ -908,6 +906,7 @@ else:
     # Read persisted EV inputs
     prob_source = st.session_state.get("prob_source", "NCA & CatBoost Avg")
     rr_assumed  = float(st.session_state.get("rr_assumed", 1.80))
+
 
     # Show computed context
     context_tilt = float(ss.get("ctx_score", 0.0))
