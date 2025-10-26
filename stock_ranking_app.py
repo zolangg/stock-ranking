@@ -755,7 +755,7 @@ else:
         )
     with c2:
         rr_assumed = st.number_input(
-            "Assumed R:R (no sizing)", min_value=0.1, value=1.80, step=0.10, format="%.2f"
+            "Assumed R:R", min_value=0.1, value=1.80, step=0.10, format="%.2f"
         )
 
     # Convert series_% to 0..1
