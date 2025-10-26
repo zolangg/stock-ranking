@@ -733,7 +733,7 @@ else:
 
 # ============================== EV (Single Chart: Liquidity + Catalyst Adjusted) ==============================
 st.markdown("---")
-st.subheader("EV (Adjusted: Liquidity + Catalyst)")
+st.subheader("Expected Value")
 
 if not thr_labels:
     st.info("EV needs the computed probability series. Upload DB → Build model → Add stocks.")
