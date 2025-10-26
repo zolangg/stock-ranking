@@ -814,7 +814,7 @@ else:
                 x=alt.X("GainCutoff_%:O", title="Gain% cutoff"),
                 y=alt.Y("EV_$:Q", title="EV ($ per trade)"),
                 color=alt.condition(
-                    alt.datum.EV_$ >= 0,
+                    alt.datum["EV_$"] >= 0,
                     alt.value("#015e06"),
                     alt.value("#b30100")
                 ),
