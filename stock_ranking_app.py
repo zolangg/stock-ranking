@@ -1,6 +1,3 @@
-# Premarket Stock Alignment — SATURATED BARS (no opacity mapping)
-# + LIVE 1050-min normalization toggle (applied right before modeling)
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -20,10 +17,6 @@ except Exception:
 st.set_page_config(page_title="Premarket Stock Alignment", layout="wide")
 st.title("Premarket Stock Alignment")
 
-# 1050 toggle (your new part) — now LIVE
-USE_1050 = st.checkbox("Apply 1050 min normalization (16:00 → 09:30)", value=True)
-FULL_PM_MIN = 1050.0
-
 # ============================== Session ==============================
 ss = st.session_state
 ss.setdefault("base_df", pd.DataFrame())
@@ -34,15 +27,7 @@ UNIFIED_VARS = [
     "MC_PM_Max_M","Float_PM_Max_M","Gap_%","ATR_$","PM_Vol_M","PM_$Vol_M$",
     "FR_x","PM$Vol/MC_%","Max_Pull_PM_%","RVOL_Max_PM_cum","Catalyst"
 ]
-
-# We include potential 1050 variants in allowed features (only used if present)
-ALLOWED_LIVE_FEATURES = UNIFIED_VARS[:] + [
-    "PM_Vol_M_1050",
-    "PM_$Vol_M$_1050",
-    "FR_x_1050",
-    "PM$Vol/MC_%_1050",
-    "RVOL_Max_PM_cum_1050",
-]
+ALLOWED_LIVE_FEATURES = UNIFIED_VARS[:]
 EXCLUDE_FOR_NCA = []
 
 # ============================== Helpers ==============================
@@ -78,43 +63,6 @@ def _to_float(x):
         return float(s)
     except Exception:
         return np.nan
-
-def _apply_1050_block(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Create 1050-normalized columns for time-biased variables only:
-    PM_Vol_M, PM_$Vol_M$, FR_x, PM$Vol/MC_%, RVOL_Max_PM_cum
-    We do NOT touch MC, Float, Gap, ATR, Max_Pull, Catalyst.
-    """
-    if df is None or df.empty:
-        return df
-
-    # PM volume
-    if "PM_Vol_M" in df.columns:
-        df["PM_Vol_M_1050"] = df["PM_Vol_M"] / FULL_PM_MIN
-
-    # PM $ volume
-    if "PM_$Vol_M$" in df.columns:
-        df["PM_$Vol_M$_1050"] = df["PM_$Vol_M$"] / FULL_PM_MIN
-
-    # FR_x = PM_Vol / Float → normalize PM side
-    if "FR_x" in df.columns:
-        if "PM_Vol_M_1050" in df.columns and "Float_PM_Max_M" in df.columns:
-            df["FR_x_1050"] = (df["PM_Vol_M_1050"] / df["Float_PM_Max_M"]).replace([np.inf, -np.inf], np.nan)
-        else:
-            df["FR_x_1050"] = df["FR_x"] / FULL_PM_MIN
-
-    # PM$Vol/MC_% → normalize PM $ side
-    if "PM$Vol/MC_%" in df.columns:
-        if "PM_$Vol_M$_1050" in df.columns and "MC_PM_Max_M" in df.columns:
-            df["PM$Vol/MC_%_1050"] = (df["PM_$Vol_M$_1050"] / df["MC_PM_Max_M"] * 100.0).replace([np.inf, -np.inf], np.nan)
-        else:
-            df["PM$Vol/MC_%_1050"] = df["PM$Vol/MC_%"] / FULL_PM_MIN
-
-    # RVOL — you said include it
-    if "RVOL_Max_PM_cum" in df.columns:
-        df["RVOL_Max_PM_cum_1050"] = df["RVOL_Max_PM_cum"] / FULL_PM_MIN
-
-    return df
 
 # ============================== Upload / Build ==============================
 st.subheader("Upload Database")
@@ -187,7 +135,6 @@ if build_btn:
             keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT"])
             df = df[[c for c in df.columns if c in keep_cols]].copy()
 
-            # store RAW in session — 1050 comes later
             ss.base_df = df
             st.success(f"Loaded “{sel_sheet}”. Base ready.")
         except Exception as e:
@@ -216,7 +163,6 @@ with st.form("add_form", clear_on_submit=True):
     submitted = st.form_submit_button("Add", use_container_width=True)
 
 if submitted and ticker:
-    # store RAW values; we will derive 1050 later at runtime
     row = {
         "Ticker": ticker,
         "MC_PM_Max_M": mc_pmmax,
@@ -517,16 +463,10 @@ st.subheader("Alignment")
 def vspace(px: int = 16):
     st.markdown(f"<div style='height:{px}px'></div>", unsafe_allow_html=True)
 
-# 1) get RAW
-base_df_raw = ss.get("base_df", pd.DataFrame())
-if base_df_raw.empty:
+base_df = ss.get("base_df", pd.DataFrame())
+if base_df.empty:
     st.warning("Upload your Excel and click **Build model stocks**. Alignment distributions are disabled until then.")
     st.stop()
-
-# 2) make working copy and apply 1050 if selected
-base_df = base_df_raw.copy()
-if USE_1050:
-    base_df = _apply_1050_block(base_df)
 
 if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
@@ -569,22 +509,7 @@ if "Max_Push_Daily_%" not in base_df.columns:
     st.error("Your DB is missing column: Max_Push_Daily_% (Max Push Daily (%) as %).")
     st.stop()
 
-# features depending on toggle
-if USE_1050:
-    var_all = []
-    for v in UNIFIED_VARS:
-        if v in ("PM_Vol_M", "PM_$Vol_M$", "FR_x", "PM$Vol/MC_%", "RVOL_Max_PM_cum"):
-            v1050 = v + "_1050"
-            if v1050 in base_df.columns:
-                var_all.append(v1050)
-            elif v in base_df.columns:
-                var_all.append(v)  # fallback
-        else:
-            if v in base_df.columns:
-                var_all.append(v)
-else:
-    var_all = [v for v in UNIFIED_VARS if v in base_df.columns]
-
+var_all = [v for v in UNIFIED_VARS if v in base_df.columns]
 if not var_all:
     st.error("No usable numeric features found after loading. Ensure your Excel has mapped numeric columns.")
     st.stop()
@@ -604,21 +529,7 @@ def _make_split(df_base: pd.DataFrame, thr_val: float, mode: str):
         df_tmp["__Group__"] = np.where(m_gain >= thr_val, gA_, "Rest")
     return df_tmp, gA_, gB_
 
-# build added_df (RAW rows) → if USE_1050, backfill 1050 cols here too
 added_df = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in set(selected_tickers)])
-if USE_1050 and not added_df.empty:
-    if "PM_Vol_M" in added_df.columns and "PM_Vol_M_1050" not in added_df.columns:
-        added_df["PM_Vol_M_1050"] = added_df["PM_Vol_M"] / FULL_PM_MIN
-    if "PM_$Vol_M$" in added_df.columns and "PM_$Vol_M$_1050" not in added_df.columns:
-        added_df["PM_$Vol_M$_1050"] = added_df["PM_$Vol_M$"] / FULL_PM_MIN
-    if "FR_x_1050" not in added_df.columns:
-        if "PM_Vol_M_1050" in added_df.columns and "Float_PM_Max_M" in added_df.columns:
-            added_df["FR_x_1050"] = (added_df["PM_Vol_M_1050"] / added_df["Float_PM_Max_M"]).replace([np.inf, -np.inf], np.nan)
-    if "PM$Vol/MC_%_1050" not in added_df.columns:
-        if "PM_$Vol_M$_1050" in added_df.columns and "MC_PM_Max_M" in added_df.columns:
-            added_df["PM$Vol/MC_%_1050"] = (added_df["PM_$Vol_M$_1050"] / added_df["MC_PM_Max_M"] * 100.0).replace([np.inf, -np.inf], np.nan)
-    if "RVOL_Max_PM_cum" in added_df.columns and "RVOL_Max_PM_cum_1050" not in added_df.columns:
-        added_df["RVOL_Max_PM_cum_1050"] = added_df["RVOL_Max_PM_cum"] / FULL_PM_MIN
 
 thr_labels = []
 series_A_med, series_B_med, series_N_med, series_C_med = [], [], [], []
@@ -667,6 +578,7 @@ with st.spinner("Calculating distributions across all cutoffs..."):
         if not any([pN, pC, pA_centers]):
             continue
 
+        # Confidence (for tooltip only)
         if nA == 0 or nB == 0:
             coverage = 0.0
         else:
@@ -694,6 +606,7 @@ with st.spinner("Calculating distributions across all cutoffs..."):
 if not thr_labels:
     st.info("Not enough data across cutoffs to train models. Try using a larger database.")
 else:
+    # --- SATURATED BARS: no opacity channel, hover still shows diagnostics ---
     data = []
 
     if 'split_mode' in locals() and split_mode == "FT Gain%":
@@ -760,6 +673,7 @@ st.subheader("Expected Value")
 if not thr_labels:
     st.info("EV needs the computed probability series. Upload DB → Build model → Add stocks.")
 else:
+    # ---- Controls you keep ----
     c1, c2 = st.columns([1.2, 1.0])
     with c1:
         prob_source = st.selectbox(
@@ -774,9 +688,11 @@ else:
             key="rr_assumed"
         )
 
+    # ---- Helper: convert % to [0,1] ----
     def _to_prob_list(series_pct):
         return [(s/100.0) if (s is not None and not np.isnan(s)) else np.nan for s in series_pct]
 
+    # ---- Build probability list from selection ----
     if prob_source.startswith("NCA & CatBoost Avg"):
         p_n = _to_prob_list(series_N_med)
         p_c = _to_prob_list(series_C_med)
@@ -791,67 +707,57 @@ else:
     elif prob_source == "CatBoost":
         p_list = _to_prob_list(series_C_med)
     else:
-        p_list = _to_prob_list(series_A_med)
+        p_list = _to_prob_list(series_A_med)  # Median Centers as fallback
+
+    # ---- Always-on tilts (robust; percentile-based) ----
+    lam_liq = 0.10  # liquidity tilt strength on probability
+    gam_cat = 0.05  # catalyst tilt strength on probability
 
     def _valid_arr(series):
         arr = pd.to_numeric(series, errors="coerce").astype(float).values if series is not None else np.array([])
         return arr[np.isfinite(arr)]
 
     def _pct_rank(x, arr: np.ndarray) -> float:
+        """Percentile rank in [0,1]; 0.5 if x or arr invalid."""
         if not np.isfinite(x) or arr.size == 0:
             return 0.5
         less = np.sum(arr < x)
         equal = np.sum(arr == x)
         return float((less + 0.5 * equal) / len(arr))
 
-    # use the same working base_df as alignment (so 1050 is respected)
-    arr_pm_mc = _valid_arr(base_df.get("PM$Vol/MC_%_1050" if USE_1050 and "PM$Vol/MC_%_1050" in base_df.columns else "PM$Vol/MC_%", pd.Series(dtype=float)))
-    arr_fr    = _valid_arr(base_df.get("FR_x_1050" if USE_1050 and "FR_x_1050" in base_df.columns else "FR_x", pd.Series(dtype=float)))
-    arr_rvol  = _valid_arr(base_df.get("RVOL_Max_PM_cum_1050" if USE_1050 and "RVOL_Max_PM_cum_1050" in base_df.columns else "RVOL_Max_PM_cum", pd.Series(dtype=float)))
+    # Historical distributions (from your DB)
+    arr_pm_mc = _valid_arr(base_df.get("PM$Vol/MC_%", pd.Series(dtype=float)))
+    arr_fr    = _valid_arr(base_df.get("FR_x", pd.Series(dtype=float)))
+    arr_rvol  = _valid_arr(base_df.get("RVOL_Max_PM_cum", pd.Series(dtype=float)))
 
-    selected_names = st.session_state.get("align_sel_tickers", [])
+    # Selected tickers → median cross-sectional values
+    selected_names = st.session_state.get("align_sel_tickers", [])  # fallback to alignment selection
     selected_set = set(selected_names) if isinstance(selected_names, list) else set()
     added_df_full = pd.DataFrame([r for r in ss.rows if r.get("Ticker") in selected_set]) if selected_set else pd.DataFrame()
 
-    if USE_1050 and not added_df_full.empty:
-        if "PM_Vol_M" in added_df_full.columns and "PM_Vol_M_1050" not in added_df_full.columns:
-            added_df_full["PM_Vol_M_1050"] = added_df_full["PM_Vol_M"] / FULL_PM_MIN
-        if "PM_$Vol_M$" in added_df_full.columns and "PM_$Vol_M$_1050" not in added_df_full.columns:
-            added_df_full["PM_$Vol_M$_1050"] = added_df_full["PM_$Vol_M$"] / FULL_PM_MIN
-        if "PM_Vol_M_1050" in added_df_full.columns and "Float_PM_Max_M" in added_df_full.columns and "FR_x_1050" not in added_df_full.columns:
-            added_df_full["FR_x_1050"] = (added_df_full["PM_Vol_M_1050"] / added_df_full["Float_PM_Max_M"]).replace([np.inf, -np.inf], np.nan)
-        if "PM_$Vol_M$_1050" in added_df_full.columns and "MC_PM_Max_M" in added_df_full.columns and "PM$Vol/MC_%_1050" not in added_df_full.columns:
-            added_df_full["PM$Vol/MC_%_1050"] = (added_df_full["PM_$Vol_M$_1050"] / added_df_full["MC_PM_Max_M"] * 100.0).replace([np.inf, -np.inf], np.nan)
-        if "RVOL_Max_PM_cum" in added_df_full.columns and "RVOL_Max_PM_cum_1050" not in added_df_full.columns:
-            added_df_full["RVOL_Max_PM_cum_1050"] = added_df_full["RVOL_Max_PM_cum"] / FULL_PM_MIN
+    pm_mc_val = float(np.nanmedian(pd.to_numeric(added_df_full.get("PM$Vol/MC_%"), errors="coerce"))) if not added_df_full.empty else np.nan
+    frx_val   = float(np.nanmedian(pd.to_numeric(added_df_full.get("FR_x"), errors="coerce")))       if not added_df_full.empty else np.nan
+    rvol_val  = float(np.nanmedian(pd.to_numeric(added_df_full.get("RVOL_Max_PM_cum"), errors="coerce"))) if not added_df_full.empty else np.nan
 
-    if USE_1050:
-        pm_mc_val = float(np.nanmedian(pd.to_numeric(added_df_full.get("PM$Vol/MC_%_1050"), errors="coerce"))) if not added_df_full.empty else np.nan
-        frx_val   = float(np.nanmedian(pd.to_numeric(added_df_full.get("FR_x_1050"), errors="coerce")))       if not added_df_full.empty else np.nan
-        rvol_val  = float(np.nanmedian(pd.to_numeric(added_df_full.get("RVOL_Max_PM_cum_1050"), errors="coerce"))) if not added_df_full.empty else np.nan
-    else:
-        pm_mc_val = float(np.nanmedian(pd.to_numeric(added_df_full.get("PM$Vol/MC_%"), errors="coerce"))) if not added_df_full.empty else np.nan
-        frx_val   = float(np.nanmedian(pd.to_numeric(added_df_full.get("FR_x"), errors="coerce")))       if not added_df_full.empty else np.nan
-        rvol_val  = float(np.nanmedian(pd.to_numeric(added_df_full.get("RVOL_Max_PM_cum"), errors="coerce"))) if not added_df_full.empty else np.nan
-
-    pr1 = _pct_rank(pm_mc_val, arr_pm_mc)
-    pr2 = _pct_rank(frx_val,   arr_fr)
-    pr3 = _pct_rank(rvol_val,  arr_rvol)
-    score = float(np.nanmean([pr1, pr2, pr3]) - 0.5)
-    lam_liq = 0.10
-    gam_cat = 0.05
+    # Percentile ranks (0..1) → center to [-0.5, 0.5] → gentle tanh mapping
+    pr1 = _pct_rank(pm_mc_val, arr_pm_mc)  # PM$Vol/MC_%
+    pr2 = _pct_rank(frx_val,   arr_fr)     # FR_x
+    pr3 = _pct_rank(rvol_val,  arr_rvol)   # RVOL_Max_PM_cum
+    score = float(np.nanmean([pr1, pr2, pr3]) - 0.5)  # [-0.5, 0.5]
     L_prob = 1.0 + lam_liq * float(np.tanh(score * 3.0))
-    L_prob = float(np.clip(L_prob, 0.85, 1.20))
+    L_prob = float(np.clip(L_prob, 0.85, 1.20))  # modest bounds
 
+    # Catalyst factor (share of 'Yes' among selected tickers)
     if not added_df_full.empty and "Catalyst" in added_df_full.columns:
         share_cat = float(np.nanmean(pd.to_numeric(added_df_full["Catalyst"], errors="coerce") >= 0.5))
     else:
         share_cat = np.nan
-    if not np.isfinite(share_cat):
+    if not np.isfinite(share_cat):  # neutral if unknown
         share_cat = 0.5
     K_prob = 1.0 + gam_cat * (2.0 * share_cat - 1.0)
-    K_prob = float(np.clip(K_prob, 0.90, 1.10))
+    K_prob = float(np.clip(K_prob, 0.90, 1.10))  # modest bounds
 
+    # ---- Apply tilts, compute EV series ----
     rr = float(st.session_state.get("rr_assumed", rr_assumed))
     rows = []
     for i, g in enumerate(thr_labels):
@@ -896,3 +802,5 @@ else:
         vspace(24)
         st.altair_chart(ev_chart, use_container_width=True)
         st.markdown("---")
+
+Does that make sense?
