@@ -518,9 +518,10 @@ else:
     if df_ft.shape[0] < 20:
         st.info("Not enough FT=1 trades in the DB to compute a regime yet (need at least ~20).")
     else:
-        window = 40  # rolling window size in number of FT trades
+        window = 40       # rolling window for Max Push stats (FT trades)
+        smooth_window = 8 # smoothing window for RegimeScore
 
-        # Rolling stats over winners (per FT trade, ordered by time/index)
+        # Rolling stats over winners
         roll_gain = df_ft["Max_Push_Daily_%"].rolling(window=window, min_periods=20)
         df_ft["reg_median_maxpush"] = roll_gain.median()
         df_ft["reg_q90_maxpush"]    = roll_gain.quantile(0.9)
@@ -545,7 +546,7 @@ else:
             else:
                 glob_eta = np.nan
 
-            # --- Compute RegimeScore for each row (uses all three variables where available) ---
+            # --- Compute raw RegimeScore for each row ---
             def _row_regime_score(row, gq=glob_q90, gm=glob_med, ge=glob_eta):
                 ratios = []
                 q = row.get("reg_q90_maxpush", np.nan)
@@ -559,22 +560,29 @@ else:
                     ratios.append(e / ge)
                 return float(np.mean(ratios)) if ratios else np.nan
 
-            df_ft_valid["RegimeScore"] = df_ft_valid.apply(_row_regime_score, axis=1)
+            df_ft_valid["RegimeScore_raw"] = df_ft_valid.apply(_row_regime_score, axis=1)
 
-            # Drop rows without a score (just in case)
+            # Smooth the regime score (rolling mean)
+            df_ft_valid["RegimeScore"] = (
+                df_ft_valid["RegimeScore_raw"]
+                .rolling(window=smooth_window, min_periods=max(3, smooth_window // 2))
+                .mean()
+            )
+
+            # Drop rows without a smoothed score
             df_ft_valid = df_ft_valid[np.isfinite(df_ft_valid["RegimeScore"])]
 
             if df_ft_valid.empty:
-                st.info("Not enough data to compute a composite regime score yet.")
+                st.info("Not enough data to compute a composite smoothed regime score yet.")
             else:
                 # Latest regime snapshot
                 last_row = df_ft_valid.iloc[-1]
-                q90_now  = float(last_row["reg_q90_maxpush"])
-                med_now  = float(last_row["reg_median_maxpush"])
-                eta_now  = float(last_row["reg_median_eta"]) if "reg_median_eta" in df_ft_valid.columns else np.nan
+                q90_now      = float(last_row["reg_q90_maxpush"])
+                med_now      = float(last_row["reg_median_maxpush"])
+                eta_now      = float(last_row["reg_median_eta"]) if "reg_median_eta" in df_ft_valid.columns else np.nan
                 regime_score = float(last_row["RegimeScore"])
 
-                # --- Regime classification (Cold / Normal / Hot) from composite score ---
+                # --- Regime classification (Cold / Normal / Hot) from smoothed score ---
                 if regime_score < 0.8:
                     regime = "Cold"
                     color  = "#b30100"
@@ -595,9 +603,9 @@ else:
                     """,
                     unsafe_allow_html=True,
                 )
-                st.caption(f"Regime score (current vs long-run average): {regime_score:.2f}")
+                st.caption(f"Smoothed regime score (current vs long-run avg): {regime_score:.2f}")
 
-                # Current snapshot metrics
+                # Current snapshot metrics (for context)
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     st.metric("q90 Max Push Daily (PMH→HOD)", f"{q90_now:.0f}%")
@@ -609,62 +617,19 @@ else:
                     else:
                         st.write("")
 
-                # ================= Historical regime charts =================
-                # 1) Max Push Daily (Median & q90) over time
-                hist_cols = [x_col, "reg_median_maxpush", "reg_q90_maxpush"]
-                df_hist = df_ft_valid[hist_cols].copy()
-                df_hist = df_hist.rename(columns={
-                    "reg_median_maxpush": "Median_MaxPushDaily",
-                    "reg_q90_maxpush":    "Q90_MaxPushDaily",
-                })
-                df_hist_long = df_hist.melt(
-                    id_vars=[x_col],
-                    value_vars=["Median_MaxPushDaily", "Q90_MaxPushDaily"],
-                    var_name="Series",
-                    value_name="Value",
-                )
-
+                # === Single historical graph: smoothed RegimeScore over time ===
+                df_reg_hist = df_ft_valid[[x_col, "RegimeScore"]].copy()
                 if x_col == "Date":
                     x_enc = alt.X("Date:T", title="Date")
                 else:
                     x_enc = alt.X("TradeIdx:Q", title="FT Trade #")
 
-                push_chart = (
-                    alt.Chart(df_hist_long)
-                    .mark_line()
-                    .encode(
-                        x=x_enc,
-                        y=alt.Y("Value:Q", title="Max Push Daily (%)"),
-                        color=alt.Color(
-                            "Series:N",
-                            scale=alt.Scale(
-                                domain=["Median_MaxPushDaily", "Q90_MaxPushDaily"],
-                                range=["#1f77b4", "#ff7f0e"],
-                            ),
-                            title="Series",
-                        ),
-                        tooltip=[
-                            x_col,
-                            "Series:N",
-                            alt.Tooltip("Value:Q", format=".0f"),
-                        ],
-                    )
-                )
-                st.altair_chart(push_chart, use_container_width=True)
-
-                # 2) RegimeScore over time (composite of q90, median, eta)
-                df_reg_hist = df_ft_valid[[x_col, "RegimeScore"]].copy()
-                if x_col == "Date":
-                    x_enc2 = alt.X("Date:T", title="Date")
-                else:
-                    x_enc2 = alt.X("TradeIdx:Q", title="FT Trade #")
-
                 score_chart = (
                     alt.Chart(df_reg_hist)
                     .mark_line()
                     .encode(
-                        x=x_enc2,
-                        y=alt.Y("RegimeScore:Q", title="Regime Score (vs long-run avg)"),
+                        x=x_enc,
+                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score (vs long-run avg)"),
                         tooltip=[
                             x_col,
                             alt.Tooltip("RegimeScore:Q", format=".2f"),
