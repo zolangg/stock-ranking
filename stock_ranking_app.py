@@ -618,24 +618,52 @@ else:
                         st.write("")
 
                 # === Single historical graph: smoothed RegimeScore over time ===
-                df_reg_hist = df_ft_valid[[x_col, "RegimeScore"]].copy()
+                # Build dataframe with extra diagnostic columns for tooltip
+                cols_for_hist = [x_col, "RegimeScore"]
+                if "reg_q90_maxpush" in df_ft_valid.columns:
+                    cols_for_hist.append("reg_q90_maxpush")
+                if "reg_median_maxpush" in df_ft_valid.columns:
+                    cols_for_hist.append("reg_median_maxpush")
+                if "reg_median_eta" in df_ft_valid.columns:
+                    cols_for_hist.append("reg_median_eta")
+
+                df_reg_hist = df_ft_valid[cols_for_hist].copy()
+
+                # Nice readable names for tooltip
+                df_reg_hist = df_reg_hist.rename(columns={
+                    "RegimeScore":        "RegimeScore",
+                    "reg_q90_maxpush":    "Q90_MaxPushDaily",
+                    "reg_median_maxpush": "Median_MaxPushDaily",
+                    "reg_median_eta":     "Median_Eta"
+                })
+
+                # X encoding: Date or FT index
                 if x_col == "Date":
                     x_enc = alt.X("Date:T", title="Date")
                 else:
+                    # we still have the original index col in df_ft_valid
+                    df_reg_hist["TradeIdx"] = df_ft_valid.reset_index().index
                     x_enc = alt.X("TradeIdx:Q", title="FT Trade #")
 
+                # Build interactive line chart with detailed tooltip
                 score_chart = (
                     alt.Chart(df_reg_hist)
-                    .mark_line(color="#ff2501")
+                    .mark_line(color="#ff7f0e")  # change color if you want another
                     .encode(
                         x=x_enc,
-                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score"),
+                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score (vs long-run avg)"),
                         tooltip=[
-                            x_col,
-                            alt.Tooltip("RegimeScore:Q", format=".2f"),
+                            # X axis
+                            x_col if x_col == "Date" else "TradeIdx:Q",
+                            # Score + components
+                            alt.Tooltip("RegimeScore:Q",       title="Regime Score",        format=".2f"),
+                            alt.Tooltip("Q90_MaxPushDaily:Q",  title="q90 Max Push Daily%",  format=".0f"),
+                            alt.Tooltip("Median_MaxPushDaily:Q", title="Median Max Push Daily%", format=".0f"),
+                            alt.Tooltip("Median_Eta:Q",        title="Median η (%/min)",     format=".2f"),
                         ],
                     )
                 )
+
                 st.altair_chart(score_chart, use_container_width=True)
 
 # ============================== Alignment (Distributions) ==============================
