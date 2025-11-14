@@ -637,6 +637,19 @@ else:
                     "reg_median_maxpush": "Median_MaxPushDaily",
                     "reg_median_eta":     "Median_Eta"
                 })
+
+                # Add per-point regime label (Cold / Normal / Hot)
+                def _label_regime(score: float) -> str:
+                    if not np.isfinite(score):
+                        return "Unknown"
+                    if score < 0.8:
+                        return "Cold"
+                    elif score > 1.2:
+                        return "Hot"
+                    else:
+                        return "Normal"
+                
+                df_reg_hist["RegimeLabel"] = df_reg_hist["RegimeScore"].apply(_label_regime)
                 
                 # X encoding: Date or FT index
                 if x_col == "Date":
