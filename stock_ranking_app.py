@@ -585,13 +585,13 @@ else:
                 # --- Regime classification (Cold / Normal / Hot) from smoothed score ---
                 if regime_score < 0.8:
                     regime = "Cold"
-                    color  = "#b30100"
+                    color  = "#faa1a4"
                 elif regime_score > 1.2:
                     regime = "Hot"
-                    color  = "#015e06"
+                    color  = "#ff2501"
                 else:
                     regime = "Normal"
-                    color  = "#c28b00"
+                    color  = "#015e06"
 
                 # Badge
                 st.markdown(
@@ -626,7 +626,7 @@ else:
 
                 score_chart = (
                     alt.Chart(df_reg_hist)
-                    .mark_line()
+                    .mark_line(color="#ff2501")
                     .encode(
                         x=x_enc,
                         y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score (vs long-run avg)"),
