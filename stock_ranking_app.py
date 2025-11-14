@@ -612,7 +612,7 @@ else:
                 with c3:
                     st.metric("Median Max Push Daily", f"{med_now:.0f}%")
                 with c4:
-                     if np.isfinite(eta_now):
+                    if np.isfinite(eta_now):
                         st.metric("Median η (%/min)", f"{eta_now:.2f}")
                     else:
                         st.write("")
