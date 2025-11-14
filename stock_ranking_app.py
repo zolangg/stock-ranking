@@ -485,7 +485,7 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
 
 # ============================== Regime (PMH Environment) ==============================
 st.markdown("---")
-st.subheader("Regime (PMH Environment)")
+st.subheader("Regime")
 
 def vspace(px: int = 16):
     st.markdown(f"<div style='height:{px}px'></div>", unsafe_allow_html=True)
@@ -603,7 +603,7 @@ else:
                     """,
                     unsafe_allow_html=True,
                 )
-                st.caption(f"Smoothed regime score (current vs long-run avg): {regime_score:.2f}")
+                st.caption(f"Smoothed regime score: {regime_score:.2f}")
 
                 # Current snapshot metrics (for context)
                 c1, c2, c3 = st.columns(3)
