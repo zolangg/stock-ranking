@@ -131,8 +131,35 @@ if build_btn:
                 pd.to_numeric(raw[pmh_col].map(_to_float), errors="coerce") * 100.0
                 if pmh_col is not None else np.nan
             )
-
-            keep_cols = set(UNIFIED_VARS + ["Max_Push_Daily_%", "FT"])
+            
+            # --- NEW: load Date (if present) ---
+            date_col = _pick(raw, ["Date", "Session Date", "Trade Date", "Day", "SessionDate"])
+            if date_col:
+                df["Date"] = pd.to_datetime(raw[date_col], errors="coerce")
+            
+            # --- NEW: load Max Push (biggest leg) if present ---
+            max_push_leg_col = _pick(raw, ["Max Push (%)", "Max Push %", "Max_Push_%", "Max Push (leg %)"])
+            if max_push_leg_col:
+                df["Max_Push_%"] = (
+                    pd.to_numeric(raw[max_push_leg_col].map(_to_float), errors="coerce") * 100.0
+                )
+            
+            # --- NEW: load η (%/min) if present (no ×100 here, we keep raw %/min) ---
+            eta_col = _pick(raw, ["η (%/min)", "eta (%/min)", "Eta (%/min)", "Eta", "eta"])
+            if eta_col:
+                df["Eta_%_per_min"] = pd.to_numeric(raw[eta_col].map(_to_float), errors="coerce")
+            
+            # --- NEW: load MpB% Day (RTH) if present ---
+            mpb_col = _pick(raw, ["MpB% Day", "MpB% Day (RTH)", "MpB_Day_%", "Max push breakout day %"])
+            if mpb_col:
+                df["MpB_Day_%"] = (
+                    pd.to_numeric(raw[mpb_col].map(_to_float), errors="coerce") * 100.0
+                )
+            
+            keep_cols = set(
+                UNIFIED_VARS
+                + ["Max_Push_Daily_%", "Max_Push_%", "Eta_%_per_min", "MpB_Day_%", "FT", "Date"]
+            )
             df = df[[c for c in df.columns if c in keep_cols]].copy()
 
             ss.base_df = df
@@ -468,6 +495,135 @@ if base_df.empty:
     st.warning("Upload your Excel and click **Build model stocks**. Alignment distributions are disabled until then.")
     st.stop()
 
+# ============================== Regime (PMH Environment) ==============================
+st.markdown("---")
+st.subheader("Regime (PMH Environment)")
+
+needed_cols = {"Max_Push_Daily_%", "FT"}
+missing = needed_cols - set(base_df.columns)
+if missing:
+    st.info("Regime view needs at least Max_Push_Daily_% and FT in your DB.")
+else:
+    df_reg = base_df.copy()
+
+    # Use Date where possible, else use a simple trade index
+    if "Date" in df_reg.columns and df_reg["Date"].notna().any():
+        df_reg = df_reg.sort_values("Date")
+        x_col = "Date"
+    else:
+        df_reg = df_reg.reset_index().rename(columns={"index": "TradeIdx"})
+        x_col = "TradeIdx"
+
+    # Only FT=1 winners with valid Max_Push_Daily_%
+    m_gain = pd.to_numeric(df_reg["Max_Push_Daily_%"], errors="coerce")
+    m_ft   = pd.to_numeric(df_reg["FT"], errors="coerce")
+    df_ft = df_reg[(m_ft == 1) & np.isfinite(m_gain)].copy()
+
+    if df_ft.shape[0] < 20:
+        st.info("Not enough FT=1 trades in the DB to compute a regime yet (need at least ~20).")
+    else:
+        window = 40  # rolling window size in number of FT trades
+
+        # Rolling stats over winners
+        roll_gain = df_ft["Max_Push_Daily_%"].rolling(window=window, min_periods=20)
+        df_ft["reg_median_maxpush"] = roll_gain.median()
+        df_ft["reg_q90_maxpush"]    = roll_gain.quantile(0.9)
+
+        if "Max_Push_%" in df_ft.columns:
+            df_ft["reg_median_leg"] = df_ft["Max_Push_%"].rolling(window=window, min_periods=20).median()
+        if "Eta_%_per_min" in df_ft.columns:
+            df_ft["reg_median_eta"] = df_ft["Eta_%_per_min"].rolling(window=window, min_periods=20).median()
+        if "MpB_Day_%" in df_ft.columns:
+            df_ft["reg_median_mpb"] = df_ft["MpB_Day_%"].rolling(window=window, min_periods=20).median()
+
+        df_ft_valid = df_ft.dropna(subset=["reg_q90_maxpush"])
+        if df_ft_valid.empty:
+            st.info("Not enough rolling data to show a regime curve yet.")
+        else:
+            # Latest regime snapshot
+            last_row = df_ft_valid.iloc[-1]
+            q90_now  = float(last_row["reg_q90_maxpush"])
+            med_now  = float(last_row["reg_median_maxpush"])
+            eta_now  = float(last_row["reg_median_eta"]) if "reg_median_eta" in df_ft_valid.columns else np.nan
+
+            # --- Regime classification (Cold / Normal / Hot) ---
+            # NOTE: thresholds are in "percent points" because we multiplied by 100 earlier
+            if q90_now < 120:
+                regime = "Cold"
+                color  = "#b30100"
+            elif q90_now > 200:
+                regime = "Hot"
+                color  = "#015e06"
+            else:
+                regime = "Normal"
+                color  = "#c28b00"
+
+            # Badge
+            st.markdown(
+                f"""
+                <div style="display:inline-block;padding:6px 12px;border-radius:999px;
+                           background-color:{color};color:white;font-weight:600;">
+                    Regime: {regime}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # Current snapshot metrics
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("q90 Max Push Daily (PMH→HOD)", f"{q90_now:.0f}%")
+            with c2:
+                st.metric("Median Max Push Daily", f"{med_now:.0f}%")
+            with c3:
+                if np.isfinite(eta_now):
+                    st.metric("Median η (%/min)", f"{eta_now:.2f}")
+                else:
+                    st.write("")
+
+            # Historical regime chart (from first date / trade with enough history)
+            hist_cols = [x_col, "reg_median_maxpush", "reg_q90_maxpush"]
+            df_hist = df_ft_valid[hist_cols].copy()
+            df_hist = df_hist.rename(columns={
+                "reg_median_maxpush": "Median_MaxPushDaily",
+                "reg_q90_maxpush":    "Q90_MaxPushDaily",
+            })
+            df_hist_long = df_hist.melt(
+                id_vars=[x_col],
+                value_vars=["Median_MaxPushDaily", "Q90_MaxPushDaily"],
+                var_name="Series",
+                value_name="Value",
+            )
+
+            if x_col == "Date":
+                x_enc = alt.X("Date:T", title="Date")
+            else:
+                x_enc = alt.X("TradeIdx:Q", title="FT Trade #")
+
+            reg_chart = (
+                alt.Chart(df_hist_long)
+                .mark_line()
+                .encode(
+                    x=x_enc,
+                    y=alt.Y("Value:Q", title="Max Push Daily (%)"),
+                    color=alt.Color(
+                        "Series:N",
+                        scale=alt.Scale(
+                            domain=["Median_MaxPushDaily", "Q90_MaxPushDaily"],
+                            range=["#1f77b4", "#ff7f0e"],
+                        ),
+                        title="Series",
+                    ),
+                    tooltip=[
+                        x_col,
+                        "Series:N",
+                        alt.Tooltip("Value:Q", format=".0f"),
+                    ],
+                )
+            )
+            st.altair_chart(reg_chart, use_container_width=True)
+
+# ============================== Alignment (Distributions) ==============================
 if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
