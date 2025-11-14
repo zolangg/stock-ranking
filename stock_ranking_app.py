@@ -516,22 +516,22 @@ else:
     df_ft = df_reg[(m_ft == 1) & np.isfinite(m_gain)].copy()
 
     if df_ft.shape[0] < 20:
-        st.info("Not enough FT=1 trades in the DB to compute a regime yet (need at least ~20).")
+        st.info("Not enough FT=1 trades in the DB to compute a regime yet.")
     else:
         window = 40       # rolling window for Max Push stats (FT trades)
-        smooth_window = 8 # smoothing window for RegimeScore
+        smooth_window = 7 # smoothing window for RegimeScore
 
         # Rolling stats over winners
-        roll_gain = df_ft["Max_Push_Daily_%"].rolling(window=window, min_periods=20)
+        roll_gain = df_ft["Max_Push_Daily_%"].rolling(window=window, min_periods=5)
         df_ft["reg_median_maxpush"] = roll_gain.median()
         df_ft["reg_q90_maxpush"]    = roll_gain.quantile(0.9)
 
         if "Max_Push_%" in df_ft.columns:
-            df_ft["reg_median_leg"] = df_ft["Max_Push_%"].rolling(window=window, min_periods=20).median()
+            df_ft["reg_median_leg"] = df_ft["Max_Push_%"].rolling(window=window, min_periods=5).median()
         if "Eta_%_per_min" in df_ft.columns:
-            df_ft["reg_median_eta"] = df_ft["Eta_%_per_min"].rolling(window=window, min_periods=20).median()
+            df_ft["reg_median_eta"] = df_ft["Eta_%_per_min"].rolling(window=window, min_periods=5).median()
         if "MpB_Day_%" in df_ft.columns:
-            df_ft["reg_median_mpb"] = df_ft["MpB_Day_%"].rolling(window=window, min_periods=20).median()
+            df_ft["reg_median_mpb"] = df_ft["MpB_Day_%"].rolling(window=window, min_periods=5).median()
 
         # Keep only rows where we have rolling q90
         df_ft_valid = df_ft.dropna(subset=["reg_q90_maxpush"])
