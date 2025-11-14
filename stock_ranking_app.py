@@ -629,7 +629,7 @@ else:
                     .mark_line(color="#ff2501")
                     .encode(
                         x=x_enc,
-                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score (vs long-run avg)"),
+                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score"),
                         tooltip=[
                             x_col,
                             alt.Tooltip("RegimeScore:Q", format=".2f"),
