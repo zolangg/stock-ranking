@@ -617,7 +617,8 @@ else:
                     else:
                         st.write("")
 
-                # === Single historical graph: smoothed RegimeScore over time ===
+                # === Single historical graph: smoothed RegimeScore over time (with regime labels) ===
+                
                 # Build dataframe with extra diagnostic columns for tooltip
                 cols_for_hist = [x_col, "RegimeScore"]
                 if "reg_q90_maxpush" in df_ft_valid.columns:
@@ -626,9 +627,9 @@ else:
                     cols_for_hist.append("reg_median_maxpush")
                 if "reg_median_eta" in df_ft_valid.columns:
                     cols_for_hist.append("reg_median_eta")
-
+                
                 df_reg_hist = df_ft_valid[cols_for_hist].copy()
-
+                
                 # Nice readable names for tooltip
                 df_reg_hist = df_reg_hist.rename(columns={
                     "RegimeScore":        "RegimeScore",
@@ -636,34 +637,76 @@ else:
                     "reg_median_maxpush": "Median_MaxPushDaily",
                     "reg_median_eta":     "Median_Eta"
                 })
-
+                
+                # Add per-point regime label (Cold / Normal / Hot)
+                def _label_regime(score: float) -> str:
+                    if not np.isfinite(score):
+                        return "Unknown"
+                    if score < 0.8:
+                        return "Cold"
+                    elif score > 1.2:
+                        return "Hot"
+                    else:
+                        return "Normal"
+                
+                df_reg_hist["RegimeLabel"] = df_reg_hist["RegimeScore"].apply(_label_regime)
+                
                 # X encoding: Date or FT index
                 if x_col == "Date":
                     x_enc = alt.X("Date:T", title="Date")
+                    x_field_tooltip = "Date:T"
                 else:
-                    # we still have the original index col in df_ft_valid
-                    df_reg_hist["TradeIdx"] = df_ft_valid.reset_index().index
+                    # ensure a stable index for plotting when no Date
+                    df_reg_hist = df_reg_hist.reset_index(drop=True)
+                    df_reg_hist["TradeIdx"] = df_reg_hist.index + 1
                     x_enc = alt.X("TradeIdx:Q", title="FT Trade #")
-
-                # Build interactive line chart with detailed tooltip
-                score_chart = (
+                    x_field_tooltip = "TradeIdx:Q"
+                
+                # Base line (always same color)
+                line = (
                     alt.Chart(df_reg_hist)
-                    .mark_line(color="#ff2501")
+                    .mark_line(color="#ff7f0e")
                     .encode(
                         x=x_enc,
-                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score"),
+                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score (vs long-run avg)"),
+                    )
+                )
+                
+                # Colored points by regime (Cold / Normal / Hot)
+                points = (
+                    alt.Chart(df_reg_hist)
+                    .mark_circle(size=40)
+                    .encode(
+                        x=x_enc,
+                        y="RegimeScore:Q",
+                        color=alt.Color(
+                            "RegimeLabel:N",
+                            scale=alt.Scale(
+                                domain=["Cold", "Normal", "Hot", "Unknown"],
+                                range=["#b30100", "#c28b00", "#015e06", "#6c6c6c"],
+                            ),
+                            title="Regime",
+                        ),
                         tooltip=[
-                            # X axis
-                            x_col if x_col == "Date" else "TradeIdx:Q",
-                            # Score + components
-                            alt.Tooltip("RegimeScore:Q",       title="Regime Score",        format=".2f"),
-                            alt.Tooltip("Q90_MaxPushDaily:Q",  title="q90 Max Push Daily%",  format=".0f"),
-                            alt.Tooltip("Median_MaxPushDaily:Q", title="Median Max Push Daily%", format=".0f"),
-                            alt.Tooltip("Median_Eta:Q",        title="Median η (%/min)",     format=".2f"),
+                            x_field_tooltip,
+                            alt.Tooltip("RegimeScore:Q",        title="Regime Score",           format=".2f"),
+                            alt.Tooltip("Q90_MaxPushDaily:Q",   title="q90 Max Push Daily%",    format=".0f"),
+                            alt.Tooltip("Median_MaxPushDaily:Q",title="Median Max Push Daily%", format=".0f"),
+                            alt.Tooltip("Median_Eta:Q",         title="Median η (%/min)",       format=".2f"),
+                            alt.Tooltip("RegimeLabel:N",        title="Regime"),
                         ],
                     )
                 )
-
+                
+                # Horizontal guides at 0.8 and 1.2 (Cold/Hot thresholds)
+                guide_df = pd.DataFrame({"y": [0.8, 1.2]})
+                guides = (
+                    alt.Chart(guide_df)
+                    .mark_rule(strokeDash=[4, 4], color="#888888")
+                    .encode(y="y:Q")
+                )
+                
+                score_chart = (line + points + guides).resolve_scale(color="independent")
                 st.altair_chart(score_chart, use_container_width=True)
 
 # ============================== Alignment (Distributions) ==============================
