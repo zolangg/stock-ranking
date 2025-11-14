@@ -665,10 +665,10 @@ else:
                 # Base line (always same color)
                 line = (
                     alt.Chart(df_reg_hist)
-                    .mark_line(color="#ff7f0e")
+                    .mark_line(color="#ff2501")
                     .encode(
                         x=x_enc,
-                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score (vs long-run avg)"),
+                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score"),
                     )
                 )
                 
@@ -683,7 +683,7 @@ else:
                             "RegimeLabel:N",
                             scale=alt.Scale(
                                 domain=["Cold", "Normal", "Hot", "Unknown"],
-                                range=["#b30100", "#c28b00", "#015e06", "#6c6c6c"],
+                                range=["#faa1a4", "#015e06", "#ff2501", "#b30100"],
                             ),
                             title="Regime",
                         ),
