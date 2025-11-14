@@ -593,26 +593,26 @@ else:
                     regime = "Normal"
                     color  = "#015e06"
 
-                # Badge
-                st.markdown(
-                    f"""
-                    <div style="display:inline-block;padding:6px 12px;border-radius:999px;
-                               background-color:{color};color:white;font-weight:600;">
-                        Regime: {regime}
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                st.caption(f"Smoothed regime score: {regime_score:.2f}")
-
                 # Current snapshot metrics (for context)
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4 = st.columns(4)
                 with c1:
-                    st.metric("q90 Max Push Daily (PMH→HOD)", f"{q90_now:.0f}%")
+                    # Badge
+                    st.markdown(
+                        f"""
+                        <div style="display:inline-block;padding:6px 12px;border-radius:999px;
+                                   background-color:{color};color:white;font-weight:600;">
+                            Regime: {regime}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(f"Smoothed regime score: {regime_score:.2f}")
                 with c2:
-                    st.metric("Median Max Push Daily", f"{med_now:.0f}%")
+                    st.metric("q90 Max Push Daily (PMH→HOD)", f"{q90_now:.0f}%")
                 with c3:
-                    if np.isfinite(eta_now):
+                    st.metric("Median Max Push Daily", f"{med_now:.0f}%")
+                with c4:
+                     if np.isfinite(eta_now):
                         st.metric("Median η (%/min)", f"{eta_now:.2f}")
                     else:
                         st.write("")
