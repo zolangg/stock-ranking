@@ -483,21 +483,17 @@ def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame
         "B_pct": 100.0 * counts[gB_] / total if total > 0 else 0.0,
     }
 
-# ============================== Alignment (Distributions) ==============================
+# ============================== Regime (PMH Environment) ==============================
 st.markdown("---")
-st.subheader("Alignment")
+st.subheader("Regime (PMH Environment)")
 
 def vspace(px: int = 16):
     st.markdown(f"<div style='height:{px}px'></div>", unsafe_allow_html=True)
 
 base_df = ss.get("base_df", pd.DataFrame())
 if base_df.empty:
-    st.warning("Upload your Excel and click **Build model stocks**. Alignment distributions are disabled until then.")
+    st.warning("Upload your Excel and click **Build model stocks**. Regime plot and alignment distributions are disabled until then.")
     st.stop()
-
-# ============================== Regime (PMH Environment) ==============================
-st.markdown("---")
-st.subheader("Regime (PMH Environment)")
 
 needed_cols = {"Max_Push_Daily_%", "FT"}
 missing = needed_cols - set(base_df.columns)
@@ -624,6 +620,9 @@ else:
             st.altair_chart(reg_chart, use_container_width=True)
 
 # ============================== Alignment (Distributions) ==============================
+st.markdown("---")
+st.subheader("Alignment")
+
 if not ss.rows:
     st.info("Add at least one stock to compute distributions across cutoffs.")
     st.stop()
