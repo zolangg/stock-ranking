@@ -638,19 +638,6 @@ else:
                     "reg_median_eta":     "Median_Eta"
                 })
                 
-                # Add per-point regime label (Cold / Normal / Hot)
-                def _label_regime(score: float) -> str:
-                    if not np.isfinite(score):
-                        return "Unknown"
-                    if score < 0.8:
-                        return "Cold"
-                    elif score > 1.2:
-                        return "Hot"
-                    else:
-                        return "Normal"
-                
-                df_reg_hist["RegimeLabel"] = df_reg_hist["RegimeScore"].apply(_label_regime)
-                
                 # X encoding: Date or FT index
                 if x_col == "Date":
                     x_enc = alt.X("Date:T", title="Date")
@@ -669,24 +656,6 @@ else:
                     .encode(
                         x=x_enc,
                         y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score"),
-                    )
-                )
-                
-                # Colored points by regime (Cold / Normal / Hot)
-                points = (
-                    alt.Chart(df_reg_hist)
-                    .mark_circle(size=40)
-                    .encode(
-                        x=x_enc,
-                        y="RegimeScore:Q",
-                        color=alt.Color(
-                            "RegimeLabel:N",
-                            scale=alt.Scale(
-                                domain=["Cold", "Normal", "Hot", "Unknown"],
-                                range=["#faa1a4", "#015e06", "#ff2501", "#b30100"],
-                            ),
-                            title="Regime",
-                        ),
                         tooltip=[
                             x_field_tooltip,
                             alt.Tooltip("RegimeScore:Q",        title="Regime Score",           format=".2f"),
