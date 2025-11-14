@@ -675,7 +675,7 @@ else:
                     .encode(y="y:Q")
                 )
                 
-                score_chart = (line + points + guides).resolve_scale(color="independent")
+                score_chart = (line + guides).resolve_scale(color="independent")
                 st.altair_chart(score_chart, use_container_width=True)
 
 # ============================== Alignment (Distributions) ==============================
