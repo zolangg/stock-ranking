@@ -541,18 +541,40 @@ else:
             q90_now  = float(last_row["reg_q90_maxpush"])
             med_now  = float(last_row["reg_median_maxpush"])
             eta_now  = float(last_row["reg_median_eta"]) if "reg_median_eta" in df_ft_valid.columns else np.nan
-
-            # --- Regime classification (Cold / Normal / Hot) ---
-            # NOTE: thresholds are in "percent points" because we multiplied by 100 earlier
-            if q90_now < 120:
+            
+            # --- Global baselines over all FT winners ---
+            glob_q90 = float(df_ft["Max_Push_Daily_%"].quantile(0.9))
+            glob_med = float(df_ft["Max_Push_Daily_%"].median())
+            if "Eta_%_per_min" in df_ft.columns:
+                glob_eta = float(df_ft["Eta_%_per_min"].median())
+            else:
+                glob_eta = np.nan
+            
+            # --- Ratios current vs baseline ---
+            ratios = []
+            
+            if np.isfinite(q90_now) and np.isfinite(glob_q90) and glob_q90 > 0:
+                ratios.append(q90_now / glob_q90)
+            if np.isfinite(med_now) and np.isfinite(glob_med) and glob_med > 0:
+                ratios.append(med_now / glob_med)
+            if np.isfinite(eta_now) and np.isfinite(glob_eta) and glob_eta > 0:
+                ratios.append(eta_now / glob_eta)
+            
+            if ratios:
+                regime_score = float(np.mean(ratios))
+            else:
+                regime_score = 1.0  # fallback: neutral
+            
+            # --- Regime classification (Cold / Normal / Hot) from composite score ---
+            if regime_score < 0.8:
                 regime = "Cold"
-                color  = "#b30100"
-            elif q90_now > 200:
+                color  = "#faa1a4"
+            elif regime_score > 1.2:
                 regime = "Hot"
-                color  = "#015e06"
+                color  = "#ff2501"
             else:
                 regime = "Normal"
-                color  = "#c28b00"
+                color  = "#015e06"
 
             # Badge
             st.markdown(
