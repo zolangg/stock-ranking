@@ -648,10 +648,10 @@ else:
                 # Build interactive line chart with detailed tooltip
                 score_chart = (
                     alt.Chart(df_reg_hist)
-                    .mark_line(color="#ff7f0e")  # change color if you want another
+                    .mark_line(color="#ff2501")
                     .encode(
                         x=x_enc,
-                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score (vs long-run avg)"),
+                        y=alt.Y("RegimeScore:Q", title="Smoothed Regime Score"),
                         tooltip=[
                             # X axis
                             x_col if x_col == "Date" else "TradeIdx:Q",
