@@ -582,6 +582,9 @@ else:
                 eta_now      = float(last_row["reg_median_eta"]) if "reg_median_eta" in df_ft_valid.columns else np.nan
                 regime_score = float(last_row["RegimeScore"])
 
+                # Make current regime score available to other parts of the app (e.g. EV)
+                ss["RegimeScore_current"] = regime_score
+
                 # --- Regime classification (Cold / Normal / Hot) from smoothed score ---
                 if regime_score < 0.8:
                     regime = "Cold"
@@ -986,21 +989,46 @@ else:
 
     # ---- Apply tilts, compute EV series ----
     rr = float(st.session_state.get("rr_assumed", rr_assumed))
+
+    # RegimeScore from session (set in the Regime block); default neutral = 1.0
+    regime_score = float(st.session_state.get("RegimeScore_current", 1.0))
+    if not np.isfinite(regime_score) or regime_score <= 0:
+        regime_score = 1.0
+
+    # Regime tilts:
+    # - R_prob: gentle tilt on probability (square-root of regime_score)
+    # - R_rr:   stronger tilt on reward (direct regime_score)
+    alpha_reg_prob = 0.5  # controls how strongly regime affects probability
+    R_prob = float(np.clip(regime_score ** alpha_reg_prob, 0.7, 1.4))
+    R_rr   = float(np.clip(regime_score,                    0.6, 1.6))
+
     rows = []
     for i, g in enumerate(thr_labels):
         p = p_list[i] if i < len(p_list) else np.nan
         if not np.isfinite(p):
             continue
-        p_adj = float(np.clip(p * L_prob * K_prob, 0.0, 1.0))
-        ev_r  = float(np.clip(p_adj * rr - (1.0 - p_adj), -3.0, 8.0))
+
+        # Combine all tilts on probability
+        p_env = float(np.clip(p * L_prob * K_prob * R_prob, 0.0, 1.0))
+
+        # Regime-adjusted reward side
+        rr_env = float(rr * R_rr)
+
+        # Final EV (R), clipped to a reasonable range
+        ev_r = float(np.clip(p_env * rr_env - (1.0 - p_env), -3.0, 8.0))
+
         rows.append({
             "GainCutoff_%": int(g),
             "EV_R": ev_r,
             "P_model": float(p),
-            "P_adj": float(p_adj),
+            "P_adj": float(p_env),
             "RR": rr,
+            "RR_env": rr_env,
             "LiqTilt": float(L_prob),
             "CatTilt": float(K_prob),
+            "RegimeScore": regime_score,
+            "RegProbTilt": R_prob,
+            "RegRRTilt": R_rr,
         })
 
     df_ev = pd.DataFrame(rows)
