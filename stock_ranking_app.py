@@ -1076,15 +1076,23 @@ else:
                 color=alt.condition(alt.datum["EV_R"] >= 0, alt.value("#015e06"), alt.value("#b30100")),
                 tooltip=[
                     alt.Tooltip("GainCutoff_%:O", title="Cutoff (%)"),
-                    alt.Tooltip("EV_R:Q", title="EV (R)", format=".3f"),
-                    alt.Tooltip("P_model:Q", title="P(model)", format=".2f"),
-                    alt.Tooltip("P_adj:Q",   title="P(adjusted)", format=".2f"),
-                    alt.Tooltip("RR:Q",      title="R:R", format=".2f"),
-                    alt.Tooltip("LiqTilt:Q", title="Liquidity ×", format=".3f"),
-                    alt.Tooltip("CatTilt:Q", title="Catalyst ×",  format=".3f"),
+                    alt.Tooltip("EV_R:Q",         title="EV (R)",          format=".3f"),
+                    alt.Tooltip("P_model:Q",      title="P(model raw)",    format=".2f"),
+                    alt.Tooltip("P_base:Q",       title="P(base rate)",    format=".2f"),
+                    alt.Tooltip("P_eff:Q",        title="P(effective)",    format=".2f"),
+                    alt.Tooltip("P_adj:Q",        title="P(env final)",    format=".2f"),
+                    alt.Tooltip("RR:Q",           title="R:R input",       format=".2f"),
+                    alt.Tooltip("RR_env:Q",       title="R:R env adj",     format=".2f"),
+                    alt.Tooltip("LiqTilt:Q",      title="Liquidity ×",     format=".3f"),
+                    alt.Tooltip("CatTilt:Q",      title="Catalyst ×",      format=".3f"),
+                    alt.Tooltip("RegimeScore:Q",  title="Regime Score",    format=".2f"),
+                    alt.Tooltip("RegProbTilt:Q",  title="Regime × prob ×", format=".3f"),
+                    alt.Tooltip("RegRRTilt:Q",    title="Regime × RR ×",   format=".3f"),
+                    alt.Tooltip("ModelConf:Q",    title="Model conf",      format=".2f"),
                 ],
             )
         )
+
         vspace(24)
         st.altair_chart(ev_chart, use_container_width=True)
         st.markdown("---")
