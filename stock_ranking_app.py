@@ -987,7 +987,7 @@ else:
     K_prob = 1.0 + gam_cat * (2.0 * share_cat - 1.0)
     K_prob = float(np.clip(K_prob, 0.90, 1.10))  # modest bounds
 
-    # ---- Apply tilts, compute EV series ----
+        # ---- Apply tilts, compute EV series ----
     rr = float(st.session_state.get("rr_assumed", rr_assumed))
 
     # RegimeScore from session (set in the Regime block); default neutral = 1.0
@@ -1008,8 +1008,36 @@ else:
         if not np.isfinite(p):
             continue
 
+        # ---------- MODEL-CONFIDENCE BLEND ----------
+        # Base rate from DB: nA / (nA + nB) at this cutoff
+        if i < len(diag_nA):
+            nA_i = float(diag_nA[i])
+            nB_i = float(diag_nB[i])
+            tot  = nA_i + nB_i
+            p_base = nA_i / tot if tot > 0 else np.nan
+        else:
+            p_base = np.nan
+
+        # Confidence from diagnostics (0.25–1), fallback = 1 (trust model)
+        if i < len(diag_conf):
+            conf_i = float(diag_conf[i])
+        else:
+            conf_i = 1.0
+
+        if not np.isfinite(conf_i):
+            conf_i = 1.0
+        conf_i = float(np.clip(conf_i, 0.0, 1.0))
+
+        # If no usable base rate, just use the model
+        if not np.isfinite(p_base):
+            p_eff = p
+        else:
+            p_eff = conf_i * p + (1.0 - conf_i) * p_base
+        p_eff = float(np.clip(p_eff, 0.0, 1.0))
+        # -------------------------------------------
+
         # Combine all tilts on probability
-        p_env = float(np.clip(p * L_prob * K_prob * R_prob, 0.0, 1.0))
+        p_env = float(np.clip(p_eff * L_prob * K_prob * R_prob, 0.0, 1.0))
 
         # Regime-adjusted reward side
         rr_env = float(rr * R_rr)
@@ -1021,6 +1049,8 @@ else:
             "GainCutoff_%": int(g),
             "EV_R": ev_r,
             "P_model": float(p),
+            "P_base": float(p_base) if np.isfinite(p_base) else np.nan,
+            "P_eff": float(p_eff),
             "P_adj": float(p_env),
             "RR": rr,
             "RR_env": rr_env,
@@ -1029,6 +1059,7 @@ else:
             "RegimeScore": regime_score,
             "RegProbTilt": R_prob,
             "RegRRTilt": R_rr,
+            "ModelConf": conf_i,
         })
 
     df_ev = pd.DataFrame(rows)
