@@ -173,23 +173,39 @@ st.markdown("---")
 st.subheader("Add Stock")
 
 with st.form("add_form", clear_on_submit=True):
-    c1, c2, c3 = st.columns([1.2, 1.2, 0.8])
+    c1, c2, c3 = st.columns([1.2, 1.2, 0.9])
+
     with c1:
         ticker      = st.text_input("Ticker", "").strip().upper()
         mc_pmmax    = st.number_input("Premarket Market Cap (M$)", 0.0, step=0.01, format="%.2f")
         float_pm    = st.number_input("Premarket Float (M)", 0.0, step=0.01, format="%.2f")
         gap_pct     = st.number_input("Gap %", 0.0, step=0.01, format="%.2f")
         max_pull_pm = st.number_input("Premarket Max Pullback (%)", 0.0, step=0.01, format="%.2f")
+
     with c2:
         atr_usd     = st.number_input("Prior Day ATR ($)", 0.0, step=0.01, format="%.2f")
         pm_vol      = st.number_input("Premarket Volume (M)", 0.0, step=0.01, format="%.2f")
         pm_dol      = st.number_input("Premarket Dollar Vol (M$)", 0.0, step=0.01, format="%.2f")
         rvol_pm_cum = st.number_input("Premarket Max RVOL", 0.0, step=0.01, format="%.2f")
+
     with c3:
-        catalyst_yn = st.selectbox("Catalyst?", ["No", "Yes"], index=0)
+        catalyst_level = st.selectbox(
+            "Catalyst impact",
+            ["None", "Very negative", "Negative", "Neutral", "Positive", "Very positive"],
+            index=0,
+        )
+        dilution_level = st.selectbox(
+            "Dilution risk",
+            ["Unknown", "Low", "Medium", "High"],
+            index=0,
+        )
+
     submitted = st.form_submit_button("Add", use_container_width=True)
 
 if submitted and ticker:
+    # For models: none = 0, all other catalyst levels = 1
+    catalyst_bin = 0.0 if catalyst_level == "None" else 1.0
+
     row = {
         "Ticker": ticker,
         "MC_PM_Max_M": mc_pmmax,
@@ -202,9 +218,15 @@ if submitted and ticker:
         "PM$Vol/MC_%": (pm_dol / mc_pmmax * 100.0) if mc_pmmax > 0 else np.nan,
         "Max_Pull_PM_%": max_pull_pm,
         "RVOL_Max_PM_cum": rvol_pm_cum,
-        "Catalyst": 1.0 if catalyst_yn == "Yes" else 0.0,
-        "CatalystYN": catalyst_yn,
+
+        # Models see simple 0/1
+        "Catalyst": catalyst_bin,
+
+        # EV / tilts see the detailed labels
+        "CatalystLevel": catalyst_level,
+        "DilutionLevel": dilution_level,
     }
+
     ss.rows.append(row)
     st.success(f"Saved {ticker}.")
 
@@ -977,17 +999,57 @@ else:
     L_prob = 1.0 + lam_liq * float(np.tanh(score * 3.0))
     L_prob = float(np.clip(L_prob, 0.85, 1.20))  # modest bounds
 
-    # Catalyst factor (share of 'Yes' among selected tickers)
-    if not added_df_full.empty and "Catalyst" in added_df_full.columns:
-        share_cat = float(np.nanmean(pd.to_numeric(added_df_full["Catalyst"], errors="coerce") >= 0.5))
+    # ---- Catalyst tilt (multi-level, from CatalystLevel) ----
+    cat_level_current = None
+    K_prob = 1.0  # default neutral
+    
+    if not added_df_full.empty and "CatalystLevel" in added_df_full.columns:
+        # Take the most common catalyst level among selected tickers
+        mode_series = added_df_full["CatalystLevel"].dropna().astype(str)
+        if not mode_series.empty:
+            cat_level_current = mode_series.mode().iloc[0]
+    
+    # Map level -> tilt for EV (probability side)
+    if cat_level_current == "Very negative":
+        K_prob = 0.75    # heavy punishment
+    elif cat_level_current == "Negative":
+        K_prob = 0.90    # mild punishment
+    elif cat_level_current == "Neutral":
+        K_prob = 1.00    # fully neutral
+    elif cat_level_current == "Positive":
+        K_prob = 1.10    # moderate boost
+    elif cat_level_current == "Very positive":
+        K_prob = 1.25    # strong boost
+    elif cat_level_current == "None":
+        # no catalyst at all: slightly worse than neutral
+        K_prob = 0.90
     else:
-        share_cat = np.nan
-    if not np.isfinite(share_cat):  # neutral if unknown
-        share_cat = 0.5
-    K_prob = 1.0 + gam_cat * (2.0 * share_cat - 1.0)
-    K_prob = float(np.clip(K_prob, 0.90, 1.10))  # modest bounds
+        K_prob = 1.00    # unknown = neutral
+    
+    K_prob = float(np.clip(K_prob, 0.70, 1.30))  # safety clamp
 
-        # ---- Apply tilts, compute EV series ----
+    # ---- Dilution tilt (from DilutionLevel) ----
+    dil_level_current = None
+    D_prob = 1.0  # default neutral
+    
+    if not added_df_full.empty and "DilutionLevel" in added_df_full.columns:
+        mode_series = added_df_full["DilutionLevel"].dropna().astype(str)
+        if not mode_series.empty:
+            dil_level_current = mode_series.mode().iloc[0]
+    
+    # Map dilution level -> tilt
+    if dil_level_current == "Low":
+        D_prob = 1.05   # slightly favorable
+    elif dil_level_current == "Medium":
+        D_prob = 0.90   # mild headwind
+    elif dil_level_current == "High":
+        D_prob = 0.80   # strong headwind, heavy supply
+    else:  # "Unknown" or missing
+        D_prob = 1.00   # neutral
+    
+    D_prob = float(np.clip(D_prob, 0.70, 1.10))
+
+    # ---- Apply tilts, compute EV series ----
     rr = float(st.session_state.get("rr_assumed", rr_assumed))
 
     # RegimeScore from session (set in the Regime block); default neutral = 1.0
@@ -1036,8 +1098,8 @@ else:
         p_eff = float(np.clip(p_eff, 0.0, 1.0))
         # -------------------------------------------
 
-        # Combine all tilts on probability
-        p_env = float(np.clip(p_eff * L_prob * K_prob * R_prob, 0.0, 1.0))
+        # Combine all tilts on probability (liquidity, catalyst, regime, dilution)
+        p_env = float(np.clip(p_eff * L_prob * K_prob * R_prob * D_prob, 0.0, 1.0))
 
         # Regime-adjusted reward side
         rr_env = float(rr * R_rr)
@@ -1060,6 +1122,9 @@ else:
             "RegProbTilt": R_prob,
             "RegRRTilt": R_rr,
             "ModelConf": conf_i,
+            "DilutionAdj": float(D_prob),
+            "CatLevel": cat_level_current if cat_level_current is not None else "Unknown",
+            "DilutionLevel": dil_level_current if dil_level_current is not None else "Unknown",
         })
 
     df_ev = pd.DataFrame(rows)
@@ -1089,6 +1154,8 @@ else:
                     alt.Tooltip("RegProbTilt:Q",  title="RegimeProbAdj", format=".3f"),
                     alt.Tooltip("RegRRTilt:Q",    title="RegimeRRAdj",   format=".3f"),
                     alt.Tooltip("ModelConf:Q",    title="Model conf",      format=".2f"),
+                    alt.Tooltip("CatLevel:N",      title="Catalyst level"),
+                    alt.Tooltip("DilutionLevel:N", title="Dilution level"),
                 ],
             )
         )
