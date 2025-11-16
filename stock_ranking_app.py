@@ -384,101 +384,230 @@ def _nca_predict_proba_row(xrow: dict, model: dict) -> float:
     return float(np.clip(pA, 0.0, 1.0))
 
 def _train_catboost_once(df_groups: pd.DataFrame, gA_label: str, gB_label: str, features: list[str]) -> dict:
-    if not _CATBOOST_OK: return {}
+    """
+    Train a (possibly) small CatBoost ensemble for the given Gain% split.
+    - Uses dynamic complexity based on sample size.
+    - Averages predictions from several seeds.
+    - Calibrates the averaged probability with isotonic or Platt.
+    """
+    if not _CATBOOST_OK:
+        return {}
+
     present = set(df_groups["__Group__"].dropna().unique().tolist())
-    if not ({gA_label, gB_label} <= present): return {}
+    if not ({gA_label, gB_label} <= present):
+        return {}
+
     df2 = df_groups[df_groups["__Group__"].isin([gA_label, gB_label])].copy()
     feats = [f for f in features if f in df2.columns and f in ALLOWED_LIVE_FEATURES and f not in EXCLUDE_FOR_NCA]
-    if not feats: return {}
+    if not feats:
+        return {}
+
     Xdf = df2[feats].apply(pd.to_numeric, errors="coerce")
     y = (df2["__Group__"].values == gA_label).astype(int)
+
     mask_finite = np.isfinite(Xdf.values).all(axis=1)
-    Xdf = Xdf.loc[mask_finite]; y = y[mask_finite]
+    Xdf = Xdf.loc[mask_finite]
+    y   = y[mask_finite]
+
     n = len(y)
-    if n < 40 or np.unique(y).size < 2: return {}
+    if n < 40 or np.unique(y).size < 2:
+        return {}
+
     X_all = Xdf.values.astype(np.float32, copy=False)
     y_all = y.astype(np.int32, copy=False)
+
+    # ---------- Dynamic complexity based on n ----------
+    if n >= 400:
+        depth = 4
+        iterations = 400
+        l2_leaf_reg = 8
+    elif n >= 200:
+        depth = 3
+        iterations = 300
+        l2_leaf_reg = 10
+    else:
+        depth = 2
+        iterations = 200
+        l2_leaf_reg = 12
+
     from sklearn.model_selection import StratifiedShuffleSplit
+
     test_size = 0.2 if n >= 100 else max(0.15, min(0.25, 20 / n))
     sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
     tr_idx, va_idx = next(sss.split(X_all, y_all))
+
     Xtr, Xva = X_all[tr_idx], X_all[va_idx]
     ytr, yva = y_all[tr_idx], y_all[va_idx]
+
     def _has_both_classes(arr):
         return np.unique(arr).size == 2
+
     eval_ok = (len(yva) >= 8) and _has_both_classes(yva) and _has_both_classes(ytr)
-    params = dict(
+
+    base_params = dict(
         loss_function="Logloss",
         eval_metric="Logloss",
-        iterations=200,
+        iterations=iterations,
         learning_rate=0.05,
-        depth=2,
-        l2_leaf_reg=10,
+        depth=depth,
+        l2_leaf_reg=l2_leaf_reg,
         bootstrap_type="Bayesian",
         bagging_temperature=0.5,
         auto_class_weights="Balanced",
-        random_seed=42,
         allow_writing_files=False,
         verbose=False,
     )
-    if eval_ok: params.update(dict(od_type="Iter", od_wait=40))
-    else:       params.update(dict(od_type="None"))
-    model = CatBoostClassifier(**params)
-    try:
-        if eval_ok: model.fit(Xtr, ytr, eval_set=(Xva, yva))
-        else:       model.fit(X_all, y_all)
-    except Exception:
+
+    # ---------- Small ensemble of seeds ----------
+    # For small n, we use only one seed; for larger n, a few seeds.
+    if n >= 250:
+        seed_list = [42, 1337, 7]
+    elif n >= 150:
+        seed_list = [42, 1337]
+    else:
+        seed_list = [42]
+
+    models = []
+    p_raw_list = []
+
+    for sd in seed_list:
+        params = dict(base_params)
+        params["random_seed"] = sd
+
+        # Only use early stopping if eval set is valid
+        if eval_ok:
+            params.update(dict(od_type="Iter", od_wait=40))
+        else:
+            params.update(dict(od_type="None"))
+
+        model = CatBoostClassifier(**params)
+
         try:
-            model = CatBoostClassifier(**{**params, "od_type": "None"})
-            model.fit(X_all, y_all)
-            eval_ok = False
+            if eval_ok:
+                model.fit(Xtr, ytr, eval_set=(Xva, yva))
+            else:
+                model.fit(X_all, y_all)
         except Exception:
-            return {}
-    iso_bx = np.array([]); iso_by = np.array([]); platt = None; ece = np.nan
-    try:
+            # As a fallback, try without early stopping at all
+            try:
+                params["od_type"] = "None"
+                model = CatBoostClassifier(**params)
+                model.fit(X_all, y_all)
+            except Exception:
+                continue  # skip this seed if it totally fails
+
+        models.append(model)
+
         if eval_ok:
             p_raw = model.predict_proba(Xva)[:, 1].astype(float)
-            if np.unique(p_raw).size >= 3 and _has_both_classes(yva):
-                bx, by = _pav_isotonic(p_raw, yva.astype(float))
+            p_raw_list.append(p_raw)
+
+    if not models:
+        return {}
+
+    # ---------- Calibration: isotonic or Platt, on ensemble mean ----------
+    iso_bx = np.array([])
+    iso_by = np.array([])
+    platt = None
+    ece = np.nan
+
+    if eval_ok and p_raw_list:
+        # Ensemble mean probability on validation set
+        p_raw_stack = np.vstack(p_raw_list)
+        p_raw_mean = np.mean(p_raw_stack, axis=0)
+
+        try:
+            if np.unique(p_raw_mean).size >= 3 and _has_both_classes(yva):
+                bx, by = _pav_isotonic(p_raw_mean, yva.astype(float))
                 if len(bx) >= 2:
                     iso_bx, iso_by = np.array(bx), np.array(by)
-                    p_cal = _iso_predict(iso_bx, iso_by, p_raw)
+                    p_cal = _iso_predict(iso_bx, iso_by, p_raw_mean)
                     ece = _ece_score(yva, p_cal)
+
             if iso_bx.size < 2:
-                z0 = p_raw[yva==0]; z1 = p_raw[yva==1]
+                # Platt fallback on ensemble mean
+                z0 = p_raw_mean[yva == 0]
+                z1 = p_raw_mean[yva == 1]
                 if z0.size and z1.size:
                     m0, m1 = float(np.mean(z0)), float(np.mean(z1))
-                    s0, s1 = float(np.std(z0)+1e-9), float(np.std(z1)+1e-9)
-                    m = 0.5*(m0+m1); k = 2.0 / (0.5*(s0+s1) + 1e-6)
+                    s0, s1 = float(np.std(z0) + 1e-9), float(np.std(z1) + 1e-9)
+                    m = 0.5 * (m0 + m1)
+                    k = 2.0 / (0.5 * (s0 + s1) + 1e-6)
                     platt = (m, k)
-                    p_cal = 1.0 / (1.0 + np.exp(-platt[1]*(p_raw - platt[0])))
+                    p_cal = 1.0 / (1.0 + np.exp(-platt[1] * (p_raw_mean - platt[0])))
                     ece = _ece_score(yva, p_cal)
-    except Exception:
-        pass
-    return {"ok": True, "feats": feats, "gA": gA_label, "gB": gB_label, "cb": model, "iso_bx": iso_bx.tolist(), "iso_by": iso_by.tolist(), "platt": platt, "ece": float(ece) if np.isfinite(ece) else np.nan}
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "feats": feats,
+        "gA": gA_label,
+        "gB": gB_label,
+        # Keep the first model in cb for backward compatibility
+        "cb": models[0],
+        # New: full ensemble
+        "cb_list": models,
+        "iso_bx": iso_bx.tolist(),
+        "iso_by": iso_by.tolist(),
+        "platt": platt,
+        "ece": float(ece) if np.isfinite(ece) else np.nan,
+    }
 
 def _cat_predict_proba_row(xrow: dict, model: dict) -> float:
-    if not model or not model.get("ok"): return np.nan
+    """
+    Predict probability using:
+    - mean of CatBoost ensemble (if available),
+    - then isotonic or Platt calibration.
+    """
+    if not model or not model.get("ok"):
+        return np.nan
+
     feats = model["feats"]
     vals = []
     for f in feats:
         v = pd.to_numeric(xrow.get(f), errors="coerce")
         v = float(v) if pd.notna(v) else np.nan
-        if not np.isfinite(v): return np.nan
+        if not np.isfinite(v):
+            return np.nan
         vals.append(v)
+
     X = np.array(vals, dtype=float).reshape(1, -1)
-    try:
+
+    cb_list = model.get("cb_list")
+    if not cb_list:
+        # Backward compatibility: single model
         cb = model.get("cb")
-        if cb is None: return np.nan
-        z = float(cb.predict_proba(X)[0, 1])
-    except Exception: return np.nan
+        if cb is None:
+            return np.nan
+        try:
+            z = float(cb.predict_proba(X)[0, 1])
+        except Exception:
+            return np.nan
+    else:
+        # Ensemble mean
+        z_vals = []
+        for cb in cb_list:
+            try:
+                z_vals.append(float(cb.predict_proba(X)[0, 1]))
+            except Exception:
+                continue
+        if not z_vals:
+            return np.nan
+        z = float(np.mean(z_vals))
+
     iso_bx = np.array(model.get("iso_bx", []), dtype=float)
     iso_by = np.array(model.get("iso_by", []), dtype=float)
+    pl = model.get("platt")
+
     if iso_bx.size >= 2 and iso_by.size >= 2:
         pA = float(_iso_predict(iso_bx, iso_by, np.array([z]))[0])
+    elif pl:
+        m, k = pl
+        pA = 1.0 / (1.0 + np.exp(-k * (z - m)))
     else:
-        pl = model.get("platt")
-        pA = z if not pl else 1.0 / (1.0 + np.exp(-pl[1]*(z - pl[0])))
+        pA = z
+
     return float(np.clip(pA, 0.0, 1.0))
 
 def _compute_alignment_median_centers(stock_row: dict, centers_tbl: pd.DataFrame) -> dict:
